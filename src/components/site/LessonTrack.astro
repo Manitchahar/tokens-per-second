@@ -1,0 +1,50 @@
+---
+// A module drawn as one track of a profiler trace: each lesson is a span sized by its minutes.
+// Marks, not colours, carry state: filled = done, flag = where you stopped, outline = ahead,
+// hatched = a lab or project, the playhead = the lesson you are reading.
+import type { FlatLesson } from '../../data/course';
+import { url } from '../../site';
+
+interface Props { lessons: FlatLesson[]; current?: string; available: Set<string>; showLabels?: boolean; size?: 'sm' | 'md' }
+const { lessons, current, available, showLabels = false, size = 'md' } = Astro.props;
+---
+<ol class:list={['ltrack', size]} aria-label="Lessons in this module">
+  {lessons.map((l) => {
+    const key = `${l.module.slug}/${l.slug}`;
+    const has = available.has(key);
+    const isCur = key === current;
+    const Tag = has ? 'a' : 'span';
+    return (
+      <li style={`flex: ${l.minutes} 1 0`} class:list={['ls', l.kind, { current: isCur, missing: !has }]} data-lesson-key={key}>
+        <Tag href={has ? url(l.href) : undefined} title={`${l.code} ${l.title} · ${l.minutes} min`} aria-current={isCur ? 'page' : undefined}>
+          <span class="bar" />
+          {showLabels && <span class="lbl"><span class="code">{l.code}</span> {l.title}</span>}
+          <span class="visually-hidden">{l.code} {l.title}{!has ? ' (being written)' : ''}</span>
+        </Tag>
+      </li>
+    );
+  })}
+</ol>
+
+<style>
+  .ltrack { list-style: none; margin: 0; padding: 0; display: flex; gap: 3px; width: 100%; }
+  .ls { min-width: 10px; position: relative; }
+  .ls > a, .ls > span { display: block; text-decoration: none; color: inherit; padding: 6px 0; }
+  .bar { display: block; height: 10px; border-radius: 2px; border: 1px solid var(--rule-2); transition: background 0.3s, border-color 0.3s; }
+  .md .bar { height: 12px; }
+  .ls.lab .bar, .ls.project .bar {
+    background-image: repeating-linear-gradient(135deg, var(--rule-2) 0 1.5px, transparent 1.5px 5px);
+  }
+  .ls.missing .bar { border-style: dashed; border-color: var(--rule); background-image: none; }
+  .ls > a:hover .bar { border-color: var(--text-2); }
+  .ls:global(.is-done) .bar { background: var(--text-2); border-color: var(--text-2); }
+  .ls:global(.is-done).lab .bar, .ls:global(.is-done).project .bar { background-image: repeating-linear-gradient(135deg, var(--text-2) 0 1.5px, var(--ground) 1.5px 5px); }
+  .ls.current .bar { border-color: var(--text); box-shadow: 0 0 0 1px var(--text); }
+  .ls.current::before { content: ''; position: absolute; left: 50%; top: -6px; bottom: -6px; width: 1px; background: var(--text); }
+  .ls:global(.is-flag)::after {
+    content: ''; position: absolute; left: 2px; top: -9px; width: 7px; height: 6px;
+    background: var(--compute); clip-path: polygon(0 0, 100% 0, 65% 50%, 100% 100%, 0 100%);
+  }
+  .lbl { display: block; font-size: 0.72rem; color: var(--text-2); margin-top: 0.35rem; line-height: 1.3; padding-right: 0.3rem; }
+  .code { font-family: var(--font-mono); color: var(--text-3); }
+</style>

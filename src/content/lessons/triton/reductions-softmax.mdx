@@ -1,0 +1,256 @@
+---
+title: 'Reductions & a fused softmax'
+summary: 'Collapse a whole block into one number on the GPU, then use that to write a softmax that reads its input exactly once — and see why the three-pass version is the single easiest optimization in inference.'
+objectives:
+  - Write a reduction with tl.sum, tl.max and axis arguments, and explain the tree it generates
+  - Derive the three-pass softmax and count its memory traffic
+  - 'Implement the online softmax: one pass, a running max and a rescaled running sum'
+  - Prove the online result is numerically identical to the naive one
+  - Measure the traffic reduction and explain why the fused kernel is bandwidth-bound
+---
+import SoftmaxBlocks from '@/components/viz/triton/SoftmaxBlocks.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Vector add was easy because every element was independent: program $p$ touched element $p$, and there was nothing to combine. Almost everything interesting in an LLM is the opposite — you take a whole row and collapse it to a few numbers. Softmax. RMSNorm. The sum over the vocabulary before top-p sampling. The mean and sum in attention.
+
+That operation is a <Term t="reduction">reduction</Term>, and it is the second half of the Triton programming model. Once you can reduce a block and fuse the result into the same kernel, you can write the small memory-bound operations that actually dominate inference runtime.
+
+## A reduction is not a loop
+
+Here is the instinct to discard. On a CPU you write a loop:
+
+```python
+total = 0.0
+for i in range(n):
+    total += row[i]
+```
+
+On a GPU that is a disaster. Each iteration waits on the last, one thread does all $n$ additions, and the other 31 threads in the warp sit in lockstep doing nothing — exactly the branch-in-a-warp problem from Module 02. A loop on a GPU is not a fast loop; it is $n$ serialized steps on one lane.
+
+Triton gives you the reduction directly:
+
+```python
+s = tl.sum(row)          # collapse the whole block to one number
+m = tl.max(row)          # same, for the maximum
+```
+
+There is no loop in your code, and there is not a loop in the generated code either. A block-wide reduction compiles to a **tree**: pair up the elements, add each pair, halve the count, repeat. For a block of 1,024 elements that is $\log_2 1024 = 10$ steps, and every step halves the work — 1,024, then 512, then 256, down to 1. Total work is about twice $n$ additions, not $n$ serialized ones.
+
+You can also reduce along one axis of a 2-D tile:
+
+```python
+s = tl.sum(tile, axis=1)   # one number per row
+s = tl.sum(tile, axis=0)   # one number per column
+```
+
+<Callout type="intuition" title="Why the tree is the right shape">
+  The depth is $\log_2 n$ and the width doubles each step, so no single step does much work and no step waits long. Compare the loop: depth $n$, width 1, every step waiting on the last. The tree is not an optimization of the loop — it is a different problem shape, and on a GPU it is the only sensible one.
+</Callout>
+
+The cost is that a reduction **collapses information**: once you have `tl.max(row)`, the individual values are gone unless you kept them. That is why reduction and fusion are the same subject, and why softmax is the perfect example.
+
+## Softmax, and why it costs three passes
+
+Recall from Module 01 what softmax does to a row of scores $z_1 \dots z_n$:
+
+$$
+p_i = \frac{e^{z_i - m}}{\sum_{j=1}^{n} e^{z_j - m}}, \qquad m = \max_j z_j
+$$
+
+Two things force the max into the formula. First, <Term t="numerical-stability">numerical stability</Term>: $e^{100}$ overflows FP16 to infinity, so subtracting the max $m$ first guarantees every exponentiated value is at most one. Second, the subtraction genuinely cancels out and changes nothing mathematically, because $e^{z_i - m} = e^{z_i} / e^m$ and the $e^m$ divides out of the normalization.
+
+So a correct softmax *needs the max before it starts*. Written as ordinary code:
+
+```python
+m = row.max()             # read the row      ← pass 1
+e = (row - m).exp()
+l = e.sum()               # read the row again ← pass 2
+out = e / l               # divide
+```
+
+Each pass is a kernel launch, and between launches the intermediate lives in HBM.
+
+<Scrolly>
+  <SoftmaxBlocks client:visible slot="stage" />
+
+  <Step title="1. The input">
+    A row of attention scores. In real attention this row is the scores for one query against every cached key, so its length is the context length — thousands of elements. The next token is sampled from the probabilities you are about to compute.
+  </Step>
+
+  <Step title="2. Softmax as you know it">
+    Subtract the max, exponentiate, divide by the sum. It turns arbitrary scores into positive numbers that sum to 1, which is the definition of a probability distribution.
+  </Step>
+
+  <Step title="3. The max has to come first">
+    You cannot exponentiate until you know the row's maximum, or a large score overflows to infinity and poisons the whole row to `NaN`. So the max is a genuine dependency, not a stylistic choice.
+  </Step>
+
+  <Step title="4. Three passes, twice the traffic">
+    Written naively that is three reads of the row and one write: read for the max, read to exponentiate and sum, then divide and write. For a row of 8 FP16 values, 64 bytes moved instead of 32.
+  </Step>
+
+  <Step title="5. Reduction in one step">
+    Both the max and the sum are single-block reductions. The naive version launches three kernels and makes three trips to HBM; the fused version launches one and makes one.
+  </Step>
+
+  <Step title="6. Carry the running max">
+    The fix is to stop needing the global max in advance. Carry a running max $m$ and a running sum $\ell$ through the blocks. When a new block raises the maximum, **rescale the old sum** by $e^{m_{\text{old}} - m_{\text{new}}}$ — the correction that keeps $\ell$ meaning the same thing.
+  </Step>
+
+  <Step title="7. One pass, one read">
+    Each element is read exactly once. The row never leaves on-chip memory, so the cost drops from three reads and one write to one read and one write.
+  </Step>
+
+  <Step title="8. The fused kernel">
+    Read once, compute everything, write once. With no math bottleneck left, the kernel is purely bandwidth-bound — and that is the *goal*, because it means you cannot make it faster.
+  </Step>
+</Scrolly>
+
+## The online softmax
+
+The rescaling is the whole trick, so let me derive it properly rather than assert it.
+
+Suppose after processing some blocks you hold:
+
+- $m$ — the largest value seen so far
+- $\ell = \sum_{j \text{ seen}} e^{z_j - m}$
+
+Now a new block arrives with maximum $m'$. Two cases.
+
+**If $m' \le m$**: the running max is still correct and every new term $e^{z - m'}$ can go straight in, so $\ell \leftarrow \ell + \sum e^{z - m}$.
+
+**If $m' > m$**: the true maximum has risen, and $\ell$ is now measured against the wrong baseline. Fix it by rewriting every old term against the new one:
+
+$$
+\ell = \sum_j e^{z_j - m'} = \sum_j e^{z_j - m} \cdot e^{m - m'} = \ell \cdot e^{m - m'}
+$$
+
+Since $m - m' < 0$, this *shrinks* $\ell$ — which is correct, because raising the baseline shrinks every term. Then add the new block's terms and set $m \leftarrow m'$.
+
+One multiply by $e^{m - m'}$, one maximum, one sum, per block. At the end, $p_i = e^{z_i - m} / \ell$.
+
+<Callout type="math" title="Worked example: a 4-element row, streamed in blocks of 2">
+  Scores $[1, 4, 3, 2]$, softmax in FP32. Stream as blocks $[1,4]$ then $[3,2]$.
+
+  **Block 1.** $m = 4$. Terms: $e^{1-4} = 0.1353$, $e^{4-4} = 1$. $\ell = 1.1353$.
+
+  **Block 2.** Its max is 3, which is below the running max of 4, so the running max is unchanged. Add $e^{3-4} = 0.3679$ and $e^{2-4} = 0.1353$. Now $\ell = 1.1353 + 0.3679 + 0.1353 = 1.6385$.
+
+  **Result.** $p = [0.0826,\ 0.6104,\ 0.2245,\ 0.0826]$. Sum = 1.0000. Identical to the three-pass version.
+
+  **Now the case that matters.** Stream as $[3, 2]$ then $[1, 4]$ instead — worst case for the running max. Block 1: $m = 3$, $\ell = 1 + e^{-1} = 1.3679$. Block 2 has $m' = 4 > 3$, so rescale: $\ell \leftarrow 1.3679 \times e^{3-4} = 0.5032$. Then add $e^{1-4} = 0.1353$ and $e^{4-4} = 1$: $\ell = 1.6385$.
+
+  **Exactly the same answer.** The rescaling absorbed the reordering, and the row was still read only once.
+</Callout>
+
+## The kernel
+
+```python
+@triton.jit
+def softmax_kernel(x_ptr, out_ptr, n_cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)                       # one program per row
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+
+    x = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=-float('inf'))
+
+    m = tl.max(x, axis=0)                        # reduction 1: the row max
+    z = x - m                                   # safe: every value is now <= 0
+    e = tl.exp(z)                               # and therefore <= 1
+    l = tl.sum(e, axis=0)                        # reduction 2: the normalizer
+    out = e / l
+
+    tl.store(out_ptr + row * n_cols + cols, out, mask=mask)
+```
+
+Six lines of real work, and it is **already the fused version**. Read the row once into registers, do both reductions on the register-resident block, write once. The row never touches HBM twice.
+
+Two details carry real weight:
+
+**`other=-float('inf')`** on the masked load. Without it, the padded lanes hold zeros, and `tl.max` would return 0 — which then makes $e^{0 - 0} = 1$ for every padded lane, and those ones land in the sum. The result is a row whose probabilities do not add to 1. Masked lanes must be **neutral for the operation**, which for a max means negative infinity, not zero.
+
+**`BLOCK` must be at least `n_cols`.** This kernel assumes a whole row fits in one block. For a 128,256-entry vocabulary, that is fine — 128K elements would be one row of 128,256, which is too wide. Attention rows, by contrast, can be tens of thousands long, and there the row must be streamed in blocks with the online update above. Both kernels are worth writing; the vocabulary one is the easier win.
+
+<Callout type="pitfall" title="The division that eats your speedup">
+  `e / l` in FP32 is a real division: several dozen cycles each. On a bandwidth-bound kernel that is usually hidden, but if you ever find yourself compute-limited, replace it with the reciprocal: `l = 1.0 / tl.sum(e, axis=0)` then `out = e * l`. One division per row instead of one per element. Measure before you bother.
+</Callout>
+
+## What this actually buys
+
+Let me price it for a real shape. Attention on a 4,096-token context, FP16, one query token, one head:
+
+<Callout type="math" title="Worked example: softmax over a 4,096-token context">
+  One row, one head, FP16.
+
+  - **Three passes:** 3 reads + 1 write of 4,096 elements × 2 bytes = 4 × 8,192 = **32,768 bytes**
+  - **One fused pass:** 1 read + 1 write = **16,384 bytes**
+
+  On a T4 at about 320 GB/s, that is $\frac{32{,}768}{320 \times 10^{9}} \approx 102\ \mu s$ versus $\frac{16{,}384}{320 \times 10^{9}} \approx 51\ \mu s$. On an H100 at 3.35 TB/s, $\frac{32{,}768}{3.35 \times 10^{12}} \approx 9.8\ \mu s$ versus $\frac{16{,}384}{3.35 \times 10^{12}} \approx 4.9\ \mu s$.
+
+  Multiply by heads and layers: a Llama-3.1-8B layer has 32 query heads, and the model has 32 layers. So a decode step touches **1,024 such rows**. Saving 16,384 bytes on each is 16.8 MB per token, which on a T4 is $\frac{16.8 \times 10^{6}}{320 \times 10^{9}} \approx 52\ \mu s$ — and it costs one extra line of code.
+
+  This is why "just fuse it" is the first thing every inference engineer tries, and why it usually works.
+</Callout>
+
+Now put it in context with the roofline from Module 02. Softmax does about 4 FLOPs per element (subtract, exp, divide) and moves 2 bytes per element in the fused version — an arithmetic intensity near **2 FLOP/byte**. The GPU ridge is far above that: an H100's ridge is about 295, a T4's about 203. So the fused kernel sits deep on the memory slope of the roofline, and **its performance is set entirely by how many bytes you move**.
+
+That is a good place to be. It also means the *only* remaining lever is bytes — which is why quantization (Module 11) and fusion are the two optimizations that apply to essentially every memory-bound kernel.
+
+## Why reduction makes fusion natural
+
+Here is the structural reason this lesson and the next one are the same idea.
+
+A reduction gives you a value that depends on the **whole block**. A fusion gives you a value that never leaves **on-chip memory**. Both are ways of breaking the pattern where every operation is its own kernel launch with a round trip through HBM.
+
+So when you look at a transformer layer and see this sequence:
+
+```
+x → RMSNorm → RoPE → Q/K/V projections → attention → output projection → residual add → SiLU → gate/up → SiLU → multiply → down → residual add
+```
+
+…count the round trips. For a 1-token decode on an 8B model, most of those tensors are tiny: one token of 4,096 FP16 values is **8 KB**. Moving 8 KB takes about 25 ns at HBM speed. But launching a kernel takes about 5 µs — two hundred times longer. You are not bandwidth-bound; you are **launch-bound**.
+
+One 8B model decode step is roughly 700 kernel launches. At 5 µs each that is 3.5 ms of pure overhead, which is most of why a naive PyTorch decode step took about 7 ms in Module 00. Fusion is how you collapse that count. That is the next lesson's whole subject.
+
+<Callout type="intuition" title="The rule that decides whether to fuse">
+  Fuse two operations when **the intermediate is smaller than the launch overhead it costs to round-trip**. 8 KB versus 5 µs says fuse. 500 MB versus 5 µs says do not bother — the launch is 0.001% of the work and you will only add register pressure. This one comparison tells you which of your kernels are worth touching.
+</Callout>
+
+## Try it yourself
+
+The notebook has the three-pass kernel, the fused kernel, the streaming online kernel for rows that do not fit in a block, and the correctness comparison against `torch.softmax` including the numerical error.
+
+<Colab nb="13-softmax.ipynb" />
+
+<Callout type="try" title="Predict, then run">
+  1. You swap `other=-float('inf')` for `other=0.0` on the masked load. Will the kernel error, produce `NaN`, or quietly produce probabilities that do not sum to 1? Which, and why?
+  2. For a vocabulary row of $n = 128{,}256$, `BLOCK = 65536` cannot work. What is the *minimum* structural change — and what does it cost you in memory traffic compared to the fused version?
+  3. Time the fused kernel on rows of 1,024 and 32,768. Which is closer to peak bandwidth, and why is the small one worse even though it has less data?
+  4. Why is `tl.max` needed at all if you are going to divide by the sum anyway — the sum would renormalize regardless?
+</Callout>
+
+<Callout type="recap" title="The idea to remember">
+  A GPU reduction is a **tree**, not a loop: $\log_2 n$ steps, each halving the width, instead of $n$ serialized steps on one lane. `tl.sum(x, axis=0)` collapses a block to one number and you never see the machinery.
+
+  Softmax needs the row max before it can exponentiate, which is why it is three passes and three trips to memory. But if you carry a running max $m$ and running sum $\ell$, and rescale $\ell \leftarrow \ell e^{m_{\text{old}} - m_{\text{new}}}$ whenever the max rises, you get **the identical answer in one pass and one read**. That single change is the fused softmax, and it is the template for every fusion in the next lesson.
+</Callout>
+
+<KeyNotes>
+  1. A <Term t="reduction">reduction</Term> on a GPU is a **tree of pairwise combines**, $\log_2 n$ deep — not a loop. `tl.sum(x)` / `tl.max(x)` / `tl.sum(x, axis=1)` are the whole API.
+  2. A reduction **collapses information**. That is exactly why reduction and fusion belong in the same lesson: keeping the block on-chip is what lets you reduce without a second trip to HBM.
+  3. Softmax needs the row max *before* exponentiating, so the naive form is **three reads and one write**.
+  4. **Online softmax** carries a running max and running sum, rescaling the sum by $e^{m_{\text{old}} - m_{\text{new}}}$ whenever a block raises the max. One read, one write, identical result.
+  5. Masked lanes must be **neutral for the operation**: `other=-float('inf')` on the load, or `tl.max` returns 0 and the probabilities silently stop summing to 1.
+  6. Fused softmax has an arithmetic intensity near **2 FLOP/byte**, deep on the memory slope of the roofline — its speed is set by bytes alone, which is exactly what you want.
+  7. The rule for whether to fuse: **intermediate smaller than ~5 µs of launch overhead → fuse**. One token × 4,096 hidden in FP16 is 8 KB, so a decode layer is launch-bound, not bandwidth-bound.
+  8. A whole decode step is roughly 700 kernel launches. Collapsing that count is the single biggest win available to an inference engineer, and it is what the next lesson does.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What does tl.sum(row) compile to on a GPU?', options: ['A sequential loop over the row on one thread', 'A tree of pairwise adds, log2(n) deep', 'A matrix multiply', 'A reduction through shared memory in global order'], answer: 1, why: 'A block-wide reduction is a tree: 1024 elements become 512 sums, then 256, and so on — 10 steps for a 1024-element block, with every step doing twice the parallel work of the last.' },
+  { q: 'A 4,096-element FP16 row goes through the naive three-pass softmax and then the fused one-pass version. How many bytes does the naive version move, in total?', numeric: true, answer: 32768, unit: 'bytes', why: 'Three reads plus one write of 4,096 × 2 = 8,192 bytes each gives 4 × 8,192 = 32,768 bytes. The fused version moves 2 × 8,192 = 16,384.' },
+  { q: 'The streaming softmax holds m = 3 and l = 1.3679 when a new block arrives with maximum m_new = 4. What is l after the rescaling, before adding the new block?', numeric: true, answer: 0.5032, tolerance: 0.005, why: 'l = 1.3679 × exp(3 − 4) = 1.3679 × 0.3679 = 0.5032. Raising the baseline shrinks every old term, which is exactly what the factor does.' },
+  { q: 'Why must the masked load use other=-float(inf) rather than the default 0?', options: ['Because negative infinity is faster to compare', 'Because a padded lane of 0 would make tl.max return 0, so the padded lanes get exp(0) = 1 and enter the sum', 'Because tl.max cannot handle zero', 'Because it avoids a NaN'], answer: 1, why: 'The masked lanes must not affect the reduction. With zeros they would set the running max to 0 (when the real max is negative) and would each contribute 1 to the sum, so the probabilities would not total 1.' },
+  { q: 'At BLOCK_SIZE = 1, how many programs does a 4096-element vector add launch, and roughly how much time is launch overhead at ~5 µs each?', options: ['4 programs, 20 µs', '4,096 programs, ~20 ms', '64 programs, 320 µs', '1,024 programs, ~1 ms'], answer: 1, why: 'One program per element gives 4,096 launches. At about 5 µs each that is roughly 20 ms of overhead, to move 8 KB of data.' },
+  { q: 'Fused softmax runs at about 2 FLOP per byte. A T4 has a ridge near 203 FLOP/byte. What does that tell you?', options: ['It is compute-bound', 'It is memory-bound — its speed is set by bytes moved, so only reducing traffic can help', 'It will run at exactly 2% of peak FLOPs', 'The block size is too small'], answer: 1, why: 'Below the ridge, memory is the limit. Intensity 2 sits deep on the memory slope, so the kernel is bandwidth-bound and no arithmetic improvement can speed it up — only fewer bytes.' },
+] } />

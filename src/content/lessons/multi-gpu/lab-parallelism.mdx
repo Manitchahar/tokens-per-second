@@ -1,0 +1,206 @@
+---
+title: 'Lab: Choose a parallelism strategy'
+summary: 'Run the decision procedure. The in-browser planner gives you an answer with its reasoning for any model, GPU, fabric and workload; the Colab notebook implements tensor parallelism, verifies it against the single-GPU reference, counts the pipeline bubble from a real schedule, measures a real collective, and produces the strategy matrix you would bring to a capacity review.'
+objectives:
+  - 'Apply the five-step decision procedure to a model, a GPU, a fabric and a workload, and defend the answer'
+  - 'Implement a tensor-parallel MLP and verify it against the unsplit reference, with an honest FP16 tolerance'
+  - 'Compute and verify the pipeline bubble two independent ways, from the formula and from a counted schedule'
+  - 'Calibrate a communication latency constant from a real torch.distributed collective'
+  - 'Produce a strategy matrix over a grid of configurations and identify the cases where the right answer is "neither"'
+colab: 18-parallelism.ipynb
+---
+import ParallelismLab from '@/components/viz/multi-gpu/ParallelismLab.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Four lessons of arithmetic. Now do it: given a model, a GPU, a fabric and a workload, say which parallelism to use — and say why, with the numbers.
+
+Two halves. The planner is instant and shows its reasoning; the notebook is an hour and gives you code you can defend in a design review.
+
+<Colab nb="18-parallelism.ipynb" />
+
+## Half one: the planner
+
+Pick a model and a GPU and the memory bar tells you the first thing that matters: **does it fit?** Below it, four rows check each strategy in escalation order and mark the one it recommends.
+
+<Scrolly>
+  <ParallelismLab client:visible slot="stage" />
+
+  <Step title="1. Set the model and the card">
+    Everything downstream is arithmetic from the model config and the GPU's capacity and bandwidth. The context and batch you serve are just as important as the model — the same 70B is easy at 2k context and impossible at 128k.
+  </Step>
+
+  <Step title="2. Does it fit?">
+    Weights plus KV cache plus overhead, against about 96% of capacity. If the bar is comfortably inside, the correct answer is **replicas** and nothing else.
+  </Step>
+
+  <Step title="3. If not, does it fit quantized?">
+    FP8 halves the weights; 4-bit quarters them. Quantization costs **no communication at all**, so it is nearly always cheaper than buying a second GPU. Switch the precision control and watch rows appear.
+  </Step>
+
+  <Step title="4. Only now: how many GPUs?">
+    Inside the island first. Tensor parallelism cannot leave a fast fabric, and crossing a node boundary with it costs 40x more than pipeline parallelism does.
+  </Step>
+
+  <Step title="5. Inside the node: tensor">
+    TP divides weights *and* KV cache by t, at the price of 64 to 160 collectives per forward pass. Over NVLink that is 0.1 to 2% of a decode step, so it is effectively free.
+  </Step>
+
+  <Step title="6. Across nodes: pipeline">
+    PP divides weights and KV by the stage count too, but moves only one activation per boundary — 40x less data than TP's two collectives per layer. That is why it survives InfiniBand where TP does not.
+  </Step>
+
+  <Step title="7. Then fill the pipeline">
+    The bubble is a function of micro-batches, and micro-batches come from concurrent requests. Set batch to 2 with PP=8 and the bubble is 70%. **The pipeline you cannot fill is worse than no pipeline.**
+  </Step>
+
+  <Step title="8. Everything left becomes replicas">
+    Re-run it: at 64 GPUs with Llama-70B you get TP=8, PP=2, and 4 replicas — 4 independent serving instances, not one big one.
+  </Step>
+</Scrolly>
+
+**Check yourself before the notebook.** Set Llama-3.1-70B on an H100 with batch 32 at 8k context and 8 GPUs:
+
+1. Does it fit on one GPU in BF16? In FP8?
+2. If you go to INT4, does it fit? What would you then deploy — TP, PP, or replicas?
+3. What is the single biggest constraint on Llama-3.1-70B's TP degree, and why is it not the one people expect?
+4. Drop the interconnect to InfiniBand. Which of the four rows changes, and which two do not?
+
+## Half two: the notebook
+
+<Callout type="try" title="Setup (3 minutes)">
+  Open the notebook above in Colab, choose **Runtime → Change runtime type → T4 GPU**, and run the cells top to bottom with <kbd>Shift</kbd>+<kbd>Enter</kbd>. It downloads Qwen2.5-0.5B-Instruct (about 1 GB) in section 9, so everything before that runs offline. **It is written for a single GPU on purpose** — see the note below.
+</Callout>
+
+<Callout type="intuition" title="Why the notebook simulates multi-GPU on one GPU">
+  A Colab T4 has one device. That is a constraint, but it is the *right* constraint: every formula in this module is arithmetic, so you can implement the mechanism (a tensor-parallel MLP is just sliced tensors and a sum) and verify it exactly, on one card, without a cluster. Section 5 does run a real `torch.distributed` collective, which gives you a real measured latency constant for the `link_time` model.
+
+  Being able to derive and verify the formulas on hardware you can rent for free is the entire reason this lab exists. When you get access to a real 8-GPU node, you will plug measured numbers into code you already trust.
+</Callout>
+
+### 1. Read the config, derive the constants
+
+Section 0 defines a `Cfg` class holding a model's shape, and section 1 uses it to print, for four real models, the weights size, the KV bytes per token, and the **legal TP degrees**. The last one is worth reading carefully:
+
+- Llama-3.1-8B and 70B allow TP up to 8, capped by their 8 KV heads.
+- **Qwen2.5-1.5B allows only TP = 1 or 2**, because it has 2 KV heads.
+
+The cell asserts that Llama-3.1-8B's KV per token is exactly 131,072 bytes. If it is not, check `head_dim` and `kv_heads` — those are the two fields people get wrong.
+
+### 2. The memory budget
+
+Section 2 prints the four GPUs the course uses with capacity, usable budget, bandwidth, and the **ridge point** (FLOP/s ÷ bytes/s). That last column is ~295 for an H100 and you derived it in Module 12 — it is the arithmetic intensity at which a kernel stops being memory-bound, and it is why decode sits permanently on the memory side of the roofline.
+
+Then it answers the first question for four models at batch 16, 8k context, in BF16 and FP8.
+
+**Expected:** the two small models fit in both; the two large ones fit in neither BF16 but the 32B fits in FP8. **Read the FP8 row carefully — it is usually the whole answer**, and it costs no communication.
+
+### 3. Implement tensor parallelism, verify it
+
+Section 3 builds `tp_mlp`: column-parallel on the first matrix, no communication; row-parallel on the second, partial sums summed across ranks. It compares against the unsplit `silu(x @ w1) @ w2`.
+
+**Expected output:** a relative error around 1e-3 or below and `True`. That is FP16 rounding from summing $t$ partial sums in a different order than one big GEMM — and it is the honest tolerance. **Tensor parallelism is not bitwise exact**, and any framework claiming otherwise deserves suspicion.
+
+The cell then suggests three deliberate bugs to try: slicing the wrong dimension of `w1` (silently wrong), averaging instead of summing (off by exactly $t$), and slicing `w2` by output columns (caught by a shape error, which is the good outcome).
+
+### 4. Price tensor parallelism
+
+Section 4 prints TP communication for Llama-3.1-70B at $t \in \{2,4,8\}$ across six fabrics, then the number that matters: **communication as a fraction of the decode step**.
+
+**Expected:** the byte count *rises* with $t$ (the ring factor `2(t-1)/t` grows even as per-GPU weights shrink), NVLink stays in single digits, and PCIe and InfiniBand blow up as batch grows.
+
+Predict two things before you run it: at batch 1 the overhead should be lower than at batch 32 on every fabric, and at $t = 8$ the total bytes should exceed $t = 4$.
+
+### 5. The pipeline bubble, counted
+
+Section 5 builds the schedule grid, draws it, and verifies the bubble formula against a counted grid across all 18 combinations of $P \in \{2,4,8\}$ and $M \in \{1,\dots,32\}$.
+
+**Expected:** `True`, with no mismatches. You have now computed the bubble two independent ways.
+
+Look at the printed `P=4, M=1` and `P=8, M=8` schedules side by side. The second is *worse* — more stages with the same micro-batches. That is the whole lesson about pipeline parallelism in one picture.
+
+### 6. Measure a real collective
+
+Section 6 initialises a single-process `torch.distributed` group and times `all_reduce` at five sizes.
+
+**This is your calibration.** With `world_size = 1` no bytes cross a link, so the numbers are the pure launch overhead — the latency term, paid once per message. Llama-70B at TP=8 issues 160 of these per forward pass; at 40 µs each that is 6.4 ms before a single byte moves.
+
+That measurement is why the lesson's advice was to count *messages*. Use the number it prints as the `latency` constant in `link_time`, then check that your predictions match the arithmetic from section 4. You calibrated the model against hardware instead of trusting a slide.
+
+### 7. Context parallelism loses
+
+Section 7 prices CP for Llama-3.1-8B at 32k and 128k context, then computes the penalty factor on every fabric.
+
+**Expected:** per-GPU KV falls exactly by $P$ while communication grows with it; at 128k context with $P = 8$ the per-forward-pass communication is in the hundreds of gigabytes. Then the penalty table: **every cell is above 1x**, the values are identical regardless of context length, and over PCIe at $P = 4$ it is about 393x.
+
+The point of that second table is stronger than "CP is slow". **There is no break-even degree.** The KV cache cancels out of the ratio, leaving $(P-1)\rho$, which exceeds 1 for every $P > 1$. So context parallelism is never a speed optimisation — it is only a way to fit a request that has nowhere else to go.
+
+### 8. The strategy matrix
+
+Section 8 runs the full decision procedure over a grid of models, GPUs, batch sizes, contexts and GPU counts, and prints a table of `TP / PP / replicas` with a one-line reason.
+
+**This is the artefact.** The rows worth reading:
+
+- Most rows say `replicate` or `fp8 fits`. That is the answer you want far more often than not.
+- Llama-3.1-8B moves from `replicate` to `TP=2` and then `TP=4` as context and batch grow. **TP is driven by the KV term**, so long context and high concurrency — not model size — are what push the degree up.
+- Qwen2.5-32B and Llama-3.1-70B reach `TP=8, PP>1` at 64 requests and 32k context, and nothing rescues those rows: the KV cache is the dominant term and it divides by both $t$ and $P$.
+- Now re-run with `wbytes=1` and watch the shard rows collapse into `replicate`. That is quantization doing work that would otherwise cost four GPUs.
+
+A note on what you will *not* see: because TP and PP both divide the KV cache by their degree, there is no row where a PP-only plan helps. A PP-only plan would mean TP was blocked by the KV head count, which none of these four models trigger — it needs a model like Qwen2.5-1.5B pushed to a context where even TP=2 is not enough.
+
+### 9. Verify against a real model
+
+Section 9 loads Qwen2.5-0.5B-Instruct, runs a generation, reads the real KV cache out of the model, and compares the measured bytes per token against the formula's prediction.
+
+**Expected:** agreement within a few percent, and an assertion that fails loudly if it is off by more than 5%. If it fails, the field to check is `num_key_value_heads` — a GQA model stores 2 KV heads, not 12, and that factor is the most common source of wrong capacity numbers in the wild.
+
+### 10. One function, and the cases that say no
+
+Section 10 defines `recommend(model, gpu, fabric, batch, ctx, gpus)` and prints the reasoning for six real configurations.
+
+The last case is the one to sit with: **Qwen2.5-1.5B at 128k context with 16 concurrent requests**. It needs 15 GB of KV — and it still fits on a single A100. The honest recommendation is `replicate`: eight cards on PCIe that never talk to each other. No sharding, no bubble, no collectives.
+
+This is the result people find least satisfying and should most trust. A request that costs nothing to serve well should not be given a complicated architecture, and the decision procedure's job is to *find* that case rather than route around it.
+
+<Callout type="mentor" title="A decision procedure that cannot say no is not finished">
+  The hardest part of a capacity recommendation is not picking a parallelism. It is turning down a request that has grown past the point where any parallelism helps, and saying "this workload needs a different model, a shorter context, or a different product shape."
+
+  If you take one skill from this module, take that one. Every formula here is a tool for establishing that sharding is or is not the answer — and "it fits, use replicas" and "nothing here helps" are both valid, and both are the right answer more often than the industry admits.
+</Callout>
+
+## Check yourself
+
+Answer these in your notes, with the arithmetic shown.
+
+1. Section 4's table: why does the byte count rise from $t = 4$ to $t = 8$ when each GPU holds half as many weights?
+2. Section 5 verifies the bubble formula against a counted grid. Construct a case where the two would disagree, and say why it cannot happen.
+3. Section 6 measures the collective launch overhead. Using that number, compute how much of a TP=8 Llama-70B decode step is launch overhead alone at 4 ms per step.
+4. In the section 8 matrix, find a row where PP alone is chosen for a KV-bound workload. Explain why that row is a warning sign rather than a good answer.
+5. Section 10's last case recommends **replicate**, not sharding. Name three fixes for a workload that genuinely does not fit, and say which you would pick first.
+
+**Answers, once you have done the work:**
+
+1. The ring factor is `2(t-1)/t`: 1.5 at $t=4$, 1.75 at $t=8$. Each GPU's *weights* fall by half, but the all-reduce payload is the full hidden state, which does not shrink at all. More ranks means more hops, so total bytes per GPU rise — the communication does not fall as $\frac{1}{t}$ the way memory does.
+2. They cannot disagree, because the grid is a direct count of the definition: $M + P - 1$ slots, $P \cdot M$ busy. Any disagreement would mean the closed form was mis-derived, not mis-implemented. That is the standard worth holding: if a formula and a direct count of the same object differ, one of them is wrong, and you have found a bug.
+3. $L = 80$ layers, so $n = 2L = 160$ collectives per forward pass. At 40 µs each: $t = 160 \times 40\ \mu s = 6.4$ ms — which is *more* than a 4 ms step. So at that overhead the configuration is not merely inefficient, it cannot run. This is why the real number has to be measured: a T4's launch overhead is not an H100's, and the 40 µs the lesson uses is a typical value, not a measured one. Section 6 measures yours.
+4. Pipeline divides the *weights* by $P$, and it divides the KV cache by $P$ too — along layers rather than along tokens, but by the same factor. So on memory alone PP and TP are interchangeable at equal GPU count. What makes the PP-only row a warning sign is that it means TP was blocked by $n_{kv}$, so you are paying a bubble to achieve something a $t = 2$ TP group could not. The right move is to shorten the context, quantize the KV, or accept $t = 2$ and replicate.
+5. **Shorten the context** (chunking, summarisation, a lower `max_model_len`), **quantize the KV cache** (FP8 halves it, with zero communication), or **tier it** (hot tokens on GPU, cold ones on CPU — Module 20). First pick: shorten the context, because it is free, it reduces latency as well as memory, and it requires no new hardware and no quality loss. Quantize the KV second, since it costs a little quality for a 2x memory win; tiering is last, because it adds a whole new latency component to the decode path.
+
+<KeyNotes>
+  1. The first two questions settle most cases: does it fit on one GPU, and does it fit quantized? "Yes" to either means **replicate**, and sharding is pure overhead.
+  2. A tensor-parallel MLP is column-parallel then row-parallel; verified against the unsplit reference it agrees to about 1e-3 relative in FP16 — the rounding of summing $t$ partials, not a bug.
+  3. TP communication per forward pass rises with $t$ (ring factor `2(t-1)/t`) and per-GPU weights fall: the collective payload is the hidden state, which does not shrink. That asymmetry is the whole sublinear-speedup story.
+  4. NVLink keeps TP under a few percent of a decode step at every batch size; PCIe and InfiniBand cross 10% and keep climbing. TP belongs inside the node.
+  5. The pipeline bubble `(P-1)/(M+P-1)` is verifiable against a counted schedule, and micro-batches — not stages — are the cure. `M >= 4P` is the rule of thumb.
+  6. Real collective launch overhead (~tens of µs) is paid *per message*. At 160 messages per forward pass it can exceed the entire step, which is why you count messages and measure the constant yourself.
+  7. Context parallelism reduces KV memory by $P$ but moves $(P-1)/P$ of the whole cache per layer, so its penalty is $(P-1)\rho$ — above 1 for every $P > 1$ on every fabric. It is never a speed optimisation, only a last resort for a request that otherwise will not fit.
+  8. TP and PP both divide weights *and* KV by their degree, so memory-wise they are interchangeable at equal GPU count — a PP-only plan means TP was blocked by `n_kv`. Read it as a prompt to shorten context or quantize the KV, not as a deeper pipeline.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B in BF16 on an H100, batch 32 at 8k context. What is the correct strategy?', options: ['Tensor-parallel across 4 GPUs', 'Pipeline across 2 GPUs', 'Replicate — it fits on one GPU', 'Context-parallel across 4 GPUs'], answer: 2, why: '16.06 GB of weights + 32 × 8,192 × 131,072 = 34.4 GB of KV = about 50 GB, inside an H100’s ~76.8 GB usable budget. A model that fits needs no sharding: replicas give linear throughput with zero communication, no bubble, and no divisibility constraints.' },
+  { q: 'Qwen2.5-1.5B has 12 query heads and 2 KV heads. What is its largest legal tensor-parallel degree?', numeric: true, answer: 2, tolerance: 0, unit: 't', why: 't must divide KV heads (2) as well as query heads and the MLP width. So t ∈ {1, 2}. This is why pipeline — which only needs layers, and Qwen2.5-1.5B has 28 — is the universal fallback when a model cannot be tensor-parallelised far enough.' },
+  { q: 'At TP=8 on Llama-3.1-70B, each GPU holds half the weights it would at TP=4. Why is the TOTAL collective traffic per GPU HIGHER at TP=8?', options: ['More GPUs means more memory bandwidth', 'The ring factor is 2(t-1)/t — 1.5 at t=4, 1.75 at t=8 — and the all-reduce payload is the full hidden state, which does not shrink with t', 'TP=8 duplicates the KV cache', 'The optimizer state doubles'], answer: 1, why: 'Weights fall as 1/t but the collective payload is independent of t, and each GPU sends a ring factor’s worth of it that GROWS with t. Communication per GPU rises while memory per GPU falls — which is why TP speedup is sublinear and why TP past the island is a different kind of decision.' },
+  { q: 'Measured all_reduce launch overhead is 40 µs. Llama-3.1-70B at TP=8 issues 2 collectives per layer over 80 layers. On a 4 ms decode step, what fraction is pure launch overhead?', numeric: true, answer: 160, tolerance: 10, unit: '%', why: '160 collectives × 40 µs = 6.4 ms, which is 160% of a 4 ms step. The configuration cannot run. This is why message COUNT matters more than byte count, and why you must measure the latency constant on your own hardware rather than trusting a spec number.' },
+  { q: 'A pipeline has 8 stages and the service runs 6 concurrent requests. Roughly what bubble should you expect?', numeric: true, answer: 54, tolerance: 6, unit: '%', why: 'M is capped by concurrency, so M = 6: bubble = (8-1)/(6+8-1) = 7/13 = 54%. The bubble is a function of load, not hardware — it improves exactly when throughput is already good and hurts most when you need help. At this concurrency, replicas would beat the pipeline.' },
+  { q: 'Why is a PP-only plan for a long-context, large-batch workload a warning sign?', options: ['Pipelines are always slower than TP', 'PP divides weights and KV by P just as TP does, so a PP-only plan means TP was blocked by the KV head count — you are paying a bubble to achieve what t=2 TP could not, when the real fix is a shorter context or a quantized KV', 'PP cannot be combined with quantization', 'The bubble is worse at long context'], answer: 1, why: 'Memory-wise the two are interchangeable at equal GPU count, so a PP-only plan carries the bubble cost for nothing TP could not have given you. Qwen2.5-1.5B with 2 KV heads is the canonical case: TP stops at 2, and PP reaches 4 — but shortening the context or quantizing the KV is cheaper than both.' },
+] } />

@@ -1,0 +1,202 @@
+---
+title: 'Decode attention & attention backends'
+summary: 'Why decode attention is a different craft from prefill: one query row, a hard bandwidth wall at an intensity fixed by the GQA group factor, and a family of specialised kernels — paged, FlashDecoding, and vendor backends — that exist to feed it.'
+objectives:
+  - Compute decode attention’s arithmetic intensity from the GQA group factor, and explain why it does not improve with context
+  - Explain why a matrix-vector product is the worst shape on a GPU and why prefilling cannot help decode
+  - Describe split-K / FlashDecoding and the exact combine step that makes it correct
+  - Explain how a paged decode kernel differs from a contiguous one and price the gather
+  - Name the attention backends a production engine can choose between and what each is for
+collab: 14-attention-backends.ipynb
+---
+import DecodeAttention from '@/components/viz/attention-optimization/DecodeAttention.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every optimisation in the last two lessons assumed a big square of queries. Prefill has one. Decode does not, and the difference is not a detail — it is a different workload with a different bottleneck, different kernels, and different optimisations.
+
+This is the lesson that explains why your engine's decode speed does not improve the way its prefill speed does, and what the industry actually does about it.
+
+## One row against everything
+
+Prefill processes $T$ query rows. Decode processes **exactly one** — the row for the token being generated right now.
+
+So for Llama-3.1-8B, one layer, one decode step:
+
+$$
+Q: 32 \times 128 = 4{,}096 \text{ numbers} = 8\ \text{KB}
+$$
+
+$$
+K, V \text{ read: } 2 \times 8 \times 128 \times 2 \times T \text{ bytes} = 4{,}096\ \times T
+$$
+
+At $T = 8{,}192$ that is **33.6 MB of KV read to produce 8 KB of output**. The ratio is 4,096:1. Slide the context control in the visual and watch the read grow linearly while the output never changes.
+
+<Scrolly>
+  <DecodeAttention client:visible slot="stage" />
+
+  <Step title="1. One query row, not a matrix">
+    The query is 32 heads by 128 numbers — 8 KB for the whole layer. Compare with prefill, where the query block is 128 rows and 65,536 numbers. **This is the entire difference in workload.**
+  </Step>
+
+  <Step title="2. It must read the whole KV cache">
+    To attend to every previous token, this one row must read all of $K$ and $V$. At 8,192 tokens that is 33.6 MB per layer, every decode step, across 32 layers — 1.07 GB of KV traffic per token generated.
+  </Step>
+
+  <Step title="3. A dot product fills no tensor core">
+    Scores against a single query row are a **matrix-vector product**. A tensor core computes a 16×16×16 tile of multiply-adds; one output number here uses a single row of 128. Almost the whole tensor core is idle. This is why decode gets nowhere near peak FLOP/s, and no amount of kernel tuning will fix it.
+  </Step>
+
+  <Step title="4. GQA shares one KV head four ways">
+    Llama-3.1-8B has 32 query heads but only 8 KV heads, so four query heads read the same $K$ and $V$. That is why the KV cache is small — and it fixes arithmetic intensity at exactly **4 FLOP per byte**.
+  </Step>
+
+  <Step title="5. Split the KV across the SMs">
+    One row of work cannot fill 100+ SMs. So split the sequence into chunks and process them in parallel — <Term t="flash-decoding">FlashDecoding</Term>, also called split-K. Each chunk reads a slice of the cache and computes a partial answer. Raise the split count and watch the idle SMs fill in.
+  </Step>
+
+  <Step title="6. Combine the partial softmaxes">
+    Each split returns three numbers per head: its own $m$, $\ell$ and partial $O$. A tiny second kernel merges them with the **online softmax rule from lesson one** — exactly, not approximately. The combine costs a fraction of the main loop because it touches $O(\text{splits})$ values, not $O(T)$.
+  </Step>
+
+  <Step title="7. The blocks are not contiguous">
+    With PagedAttention the cache lives in scattered blocks, so each split follows the block table and gathers as it goes. That gather is one extra copy of the KV, about **1%** of the step — the price you already paid for in Module 08, now showing up in the kernel.
+  </Step>
+
+  <Step title="8. What the roofline actually says">
+    Intensity is 4 FLOP/byte — the GQA group factor, **independent of context length**. On an H100 the memory time is about 74× the compute time. Decode attention is bandwidth-bound forever, and no kernel makes it otherwise.
+  </Step>
+</Scrolly>
+
+## The intensity number is worth sitting with
+
+Module 12 gave you the roofline. Apply it to decode attention and you get the single most useful fact in this lesson:
+
+$$
+I_{\text{decode}} = \frac{\text{FLOP}}{\text{bytes}} = \frac{4 \cdot n_q \cdot d}{4 \cdot n_{kv} \cdot d} = \frac{n_q}{n_{kv}} = \text{group factor}
+$$
+
+The head dimension $d$ and the 2 for K and V cancel completely. What is left is **the GQA group factor, and nothing else**.
+
+| Model | Query heads | KV heads | Group factor | Intensity |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 14 | 2 | 7 | 7 FLOP/byte |
+| Llama-3.2-3B | 24 | 8 | 3 | 3 FLOP/byte |
+| **Llama-3.1-8B** | 32 | 8 | **4** | **4 FLOP/byte** |
+| Llama-3.1-70B | 64 | 8 | 8 | 8 FLOP/byte |
+
+Now compare with the H100 ridge point of about 295 FLOP/byte. Decode attention is **74× below it** for Llama-3.1-8B. Even Llama-3.1-70B, at intensity 8, is 37× below.
+
+<Callout type="intuition" title="GQA is a bandwidth optimisation disguised as an architecture choice">
+  Ask why Llama-3 uses 8 KV heads instead of 32 and the honest answer is not "quality". MQA (32 query heads on 1 KV head) makes the KV cache 8× smaller than even GQA, which directly multiplies concurrency. But too much sharing costs quality. GQA-8 was a deliberate point on that curve.
+
+  The second-order effect lands exactly here: **smaller KV cache means lower arithmetic intensity, which means decode attention is more memory-bound.** The two facts are the same fact. A model with MQA would be *more* bandwidth-starved per byte than GQA — but it would also hold far more sequences, which usually wins. This is the kind of trade you make with a roofline in hand, not with intuition.
+</Callout>
+
+<Callout type="math" title="The decode-step floor, for Llama-3.1-8B on an H100">
+  At $T = 8{,}192$ context, one decode step reads the KV of all 32 layers:
+
+  $$
+  8{,}192 \times 131{,}072\ \text{bytes} = 1.07\ \text{GB}
+  $$
+
+  At 3.35 TB/s that is **320 µs**, so 3,125 tokens/s for a *single* sequence — and that is attention alone, ignoring the 16 GB of weights you must also read (4.8 ms on its own). **Weights dominate until you batch.** This is exactly why Module 07's continuous batching exists, and why the interesting decode number is always "per sequence in a batch of N", not "for one sequence".
+
+  The takeaway: attention decode is a bandwidth problem whose bandwidth is set by context length. Batch to amortise the weights, shorten the context to cut this term.
+</Callout>
+
+## Why a fused kernel does not rescue decode
+
+A natural hope: "FlashAttention made prefill fast, so it should make decode fast." It does not, and the reason is structural.
+
+Prefill's fused kernel wins because it removes $O(T^2)$ of intermediate traffic while doing $O(T^2)$ of FLOPs — the arithmetic intensity goes *up*. Decode has no intermediate at all: $QK^\top$ produces $T$ numbers, not $T^2$. There is nothing to fuse away. Decode's cost is simply "read the cache", and the kernel's job is only to do that at peak bandwidth.
+
+This is why there are two separate kernel families rather than one good kernel:
+
+| | Prefill | Decode |
+|---|---|---|
+| Query rows | $T$ | 1 |
+| Score shape | $T \times T$ | one row of length $T$ |
+| Bound by | compute (after fusion) | **bandwidth** |
+| Optimisation | fuse away the intermediate, reuse Q in SRAM | parallelise the read across SMs, hide latency |
+| Kernel idea | FlashAttention | FlashDecoding, paged decode, CUDA graphs |
+
+## Split-K in detail
+
+Because there is no reuse to exploit and the work is a pure read, the only lever is **parallelism**: give each SM a slice of the sequence.
+
+A FlashDecoding kernel, one decode step:
+
+1. Pick a number of splits $n_s$ (typically chosen from the number of SMs and the sequence length).
+2. Divide the $T$ tokens into $n_s$ ranges.
+3. Each split $j$ computes, for its range, the scores, then a local $m_j$, $\ell_j$, and a partial output $O_j$ — using the same online softmax, just with a local maximum.
+4. **Combine**: one small kernel reads all $(m_j, \ell_j, O_j)$ and produces the final output by merging with the associative rule:
+
+$$
+m = \max_j m_j, \qquad \ell = \sum_j \ell_j e^{m_j - m}, \qquad O = \sum_j O_j e^{m_j - m}, \qquad \text{out} = O/\ell
+$$
+
+This is exactly lesson one's merge rule, applied to $n_s$ partials instead of $n$ tiles. **The same mathematics that made FlashAttention exact makes split-K decode exact.**
+
+<Callout type="real" title="Why the split count is a tuning knob">
+  Too few splits and SMs idle. Too many and each split's combine overhead dominates, plus each split re-reads its slice's index overhead. Real kernels pick $n_s$ adaptively: roughly, more splits when the sequence is long or the batch is small, fewer when the batch is large and the machine is already full. The optimum is not a constant — it moves with batch size and context, which is why "tune attention backend" advice is usually answered with "it depends on your workload".
+</Callout>
+
+## Paged decode: reading scattered blocks
+
+Under PagedAttention (Module 08) the KV is not one contiguous tensor; it is a list of fixed-size blocks recorded in a block table. A decode attention kernel must therefore, for each split, walk the block table and gather each block.
+
+The cost is the <Term t="gather">gather</Term>: one extra copy of the KV from scattered addresses into a contiguous per-SM buffer. Priced earlier at about 1% of a decode step, it is small but real, and it is why the block size interacts with the attention kernel's efficiency — larger blocks mean fewer, larger, more efficient gathers.
+
+What a good engine actually needs is a kernel that **understands block tables directly**, like SGLang's radix-attention kernels, so the gather is unnecessary. The paged-kernel variant is a distinct backend from the plain one, and picking the right one is a real operational decision.
+
+## The backends, and what each is for
+
+Serving engines offer a choice of attention implementation. At the time of writing, the landscape is roughly:
+
+| Backend | What it does | Where it wins |
+|---|---|---|
+| **Eager / naive** | plain `softmax(QKᵀ)V`, materialises $S$ | nowhere; the reference for correctness |
+| **FlashAttention-2** | fused tile loop, no intermediate | prefill, and decode at large batch |
+| **FlashDecoding** | FlashAttention plus split-K | decode at small batch / long context |
+| **PagedAttention** | block-table-aware kernel, gathers as it goes | decode under PagedAttention (the vLLM default path) |
+| **SGLang radix** | indexes the block table directly, no gather | prefix-heavy decode; no copy |
+| **Vendor kernels** (cuBLASLt, CUTLASS, FlashInfer, TensorRT-LLM) | hand-tuned per architecture | whichever GPU you are on, once tuned |
+
+There is no universally best one, because the right answer depends on **shape**: batch size, context length, and whether you are prefilling or decoding. A backend tuned for large-batch prefill can be the worst choice for single-request decode, and vice versa.
+
+<Callout type="pitfall" title="How to choose, without a benchmark">
+  You almost always do not want to tune this by hand, and you do not want to tune it on a synthetic workload. The honest workflow is the one from Module 06: measure with **your** real traffic mix. Pick a backend, measure prefill throughput and decode latency at your actual batch and context, compare against the eager baseline for correctness, and keep the winner.
+
+  What you can reason about without measuring: the GQA group factor fixes decode's bandwidth wall (nothing backend-side changes it), and the paged gather is ~1% (so do not expect a backend to fix a bigger problem). Beyond that, it is empirical.
+</Callout>
+
+## Where this leaves the module
+
+You have the complete picture of attention optimisation:
+
+- **Prefill** is compute-dense; the win is *fusing* the $O(T^2)$ intermediate away (FlashAttention).
+- **Decode** is bandwidth-bound with intensity fixed at the GQA group factor; the win is *parallelising the read* (FlashDecoding) and *not paying for fragmentation* (paged kernels).
+- Both share the **online softmax** as the enabling idea — which is why one lesson's trick appears in both kernels.
+
+The lab now puts numbers on all of it, comparing eager, fused, and paged implementations on a real GPU and letting you verify that the faster ones return the same answers. After that, Module 15 attacks the *other* thing that wastes decode time: the gap between kernels where Python runs.
+
+<KeyNotes>
+  1. Decode is one query row against the whole KV cache. At $T = 8{,}192$ on Llama-3.1-8B that reads 33.6 MB of KV per layer to produce 8 KB of output.
+  2. Decode attention's arithmetic intensity is exactly the **GQA group factor** $n_q/n_{kv}$ — 4 for Llama-3.1-8B — because $d$ and the 2-for-K-and-V cancel. It does not change with context length.
+  3. That puts decode attention ~74× below the H100 ridge point, so it is bandwidth-bound permanently. A fused kernel cannot help, because there is no intermediate to fuse away.
+  4. GQA is a bandwidth optimisation: fewer KV heads means a smaller cache and more concurrency, at the cost of lower intensity. The two effects are the same effect.
+  5. The decode lever is parallelism, not fusion: **split-K / FlashDecoding** splits the sequence across SMs, each computing a partial $(m_j, \ell_j, O_j)$, merged exactly by the same online-softmax rule.
+  6. The split count is a tuning knob that moves with batch size and context length, which is why "best backend" depends on workload shape.
+  7. A paged decode kernel walks the block table and gathers — about 1% overhead — unless it indexes the table directly (SGLang-style), removing the copy.
+  8. Prefill and decode are different workloads with different bounds (compute vs bandwidth) and different kernel families. No single backend wins both; pick with your real traffic mix, not a synthetic one.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B has 32 query heads and 8 KV heads, head dim 128, BF16. What is decode attention’s arithmetic intensity in FLOP per byte?', numeric: true, answer: 4, tolerance: 0.5, unit: 'FLOP/byte', why: 'FLOP = 4·nq·d = 4·32·128; bytes = 4·nkv·d = 4·8·128. The d and the factor 4 cancel, leaving nq/nkv = 32/8 = 4. It is the GQA group factor, independent of context.' },
+  { q: 'A decode step reads the whole KV cache of all 32 layers for 8,192 tokens of Llama-3.1-8B. How many bytes does it read?', numeric: true, answer: 1073741824, tolerance: 100000000, unit: 'bytes', why: '8192 tokens × 131,072 bytes/token = 1,073,741,824 bytes = 1.07 GB. At 3.35 TB/s that is a 320 µs floor for attention alone per decode step.' },
+  { q: 'Why does split-K decode stay exact, not approximate?', options: ['It rounds the scores to fewer bits', 'Each split produces a partial (m, ℓ, O), and the online-softmax merge is associative, so combining them equals one pass over the whole sequence', 'It only ever computes the most recent tokens', 'It uses the causal mask'], answer: 1, why: 'This is lesson one’s merge rule applied to n_s partials instead of n tiles. Because the rescale-and-add is associative, any grouping of the sequence gives the same result.' },
+  { q: 'Why does FlashAttention’s fusion barely help decode, when it transforms prefill?', options: ['Decode runs in FP8', 'Decode produces no T x T intermediate to fuse away — its cost is simply reading the cache, so the only lever is parallelising that read', 'Decode uses the KV cache twice', 'Fusion only works when batch > 1'], answer: 1, why: 'Fusion wins when there is intermediate traffic to remove. Decode computes a 1×T score vector, so there is nothing to remove; its bound is a pure bandwidth wall that only more parallelism can relieve.' },
+  { q: 'Why is the GQA group factor lower intensity considered a bandwidth optimisation?', options: ['Fewer KV heads means fewer bytes to read per token, which is exactly the bandwidth decode is starved for', 'More query heads make the tensor cores faster', 'GQA removes the causal mask', 'It is not; it is a quality choice'], answer: 0, why: 'Decode is bandwidth-bound, so shrinking the KV cache per token directly increases how many sequences fit and how fast each reads. The lower intensity is the cost side of the same knob.' },
+  { q: 'The paged decode kernel’s gather (walking the block table) costs roughly what fraction of a decode step?', options: ['Negligible, under 0.01%', 'About 1%', 'About 25%', 'About 50%'], answer: 1, why: 'One extra copy of the KV per step, at ~1% of the step time. It is why the paged kernel is usually still far faster than naive attention that assumes contiguity, and why indexing the block table directly (no gather) is a worthwhile optimisation.' },
+]} />

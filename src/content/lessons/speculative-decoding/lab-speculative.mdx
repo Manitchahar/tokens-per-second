@@ -1,0 +1,190 @@
+---
+title: 'Lab: Map where speculation wins'
+summary: 'Measure speculative decoding instead of trusting a speedup number. An in-browser simulator predicts the outcome from acceptance rate, draft cost, batch size and method, and a Colab notebook implements the algorithm, proves it is exact, and measures all three of those quantities on a real T4.'
+objectives:
+  - Implement speculative sampling from scratch and prove its output distribution matches plain sampling
+  - Measure the acceptance rate a on real generated text
+  - Measure the draft cost ratio rho on your GPU and explain why it exceeds the parameter ratio
+  - Verify empirically that a verification pass costs about one decode step
+  - Use the formula to predict the speedup and decide whether to enable speculation
+colab: 16-speculative.ipynb
+---
+import SpecLab from '@/components/viz/speculative-decoding/SpecLab.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last four lessons were argument. This lab is where you measure, and it is built around one habit: **implement, verify, then time.**
+
+The payoff is bigger here than in the attention lab, because the thing being measured is an *algorithmic* property — whether the output distribution is preserved — and that is exactly the kind of claim a paper can state and an implementation can quietly break.
+
+There are two halves. The simulator takes ten minutes and teaches you where the boundaries are. The notebook takes an hour and gives you numbers from a real GPU.
+
+<Colab nb="16-speculative.ipynb" />
+
+## Half one: the simulator
+
+Five workloads, six methods, four GPUs. Everything on screen is computed from bandwidth, FLOP/s, and the two measured quantities — **acceptance rate $a$** and **draft cost ratio $\rho$**.
+
+The point is not any single number. It is that the verdict flips when you change the *workload* and the *batch size*, while the model and the hardware stay identical.
+
+<Scrolly>
+  <SpecLab client:visible slot="stage" />
+
+  <Step title="1. Five workloads, one engine">
+    Interactive chat, code completion, summarisation, creative writing, and high-concurrency serving. Same model, same card. Only the text's predictability and the batch size change — and that is enough to flip the answer.
+  </Step>
+
+  <Step title="2. Acceptance is the strongest lever">
+    Code accepts around 0.8; creative writing sits near 0.4. The speedup moves several-fold across that range. **If you measure $a$ on the wrong traffic, every conclusion you draw is wrong.**
+  </Step>
+
+  <Step title="3. The break-even line is $a = \rho$">
+    The dashed line on the acceptance bar is where speculation exactly pays for itself. For a 1B drafting an 8B it is 12.5%. Nothing below it is worth doing, however good the method.
+  </Step>
+
+  <Step title="4. The method only moves $\rho$">
+    Every drafting method changes the cost ratio and nothing else. Prompt lookup sits almost on the break-even line; a large draft model sits well to the right of it. Pick the method that matches your traffic's acceptance rate.
+  </Step>
+
+  <Step title="5. $\gamma$ has a flat part">
+    Speedup rises with $\gamma$ then flattens as the token count approaches $\frac{1}{1-a}$. Past the flat part, more drafts buy nothing and cost scheduling work and memory.
+  </Step>
+
+  <Step title="6. Batch kills it">
+    Switch to the batch-64 workload. The weights are read once for everyone, the step becomes compute-bound, and the free-verification premise no longer holds. The verdict drops toward or below 1.0.
+  </Step>
+
+  <Step title="7. Read your own verdict">
+    The summary line combines acceptance, method, batch and block size for your configuration. Before trusting it, measure the two numbers it rests on.
+  </Step>
+
+  <Step title="8. Now go and measure">
+    The notebook measures $a$, $\rho$ and the verify-versus-decode ratio on a real T4. Compare its numbers against these predictions and you will know how much to trust a model like this one.
+  </Step>
+</Scrolly>
+
+**Check yourself before the notebook.** Answer without the page:
+
+1. Why does a batch-64 workload make the simulator's verdict worse, when the acceptance rate is unchanged?
+2. If your text has an acceptance rate of 0.5, which methods clear the break-even line for a 1B-drafts-8B setup?
+3. The simulator's token count per block rises with $\gamma$ but flattens. What sets the ceiling?
+4. Why is a draft model's cost ratio usually *larger* than its parameter ratio?
+
+## Half two: the notebook
+
+<Callout type="try" title="Setup (3 minutes)">
+  Open the notebook above in Colab, choose **Runtime → Change runtime type → T4 GPU**, and run the cells top to bottom with <kbd>Shift</kbd>+<kbd>Enter</kbd>. The first four sections are pure PyTorch on tiny tensors and run in seconds; the model sections download Qwen2.5-0.5B and 1.5B-Instruct, which fit comfortably on a T4.
+</Callout>
+
+### 1. Implement the algorithm, and get the details right
+
+Section 1 is the whole technique in about twenty lines. There is no "fast mode" and no quality knob.
+
+Read the docstring carefully, because **three one-word details make it exact**, and all three are easy to get wrong:
+
+1. The proposal $x$ must be **sampled** from $q$, not taken as `q.argmax()`.
+2. An accepted token is emitted **as $x$** — the $q(x)$ in the acceptance test cancels the $q(x)$ that $x$ was drawn with, and that cancellation *is* the proof.
+3. The bonus token is **sampled** from $p$, not taken as `p.argmax()`, because plain sampling would have sampled it too.
+
+### 2. Prove it is exact
+
+Section 2 runs the algorithm 10,000 times against a deliberately miscalibrated drafter — one whose best guess is the target's *fourth* choice — and compares the histogram of emitted tokens against plain sampling from the target.
+
+**Expected:** every row within about 0.01 of the target, which is the sampling noise at 200,000 trials. It also prints observed versus predicted tokens-per-block, and they should agree to three or four decimals.
+
+**This is the most important cell in the notebook.** Everything downstream assumes the output distribution is untouched. If a row is off by a lot, stop and fix the algorithm before reading any timing.
+
+<Callout type="pitfall" title="If the whole histogram is uniformly off, suspect the denominator">
+  A constant scaling error across every token is almost never a bug in the acceptance logic — it is a bug in how you normalised. You produced a *variable* number of tokens per trial, so you must divide by the number of tokens actually emitted, not by the number of trials. This bit me while writing this lab, and it looks exactly like a subtly-wrong algorithm if you do not know to look for it.
+</Callout>
+
+### 3. Check the formula against the simulation
+
+Section 3 evaluates the derived expressions for $a = 0.72$, $\rho = 0.125$ across a $\gamma$ sweep, then solves numerically for the break-even acceptance rate at several cost ratios.
+
+**Expected:** the break-even comes out at essentially $\rho$ for every value tried — 0.02, 0.125, 0.300. That is the cancellation from the previous lesson made visible: the $\gamma$ dependence divides out, and the rule is simply $a > \rho$.
+
+### 4. Measure acceptance on real text
+
+Section 4 loads Qwen2.5-1.5B-Instruct as the target and Qwen2.5-0.5B-Instruct as the drafter, then runs a real prompt and counts how many drafted tokens the target agreed with.
+
+**Expected:** something in the 0.6–0.8 range for a templated translation task, since the phrasing is highly constrained. On free-form prose this will be noticeably lower — and that gap is the entire point of the lesson: **acceptance is a property of your content, so measure it on your own traffic.**
+
+### 5. Measure $\rho$ — and be surprised
+
+Section 5 times a decode step of each model on your T4 and divides.
+
+**Expected:** $\rho$ in the 0.4–0.6 range, against a parameter ratio of about 0.33. The gap is the lesson: both models pay the **same fixed per-step overhead** — kernel launches, scheduling, Python — and on a slow card that fixed cost dominates. **This is why a T4 is a poor place to run neural speculation**, and a good place to run the free methods, whose $\rho$ is essentially zero.
+
+### 6. Verify the premise: is the check really free?
+
+Section 6 times the target on one position versus on $\gamma+1$ positions for several $\gamma$.
+
+**Expected:** the ratio stays near 1.0× for small $\gamma$ and only climbs once the arithmetic becomes significant. This measurement is the foundation of the entire technique — if the ratio were 4×, speculation would be pointless.
+
+### 7. Feed your measurements into the formula
+
+Section 7 plugs your measured $a$ and $\rho$ into the model and prints the verdict.
+
+**Be prepared for a loss.** On a T4 with these two small models, $\rho$ is often *above* the acceptance rate, which means the correct answer is "do not enable it here". That is a legitimate and instructive result: it means the drafter is too close in size to the target, on a card too slow at launches.
+
+### 8. Find the regimes that flip the sign
+
+Section 8 sweeps acceptance from 0.1 to 0.9 and prints the verdict for each, then shows how the weight bytes per token fall as batch grows, then notes the short-output case.
+
+**Expected:** the sign flip exactly where $a$ crosses $\rho$. If it does not, your implementation is wrong.
+
+### 9. N-gram drafting, where $\rho \approx 0$
+
+Section 9 builds an n-gram table from the model's own output and replays it, measuring the acceptance of a drafter that runs **no network at all**.
+
+**Expected:** a decent acceptance rate and a predicted speedup comfortably above 1, because $\rho$ is a dict lookup. Compare that with the neural drafter's $\rho$ from section 5 — on a T4, the method with no model at all wins.
+
+<Callout type="mentor" title="The habit this lab is really building">
+  Section 2 and section 11 are the point. The exactness of speculative decoding is a *provable* property, and it is destroyed by changing `argmax()` into a sample or vice versa — a one-word edit that produces plausible output, no exception, and a wrong distribution.
+
+  So: **implement, verify, then time**, and when two implementations disagree, the first question is never "which is faster" but "which is correct". The same discipline Module 06 taught for benchmarks, applied to an algorithm.
+</Callout>
+
+### 10. Three ways to get this wrong
+
+Section 11 runs the exactness test again with the argmax bug deliberately reintroduced, and prints both histograms.
+
+**Expected:** the correct version matches to ~0.01; the broken version is off by *tens of percent* on the tokens the drafter favours and near zero everywhere else. Nothing crashes. This is what a silent distribution bug looks like, and it is why the verification in section 2 is not optional.
+
+## Check yourself
+
+Answer these in your notes, with the arithmetic shown.
+
+1. Your measured acceptance is $a = 0.55$ and your measured cost ratio is $\rho = 0.22$, at $\gamma = 5$. Compute the tokens per block and the speedup.
+2. Section 5 shows $\rho$ around 0.5 when the parameter ratio is 0.33. Name the term that accounts for the difference and explain why it is worse on a T4 than on an H100.
+3. Section 6 shows the verify pass at 1.02× a decode step for $\gamma = 4$. If that ratio were 3×, what would happen to your measured speedup from section 7, and why?
+4. Section 9's n-gram drafter beats the neural drafter on the T4. On an H100 with an 8B target, would you expect that to still hold? What number decides it?
+5. From the whole lab: which of the two measurements — $a$ or $\rho$ — is more likely to be wrong if you skip measuring it, and why?
+
+**Answers, once you have done the work:**
+
+1. $d = (1 - 0.55^5)/(1 - 0.55) = (1 - 0.0503)/0.45 = 0.9497/0.45 = 2.110$. Tokens $= 1 + 0.55 \times 2.110 = 2.161$. Cost $= 1 + 0.22 \times 2.110 = 1.464$. Speedup $= 2.161/1.464 = 1.48\times$. Note the margin: $a/\rho = 2.5$, so it wins — but not by the \$2.2\times$ a 1B-drafts-8B pairing gives, because that pairing has a much lower $\rho$.
+2. The fixed per-step overhead — kernel launches, scheduling, Python — which both models pay identically regardless of size (Module 15). It is a larger *share* of a small model's step, so $\rho$ exceeds the parameter ratio, and the effect is worse on a T4 because the T4's memory bandwidth is low, making the step longer in absolute terms while the launch overhead stays the same.
+3. The speedup would fall by roughly the same factor, because the verification pass is the dominant term in the cost (it is the "1" in cost $= 1 + \rho d$, and $\rho d$ is small). Tripling the dominant term takes the speedup from about 1.5× to well under 1× — speculation would become a loss. This is why section 6 is measured rather than assumed.
+4. No. The deciding number is $\rho$, and $\rho$ falls sharply on a faster card: an H100's much higher bandwidth shortens the target's step, so the same fixed overhead is a smaller share of it, and the parameter ratio dominates again. The 8B target also gives the free methods much less to copy from. Measure both before deciding.
+5. $\rho$, more likely. Acceptance can be estimated by reading a paper's reported numbers for a similar model and workload, and it degrades gracefully — being wrong about it by 0.1 changes the speedup modestly. $\rho$ is a property of *your* deployment (model pair, batch size, card, whether you compiled) and is commonly assumed to be the parameter ratio, which is what section 5 shows to be wrong.
+
+<KeyNotes>
+  1. The order is always **implement, verify, then time**. Exactness is a provable property of the algorithm, so a distribution test is the strongest check available.
+  2. Three details make the algorithm exact: sample the proposal from $q$, emit an accepted token as-is, and sample the bonus token from $p$. Section 11 shows the argmax version is off by tens of percent with no error raised.
+  3. Normalise a variable-length histogram by the **tokens emitted**, not the trial count, or every row is uniformly wrong.
+  4. The break-even check is $a > \rho$, and the numerical solve should return $\rho$ itself for every cost ratio — that is the $\gamma$ cancellation made visible.
+  5. Measured $\rho$ on a T4 is much larger than the parameter ratio, because both models pay the same fixed per-step overhead and it is a bigger share of a small model's step.
+  6. Verifying the pass costs about one decode step for small $\gamma$ — the premise the whole technique rests on, and the one most worth measuring.
+  7. A "loss" on small hardware is a legitimate result, not a failed experiment; it usually means the drafter is too close in size to the target for that card.
+  8. When $\rho$ is large, the free methods win: n-gram and prompt lookup run no network, so almost any acceptance rate clears their near-zero cost ratio.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Section 2 prints a histogram where every token is off from the target by roughly the same proportion. What is the most likely cause?', options: ['The acceptance rule is wrong', 'The histogram was normalised by the number of trials instead of the number of tokens emitted', 'The draft model is miscalibrated', 'gamma is too small'], answer: 1, why: 'A uniform scaling error across all tokens is a normalisation bug, not an algorithm bug. Each trial emits a variable number of tokens, so you must divide by the total emitted. A genuinely wrong acceptance rule produces lopsided errors concentrated on the tokens the drafter favours.' },
+  { q: 'Your measured acceptance is a = 0.55 and rho = 0.22 at gamma = 5. What is the speedup?', numeric: true, answer: 1.48, tolerance: 0.05, unit: 'x', why: 'd = (1 - 0.55^5)/(1 - 0.55) = 2.110. Tokens = 1 + 0.55 x 2.110 = 2.161. Cost = 1 + 0.22 x 2.110 = 1.464. Speedup = 2.161 / 1.464 = 1.48x. It wins because a > rho.' },
+  { q: 'Section 5 measures rho around 0.5 while the parameter ratio is 0.33. Why is rho higher?', options: ['Both models pay the same fixed per-step overhead, which is a larger share of a small model\'s step', 'The draft model runs at lower precision', 'The target model has more layers', 'KV cache reads dominate'], answer: 0, why: 'Kernel launches, scheduling and Python cost the same for both models. Because a small model\'s memory-bound step is shorter, that fixed cost is a bigger fraction of it, so the measured ratio exceeds the parameter ratio. The effect is worse on a slow card like the T4.' },
+  { q: 'Section 6 finds the verify pass costs 1.02x a decode step at gamma = 4. If this ratio were 3x instead, what would happen?', options: ['Nothing, since acceptance is what matters', 'The dominant cost term triples, so the speedup falls and could drop below 1', 'The acceptance rate would rise', 'Tokens per block would increase'], answer: 1, why: 'The verify pass is the "1" in cost = 1 + rho*d, and rho*d is small. Tripling it takes the dominant term to 3, which with tokens around 2 means the cost exceeds the tokens delivered and speculation becomes a net loss.' },
+  { q: 'An 8B target is verified on a single A100 at batch 1. Its verification pass costs about the same as one decode step. Over 20 blocks it emits 48 tokens, and drafting costs 0.15 decode steps per token drafted, 1.2 tokens drafted per block. What is the total cost in decode steps?', numeric: true, answer: 23.6, tolerance: 0.4, unit: 'decode steps', why: 'Verification: 20 blocks x 1 pass = 20 decode steps. Drafting: 20 blocks x 1.2 drafted x 0.15 = 3.6 decode steps. Total = 23.6 decode steps for 48 tokens. Plain decoding would have cost 48 decode steps, so the speedup is 48 / 23.6 = 2.03x.' },
+  { q: 'Which measurement is more dangerous to skip: a or rho?', options: ['a, because it varies wildly between runs', 'rho, because it is a property of your specific deployment and is commonly assumed to equal the parameter ratio', 'Neither, both are easy to estimate', 'a, because it cannot be measured'], answer: 1, why: 'rho depends on the model pair, batch size, card and whether you compiled. People routinely assume it equals the parameter ratio, and section 5 shows how wrong that is. Acceptance degrades more gracefully: being wrong about it changes the speedup smoothly.' },
+]} />

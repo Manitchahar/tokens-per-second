@@ -1,0 +1,131 @@
+---
+title: 'Module 25 · Inference Economics'
+module: economics
+---
+
+## The one identity
+
+Everything in this module is one line, used three ways.
+
+$$
+\underbrace{\text{GPU-seconds per request}}_{m} = t_{pre} + \frac{n_{out}\, t_{step}}{B}
+$$
+
+- **Prefill** you own alone — one parallel pass over your prompt, compute-bound.
+- **Decode** is shared: one step serves all $B$ sequences, so your share is $t_{step}/B$.
+
+Then dollars, two ways:
+
+$$
+\text{\$/M output} = \frac{m \times (p/3600) \times 10^6}{n_{out}}
+\qquad
+\text{fleet} = \left\lceil \frac{\lambda \times m}{\rho} \right\rceil
+$$
+
+$p$ = dollars per GPU-hour · $\lambda$ = requests/s · $\rho$ = target utilization.
+
+**Same $m$, two questions:** divide by $n_{out}$ for price per token, multiply by $\lambda$ for fleet size.
+
+## The two terms
+
+| | $t_{pre}$ | $t_{step}$ |
+|---|---|---|
+| Bound by | **FLOP/s** (compute) | **bandwidth** (bytes) |
+| Time | $\max\frac{2Pn}{\text{flops}\cdot m_{fu}},\ \frac{W}{\text{bw}\cdot m_{bu}} + 2\text{ms}$ | $\max\frac{W + B\cdot c\cdot k_{kv}}{\text{bw}\cdot m_{bu}},\ \frac{2PB}{\text{flops}\cdot m_{fu}} + 1.5\text{ms}$ |
+| Shared? | No | Yes, across the batch |
+| Batching helps | **Barely** | **A lot** |
+
+Achievable bandwidth fractions $m_{bu}$: about 0.80 for BF16, 0.75 for FP8, 0.65 for INT4. Achievable compute fraction $m_{fu} \approx 0.55$.
+
+## Bytes, the cheapest lever
+
+$$
+\text{weights} = P \times b, \qquad
+\text{KV/token} = 2 \cdot L \cdot H_{kv} \cdot d_h \cdot b_{kv}
+$$
+
+Llama-3.1-8B BF16: 16.1 GB weights, **128 KB/token KV**. At 2,048 ctx that is 262 MB of KV per stream.
+
+$$
+\text{max streams} = \frac{\text{mem} - \text{weights} - 0.04\,\text{mem}}{\text{KV/token} \times c}
+$$
+
+**8B on an 80 GB card, BF16:** 226 streams at 2,048 ctx · 905 at 512 · 56 at 8,192. Context length moves concurrency by >10×.
+
+## Output tokens cost multiples of prompt tokens
+
+Same config (8B, H100, batch 64, 2,048 ctx):
+
+| Shape | \$/M prompt | \$/M output | Ratio |
+|---|---|---|---|
+| 512 in / 256 out | 0.023 | 0.20 | **8.5×** |
+| 2,048 in / 64 out | 0.021 | 0.83 | **39×** |
+| 128 in / 1,024 out | 0.043 | 0.16 | 3.6× |
+
+**The ratio is not constant — it is your prompt-to-answer ratio.** Cheapest levers: cap `max_tokens`, shorten prompts, cache shared prefixes.
+
+## Choosing a GPU
+
+$$
+\text{goodput per dollar} = \frac{\text{goodput (tok/s)} \times 3600}{p}
+$$
+
+Two prices per card, and **they rank differently**:
+
+| Card | \$/hr | \$ per (TB/s) → decode | \$ per (PFLOP/s) → prefill |
+|---|---|---|---|
+| T4 | 0.35 | 1.09 | 5.38 |
+| L4 | 0.80 | 2.67 | 6.61 |
+| A100 80GB | 1.60 | 0.80 | 5.13 |
+| H100 SXM | 2.50 | 0.75 | 2.53 |
+| H200 | 3.50 | 0.73 | 3.54 |
+| B200 | 5.50 | 0.69 | 2.44 |
+
+- A100 → B200: bandwidth price falls **14%**, FLOP price falls **52%**. New hardware helps prefill far more than decode.
+- **Break-even test: a cheaper card wins if it is proportionally slower than it is cheaper.** Compute both factors *per user*, not per batch.
+- Worked (8B, 512/256, 2,048 ctx, 64 streams): A100/H100/H200/B200 span **3.3× in throughput, 1.06× in value**. When the spread is under ~10%, choose on fit and operational risk.
+- On **prefill-bound** traffic the spread is much larger — the newest card does win. Compute the spread for your workload before generalising.
+
+## When it does not fit
+
+- 70B BF16 = **141 GB** → 2 cards minimum, bill ×2, plus ~15% per extra rank for the all-reduces.
+- **Precision first, then card.** 70B INT4 = 35 GB → **1 card** at \$1.35/M output vs \$6.65 for BF16 on two H100s — **5× cheaper**.
+- Never price a configuration that would OOM. It is arithmetic about a machine that does not exist.
+
+## Capacity planning
+
+$$
+\text{busy GPUs} = \lambda \times m \quad\text{(a floor)} \qquad
+\text{fleet} = \left\lceil \frac{\lambda m}{\rho} \right\rceil
+$$
+
+Worked (8B, H100, 64 streams, 512/256, $m = 0.073$ GPU-s):
+
+| Rate | Busy | Fleet @60% | \$/month |
+|---|---|---|---|
+| 2 req/s | 0.15 | 1 | 1,825 |
+| 12 req/s | 0.87 | 2 | 3,650 |
+| 30 req/s | 2.18 | 4 | 7,300 |
+
+- **Run at 50–70%.** The unused 30–50% is the queue having somewhere to go.
+- **The bill is a step function of fleet size**, not of utilization. Utilization moves within a step; only card count moves between steps.
+- **Headroom = committed capacity**, not a utilization target. Autoscaling on utilization gives a floor, never a ceiling in time. Scale on queue depth or p95 latency.
+- **Utilization tax:** at 40% average utilization you pay **2.5×** per unit of useful work.
+
+## Re-run the plan when
+
+Model changes · precision changes · prompt/output length distribution shifts · engine version moves · **traffic crosses the last step you planned** (the expensive one).
+
+## Reporting rules
+
+1. Every cost number states **model, GPU, precision, concurrency, and both length distributions**. A cost per token without its workload is a rumour.
+2. Keep **derived / measured / structural** columns apart and label every cell (Module 17's discipline).
+3. Eliminate on **hard constraints first** — does it fit, does it meet the SLO. Missing the SLO eliminates; it does not score badly.
+4. Report **goodput per dollar**, not throughput and not dollars per million tokens alone.
+5. Report the fleet as **floor + committed + headroom reason + scaling trigger**.
+6. Ship a **sensitivity section with thresholds**. A decision without one is a preference.
+
+## Module order
+
+- 25.1 cost-per-token → 25.2 goodput-per-dollar → 25.3 capacity-planning → 25.P project-cheapest-system
+- Next: **Module 26 Specialized Workloads** — agents, reasoning, multi-LoRA and multimodal change the *workload*, not the method. The identity holds; the inputs move.

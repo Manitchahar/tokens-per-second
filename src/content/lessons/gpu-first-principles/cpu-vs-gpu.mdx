@@ -1,0 +1,148 @@
+---
+title: 'CPU vs GPU: a few geniuses, or ten thousand workers'
+summary: 'Why a GPU beats a CPU at inference, in terms you can picture — cores that wait, and the trick of keeping the math units busy while memory is slow. Ends with the shapes of work that suit each machine.'
+objectives:
+  - Explain a memory stall and why a core spends most of its life in one
+  - Describe latency hiding, and what a warp is
+  - Justify, with arithmetic, why a GPU wins on throughput and a CPU wins on latency
+  - Predict whether a given job should go on a GPU or a CPU
+---
+import CpuGpuCores from '@/components/viz/gpu/CpuGpuCores.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In Module 00 you watched a decode step take about 7 ms to produce a single token. In Module 01 you worked out that producing that token needs roughly 16 GFLOP of arithmetic.
+
+Do that division on a modern GPU and you get an answer that makes no sense: the math should have taken about **0.02 milliseconds**. It took 350 times longer. The GPU spent 99.7% of that step not computing.
+
+Nothing is broken. You have just run into the central fact of this entire course, and this module is where we earn it properly.
+
+## The shape of the problem
+
+Here is a program, in the only pseudocode that matters:
+
+```
+x = 0
+for each of 8 billion weights:
+    x += weight * token          # one multiply, one add
+```
+
+There are no `if` statements. There is no loop that depends on a previous result. There is no pointer chasing. Every one of those 8 billion operations is completely independent of every other one: **for each of them, the only thing you need is the weight itself, and where it lives in memory.**
+
+That shape has a name: it is *embarrassingly parallel*. And it is exactly the shape of every matrix multiply in a neural network, which is why neural networks moved to GPUs long before anyone called them language models.
+
+<Callout type="intuition" title="A stadium, not a workshop">
+  A CPU is a workshop with a few master craftspeople. Each one has extraordinary tools, can hold a huge amount in their head, plans three moves ahead, and is very hard to interrupt.
+
+  A GPU is a stadium of ten thousand people each with a single screwdriver. Individually they are hopeless. But the job has no dependencies, so you can shout instructions at the whole crowd and every pair of hands works at the same time.
+
+  Neither is better. They are built for opposite problems.
+</Callout>
+
+## Why a core spends most of its life waiting
+
+A single core cannot run more than one instruction stream. When it executes `w[i] * t`, the multiply itself takes a fraction of a nanosecond. Getting `w[i]` there takes **400 to 700 nanoseconds** — it has to come from DRAM across a memory bus that is physically centimetres away.
+
+<Scrolly>
+  <CpuGpuCores client:visible slot="stage" />
+
+  <Step title="1. One instruction">
+    A core has a small arithmetic unit, a small cache, and control logic. It can only be doing one thing at a time, and the "doing one thing" is the shortest part.
+  </Step>
+
+  <Step title="2. Then it waits">
+    Ask for a number that is not in the cache and the core cannot continue. It sits there, holding nothing, until the memory system delivers. That gap is a **stall**.
+  </Step>
+
+  <Step title="3. The killer: everyone waits together">
+    The problem is not that a core waits. It is that eight cores issued at the same moment all wait at the same moment. The machine's arithmetic units go dark together, and the memory system, which *could* be streaming, gets one thin trickle instead of a flood.
+  </Step>
+
+  <Step title="4. So the GPU changes the shape of the machine">
+    Instead of a few large caches and a few cores, a GPU has many small ones: 40 multiprocessors on a free T4, 132 on an H100, 148 on a B200. Each is a simple, cheap processor with its own small L1 cache.
+  </Step>
+
+  <Step title="5. The trick: many streams per core">
+    Each multiprocessor runs several independent **warps** at once. On an H100, 32 threads share one instruction. Several warps live on the same multiprocessor at the same time, and the hardware switches between them freely. One warp waits for memory; another computes. The multiprocessor does not stop.
+  </Step>
+
+  <Step title="6. You pay for it">
+    Every resident warp needs registers and instruction slots, so a multiprocessor can only host a limited number at once. That limit is **occupancy**. More warps means better latency hiding and worse cache behaviour. Every kernel launch is a negotiation about where to sit.
+  </Step>
+
+  <Step title="7. What this buys">
+    When your work has enough independent pieces, the GPU's advantage is not a small constant. It is the difference between 8 wide cores and 132 of them, each running 8 or more concurrent streams.
+  </Step>
+</Scrolly>
+
+<Callout type="math" title="Do the division yourself">
+  A modern server CPU: 8 cores at about 3 GHz, each issuing a 16-wide floating-point multiply-add per cycle.
+
+  $$
+  8 \times 3\times 10^9 \times 32 = 7.7\times 10^{11} \approx 770\ \text{GFLOP/s}
+  $$
+
+  An H100, dense BF16 on tensor cores: about 989 TFLOP/s.
+
+  $$
+  \frac{989\times 10^{12}}{7.7\times 10^{11}} \approx 1{,}280\times
+  $$
+
+  Three orders of magnitude. And that is a *best case* on both sides.
+</Callout>
+
+## The GPU also has a weakness
+
+Everything above is throughput. Ask a GPU to do one thing, well, right now, and a CPU wins, and it is not close.
+
+A GPU pays a fixed cost to get started. It needs a **kernel launch**: the driver programs the multiprocessors, and on a modern GPU that costs on the order of **5 to 10 microseconds** before a single instruction runs. A CPU just runs the next instruction, in about half a nanosecond.
+
+<Callout type="pitfall" title="Launch overhead is why tiny GPU kernels are a trap">
+  Suppose you write a loop that adds one number to a tensor, one element at a time, 1,000 times, on the GPU. Each step is one launch. You have spent 1,000 × 8 µs = **8 ms of pure overhead** to do 1,000 additions. On the CPU the same loop takes microseconds.
+
+  The fix is not a faster GPU. It is to stop launching: batch the work into one kernel, or let PyTorch fuse it. This one habit explains a large share of the gap between a naive PyTorch LLM and an optimized engine.
+</Callout>
+
+So: a GPU is a machine for doing **a great deal of independent arithmetic at once**. A CPU is a machine for doing **a little complicated control flow, right now, with no setup cost**.
+
+## Which machine gets which job
+
+LLM inference is really two different jobs wearing the same coat, and the coat is why people get confused.
+
+<Callout type="recap" title="The split">
+  **On the GPU:** every matrix multiply, attention, the KV cache, softmax over big vectors, and the whole forward pass. This is pure arithmetic over big independent arrays.
+
+  **On the CPU:** tokenizing your text, detokenizing, sampling and top-k over the vocabulary, the HTTP layer, the scheduler, the database, the rate limiter, and deciding what to do next. This is small, branchy, and latency-critical.
+
+  The real cost of a wrong choice is not the arithmetic. It is the transfer. Every time a number crosses from one machine to the other, you pay a round trip over a network — tens of milliseconds, which is several decode steps. Keeping the token loop entirely on one side of that boundary is a real design decision, and you will make it deliberately in Module 07.
+</Callout>
+
+And the ultimate test, which you should be able to answer instantly for any workload from now on:
+
+<Callout type="try" title="The one question">
+  **How many independent pieces of arithmetic does this job have, and does it do the same thing to all of them?**
+
+  Millions of independent, identical operations: GPU. A few operations with data-dependent branches: CPU.
+
+  A matrix multiply over 4,096 × 4,096 weights: 16 million independent operations, identical work each. GPU, and not close.
+
+  Choosing the top 50 of 128,000 logits: 128,000 comparisons with early exit. CPU, and not close.
+</Callout>
+
+<KeyNotes>
+  1. A core executes one instruction stream. Fetching a number from DRAM takes 400–700 ns; the arithmetic that uses it takes far less, so cores spend most of their life **stalled**.
+  2. A CPU handles this with big caches, branch prediction, out-of-order execution and a few very fast cores. It optimises for **latency of one stream**.
+  3. A GPU optimises for **throughput**: many small cores (40–148 SMs), each running several independent **warps** so that one warp's memory wait is covered by another's arithmetic. That is **latency hiding**.
+  4. Every resident warp costs registers and instruction slots. How many fit is **occupancy**, and it trades latency hiding against per-thread cache space.
+  5. A CPU of 8 cores reaches on the order of 0.8 TFLOP/s; an H100 about 989 TFLOP/s dense BF16. That is the gap you are buying.
+  6. The GPU pays ~5–10 µs per **kernel launch**. Many tiny kernels are therefore slower than one fused kernel, and this is the single most common beginner mistake in GPU code.
+  7. Independent identical arithmetic belongs on the GPU. Small branchy latency-critical work belongs on the CPU. Keep them from ping-ponging across a network.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A core stalls while waiting for a number from memory. What is the hardware trick that stops a GPU from stalling too?', options: ['Larger caches only', 'Running several independent warps on the same multiprocessor', 'More DRAM bandwidth', 'Using lower precision numbers'], answer: 1, why: 'Latency hiding: while one warp waits, another warp issues its arithmetic, so the multiprocessor stays busy. Larger caches help but are not the mechanism.' },
+  { q: 'Roughly how many floating-point operations per second does an 8-core server CPU reach with wide AVX? Answer in GFLOP/s.', numeric: true, answer: 770, tolerance: 90, unit: 'GFLOP/s', why: '8 cores × 3 GHz × 32 FLOP/cycle (16 wide FMA) ≈ 7.7 × 10¹¹ = 770 GFLOP/s.' },
+  { q: 'A GPU kernel launch on a modern GPU costs roughly how long before the first instruction runs?', options: ['50 nanoseconds', '5 to 10 microseconds', '1 millisecond', '100 milliseconds'], answer: 1, why: 'Programming 132 multiprocessors takes single-digit microseconds. A CPU, by contrast, starts the next instruction in under a nanosecond with no setup.' },
+  { q: 'You run 1,000 separate single-element GPU additions in a Python loop, and it takes 8 ms. What is the fix?', options: ['Use a smaller GPU', 'Move the loop to the CPU', 'Fuse the work into one kernel launch', 'Use a faster network'], answer: 2, why: '1,000 launches × ~8 µs of overhead = 8 ms of launch cost. Batching or fusing into one kernel removes essentially all of it.' },
+  { q: 'Which of these jobs belongs on the CPU, not the GPU?', options: ['A 4096 × 4096 matrix multiply', 'Attention over a 1,024-token context', 'Top-k over 128,000 logits to pick one token', 'Softmax over a 32,000-long vector'], answer: 2, why: 'Top-k has data-dependent early exit and returns a handful of numbers, so it is latency-critical and branchy. The others are large independent arrays.' },
+  { q: 'What is occupancy on a GPU?', options: ['The fraction of a batch that fits in the KV cache', 'How many warps an SM can hold at once, limited by registers and shared memory', 'The percentage of peak FLOP/s a kernel reaches', 'How full GPU memory is'], answer: 1, why: 'Occupancy is resident warps per multiprocessor. More warps hide latency better; fewer leave registers and shared memory per thread.' },
+]} />

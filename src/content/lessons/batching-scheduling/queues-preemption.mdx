@@ -1,0 +1,168 @@
+---
+title: 'Queues, fairness, cancellation & preemption'
+summary: Once the batch is re-formed every step, the interesting decisions are no longer about tensors — they are about people. Who waits, who jumps, what happens when a user leaves mid-sentence, and what you do when memory runs out mid-batch.
+objectives:
+  - Describe four queue policies and the workload each one is good for
+  - Calculate how long a request waits under first-come-first-served and under priority
+  - Explain starvation and the aging policy that prevents it
+  - Compute the cost of a preemption in recomputed tokens and show why it is so expensive
+  - Decide which policy a given deployment should use, and defend it
+---
+import QueuePlayground from '@/components/viz/batching-scheduling/QueuePlayground.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Two long requests are decoding. Each will hold its seat for 200 steps. A third request arrives at step 5 and wants twenty tokens — it could be done in twenty steps, a fraction of a second.
+
+It will wait 195 steps. Not because the GPU is slow, and not because the scheduler is broken, but because **both seats are occupied and neither seat is coming free soon.** That is a queue, and from here on out the hard part of serving is not arithmetic. It is deciding who waits.
+
+Every serving engine contains a queue, whether or not anyone named it one. And the queue is where the engineering decisions that show up in your pager actually live.
+
+## The queue is a policy
+
+A scheduler makes exactly two decisions, every step:
+
+1. **Who gets the next free seat?** (admission order)
+2. **What happens when someone leaves or needs more room?** (eviction)
+
+Everything else is bookkeeping. Both decisions are policy, and each has a small number of well-understood options. Here is the whole menu.
+
+| Policy | Rule | Good for | Fails when |
+|---|---|---|---|
+| **FIFO** | first in, first out | general traffic; the safe default | one very long request blocks everyone behind it |
+| **Priority** | highest priority first | paid tiers, interactive vs batch | high-priority traffic never stops, and low-priority requests starve |
+| **Shortest-first** | shortest job first | minimising average wait | long requests starve, exactly as above |
+| **Aging** | priority rises the longer you wait | fairness you can prove | needs a scheduler willing to be clever |
+
+<Scrolly>
+  <QueuePlayground client:visible slot="stage" />
+
+  <Step title="1. One workload, four policies">
+    The visual runs the same twelve requests through all four policies. Two 200-token jobs take both seats for 200 steps. R1 is a low-priority request that arrives at step 5 and finds nowhere to go. From step 50 a flood of high-priority work starts arriving. Everything you see next is a consequence of those three facts.
+  </Step>
+
+  <Step title="2. The hatched bar is the wait">
+    Every request starts hatched, at the step it arrives, and turns solid the moment it is admitted. **The length of the hatched bar is that user's TTFT.** No amount of GPU speed shortens it; only the queue does.
+  </Step>
+
+  <Step title="3. FIFO is fair, and blind">
+    Under first-come-first-served, R1 was queued before the flood arrived, so it goes next at step 200. It waits 195 steps. The high-priority requests that arrived later wait longer or shorter purely by accident of arrival order — nobody decided that, it just happened.
+  </Step>
+
+  <Step title="4. FIFO's weakness: the long request">
+    The real cost of FIFO is not unfairness, it is **blocking**. A 200-token request holds its seat for 200 steps because it is in it, not because it needs to. Anyone arriving during those 200 steps waits behind a job that may have already streamed 190 tokens.
+  </Step>
+
+  <Step title="5. Priority spends fairness">
+    Switch to priority and R1 waits 275 steps instead of 195. It got *worse*, deliberately: the flood of high-priority work is admitted ahead of it every single time a seat frees. **This is the whole trade.** Priority does not create capacity; it reorders who gets it.
+  </Step>
+
+  <Step title="6. Starvation is the failure mode">
+    Push that further and R1 never runs at all. A request that never starts has infinite TTFT, and a p99 that is not a number. Starvation is what separates a priority queue from a fair one, and it is why you never ship raw priority.
+  </Step>
+
+  <Step title="7. The fix: aging">
+    **Aging** gives every waiting request a priority that rises with its wait. The longer you sit, the more you outrank the newcomers. Starvation becomes impossible, because after long enough the starved request outranks everything.
+  </Step>
+
+  <Step title="8. Cancellation is free money">
+    Now watch the cancellation run. R0 disconnects at step 60 and its seat is free *on that same step*, not at step 200. In the visual this collapses the whole run. In production, when a user closes the tab, the engine that notices and frees immediately is measurably better than one that finishes the request first.
+  </Step>
+
+  <Step title="9. Preemption, and what it costs">
+    Preemption is the emergency valve: when a new request needs more KV memory than is free, the engine evicts a running sequence to make room. Here it evicts and then **pays to replay every token that sequence had already streamed.**
+  </Step>
+
+  <Step title="10. Choose on purpose">
+    Every row of the table is someone else's pain moved to a different column. Choosing a policy is not finding the best one; it is deciding **who you have promised to serve first**, and then measuring what that promise costs the people you did not promise.
+  </Step>
+</Scrolly>
+
+## Fairness, quantified
+
+Fairness is not a feeling here; it is the spread of waits. Take a queue of $n$ requests on $s$ seats, each wanting $\ell_i$ tokens. Under FIFO with all requests arriving together, the first $s$ start immediately and the $(s+1)$-th waits until the shortest of the first $s$ finishes:
+
+$$
+\text{wait}_k \approx \frac{\sum_{i=1}^{k} \ell_i}{s}
+$$
+
+With $s = 4$ seats and eight 40-token requests, that gives exactly what the visual shows: the first four admitted at step 0, the next four at step 40. Everyone waits either 0 or 40 steps. Perfectly fair, and the p99 is exactly the p50.
+
+<Callout type="math" title="Fairness is not the same as speed">
+  FIFO makes *every* request equally miserable, which is the definition of fair and also the definition of a bad user experience. The engineering goal is rarely equal waits — it is usually **bounding the worst wait**, which is a p99 problem. That is why real systems age the queue: to cap the maximum rather than to equalise the average.
+</Callout>
+
+## Cancellation: the cheapest win in serving
+
+Cancellation deserves more attention than it gets, because it is the only policy that costs nothing and returns something.
+
+When a client disconnects, the engine learns it through one of two paths: the HTTP connection drops, or — far more often — the streaming response simply stops being read. Either way, the engine has a sequence that will never be looked at again and is still holding KV cache, still occupying a seat, still consuming memory.
+
+The only question is how quickly it notices.
+
+| Response | Seat freed | Cost |
+|---|---|---|
+| Finish the request first | up to seconds of wasted work | a seat and its KV, for nothing |
+| Free on the next step | ~10–30 ms | nothing |
+
+<Callout type="real" title="What this means in practice">
+  Aborting a request on client disconnect is standard in modern engines — vLLM, among others, detects a dropped request and stops decoding it rather than finishing into the void. The effect is not subtle: on chat workloads with plenty of tab-closing, it can be a meaningful fraction of total work. If your engine does not do this, it is one of the cheapest wins available to you.
+</Callout>
+
+## Preemption: eviction and its price
+
+Preemption is what happens when admission fails. A new request needs $b$ KV blocks, only $b - 1$ are free, and the engine must either reject the request, stall the whole batch until memory frees up, or take a seat from someone who already has one.
+
+**Recompute preemption** takes the seat. The evicted sequence's KV blocks are freed and it goes to the back of the queue. When it is re-admitted, its KV cache is empty, so the engine must replay the prefix it had already streamed — and that replay is real GPU work producing tokens the user has already seen.
+
+The accounting, on the visual's preemption run:
+
+$$
+\text{overhead} = \frac{\text{recomputed tokens}}{\text{tokens wanted}} \times \text{work already done}
+$$
+
+Evicting a sequence that had streamed 100 tokens costs 100 tokens of recompute. Evicting one that just started costs almost nothing. So the eviction policy is obvious: **evict the newest, not the oldest.**
+
+<Callout type="pitfall" title="Why preemption is a last resort">
+  In the visual, running with one fewer seat than the memory budget allows took the workload from 300 steps to 357 — a 19% slowdown — and paid 77 tokens of recompute, for no benefit at all. Preemption is not free throughput. It is the mechanism by which the engine avoids an out-of-memory crash, and it should fire on the margin, not as a routine event.
+
+  A well-tuned engine should preempt rarely. If your preemption counter is climbing steadily, the real problem is upstream: your memory budget is set for an average context length that your traffic no longer has.
+</Callout>
+
+<Callout type="intuition" title="Why the newest sequence is the right victim">
+  The cost of evicting a sequence is proportional to how much it has already generated, because that is how much has to be replayed. The newest sequence has generated the least. So "evict the newest" is not arbitrary — it is the choice that minimises total recompute, which is the standard shortest-remaining-work argument from OS scheduling.
+</Callout>
+
+## Choosing a policy
+
+A defensible default for a production chat service, and the reasoning for each part:
+
+1. **FIFO with aging as the base.** Ageing gives you a bounded worst-case wait without needing a business priority. The bound is roughly `max_queue_depth × average_request_time`, which is a number you can state in an SLO.
+2. **Priority only where you can justify it.** A paid tier is a real business reason. Cap it: a high-priority request that has waited more than some threshold drops back to normal, so one impatient user cannot stall the queue.
+3. **Never pre-empt preemptively.** Set the memory budget from your *p95* context length, not the maximum, so preemption is a safety net rather than a routine cost.
+4. **Cancellation on, always.** It is free, it is strictly better, and there is no configuration in which turning it off helps.
+
+<Callout type="mentor" title="The habit this lesson builds">
+  Every scheduling decision is a decision about **who waits**, and the way to make it defensible is to write down whose pain you are moving and why. If you cannot name the group you are disadvantaging, you have not thought about the policy yet — you have just shipped the default.
+</Callout>
+
+<KeyNotes>
+  1. A scheduler makes two decisions per step: who gets the next seat, and who gets evicted. Both are policy.
+  2. FIFO is the safe default and is perfectly fair, but a long request blocks everyone behind it for as long as it runs.
+  3. Priority reorders who gets capacity; it does not create any. In the visual, the low-priority request waits 275 steps instead of 195.
+  4. Starvation happens when high-priority traffic never stops; **aging** (priority rising with wait) is the standard cure and bounds the worst wait.
+  5. Fairness is the spread of waits, not the average. Equal waits are fair and often a bad experience — bound the p99 instead.
+  6. Cancelling on client disconnect is free: it returns a seat and its KV cache, and is the cheapest throughput win in serving.
+  7. Preemption evicts a sequence and replays the tokens it already streamed, so the cost is proportional to how much it had generated.
+  8. Evict the newest sequence: it has generated the least, so it is the cheapest to rebuild. Preemption should be a safety net, not a routine event.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why does FIFO cause blocking even though it never skips anyone?', options: ['It admits too many requests at once', 'A long request holds its seat for its whole length, so everyone behind it waits for a job that has already streamed most of its answer', 'It sorts by arrival time incorrectly', 'FIFO batches requests together'], answer: 1, why: 'Fairness does not mean seats are released early. A 200-token request holds its seat for 200 steps regardless of policy, and everything arriving in that window waits behind it. That is head-of-line blocking.' },
+  { q: 'Two seats are busy with 200-step requests. A third request arrives at step 5. What is its wait under FIFO?', numeric: true, answer: 195, tolerance: 2, unit: 'steps', why: 'It arrived at step 5 and was admitted at step 200, so it waited 195 steps. No GPU speed would change this — only a policy or a free seat would.' },
+  { q: 'What is the standard cure for starvation in a priority queue?', options: ['Increase max_num_seqs', 'Aging: raise a request’s priority the longer it waits', 'Shrink the KV cache', 'Cancel the low-priority requests'], answer: 1, why: 'Aging makes starvation impossible because after enough waiting the starved request outranks everything else. It also bounds the worst-case wait, which is what you actually want an SLO for.' },
+  { q: 'A preemption evicts a sequence that has already streamed 100 tokens. What does it cost?', options: ['Nothing, the seat is simply freed', 'The sequence must replay its 100-token prefix when re-admitted', 'One step of latency', 'The whole batch must be rebuilt'], answer: 1, why: 'Eviction frees the KV blocks, so on re-admission the engine rebuilds the prefix from scratch. That replay is real GPU work producing tokens the user has already seen — which is why the newest sequence, having generated the least, is the right victim.' },
+  { q: 'Cancelling a request when its client disconnects is described as “free money”. Why?', options: ['It makes the model smaller', 'It returns a seat and its KV cache that would otherwise be spent producing tokens nobody will read', 'It improves the model’s accuracy', 'It increases GPU clocks'], answer: 1, why: 'A disconnected client will never see the rest of the answer. Finishing it burns GPU time, a seat and memory for nothing. Freeing immediately on disconnect is strictly better and costs nothing to implement.' },
+  { q: 'Running the visual’s workload with one fewer seat than the memory budget allows (forcing preemption) took it from 300 to 357 steps. What is the lesson?', options: ['Fewer seats is always better for latency', 'Preemption is a safety net against OOM, not a way to gain throughput — it cost 19% wall-clock and 77 recomputed tokens for no gain', 'Preemption only happens with small models', 'Steps are unrelated to preemption'], answer: 1, why: 'Preemption trades throughput for survival. If it is firing routinely your memory budget is mis-sized for the context lengths you are actually serving — size it from p95 context, not the maximum.' },
+  { q: 'With 4 seats, eight requests of 40 tokens each arrive together under FIFO. How many steps does the last request wait before being admitted?', numeric: true, answer: 40, tolerance: 1, unit: 'steps', why: 'The first four are admitted at step 0 and finish at step 39. The next four are admitted at step 40, so the last request waits 40 steps. Fairness here means everyone waits either 0 or 40 — the p99 equals the p50, which is the clearest possible illustration of FIFO.' },
+  { q: 'A request is evicted by preemption after it has streamed 100 tokens. How many tokens must the engine regenerate before it resumes, and why?', numeric: true, answer: 100, tolerance: 2, unit: 'tokens', why: 'Eviction drops the KV cache, so on re-admission the engine rebuilds the whole prefix from scratch — all 100 tokens the user already saw. That is why the newest sequence, which has generated the least, is the right victim.' },
+]}/>

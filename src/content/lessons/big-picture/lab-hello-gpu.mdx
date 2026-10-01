@@ -1,0 +1,92 @@
+---
+title: 'Lab: Say hello to a real GPU'
+summary: Open a free Colab notebook, switch on a real NVIDIA GPU, read nvidia-smi, and race the CPU against the GPU, timing it the right way.
+objectives:
+  - Open a notebook in Google Colab and attach a free T4 GPU
+  - Read the key fields of nvidia-smi
+  - Move a tensor to the GPU and multiply matrices on it
+  - Time GPU work correctly with torch.cuda.synchronize()
+colab: 00-hello-gpu.ipynb
+---
+
+Enough watching: time to touch a real GPU. You do not need to own one. **Google Colab** gives you a free NVIDIA **T4** GPU in your browser, and every lab in this course is designed to run on it.
+
+## What is Colab?
+
+<Term t="colab">Google Colab</Term> is a website that runs **Jupyter notebooks**: documents that mix text and runnable Python code, split into *cells*. You run a cell, see its output right under it, and move on to the next one. Behind the scenes, Google lends you a Linux machine with a GPU for a few hours.
+
+<Callout type="try" title="Setup, once (3 minutes)">
+  1. Sign in to a Google account.
+  2. Click **Open in Colab** below. The notebook opens in a new tab.
+  3. In Colab's menu choose **Runtime → Change runtime type**, select **T4 GPU**, and click **Save**.
+  4. Click into the first code cell and press <kbd>Shift</kbd>+<kbd>Enter</kbd>. Keep pressing it to run each cell in order.
+  5. If Colab asks *"This notebook was not authored by Google"*, click **Run anyway**. It is this course's notebook.
+</Callout>
+
+<Colab nb="00-hello-gpu.ipynb" />
+
+<Callout type="pitfall" title="If Open in Colab gives a 404">
+  The Colab button loads the notebook from this site's GitHub repository. If the course has not been published to GitHub yet, use **Download .ipynb** instead, then in Colab choose **File → Upload notebook** and pick the downloaded file.
+</Callout>
+
+## What you will do in the notebook
+
+### 1. Confirm the GPU
+
+You will ask PyTorch whether a GPU is visible and what it is. Expect **Tesla T4**, about **15 GB** of memory and **40 SMs**. An SM is one of the GPU's independent processing blocks; Module 02 opens one up.
+
+### 2. Read `nvidia-smi`
+
+`nvidia-smi` is the GPU's dashboard, and the first command every inference engineer types on a new machine. You will learn to read these fields:
+
+| Field | Meaning | Why you care |
+|---|---|---|
+| **Memory-Usage** | GPU memory used / total | Model weights and KV cache must fit here. Running out = crash (OOM). |
+| **GPU-Util** | % of time any kernel was running | A rough "is it busy" signal. 100% does *not* mean efficient (Module 12). |
+| **Pwr: Usage/Cap** | Power draw in watts | Busy, efficient kernels draw more power. |
+| **Temp** | Chip temperature | Hot GPUs slow themselves down (throttle). |
+
+### 3. Numbers on the GPU
+
+You will create a 4096 × 4096 grid of numbers (a <Term t="tensor">tensor</Term>) and copy it into GPU memory with `.to("cuda")`. You will check that it takes exactly 4096 × 4096 × 4 bytes = 67 MB. **Every number costs bytes.** This is the habit that makes memory math, later, feel easy.
+
+### 4. The race, and the #1 benchmarking bug
+
+You will multiply two big matrices on the CPU and on the GPU and time both. The GPU will win by 10× to 100×.
+
+But there is a trap, and you will fall into it on purpose. When Python launches work on the GPU, it **does not wait**: it queues the job and returns immediately. If you stop your stopwatch then, you measure how long it took to *ask*, not how long it took to *do*.
+
+```python
+torch.cuda.synchronize()          # wait until the GPU is idle
+t0 = time.perf_counter()
+c = a_gpu @ b_gpu                 # queued, returns instantly
+torch.cuda.synchronize()          # wait until the multiply is really done
+elapsed = time.perf_counter() - t0
+```
+
+<Callout type="mentor">
+  Every benchmark in this course, and in your career, needs this line. When a GPU number looks too good to be true, the first question to ask is *"did they synchronize?"*
+</Callout>
+
+### 5. Half precision
+
+You will rerun the multiply in 16-bit numbers (`float16`). Half the bytes, and the GPU switches on its **tensor cores**, the special matrix hardware. Expect several times more speed. This is why every LLM is served in 16-bit or lower.
+
+## When you are done
+
+You should be able to answer these without looking:
+
+- How many bytes does one `float32` number take? One `float16`?
+- What does `torch.cuda.synchronize()` do, and why is timing wrong without it?
+- Roughly how many TFLOP/s did your T4 reach in FP16, and what is its peak (about 65)?
+
+Write your numbers in **My notes** (bottom right). You will compare them with the roofline math in Module 02.
+
+<KeyNotes>
+  1. Colab gives you a free **T4** GPU: 16 GB of memory, 40 SMs, about 65 TFLOP/s in FP16. Enough for every lab.
+  2. `nvidia-smi` shows GPU memory usage, utilization, power and temperature.
+  3. Tensors live in a specific memory (CPU RAM or GPU memory). `.to("cuda")` copies them to the GPU.
+  4. Every number costs bytes: FP32 = 4, FP16/BF16 = 2.
+  5. GPU work is **asynchronous**. Always call `torch.cuda.synchronize()` before stopping a timer.
+  6. 16-bit math on tensor cores is several times faster than 32-bit.
+</KeyNotes>

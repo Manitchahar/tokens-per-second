@@ -1,0 +1,236 @@
+---
+title: 'Why contiguous KV memory wastes space'
+summary: 'A KV cache that reserves one flat buffer per request throws away most of its memory: the unused tail of every buffer, and the holes left behind when requests finish. This is the problem PagedAttention solves.'
+objectives:
+  - Explain why a contiguous KV allocator must reserve the maximum length up front
+  - Compute the waste for a realistic set of requests and a given max_model_len
+  - Distinguish internal fragmentation from external fragmentation in a KV cache
+  - Show a case where the pool has enough free memory but a request still cannot start
+  - Predict how max_model_len changes waste, throughput and the risk of OOM
+---
+import Fragmentation from '@/components/viz/paged-attention/Fragmentation.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Four users send you requests at the same instant. One wants a 12-token answer, one is about to write an essay, one asked a two-line question, one is asking for a summary of a long document. Every one of them will be given a private stretch of GPU memory to keep their conversation in, and it is decided before a single token comes out.
+
+The obvious way to do that is the way operating systems did it before virtual memory: one **contiguous** region per request, allocated once, big enough for the worst case. It is simple, it is fast, and it wastes most of what it holds.
+
+This lesson is about exactly how much it wastes, and why no amount of clever scheduling fixes it. The next lesson is the fix.
+
+## The reservation is the problem
+
+<Term t="kv-cache">The KV cache</Term> is stored as one buffer per sequence. During <Term t="prefill">prefill</Term> the prompt's keys and values are written into it; during <Term t="decode">decode</Term> one more token's worth is appended every step. The buffer therefore has to be as long as the request could possibly get.
+
+The engine knows that number. It is `max_model_len`, and it is a configuration setting:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192
+```
+
+So a request with a 40-token prompt must reserve `40 + max_new_tokens` tokens of KV cache — and `max_new_tokens` is itself a guess the operator makes, defaulting to something generous so that clients are not surprised. Twelve-token answer included.
+
+<Scrolly>
+  <Fragmentation client:visible slot="stage" />
+
+  <Step title="1. Four requests arrive">
+    Prompts of 40, 20, 56 and 12 tokens arrive together. None of them knows how long its own answer will be. The pool now holds **640 reserved tokens**, of which **128** hold data.
+  </Step>
+
+  <Step title="2. Reserve prompt + max_new_tokens">
+    The engine sizes each buffer for the prompt plus a configured headroom, `max_new_tokens`. Every one of those headroom slots is memory committed to a guess.
+  </Step>
+
+  <Step title="3. At arrival, the gap is worst">
+    **Red is reserved and empty.** Immediately after admission it is 512 of 640 tokens: **80% of the KV cache in flight is serving nobody.** This is the peak waste of the whole lifecycle.
+  </Step>
+
+  <Step title="4. They decode, the gap closes">
+    Green fills in as tokens arrive. The gap narrows — but never closes, because no engine can guess a final length in advance.
+  </Step>
+
+  <Step title="5. What is wasted at the end">
+    At the end, 640 tokens are still reserved and 356 hold useful data. The remaining **284 tokens — 37 MB — are wasted forever**, 44% of what was held.
+  </Step>
+
+  <Step title="6. Holes, not blocks">
+    When requests finish, their buffers come back whole and **differently sized**: 22.0, 19.4 and 18.4 MB. That is <Term t="external-fragmentation">external fragmentation</Term>: free memory in the wrong shape.
+  </Step>
+
+  <Step title="7. A long request cannot start">
+    A new request reserving 528 tokens needs **69.2 MB contiguously**. The pool has 59.8 MB free and no hole that big. **Out of memory, with memory to spare.**
+  </Step>
+
+  <Step title="8. The rule">
+    Never reserve what you have not been asked for. Reserve in small fixed units and grow on demand — which is exactly what the next lesson builds.
+  </Step>
+</Scrolly>
+
+## Where the bytes come from
+
+The waste is measured in bytes, so let us do the arithmetic. From Module 05, for Llama-3.1-8B in BF16, one token of context costs:
+
+$$
+\text{bytes per token} = 2 \times L \times n_{kv} \times d_{head} \times b = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\ \text{bytes}
+$$
+
+The factors: K and V (2), 32 layers, 8 key/value heads (GQA — 32 query heads share 8), head dimension 128, and 2 bytes per number in BF16.
+
+So **128 KiB per token**, and it is the same number whether the token came from the prompt or from the model:
+
+| Context a request reaches | KV cache it needs |
+|---|---|
+| 512 tokens | 64 MiB |
+| 2,048 tokens | 256 MiB |
+| 8,192 tokens | 1 GiB |
+| 32,768 tokens | 4 GiB |
+
+At `max_model_len = 8192`, a *single* reservation is 1 GiB. An 80 GB H100 that keeps 40% free for weights and workspace has about 45 GB for KV cache, so:
+
+$$
+\frac{45\ \text{GB}}{1\ \text{GiB}} = 44 \text{ requests}
+$$
+
+Forty-four conversations on an H100. If the average request actually stops at 1,000 tokens, it needs 125 MiB, and the same 45 GB would hold **368**.
+
+<Callout type="math" title="The waste of reserving, in one formula">
+  Waste ratio of a contiguous allocator on a workload with final length $\ell$ and a configured ceiling $M$:
+
+  $$
+  \text{waste} = 1 - \frac{\mathbb{E}[\ell]}{M}
+  $$
+
+  With $\mathbb{E}[\ell] = 1{,}000$ and $M = 8{,}192$ that is **88% waste**. Every KV byte you bought is idle 88% of the time.
+
+  With $M = 2{,}048$ the same workload wastes 51%. Halving the ceiling halves the waste — at the price of rejecting long requests.
+</Callout>
+
+## Two kinds of waste
+
+Both come from the same decision, and it helps to name them separately because they have different fixes.
+
+**Internal fragmentation**: space inside an allocation you already own. The tail of each buffer, beyond the last token written. This is the red bar above, and it scales with `max_model_len`.
+
+**External fragmentation**: free memory that exists but cannot be handed out. The holes above, from buffers returned at different times. This scales with *how much churn* your workload has — short requests finishing constantly make it worse, because each one returns a differently sized hole.
+
+<Callout type="intuition" title="Why contiguous allocation is normal on a CPU">
+  A CPU program asks for a buffer, gets one, and uses it. If it needs more, it usually keeps the same buffer and the heap grows it in place, or allocates a bigger one and frees the old. Nobody notices, because a typical process holds a few hundred allocations and the cost of a hole is nothing next to the cost of the program's other mistakes.
+
+  A serving engine holds **thousands of growing allocations that churn every few seconds**. That is a completely different regime, and it is why the same idea has to be thrown out and replaced.
+</Callout>
+
+## The same waste, in the shapes real workloads have
+
+The formula above assumed a tidy workload. Real ones are messier, and the waste goes up.
+
+| Workload | $\mathbb{E}[\ell]$ | $M$ | Waste |
+|---|---|---|---|
+| Chat, short answers | 400 | 8,192 | 95% |
+| Chat, long answers | 2,000 | 8,192 | 76% |
+| Summarization | 1,000 | 4,096 | 76% |
+| Code completion | 200 | 2,048 | 90% |
+| Batch offline job (known length) | 4,000 | 4,096 | 2% |
+
+Two things jump out.
+
+**The waste ratio rewards knowing your lengths.** The last row is a batch job that pads every input to a known length: waste collapses, because the ceiling *is* the length. This is why the same model behaves so differently in an interactive API and in an offline pipeline, and why an offline engine can afford contiguous memory where an online one cannot.
+
+**Short-answer workloads are the worst case**, because $M$ is set by the longest answer you promised, and most answers never approach it.
+
+<Callout type="math" title="Why the loss is multiplicative, not additive">
+  Capacity is the number that matters commercially, and it goes as the inverse of the waste:
+
+  $$
+  \text{concurrent requests} = \frac{\text{pool tokens}}{\mathbb{E}[\ell]}, \qquad
+  \frac{\text{requests}_{\text{contiguous}}}{\text{requests}_{\text{paged}}} = \frac{\mathbb{E}[\ell]}{M}
+  $$
+
+  For $\mathbb{E}[\ell] = 2{,}000$ and $M = 8{,}192$, a contiguous allocator gets you **one request for every four** that a paged one would. Since throughput scales roughly with concurrency (Module 07), that is not a 4× memory saving — it is close to a **4× cost-per-token saving** on the same hardware.
+</Callout>
+
+## Why the allocator cannot just be smarter
+
+The tempting fix is a smarter allocator: keep the holes sorted, serve requests from the best-fitting one, merge neighbours when possible. That is exactly what a general-purpose allocator does, and it is still not enough here.
+
+1. **It cannot see the future.** A buffer sized for 8,192 that will hold 300 tokens looks identical, at allocation time, to one that will hold 8,000.
+2. **Growing is expensive.** Every engine that supports it must copy the old contents into the new buffer when a sequence passes a size boundary. At 1 GiB per request and dozens of boundaries, that copy traffic is real work on the same memory bus decode is already saturating.
+3. **The waste is not in the holes.** Even a perfect allocator leaves the reserved-but-empty tail. That is the bigger half of the loss, and it is created at reservation time, not at allocation time.
+
+So the fix has to change *what is reserved*, not just *where it comes from*.
+
+<Callout type="pitfall" title="The mistake that looks like a solution">
+  Setting `max_model_len` to 4,096 "to save memory" and then discovering your p99 prompt is 6,000 tokens. The engine now rejects requests it used to serve. The right comparison is not waste versus no waste — it is waste versus **rejected requests**, and it is also versus the alternative of not having a ceiling at all. Every option trades one number for another; know which one you are moving.
+</Callout>
+
+<Callout type="real" title="What this looks like in vLLM">
+  The reservation behaviour above is what you get from an engine with a contiguous, per-request cache. At the time of writing, vLLM does **not** use that: it defaults to its paged KV cache for the same reason, and this lesson is essentially the argument for why. You will meet the flags `--gpu-memory-utilization`, `--swap-space` and `--max-model-len` in Module 09, and you will understand every one of them differently after this lesson.
+</Callout>
+
+## Measuring it yourself
+
+Before believing any of this on your own system, measure it. There are three numbers, and all three take ten minutes.
+
+```python
+import torch
+
+# 1. Bytes per token, from the model config. No guessing.
+cfg = model.config
+kv_bytes = 2 * cfg.num_hidden_layers * cfg.num_key_value_heads * cfg.head_dim * 2  # BF16
+print(f"KV bytes per token: {kv_bytes:,}")
+
+# 2. What your pool actually holds, right now.
+free, total = torch.cuda.mem_get_info()
+print(f"GPU memory free {free/1e9:.1f} GB of {total/1e9:.1f} GB")
+
+# 3. What that means for concurrency, at YOUR average context length.
+avg_ctx = 1200                      # measure this, do not guess it
+pool = free - 2e9                    # leave room for activations
+print(f"concurrent requests: {int(pool / (kv_bytes * avg_ctx)):,}")
+```
+
+Three habits worth forming here:
+
+**Get bytes per token from the config, not from a blog post.** The only fields that matter are `num_hidden_layers`, `num_key_value_heads` and `head_dim`. If you find yourself assuming 32 KV heads, check: most modern models use fewer than query heads precisely because of GQA, and getting it wrong is a 4× error in your capacity estimate.
+
+**Measure your average context length from real traffic.** Not the one you designed for. Prompt lengths in production are a distribution with a long tail, and the tail is what decides whether you are sized correctly.
+
+**Re-run these before and after any KV-related change.** Memory sizing is the kind of thing that silently drifts out of date when you swap models, change quantization, or update an engine.
+
+<Callout type="math" title="What changes when you quantize the KV cache">
+  `kv_bytes` has one factor you can move: the 2 bytes per number. FP8 KV cache halves it. FP8 is supported by recent hardware and by most engines as a per-layer, per-head KV dtype at the time of writing.
+
+  At 8,192 tokens, Llama-3.1-8B:
+
+  | KV dtype | Bytes/token | 8,192-token context | H100 pool of 45 GB holds |
+  |---|---|---|---|
+  | BF16 | 131,072 | 1.07 GB | 42 requests |
+  | FP8 | 65,536 | 0.54 GB | **84 requests** |
+  | FP4 (where supported) | 32,768 | 0.27 GB | **168 requests** |
+
+  Quantizing the KV cache doubles your concurrency per GB. Module 11 derives the accuracy cost; the point here is that **KV bytes per token is the number you are optimizing**, and it has a tunable in it. That is why "how big is your KV cache" is always the first question when capacity is short.
+</Callout>
+
+## What the next lesson does
+
+<Callout type="recap">
+  A paged allocator never reserves a sequence's whole maximum. It hands out **small fixed-size blocks**, one per 16 tokens, and records where they went. Growing a sequence is popping one more block off a free list. Nothing is copied, nothing is reserved, and nothing has to be contiguous. That is the whole idea, and the next lesson builds it.
+</Callout>
+
+<KeyNotes>
+  1. A contiguous KV cache must reserve `prompt + max_new_tokens` tokens for each request at arrival, because the final length is unknown.
+  2. Llama-3.1-8B in BF16 needs 131,072 bytes per token: 2 for K and V, 32 layers, 8 KV heads, head dim 128, 2 bytes each.
+  3. Waste is worst **at admission**, when a short prompt sits inside a big reservation: 80% of the pool empty in the visual above.
+  4. **Internal fragmentation** is the empty tail of each reservation. **External fragmentation** is the differently sized holes returned when requests finish.
+  5. External fragmentation causes OOM with memory to spare: a pool with 60 MB free in three holes cannot serve a 69 MB contiguous request.
+  6. A better general-purpose allocator does not fix this, because it cannot predict final lengths and cannot avoid growing (which means copying).
+  7. Lowering `max_model_len` / `max_new_tokens` reduces waste proportionally but rejects long requests. It is a real trade, not a free win.
+  8. The fix is structural: allocate in small fixed blocks, grow on demand, and never copy.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'For Llama-3.1-8B in BF16, how many bytes of KV cache does one token of context need?', numeric: true, answer: 131072, tolerance: 2000, unit: 'bytes', why: '2 (K and V) × 32 layers × 8 KV heads × 128 head dim × 2 bytes = 131,072 bytes, which is 128 KiB.' },
+  { q: 'An engine reserves max_model_len = 8192 per request. Requests end at an average of 1024 tokens. Roughly what fraction of the reserved KV cache is never used?', numeric: true, answer: 87.5, tolerance: 6, unit: '%', why: 'Waste = 1 − 1024/8192 = 1 − 0.125 = 0.875, i.e. 87.5% of every reservation.' },
+  { q: 'You quadruple max_new_tokens (and so every reservation) for the same workload. What happens to waste?', options: ['Memory waste drops because longer buffers pack better', 'Reserved bytes quadruple while useful bytes stay fixed, so waste per request grows and fewer requests fit', 'Nothing changes; reservations are capped by the prompt length', 'Only the first request is affected'], answer: 1, why: 'Reserved bytes scale linearly with the ceiling while useful bytes stay fixed, so a 4× larger reservation is mostly empty and you fit roughly a quarter as many concurrent requests for the same pool.' },
+  { q: 'A pool has 30 MB free, split into holes of 12, 9 and 9 MB. A request arrives needing 20 MB contiguous. What happens?', options: ['It starts, because 30 MB is free', 'It fails with out of memory, because no single hole is 20 MB', 'The allocator merges the holes automatically', 'It runs in half precision'], answer: 1, why: 'This is external fragmentation. Free memory in total is not enough; the allocator needs one contiguous run, and 20 MB fits nowhere.' },
+  { q: 'The unused tail of a 8,192-token buffer, for a request that stopped at 900 tokens, is an example of', options: ['Internal fragmentation', 'External fragmentation', 'Tensor parallelism', 'Prefill overhead'], answer: 0, why: 'It is space inside an allocation the engine already owns: internal fragmentation. External fragmentation is the scattered free holes left behind after buffers are returned.' },
+  { q: 'A KV cache reservation for one 8,192-token request is about 1 GiB. On an H100 with 45 GB left for the KV pool, roughly how many such reservations fit?', numeric: true, answer: 45, tolerance: 4, unit: 'requests', why: '8,192 tokens × 131,072 bytes = 1.074 GB. 45 ÷ 1.074 ≈ 42–45 requests, call it about 44. At 1,000 average tokens you would fit about 360.' },
+]}/>

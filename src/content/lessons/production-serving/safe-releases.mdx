@@ -1,0 +1,208 @@
+---
+title: 'Versioning, canaries, shadow traffic & rollbacks'
+summary: 'Shipping a model is shipping an artifact, and every release strategy is a different answer to one question: how much of your users and your budget are exposed to a version you have not trusted yet? Rolling, canary, shadow and blue/green trade capacity, cost and rollback time against each other, and the right choice follows from arithmetic you can do before you deploy.'
+objectives:
+  - Explain what makes a model release reproducible, and what must be version-pinned together
+  - Set maxSurge and maxUnavailable from the capacity arithmetic rather than from defaults
+  - Design a canary that can actually fail, by naming the metric and the threshold in advance
+  - Decide when shadow traffic is worth its cost and when it is a waste of GPUs
+  - Compute the minimum traffic needed to detect a given quality regression
+---
+import Rollout from '@/components/viz/production-serving/Rollout.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every previous lesson tuned a server that was already running. Now you have to replace one, repeatedly, without the people using it noticing. And in an inference service "replace it" is not one thing: you are shipping **weights**, **code**, and **configuration**, and a release is only reproducible if all three are pinned together.
+
+The strategies for doing this — rolling, canary, shadow, blue/green — are usually presented as a menu with no reasoning attached. They are not a menu. Each is a different answer to a single question, and you can compute which one you need before you deploy.
+
+## What a release actually is
+
+<Callout type="real" title="Version skew is the default state, not an exception">
+  For the entire duration of any rollout, your fleet is serving **two different application versions at once**. That is not a mistake to be avoided; it is what a rollout is. The question is never "can I avoid version skew" but "does my system tolerate it".
+
+  It usually does, as long as you keep three things backward compatible for the length of a rollout: the request and response schema, the chat template and tokenizer (which affect prompt construction and therefore output), and the model's identity in a way clients can rely on. Break any of them and a rollout becomes a correctness incident, not a capacity event.
+</Callout>
+
+<Callout type="pitfall" title="The four things that must move as one unit">
+  The most common production-serving incident involving "the model changed" is not a model problem at all — it is that one of these moved without the others:
+
+  1. **Weights** — the checkpoint, quantized as the version it will be served in.
+  2. **Code** — the engine and your serving wrapper.
+  3. **Tokenizer and chat template** — frequently updated upstream, and a change here silently alters every prompt.
+  4. **Sampling defaults** — temperature, top-p, and stop-token handling.
+
+  Give all four a single version string, publish it in the server's `/v1/models` response, and log it on every request. Without that, you cannot answer "was this request served by the bad version?" for a single in-flight request during an incident — and that question is most of the work of an incident.
+</Callout>
+
+That last point is worth stating as a rule: **you cannot roll back what you cannot identify.** Per-request version logging is cheap (a header, a log field) and it is what makes the difference between a five-minute diagnosis and a day of guessing.
+
+## The capacity arithmetic of a rolling update
+
+Rolling update means: bring up a few new replicas, wait for them to become ready, retire the same number of old ones, repeat. The entire safety model is two numbers.
+
+<Callout type="math" title="Surge and availability, stated plainly">
+  With $N$ desired replicas, <Term t="max-surge">max surge</Term> $S$ and <Term t="max-unavailable">max unavailable</Term> $U$:
+
+  $$
+  \text{peak replicas} = N + S, \qquad \text{min serving} = N - U
+  $$
+
+  Two things follow immediately. First, **surge is the only thing keeping capacity flat**: during the swap there are $N + S$ replicas, of which only the ready ones serve, so without surge every wave drops capacity. Second, $U > 1$ is a bet that the remaining $N - U$ replicas can hold the traffic. Set $U = 1$ unless you have measured that they can.
+</Callout>
+
+**Worked: 8 replicas, one H100 each, surge 3, unavailable 1.**
+
+- Peak: \$8 + 3 = 11$ H100s during the rollout.
+- Minimum serving: \$8 - 1 = 7$.
+
+Now the number people forget — **how long the rollout takes**:
+
+$$
+t_{\text{rollout}} \approx \frac{N}{S}\times\big(t_{\text{cold start}} + t_{\text{drain}}\big)
+$$
+
+$$
+t_{\text{rollout}} \approx \frac{8}{3}\times(240 + 60)\ \text{s} \approx 2.67\ \text{waves} \times 300\ \text{s} \approx 800\ \text{s} = 13\ \text{minutes}
+$$
+
+At 240-second cold starts, a rolling deploy of 8 replicas is a **13-minute event** in which both fleets are running. That is the honest cost of not having a warm pool, and it is why the previous lesson's cold-start work is really a *deploy-frequency* lever: cut cold starts to 60 s and the same rollout takes 6 minutes.
+
+<Callout type="mentor" title="The surge number is a memory question on a shared node">
+  On a cluster where several replicas share a node, surging three extra replicas may not be free — it may evict a running pod or compete for the page cache you rely on for fast cold starts. Check whether `maxSurge` can be satisfied by your *node* capacity, not just your GPU quota. A surge that gets you an OOM-kill is worse than a slow rollout, because it takes down a replica you were counting on.
+</Callout>
+
+## Canary: a slice, and a decision
+
+A <Term t="canary">canary</Term> sends a small fraction of real traffic to the new version. The design has two halves, and the second half is where most teams go wrong.
+
+<Scrolly>
+  <Rollout client:visible slot="stage" />
+
+  <Step title="1. One fleet, four ways to replace it">
+    The same replicas, four strategies. What differs is **exposure** — how many users can see the new version — and **cost** — how many replicas run at once. Exposure is risk; cost is money; both are yours to choose deliberately.
+  </Step>
+
+  <Step title="2. Rolling update">
+    The default. New replicas come up alongside old ones, become ready, and the old ones drain (the previous lesson's timeline). Everyone is eventually on the new version, and at every moment some users are on each version.
+  </Step>
+
+  <Step title="3. Rolling: capacity holds">
+    With surge 3 and unavailable 1, capacity never dips below the desired count. That is the whole point of the surge number. Turn the shard-size slider up and the rollout gets faster but the peak cost goes up; the trade is always speed against money.
+  </Step>
+
+  <Step title="4. Canary: a slice of traffic">
+    Two of eight replicas — or 5% of *requests*, which is the better mechanism — get the new version. Everyone else stays on the known-good one. The exposure is bounded and small, which is what makes a bad version survivable.
+  </Step>
+
+  <Step title="5. Canary: the evidence">
+    The canary earns its keep only if you pre-commit to failing it on a **named metric with a threshold**. "Watch it for a while" is not a plan; it is a hope with a dashboard attached. Write the rule before the deploy.
+  </Step>
+
+  <Step title="6. Shadow traffic">
+    <Term t="shadow-traffic">Shadow traffic</Term> mirrors live requests to the new version and discards its response. Real inputs, real load, real distribution, and **zero user exposure** — the safest evidence available.
+  </Step>
+
+  <Step title="7. Shadow: what it costs">
+    You are serving every request twice for as long as you shadow. On a GPU-bound fleet that is roughly double the compute cost of the observation window. Shadow is worth it for a big model change or a risky migration; it is a waste of money for a routine weight refresh.
+  </Step>
+
+  <Step title="8. Blue/green: switch it all">
+    Two complete fleets, and traffic moves with a switch. Rollback is instant. The price is that you have been paying for double capacity continuously, not just during deploys — which is why blue/green is a capacity-arithmetic decision, not just a tooling decision.
+  </Step>
+
+  <Step title="9. Choose on the arithmetic">
+    Three questions decide it: how fast must rollback be, can you afford double capacity, and how much traffic do you need to see a regression? The next section turns the third one into a number.
+  </Step>
+</Scrolly>
+
+<Callout type="math" title="How much traffic does a canary actually need?">
+  If your new version has a quality regression of rate $r$ (say 5% of answers get worse) and you want the canary to detect it, you need enough canary requests that seeing the regression is more likely than not. With $n$ canary requests, expected regressions $= nr$; the probability of seeing none is $(1-r)^n$. Demand at least a 95% chance of detection:
+
+  $$
+  (1-r)^n \le 0.05 \quad\Longrightarrow\quad n \ge \frac{\ln 0.05}{\ln (1-r)}
+  $$
+
+  For $r = 0.05$: $n \ge \frac{-3.0}{-0.0513} \approx 58$ requests. So a 5% canary needs roughly **58 requests to notice a 5% regression with 95% confidence** — a couple of minutes of moderate traffic. But for $r = 0.01$ (a subtle 1% regression, which is more typical for a quantization change): $n \ge \frac{-3.0}{-0.01005} \approx 298$ requests. Detecting small regressions takes real volume, and this is exactly why a canary sized for a 5% problem silently passes a 1% one.
+</Callout>
+
+The design that follows from that number:
+
+1. **Randomise** the canary assignment per request, not per user or per session, so the canary sees the same distribution as the baseline.
+2. **Compare against the baseline on the same metric**, contemporaneously — not against last week's number, because traffic shifts.
+3. **Pre-commit to a threshold and a time window.** "p95 TTFT degrades more than 10% over 15 minutes" or "the failure-rate signature changes on 20 sampled outputs". Write it down before deploying.
+4. **Sample outputs for human review** as well as automated metrics. A canary that only measures latency will happily ship a model that is faster and wrong.
+
+<Callout type="pitfall" title="The canary metric that does not exist">
+  The tempting canary metric is "average output quality" or "user satisfaction", both of which are unavailable in real time. What you can measure instantly and per-request is a **proxy**: refusal rate, output length distribution, the rate of fallbacks, a tool-call validity rate, or a cheap offline judge run over sampled outputs. Pick a proxy that moves when the thing you care about moves, validate that it does on a version you already know is bad, and use it. Shipping a canary with no defined failing condition is the same as shipping no canary, at the cost of the slice you exposed users to.
+</Callout>
+
+## Shadow traffic: evidence at full price
+
+Shadow is the most rigorous option and the most expensive, and the arithmetic is stark: for the duration of the shadow you are serving **every request twice**.
+
+<Callout type="math" title="The cost of a shadow window">
+  If you shadow 5% of production for 30 minutes against a fleet costing \$X per hour, the extra spend is:
+
+  $$
+  \text{extra cost} = X \times \frac{5}{100} \times 0.5\ \text{h} = 0.025X
+  $$
+
+  So 30 minutes of 5% shadowing costs **2.5% of an hour of the fleet** — about \$2.50 on a \$100/hour fleet. That is genuinely cheap for a migration where correctness is uncertain and you have no good proxy metric. The expensive mistake is shadowing 100% of traffic for a week "to be safe", which is 168 hours of a second fleet for an answer you would have had in thirty minutes of 5%.
+</Callout>
+
+The shadow's real value is that it exercises the paths unit tests cannot: the actual prompt distribution, the actual concurrency, the actual long-tail contexts. If your new version has a bug that only appears on a 40k-token prompt, a canary may never see it (small slice) but a shadow will, on real traffic, without hurting anyone.
+
+<Callout type="real" title="Version skew inside a shadow is itself a test">
+  Shadowing is also the cheapest way to test whether your system tolerates two model versions in one process — which matters if you later run a mixture-of-experts router (Module 19) or a multi-model gateway. Shadow traffic is a free rehearsal for the hardest version-skew problem you will face.
+</Callout>
+
+## Blue/green, and what instant rollback actually requires
+
+Blue/green is two full fleets and a switch. Rollback is as fast as the switch, and that is genuinely valuable for a bad-model release you cannot detect with a metric.
+
+<Callout type="pitfall" title="Instant rollback requires that you kept the old fleet">
+  Rollback is not a reaction, it is a **property of your artifacts**. Instant rollback requires that the previous weights are still on disk, the previous image still runs, and nobody garbage-collected them. Teams that "have rollback" discover during an incident that the old checkpoint was deleted by a lifecycle policy, or that the rollback image no longer builds because a dependency was upgraded.
+
+  Test rollback **before** you need it: in a staging environment, do the deploy, break the new version deliberately, and time the rollback. If it takes longer than your incident tolerance, you do not have it.
+</Callout>
+
+The other blue/green trap: the switch itself is a <Term t="kill-switch">kill switch</Term> problem. If the new version is broken in a way that produces *no* errors, you need a control that reverts traffic without a deploy. Keep one — a traffic-split flag, a config reload, a routing change — that you can flip in seconds and that does not require shipping code. If your fix requires a deploy, you cannot stop the bleeding; you can only schedule it.
+
+## Choosing, and the version you should be on
+
+<Callout type="recap">
+  - **Rolling** — the default. Cheapest, no double capacity, rollback in minutes. Right for most releases, especially weight refreshes that changed nothing structural.
+  - **Canary** — a small real slice plus a pre-committed failing condition. Right for anything that changes model behaviour, at negligible extra cost.
+  - **Shadow** — evidence with zero exposure, at proportional compute cost. Right for migrations where correctness matters and no good proxy metric exists.
+  - **Blue/green** — instant, total rollback, continuous double capacity. Right when your incident tolerance is measured in seconds and you can afford the bill.
+</Callout>
+
+In practice most mature teams run **canary for model changes and rolling for everything else**, with shadow used deliberately at architecture boundaries. Blue/green tends to earn its cost only for very large models where a slow rolling rollout would leave version skew open for hours.
+
+<Callout type="math" title="The one number to write in the release checklist">
+  `t_rollback` — the measured time from "we decided to revert" to "the fleet is serving the old version again". For a rolling update on 8 replicas with 240-second cold starts, that is one full wave: bring up old replicas, ready, switch. Call it ~5 minutes. Write it into your runbook, time it in staging, and compare it to your incident tolerance. If it exceeds your tolerance, that is the argument for blue/green — not a preference for a nicer tool, but a measured gap between two numbers.
+</Callout>
+
+<Callout type="mentor" title="The release that never fails is not a success">
+  A canary you always pass should make you suspicious, not relieved. It usually means your threshold is loose, your slice is too small to detect anything, or your proxy metric does not track the property you care about. Keep a record of past releases and their measured deltas — that record is how you learn what your proxy is actually sensitive to, and it is the difference between a team that ships daily and a team that deploys hopefully.
+</Callout>
+
+<KeyNotes>
+  1. A release is weights + code + tokenizer/chat template + sampling defaults moving as one unit. Give them a single version string, publish it, and log it per request.
+  2. You cannot roll back what you cannot identify: per-request version logging is what makes "was this served by the bad version?" answerable during an incident.
+  3. `peak = N + surge` and `min serving = N − unavailable`. Keep unavailable at 1 unless you have measured the survivors can hold the load.
+  4. `t_rollout ≈ (N/S) × (cold start + drain)`. With N=8, surge 3, 240 s cold starts and 60 s drains that is ~13 minutes — cold-start work is really deploy-frequency work.
+  5. A canary needs `n ≥ ln(0.05)/ln(1−r)` requests to detect a regression of rate `r` at 95% confidence: ~58 for 5%, ~298 for 1%. Small regressions need far more volume than teams expect.
+  6. Write the canary's failing metric, threshold and time window **before** deploying, and use a proxy you can actually measure per request. A canary with no defined failing condition is no canary.
+  7. Shadow traffic gives zero user exposure at proportional compute cost — about 2.5% of an hour's fleet cost for 30 minutes at 5%. Cheap for a risky migration, wasteful for a routine refresh.
+  8. Instant rollback is a property of your artifacts, not a reaction: keep the old weights and image, and time the rollback in staging. Keep a kill switch that works without shipping code.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'You roll out 8 replicas with maxSurge 3 and a 240-second cold start plus a 60-second drain. Roughly how long does the rollout take?', numeric: true, answer: 13, tolerance: 3, unit: 'min', why: 'Waves = 8 / 3 = 2.67. Each wave costs cold start + drain = 300 s, so ≈ 800 s ≈ 13 minutes. Note the whole rollout runs with both fleets partially alive — and cutting cold starts to 60 s brings this to about 6 minutes, which is why cold-start work is really deploy-frequency work.' },
+  { q: 'A canary must detect a 2% quality regression with 95% confidence. Using n ≥ ln(0.05)/ln(1−r), about how many canary requests do you need?', numeric: true, answer: 149, tolerance: 15, unit: 'requests', why: 'n ≥ ln(0.05) / ln(0.98) = 2.996 / 0.0202 ≈ 148 requests. For comparison, a 5% regression needs only ~58. The lesson: halving the regression you want to catch roughly doubles the traffic you need, which is why small quality changes are so often missed by canaries.' },
+  { q: 'A 5% canary runs for 30 minutes against a fleet costing $120/hour. What does the shadow-equivalent observation cost, and when is it worth it?', options: ['$18; worth it for any release', '$36; worth it for a routine weight refresh', '$36; worth it for a risky migration with no good proxy metric, but wasteful for routine refreshes', '$180; never worth it'], answer: 2, why: 'Extra cost = $120 × 0.05 × 0.5 h = $3.00 for the canary slice; a full shadow of the same duration would be $60. Either way the principle is the same: shadowing costs you the compute you spend, so scope it to the question you cannot answer another way. Real traffic exercises long-tail contexts and real concurrency that unit tests never will, which is the reason to reach for it at an architecture boundary.' },
+  { q: 'Why does every rollout imply version skew, and what does that force you to keep compatible?', options: ['Because replicas download weights at different times; keep the request/response schema compatible', 'Because skew is a Kubernetes bug to be patched', 'Because it only affects the tokenizer, which you can pin', 'Because version skew means different GPU models in the fleet'], answer: 0, why: 'For the whole duration of a rollout, some replicas serve the old version and some the new — that is what a rollout is, not a defect. The forced constraint is that the request/response schema, the tokenizer and chat template, and model identity stay compatible for that duration. Break any of them and a rollout becomes a correctness incident rather than a capacity event.' },
+  { q: 'Your canary has been green for four releases in a row. What is the most useful conclusion?', options: ['The release process is working well, keep going', 'The canary is probably not sensitive enough — a loose threshold, too small a slice, or a proxy metric that does not track what you care about', 'The canary should be retired to save capacity', 'Increase the slice to 50% to get better evidence'], answer: 1, why: 'A canary that never fails has not proven the process works; it has failed to tell you anything. The three usual causes are a threshold loose enough to miss real regressions, a slice too small relative to the regression size (recall ~298 requests needed for 1%), or a proxy metric disconnected from the property you care about. Keep a record of past releases and their measured deltas — that record is how you calibrate the sensitivity.' },
+  { q: 'Why is "we have rollback" a property of your artifacts rather than a reaction?', options: ['Because rollback only works on blue/green deployments', 'Because instant rollback needs the old weights and image to still exist and run — so if a lifecycle policy deleted them, the rollback you believed you had does not exist', 'Because rollback requires a database transaction', 'Because rolling updates cannot be rolled back'], answer: 1, why: 'Rollback is not something you do in the moment; it is something you preserved in advance. The old checkpoint may have been deleted by a storage lifecycle policy, and the old image may no longer build because a dependency moved. The only way to know is to test it: break the new version deliberately in staging and time the revert, then compare that time to your incident tolerance. If it exceeds tolerance, that measured gap is the real argument for blue/green.' },
+]}/>

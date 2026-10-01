@@ -1,0 +1,156 @@
+---
+title: 'Lab: Hold an SLO under changing traffic'
+summary: 'Every claim in this module is a claim about a queue. You will sweep arrival rate against replica count, find where goodput collapses, compare routing policies on a mixed workload, and produce a capacity plan you could defend in a design review.'
+objectives:
+  - Measure per-replica capacity and check it against the Little's-law formula
+  - Sweep arrival rate and locate the goodput cliff on your own hardware
+  - Compare routing policies by KV spread rather than by intuition
+  - Quantify what a prefix hit rate is worth in prefill time and in memory
+  - 'Produce a capacity plan: policy, replica count, sustainable rate, alert'
+colab: 23-hold-the-slo.ipynb
+---
+import FleetLab from '@/components/viz/routing-autoscaling/FleetLab.tsx';
+
+Module 22 said to package it, start it fast, and ship it safely. This module added a fleet: routing, scaling, orchestration. And every claim we made — that least-KV beats round robin, that cache-aware routing hot-spots, that goodput falls off a cliff — is a claim about a queue.
+
+This lab is where you check them, and where you turn them into a number you can put in a design review.
+
+The service under study: a chat product with retrieval. 70% short chat prompts (~900 tokens), 30% long RAG prompts (~8,000 tokens), 250 output tokens, strong multi-turn reuse. Average 12 req/s, peak 36 req/s on weekday mornings. SLO: p99 TTFT under 1 s, TPOT under 50 ms.
+
+<Scrolly>
+  <FleetLab client:visible slot="stage" />
+
+  <Step title="1. The promise">
+    A request that misses the SLO is not a request served — it is a refund. This grid is every replica count against every arrival rate, each cell a full simulated run, coloured by the fraction of requests that met the promise. Your job is to find the boundary and then live comfortably inside it.
+  </Step>
+
+  <Step title="2. One replica alone">
+    One replica holds to about six requests per second and then collapses — goodput goes from 97% to near zero. Watch the colour change across that row: green to amber to red, and the boundary is sharper than a smooth curve would suggest, because past saturation extra arrivals do not make progress — they only wait.
+  </Step>
+
+  <Step title="3. Add capacity">
+    Each extra replica moves the boundary right. The dashed line traces the maximum sustainable rate per replica count — the last cell still at 90% goodput. This is the chart you take to a capacity conversation, because it converts "we need more GPUs" into a number.
+  </Step>
+
+  <Step title="4. The rate that fits">
+    For any row, the last green cell is your sustainable rate at that replica count. Deploy *below* it, not at it. A fleet sized to exactly its sustainable rate sits on the cliff, and one traffic spike puts it over.
+  </Step>
+
+  <Step title="5. Traffic shifts">
+    Raise the long-prompt share and watch every boundary move left. A long prompt holds the same KV slot as a short one for far more tokens, so a fleet sized for chat does not serve a RAG workload. Re-measure capacity whenever your prompt mix changes.
+  </Step>
+
+  <Step title="6. A burst hits">
+    A burst is not a sustained load. You can briefly exceed the sustainable rate and keep goodput acceptable, because the queue drains afterwards — but only if the burst is short relative to the drain time. Sustained overload is the case your capacity plan must survive.
+  </Step>
+
+  <Step title="7. Choose the config">
+    Ship three things together: a routing policy, a replica count with one spare, and a maximum arrival rate. The panel at the bottom shows whether the current setting holds the SLO or is past the cliff.
+  </Step>
+</Scrolly>
+
+<Colab nb="23-hold-the-slo.ipynb" />
+
+## Part 1 · On the real GPU: measure the constants
+
+Everything above is arithmetic on a model. This part confirms the constants with your own measurements, which is what makes the rest of the lab real.
+
+Use **Qwen2.5-0.5B-Instruct** (0.49B parameters) so it fits a free T4 with room to spare. The absolute times are far smaller than an 8B model on an H100, but the ratios and the shape of the curve are the same — both scale linearly in parameter count.
+
+The notebook measures, in order:
+
+1. **Prefill slope** at 256–2,048 tokens. Prefill time is linear in prompt length; the slope `t_prefill_per_token` is what you need.
+2. **Decode step** for batches of 1–128. The step is nearly flat in batch size while total throughput climbs — memory-bound behaviour, straight from Module 05.
+3. **The capacity formula** from Lesson 23.1: users per replica = KV pool ÷ context, and requests per second = users ÷ time in system. This is the capacity per replica — check it against what your GPU can actually do.
+4. **The cliff**, by modelling the queue that forms when the offered rate exceeds capacity. The dashed sustainable rates here are 6 req/s for one replica, 22 for four, and 30 for eight.
+5. **Routing policies**, comparing KV spread across a mixed short/long workload.
+6. **What a prefix hit rate is worth**, in both prefill milliseconds and resident memory.
+7. **A capacity table** for real GPUs (T4, A100, H100) and real models (0.5B, 8B, 70B).
+
+Record `t_prefill_per_token`, `t_decode_step` and `capacity_per_replica` in your notes.
+
+## Part 2 · Compute the cliff by hand
+
+Before you run the simulator, predict it. For a fleet of $N$ replicas at mean context $c$:
+
+```
+users_per_replica   = KV_pool_tokens / c
+capacity_per_replica = users_per_replica / (out_tokens × TPOT + TTFT_budget)
+capacity_fleet      = N × capacity_per_replica
+queue_wait          = max(0, offered_rate − capacity_fleet) × time_per_request
+TTFT                = queue_wait + one decode step
+```
+
+Compute this for four replicas at 20, 26 and 34 req/s, and write the three TTFT values down. **Predicting the shape and then explaining the gap between your prediction and the simulator is the skill.** They will differ, and the difference is the interesting part.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. Your fleet's capacity is 100 req/s and the offered rate is 130 req/s. What happens to TTFT over the next minute, and what happens to throughput? (This is where <Term t="admission-control">admission control</Term> decides whether the excess queues or is rejected.)
+  2. You add one replica, raising capacity to 125 req/s. Does that fix it?
+  3. A burst of 40 req/s lasts 10 seconds on a fleet whose sustainable rate is 30. Does goodput recover afterwards? What would make it not recover?
+</Callout>
+
+## Part 3 · Drive the simulator
+
+Work in this order and record each row. The simulator is deterministic — the same settings always give the same numbers, so your rows are comparable.
+
+| Run | Change | Goodput | p50 TTFT | p99 TTFT | Mean TPOT | Sustainable rate |
+|---|---|---|---|---|---|---|
+| 1 | 1 replica, 6 req/s | | | | | |
+| 2 | 1 replica, 24 req/s | | | | | |
+| 3 | 4 replicas, 24 req/s | | | | | |
+| 4 | 4 replicas, 36 req/s | | | | | |
+| 5 | Policy → round robin | | | | | |
+| 6 | Policy → session affinity | | | | | |
+| 7 | Policy → cache-aware, α = 8 | | | | | |
+| 8 | Long-prompt share → 0.6 | | | | | |
+| 9 | Traffic correlation → 0.9 | | | | | |
+
+Then answer these with numbers from your own runs:
+
+1. **Which single change most improves goodput** — more replicas, or a better routing policy? Why would you expect one to dominate?
+2. **Run 6 vs run 7**: affinity and cache-aware both get a hit rate. Which has better p99, and which has a better KV spread? What is buying what?
+3. **Run 8**: how much does raising the long-prompt share from 30% to 60% cost you in sustainable rate? Express it as a ratio and explain it in terms of context length.
+4. **Run 9**: with 90% traffic correlation, does cache-aware routing still help? Why or why not?
+5. **Find the cliff for 4 replicas**: the rate at which goodput drops below 90%. Compare it to your Part 2 prediction. Where does the gap come from?
+
+## Part 4 · The deliverable
+
+Write a one-page **capacity plan** for the service described above. It must contain:
+
+- the **routing policy** you would deploy, and one sentence on why for this workload;
+- the **replica count** you would run at peak, with one spare, and the arithmetic;
+- the **maximum sustainable arrival rate** at that replica count, from the simulator;
+- what changes if the long-prompt share rises to 60%;
+- the **metric you alert on first**, and the threshold;
+- your estimate of **cost per million output tokens**, from the notebook's capacity table.
+
+<Callout type="mentor" title="What a strong plan concludes">
+  The interesting sentence is not the replica count — anyone can divide. It is the *rate* and the *alert*. The engineer's job is to say: at this replica count we serve N requests per second sustainably, we find out first from [metric], and we trip at [threshold]. That is the sentence that gets paged at 3am — or, more often, does not.
+</Callout>
+
+## Part 5 · Take it to a real engine
+
+If you have a GPU with more than 16 GB, run two vLLM engines locally and put a real router in front:
+
+```bash
+# Two engines, one per port, sharing a host
+vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8001 --gpu-memory-utilization 0.45 &
+vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8002 --gpu-memory-utilization 0.45 &
+```
+
+Then drive both with a small load generator at a controlled rate and watch `vllm:num_requests_waiting` and `vllm:gpu_cache_usage_perc` per engine — those are the signals your router would score on. Compare the spread you observe against the simulator's. Expect the same shape, different absolute numbers, because a real engine adds scheduling fairness and launch overhead the simulator omits. **Predicting the shape and then explaining the gap is the skill.**
+
+<Callout type="pitfall" title="Watch for the hot replica, not the average">
+  A fleet with one saturated engine and three idle ones looks fine on the average. That is the affinity failure from Lesson 23.2, and it will not show up in a fleet-wide mean. Watch per-replica `num_requests_waiting` and `gpu_cache_usage_perc`, and alert on the worst replica, not the average — Module 06's percentile lesson, applied one level up.
+</Callout>
+
+<KeyNotes>
+  1. Capacity per replica = (KV pool ÷ context) ÷ time in system. Both terms are measurable before you deploy.
+  2. The goodput cliff is sharp: past saturation extra arrivals do not add throughput, they only add queue wait.
+  3. Deploy below the sustainable rate, not at it. A fleet sized exactly to its capacity sits on the cliff.
+  4. Context length, not request rate, sets capacity — so re-measure whenever the prompt mix changes.
+  5. Least-KV equalises the resource that actually runs out; round robin deals in counts and cannot see a 10× size difference.
+  6. Affinity buys a hit rate and pays in balance; cache-aware routing buys most of the reuse with less of the imbalance.
+  7. A burst drains if it is short relative to the drain time; sustained overload is the case your plan must survive.
+  8. Alert on the worst replica, never the fleet average — a single hot replica is invisible in a mean.
+</KeyNotes>

@@ -1,0 +1,187 @@
+---
+title: 'Lab: Compare attention implementations'
+summary: 'Measure attention the way you would in production: correctness first, then bandwidth. An in-browser simulator compares the four backends’ cost model, and a Colab notebook runs real eager, fused and paged kernels on a T4, verifies they agree, and asks you to explain the gap you find.'
+objectives:
+  - Implement and verify the online softmax against a two-pass reference in PyTorch
+  - Measure eager attention’s peak memory and show it grows quadratically with context
+  - Compare a fused Triton flash-attention kernel against eager for both speed and correctness
+  - Measure decode attention and confirm it is bandwidth-bound with intensity equal to the GQA group factor
+  - Implement a paged attention kernel, verify it matches, and price its gather
+collab: 14-attention-backends.ipynb
+---
+import AttentionBackendLab from '@/components/viz/attention-optimization/AttentionBackendLab.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last three lessons were argument. This lab is where you measure. You will take a real model on a real GPU, run three attention implementations — naive, fused and paged — check that all three return the same answer, and then explain the speed differences from the arithmetic you now have in your head.
+
+There are two halves. The simulator takes ten minutes and builds the intuition for *which* backend should win and why. The notebook takes an hour and gives you numbers you measured yourself.
+
+<Colab nb="14-attention-backends.ipynb" />
+
+## Half one: the simulator
+
+Four implementations, one layer of Llama-3.1-8B. Change the **phase** (prefill or decode), the **context length**, the **backend**, and the **GPU**, and watch four things move together: peak extra memory, memory traffic, which speed limit the layer hits, and the resulting time.
+
+The whole point is the *shape* of the curves. Slide context up and watch eager's memory bar grow quadratically while fused stays flat. Switch to decode and the whole picture inverts.
+
+<Scrolly>
+  <AttentionBackendLab client:visible slot="stage" />
+
+  <Step title="1. Four implementations, one workload">
+    Only the kernel changes between these four bars. Same model, same layer, same GPU. Everything on screen is computed from that GPU's bandwidth and FLOP/s — no benchmark is being run, so what you see is a prediction you will test in the notebook.
+  </Step>
+
+  <Step title="2. Eager pays for the intermediate">
+    At 4,096 tokens eager holds both the $T \times T$ score matrix and its normalised copy. Over 2 GB of extra memory for a single layer. Set the GPU to T4 and push the context past 8K and you can watch it cross that card's 16 GB of memory.
+  </Step>
+
+  <Step title="3. FlashAttention removes it">
+    Switch to FlashAttention and the memory bar collapses to about 45 KB. **It does not change as you raise the context**, because the peak is now dominated by the tiles in SRAM, not by the sequence.
+  </Step>
+
+  <Step title="4. The causal mask is free speed">
+    The schematic on the left shows the triangular tiles. Roughly half the score matrix is masked, and a good kernel never computes it. That is a constant-factor FLOP saving you get whether or not the kernel is fused.
+  </Step>
+
+  <Step title="5. Decode is a different shape">
+    Switch the phase to decode. The schematic collapses to a single query row against the whole cache, and eager's memory advantage evaporates — there is no big intermediate to pay for, because there is only one query.
+  </Step>
+
+  <Step title="6. Split-K fills the machine">
+    In decode, all backends are memory-bound and the only lever is getting more SMs busy. FlashDecoding splits the sequence across them. The saving is smaller than in prefill because you are fighting bandwidth either way.
+  </Step>
+
+  <Step title="7. Paged reads scattered blocks">
+    The paged kernel gathers through a block table, costing about 1% extra traffic. It is not free, but it is small — and it buys something memory management cares about more than this kernel does.
+  </Step>
+
+  <Step title="8. Pick by shape, not by name">
+    Change the GPU. A compute-bound phase scales with FLOP/s; a memory-bound phase scales with bandwidth. Change the context. The best backend in prefill is rarely the best one in decode. **This is why backend choice is a measurement, not a preference.**
+  </Step>
+</Scrolly>
+
+**Check yourself before the notebook.** Answer these without the page:
+
+1. In prefill at 4,096 tokens, why is eager's time so much worse than FlashAttention's, when they perform the same FLOPs?
+2. If you halve the GPU's bandwidth but keep its FLOP/s, which bar moves more — prefill or decode?
+3. Decode's intensity is the GQA group factor, 4 for this model. Does that number change if you double the context length? Explain.
+4. The paged backend's gather costs ~1% of traffic. Why would a paged engine accept that overhead at all?
+
+## Half two: the notebook
+
+<Callout type="try" title="Setup (3 minutes)">
+  Open the notebook above in Colab, choose **Runtime → Change runtime type → T4 GPU**, and run the cells top to bottom with <kbd>Shift</kbd>+<kbd>Enter</kbd>. It uses only PyTorch, Triton (bundled with recent PyTorch) and small models, so it downloads nothing large and the first sections run offline.
+</Callout>
+
+### 1. Prove the online softmax on the CPU
+
+Before touching the GPU, section 1 checks the mathematics. It implements the online update from lesson 1 — merge running maximum, sum and output across tiles — and compares it against a plain two-pass softmax on random data.
+
+**Expected output:** the two agree to within float32 rounding, around 1e-6, and the row sums are 1. If they disagree in a way that grows with the number of tiles, your merge is wrong, not the reference.
+
+Do not skip this cell. Every kernel below is a faster way of running this exact update, and if the update is wrong everything downstream is wrong in a subtle way.
+
+### 2. Watch eager attention's memory blow up
+
+Section 2 runs plain `softmax(QKᵀ)V` on a real layer shape while tracking `torch.cuda.max_memory_allocated`. It sweeps context from 512 to 4,096 tokens and prints peak memory per layer.
+
+**What to expect.** Peak memory roughly quadruples every time you double the context — that is the $T^2$. And at 4,096 tokens on a T4, one layer of Llama-3.1-8B in BF16 already sits above what the card comfortably holds once you account for Q, K, V and O. This is the failure the whole module exists to remove.
+
+### 3. Write a fused Triton kernel and verify it
+
+Section 3 is the real work: a FlashAttention forward kernel in Triton, built exactly like the one in the lesson — Q tile held in registers, loop over key tiles, online softmax inside, one division at the end.
+
+Then it checks correctness. **This is the important part.** It compares the fused output against PyTorch's reference on the same inputs and prints the maximum absolute difference.
+
+**Expected output:** a max difference well under 1e-2 in BF16 (which has only three decimal digits, so this is rounding, not error) and the fraction of elements matching at that tolerance essentially 1.0. If the difference is large, the usual culprits are: forgetting the `1/sqrt(d)` scale, not masking the causal half, or initialising the running maximum to something other than `-inf`.
+
+### 4. Sweep the tile size
+
+Section 4 times the fused kernel across `BR = 32, 64, 128` at a fixed context, and against eager at the same context.
+
+**What to expect.** Fused beats eager everywhere at 4,096 tokens, by roughly the ratio your simulator predicted. Tile size matters but not enormously — the win is fusion, not the specific tile. You should also see 128 sometimes tie 64: larger tiles use more registers and can cost occupancy, which is the trade the lesson warned about.
+
+### 5. Decode: confirm the bandwidth wall
+
+Section 5 switches to decode — a single query row against the whole cache — and measures achieved bandwidth and FLOP/s for both a prefill-shaped and a decode-shaped call at long context.
+
+**The check that matters.** Compute the intensity yourself and compare it to the roofline. For this model decode intensity is the GQA group factor, a handful of FLOP per byte, and the achieved GB/s should sit near the T4's peak (about 320 GB/s) while TFLOP/s is nearly zero. **If you see high FLOP/s in decode, you have a bug — you are probably not actually running the 1-query case.**
+
+### 6. Split-K decode, and the combine
+
+Section 6 implements FlashDecoding: split the sequence, reduce each split to a partial $(m, \ell, O)$, and merge with the online-softmax rule.
+
+**Expected:** the merged result matches the unsplit decode to within float32 rounding, and at small batch the split version is faster because it uses more SMs. At large batch the split stops helping — the machine is already full and you are paying combine overhead for nothing.
+
+That crossover is the single most useful number in the notebook, because it is the "when does decode split-K help" answer for your GPU specifically.
+
+### 7. A paged attention kernel, verified
+
+Section 7 scatters a real KV tensor into blocks, computes attention through the block table, and checks it against the contiguous version.
+
+**Expected:** `allclose: True`, and a max difference at rounding level. Then it times paged against contiguous and prints the overhead percentage. On a T4 the KV is small, so the gather is latency-bound rather than bandwidth-bound — expect an overhead that looks larger than the theoretical ~1% and gets closer to it as you raise the context. That is a real effect, not an error.
+
+### 8. Put it in the model
+
+Section 8 loads Qwen2.5-0.5B-Instruct, runs a short generation, and — the useful part — times the model's real attention path. It prints the KV bytes per token straight from the model config so you can check it against the constant you have been using.
+
+**Expected:** bytes/token matches your hand calculation for that architecture. If it does not, `num_key_value_heads` is the field that will explain it.
+
+### 9. When it goes wrong
+
+Four ways a fused attention kernel produces wrong answers instead of crashing:
+
+**Forgotten scale.** Dropping the `1/sqrt(d)`. Symptoms: output that is superficially plausible but noticeably worse; no NaNs.
+
+**Missing causal mask.** Forgetting to mask the future half. In decode (where the query is one row of length $T$) this leaks nothing that looks obviously wrong, so it survives tests — but in a model it quietly breaks causality. One fix: assert that positions after the diagonal are `-inf` before the max.
+
+**Running max initialised to 0, not `-inf`.** The subtle one. If every real maximum is positive the numbers are fine, so it passes normal tests; on a batch where some rows' scores are all negative it over-counts and the row stops summing to 1. Fix: initialise to `-inf`, and the first correction `exp(-inf - m)` is 0, cleanly discarding the empty state.
+
+**Accumulator left in BF16.** Keeping the running `acc` in low precision across thousands of tiles accumulates rounding error that looks like a quality regression, not a numerical bug. Fix: keep the accumulator (and `m`, `l`) in FP32 even when Q/K/V are BF16. This one costs almost nothing and is the single most common precision mistake in hand-written kernels.
+
+<Callout type="mentor" title="The habit this lab is really building">
+  Every cell follows the same order: **implement, verify, then time.** Not time, then verify. Timing a kernel you have not checked produces a number you will confidently report and that will be wrong.
+
+  This is the same discipline as Module 06's reproducible benchmarks, applied to kernels. When a fused kernel disagrees with a reference, the first question is never "how much faster is it" — it is "is it correct".
+</Callout>
+
+## Check yourself
+
+Answer these in your notes, with the arithmetic shown.
+
+1. Section 2 quadruples context and you see peak memory roughly quadruple. Derive that from the shape of the score matrix, not from the measurement.
+2. Section 4 shows `BR=128` is not always faster than `BR=64`. Give the hardware reason.
+3. Section 5's decode intensity is 4 FLOP/byte. Compute the predicted time for a 32-layer layer reading 8,192 tokens of KV on a T4 (320 GB/s) and compare to what you measured.
+4. Section 6's split-K helps at batch 1 and stops helping at batch 64. In one sentence, why?
+5. From the whole lab: which single change gave the biggest measured win — fusion, tile size, or split-K — and what does that tell you about where to spend effort next?
+
+**Answers, once you have done the work:**
+
+1. The score matrix is $T \times T$, so it holds $T^2$ numbers; doubling $T$ gives four times the numbers and four times the bytes. The KV tensors around it are linear in $T$, so the quadratic term dominates at long context.
+2. Larger query tiles mean fewer loop iterations and better tensor-core utilisation, but they need more registers to hold the accumulator (`BR x D`) and the score tile. Past a point the extra register pressure cuts occupancy — fewer resident blocks per SM — and the lost parallelism outweighs the better per-block efficiency.
+3. Bytes = 8,192 tokens × 131,072 bytes/token = 1.07 GB (for Llama-3.1-8B; use the KV bytes/token from section 8 for your actual model). At 320 GB/s that is about 3.4 ms for all 32 layers of KV traffic alone. Your measured decode time will be longer, because weights and the rest of the layer are in there too — but the attention share should be consistent with this floor.
+4. Split-K's whole purpose is to give idle SMs something to do. At batch 1 there are only one query row's worth of parallelism, so splitting helps enormously; at batch 64 the machine is already saturated by the batch, so splitting adds combine overhead and parallel work without adding throughput.
+5. Fusion gave the biggest win by far, because it removed an $O(T^2)$ term that everything else merely worked around. The lesson: attack the term that grows fastest with the parameter that matters, not the one that is easiest to tune.
+
+<KeyNotes>
+  1. Implement, verify, then time — in that order. A speed number for an unverified kernel is a number you will confidently report and that will be wrong.
+  2. The online softmax on the CPU must match a two-pass reference before you fuse it into anything. Every fast kernel below is a faster way of running that one update.
+  3. Eager attention's peak memory grows as $T^2$; fused attention's peak is $O(B_r d + B_c d)$ and is flat in context. That flatness is the property long-context prefill depends on.
+  4. Fused beats eager at long context by roughly the ratio of the traffic you removed, and the tile size (`BR`) is a second-order knob that register pressure can turn around.
+  5. Decode should show near-peak GB/s and near-zero TFLOP/s. High FLOP/s in a decode-shaped call means the call is not actually decode-shaped.
+  6. Split-K's crossover point — where extra splits stop helping because the batch already saturates the machine — is a per-GPU number worth recording for your workload.
+  7. A paged kernel's gather shows up as a latency-bound overhead on small KV and approaches the bandwidth-bound figure (~1%) as context grows. Both are correct; the apparent gap is a cache effect.
+  8. Keep the accumulator, `m` and `l` in FP32 even when Q/K/V are BF16. Accumulating rounding across thousands of tiles looks like a quality regression, not a bug, which is why it is dangerous.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A fused attention kernel disagrees with the PyTorch reference by about 5e-2 on a few elements. You are in BF16. What is the most likely explanation?', options: ['The online softmax is mathematically approximate and drifts with many tiles', 'Ordinary BF16 rounding — BF16 has only about three decimal digits', 'The causal mask was applied in the wrong direction', 'The kernel is faster than physically possible, so the timing is wrong'], answer: 1, why: 'BF16 keeps 8 bits of mantissa — roughly three decimal digits. Differences at 1e-2 to 1e-3 level are rounding, not algorithm error. An actually-wrong online softmax would show differences orders of magnitude larger, growing with tile count.' },
+  { q: 'In section 5 you measure decode-shaped attention and see near-peak GB/s but near-zero TFLOP/s. Is that a bug?', options: ['Yes — a healthy attention kernel should be compute-bound', 'No — decode attention is bandwidth-bound by design, with intensity equal to the GQA group factor', 'Yes — it means the kernel is reading the wrong tensor', 'No — it means the GPU is broken'], answer: 1, why: 'Decode intensity is nq/nkv FLOP per byte (4 for Llama-3.1-8B), which is far below any GPU ridge point. Memory-bound means high GB/s and low FLOP/s. That is the expected signature.' },
+  { q: 'Why does BR=128 sometimes tie or lose to BR=64 in the tile-size sweep?', options: ['BR=128 does more total FLOPs', 'The bigger accumulator needs more registers, cutting occupancy enough to lose more than the extra efficiency gains', 'BR=128 cannot use tensor cores at all', 'The causal mask only works with BR=64'], answer: 1, why: 'The running accumulator is BR x d. Larger BR means more registers, fewer resident blocks per SM, and therefore less latency hiding. That can outweigh the benefit of fewer, larger matmuls.' },
+  { q: 'What is the correct order of operations when building a new attention kernel?', options: ['Benchmark it, then check correctness if it is fast', 'Implement it, verify against a reference, then time it', 'Write it in Triton first, then think about the math', 'Profile it, then implement'], answer: 1, why: 'A speed number for an incorrect kernel is worse than no number, because it is a number you will confidently report. Verification is cheap; discovering a wrong fast kernel later is not.' },
+  { q: 'Section 5 measures decode-shaped attention on a T4. For Llama-3.1-8B at 8,192 tokens, the KV cache of all 32 layers is 1.07 GB. At the T4’s 320 GB/s, what is that read time in milliseconds?', numeric: true, answer: 3.35, tolerance: 0.5, unit: 'ms', why: '1.07 GB ÷ 320 GB/s ≈ 0.00335 s = 3.35 ms. This is a floor for attention alone, per decode step, before any weights are read. Your measured time will be larger — but the attention share should be consistent with this number.' },
+  { q: 'Split-K speeds up decode at batch 1 but stops helping by batch 64. The reason is that:', options: ['At batch 1 the split version uses a different algorithm', 'At low batch there are idle SMs for splitting to occupy; at high batch the machine is already saturated and splitting only adds combine overhead', 'The KV cache is smaller at batch 1', 'Split-K only works when context length is large'], answer: 1, why: 'Split-K exists to turn idle SMs into useful work. With a large batch, the SMs already have work, so splitting adds a combine pass without adding parallelism. The crossover is a per-GPU, per-workload number.' },
+  { q: 'Section 2 doubles the context length and peak memory roughly quadruples. Given that the KV cache grows linearly with context, what shape does that imply the score matrix has?', options: ['T x T', 'T x d', 'd x d', 'T x T x T'], answer: 0, why: 'Quadrupling on a doubling means the dominant term is quadratic in T. The KV tensors are linear, so the only quadratic thing in attention is the T x T score matrix (and its normalised copy).' },
+  { q: 'Section 7 gathers the KV cache of 4 sequences at 1024 tokens each for Llama-3.1-8B (131,072 bytes per token). How many bytes does the gather move in total?', numeric: true, answer: 536870912, tolerance: 50000000, unit: 'bytes', why: '1024 tokens × 131,072 bytes/token = 134,217,728 bytes per sequence, × 4 sequences = 536,870,912 bytes ≈ 0.54 GB. Divide that by the time you measured to get the gather bandwidth.' },
+  { q: 'A fused kernel returns output that is subtly but consistently wrong, and the error grows with context length. The accumulator and m/l are stored in BF16 instead of FP32. What is the diagnosis?', options: ['The kernel is mathematically exact; the issue is that rounding accumulates across thousands of tiles', 'The kernel must be non-causal', 'The scale factor 1/sqrt(d) is missing', 'Triton does not support FP32 accumulators'], answer: 0, why: 'FlashAttention is exact in exact arithmetic; keeping the running accumulator and state in FP32 is what preserves that in practice. Accumulating BF16 rounding over many tiles produces an error that grows with context and reads like a quality regression rather than a bug.' },
+]} />

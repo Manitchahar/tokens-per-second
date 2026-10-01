@@ -1,0 +1,119 @@
+---
+title: 'Visual lab: Trace one token end to end'
+summary: 'Put a real model on your own GPU and check every number this module derived: the parameter count, the KV cache size, the bytes a decode step moves, and the wall-clock time that implies. Then compare it with what you measure.'
+objectives:
+  - Derive a model's parameter count from its config and check it against the loaded weights
+  - Measure characters per token, and the KV cache a real prompt occupies
+  - Hand-compute one transformer block and match the library's output to float precision
+  - Count the module calls and kernel launches in one forward pass
+  - Compare a measured decode step against the memory-bound floor and explain the gap
+colab: 03-architecture.ipynb
+---
+
+import TokenTrace from '@/components/viz/transformers/TokenTrace.tsx';
+
+Eight lessons of theory, and not one of them has told you whether you were right. This lab does. Everything you derived — 70.2% of the weights in MLPs, 128 KiB per token of KV cache, a forward pass at 1 FLOP per byte, decode being 200× slower than prefill per token — is checkable against a real model on a real GPU, and this is where you check it.
+
+<Colab nb="03-architecture.ipynb" />
+
+## The browser simulator
+
+Below is a full interactive trace. Pick a model, a GPU and a context length, then drag the layer slider and watch the running total climb. Everything it shows is derived from published configs, so treat it as a claim you are about to test.
+
+<TokenTrace client:visible />
+
+## What you will do in the notebook
+
+<Wide>
+
+### 1. Read a config and predict the parameter count **before** loading the model
+
+Load `TinyLlama/TinyLlama-1.1B-Chat-v1.0` and `Qwen/Qwen2.5-0.5B-Instruct`. For each, print the config and compute the parameter count from the shapes alone:
+
+$$
+P = L\big(d^2 + 2\,d\,n_{kv}d_h + d^2 + 3\,d\,m\big) + V d
+$$
+
+Then load the weights and compare with `sum(p.numel() for p in model.parameters())`. **If they differ by more than 0.1%, find the matrix you forgot.** Qwen2 has extra RMSNorm gains on q and k; Llama-2-style models tie the embedding table. Those two facts are the whole difference.
+
+Write down, for each model: `layers`, `hidden`, `heads`, `kv_heads`, `head_dim`, `intermediate`, `vocab`, `tied`, and your derived parameter count.
+
+### 2. Count real tokens, and measure characters per token
+
+Tokenize four strings and print `characters / tokens` for each:
+
+- an English sentence
+- a line of Python code
+- a number-heavy string
+- one line of Chinese
+
+Then compute the KV cache the first one will need, with the formula from 03.5, and confirm against the shape the model allocates. **Write these four ratios in My notes.** Every prompt-length estimate you make from here on should use a ratio you measured.
+
+### 3. Compute one block by hand, and match the library
+
+This is the centre of the lab. Using `TinyLlama` (a plain Llama-architecture model, no extra q/k norms):
+
+1. Take the embedding row for the last prompt token.
+2. Apply `input_layernorm` yourself and confirm it matches.
+3. Project with `q_proj`, `k_proj`, `v_proj` yourself.
+4. Apply RoPE yourself, using the model's `rope_theta` from the config.
+5. Compute `softmax(QKᵀ/√d + mask)·V` yourself.
+6. Project with `o_proj`, add the residual.
+7. Apply `post_attention_layernorm`, then `gate_proj`, `up_proj`, `down_proj` with SiLU, and add the residual again.
+
+Then run `model(...)` and compare your final hidden state with the library's. **Report the maximum absolute difference.** It should be at the float32 rounding level (about 1e-5 on a BF16 model). If it is not, something in your reimplementation is wrong, and finding out what is worth more than the number itself.
+
+### 4. Watch the KV cache actually grow
+
+Run the model with `use_cache=True`, step it one token at a time, and print `past_key_values[0][0].shape` after each step. It should be `[batch, kv_heads, seq, head_dim]` and grow by exactly one row per step.
+
+Then compute the bytes that shape occupies and check it against $B_{KV} = 2\,L\,n_{kv}\,d_h \times 2$ bytes. Do it for the model at four different context lengths and print the ratio — it should be exactly 1.0 every time.
+
+### 5. Count the work, not just the time
+
+Register a forward hook on every `nn.Linear` and every block, and count how many times each fires during one forward pass. You should find:
+
+- `q_proj`, `k_proj`, `v_proj`, `o_proj`: $L$ calls each
+- `gate_proj`, `up_proj`, `down_proj`: $L$ calls each
+- total linears: $n_{\text{lin}} = 7L$
+
+Then multiply each call count by its weight count, sum, and check that the total equals the parameter count you derived in step 1 minus the embedding and output head. **If it matches to the last digit, you now understand this model completely.**
+
+### 6. Decode against the floor
+
+Time a single decode step at 512, 2,048 and 8,192 tokens of context, with CUDA events and a proper warm-up. For each, compute the memory-bound floor from your own measured bandwidth (Module 02) and report:
+
+| | measured ms | floor ms | measured ÷ floor |
+|---|---|---|---|
+
+The floor is a lower bound you cannot beat. A ratio of 1.1–1.4 is normal for eager PyTorch; if you see 3 or more, something is genuinely wrong.
+
+### 7. Prefill versus generate, on your own GPU
+
+Time a 512-token prefill, then generate 512 tokens one at a time, on the same prompt. Compute the ratio. It should be in the low hundreds.
+
+Then repeat with a batch of 8 identical prompts: prefill all 8 together, and generate 8 together. Report the per-user time and the aggregate tokens per second. **The aggregate improves much more than the per-user time gets worse.** That gap is the entire argument for batching, and you will have measured it.
+
+</Wide>
+
+## Read the output like a practitioner
+
+**Step 3 is pass/fail.** Either your block matches the library to float rounding or it does not. If it does not, the bug is almost always one of: RoPE applied to the wrong axis, RoPE applied to V, the mask applied after rather than before the softmax, or the causal direction reversed. Find it; do not move on.
+
+**Step 6 is where the course's model of the world is tested.** If your measured decode step is far above the floor, the reason is almost always kernel launches and elementwise ops rather than bandwidth, and Module 13 and Module 15 are the answer. If it is *at* the floor, you are memory-bound exactly as Module 02 predicted and the only lever is fewer bytes.
+
+**Step 7 should surprise you.** The prefill/generate ratio is the single most important efficiency fact in LLM serving and it falls out of arithmetic you can do on paper. Seeing it measured on your own GPU is the difference between knowing it and believing it.
+
+<Callout type="mentor" title="If you only do three things">
+  Step 1 (parameter count from config), step 3 (one block by hand), and step 7 (prefill vs generate). Those three cover every idea in this module. Steps 2, 4, 5 and 6 are how you build the habit of checking numbers you already believe.
+</Callout>
+
+<KeyNotes>
+  1. **$P = L(d^2 + 2\,d\,n_{kv}d_h + d^2 + 3dm) + Vd$** derives every parameter count. Getting it to match `numel()` exactly is the moment a config stops being numbers and becomes a model.
+  2. Measure characters per token on your own texts — English ≈ 4, code ≈ 2.5–3, CJK ≈ 1. Never estimate it again.
+  3. The KV cache grows by exactly one row of `kv_heads × head_dim` per layer per token. Its byte count is $B_{KV} = 2Ln_{kv}d_h b$, always, with no exceptions.
+  4. One forward pass fires $n_{\text{lin}} = 7L$ linear layers. Sum their parameter counts and you get every weight except the embedding table and the output head.
+  5. A hand-written block must match the library to about 1e-5 in float32. If it does not, the usual suspects are RoPE on V, RoPE on the wrong axis, or the mask direction.
+  6. A measured decode step within 1.1–1.4× of the memory floor is healthy for eager PyTorch. Far above it, the bottleneck is launches and elementwise ops, not bandwidth.
+  7. Prefilling 512 tokens is two orders of magnitude cheaper than generating them. Batching raises aggregate throughput far more than it costs per-user latency. Measure both.
+</KeyNotes>

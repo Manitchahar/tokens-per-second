@@ -1,0 +1,141 @@
+---
+title: 'Module 08 · PagedAttention & KV Memory'
+module: paged-attention
+---
+
+## The one number everything rests on
+
+$$
+\text{bytes per token} = 2 \times L \times n_{kv} \times d_{head} \times b
+$$
+
+2 for K and V, $L$ layers, $n_{kv}$ KV heads (GQA — the group factor), head dimension, bytes per number.
+
+| Model | Layers | KV heads | Head dim | Bytes/token (BF16) |
+|---|---|---|---|---|
+| Llama-3.1-8B | 32 | 8 | 128 | **131,072** (128 KiB) |
+| Llama-3.1-70B | 80 | 8 | 128 | **327,680** (320 KiB) |
+| Qwen2.5-0.5B | 24 | 2 | 64 | 12,288 (12 KiB) |
+| Llama-3.2-3B | 28 | 8 | 128 | 114,688 (112 KiB) |
+
+Token slot (one token, **one layer**): $2 \times n_{kv} \times d_{head} \times b$ = 4,096 bytes for Llama-3.1-8B.
+
+## Contiguous allocation: what it wastes
+
+$$
+\text{reserved} = \text{requests} \times M, \qquad \text{waste} = 1 - \frac{\mathbb{E}[\ell]}{M}
+$$
+
+$M$ = `max_model_len`, $\ell$ = final length.
+
+| $\mathbb{E}[\ell]$ / $M$ | Waste |
+|---|---|
+| 1,000 / 8,192 | **88%** |
+| 1,000 / 2,048 | **51%** |
+| 1,000 / 1,024 | **2%** |
+
+- **Internal fragmentation**: the empty tail of a reservation. Scales with $M$.
+- **External fragmentation**: free memory in unusable holes. Scales with churn.
+- Lowering $M$ halves the waste but rejects long requests.
+
+## Paged allocation
+
+Block = $B$ tokens. Table of block ids per request.
+
+| $B$ | Bytes/block (all layers) | Worst waste per request | Blocks for 4,096 tokens |
+|---|---|---|---|
+| 8 | 512 KiB | 7 tok (0.2%) | 512 |
+| 16 | **1 MiB** | 15 tok (0.4%) | 256 |
+| 32 | 2 MiB | 31 tok (0.8%) | 128 |
+| 256 | 16 MiB | 255 tok (6.2%) | 16 |
+
+$$
+\text{internal waste} \le B - 1 \text{ tokens per request}, \qquad \text{external waste} = 0
+$$
+
+**Sizing the pool**
+
+$$
+\text{tokens} = \frac{\text{pool bytes}}{131{,}072}, \qquad \text{blocks} = \frac{\text{tokens}}{B}, \qquad \text{requests} = \frac{\text{tokens}}{\mathbb{E}[\ell]}
+$$
+
+40 GB pool, $B = 16$, $\mathbb{E}[\ell] = 2{,}000$ → 305K tokens → 19,073 blocks → **152 requests**.
+
+**The three operations** — that is the whole memory manager:
+
+```python
+grow:  block_id = free_list.pop()            # O(1), 0 bytes copied
+free:  free_list.append(block_id)           # O(1), 0 bytes copied
+write: if refcount[b] > 1: b = copy_of(b)   # the only copy in the system
+```
+
+## Sharing and copy-on-write
+
+$$
+\text{refcount}[b] = |\{\text{requests pointing at } b\}|, \qquad \text{memory for prefix} = P \times 128\ \text{KiB} \quad \text{(not } R \times P\text{)}
+$$
+
+| Concurrent $R$ | 900-token prefix, no sharing | with sharing | saved |
+|---|---|---|---|
+| 8 | 921 MB | 230 MB | 75% |
+| 32 | 3.7 GB | 470 MB | **87%** |
+| 64 | 7.4 GB | 585 MB | **92%** |
+
+Marginal cost of one more request's shared prefix: **exactly zero**.
+
+- Sharing is valid only for an **exact token prefix**. Change token $i$ and every KV value after it changes.
+- A **partially filled last block is never shared** — it contains tokens past the shared prefix.
+- The copy happens at a divergence block, once. 64 KiB for $B = 16$.
+
+**Where it pays:** constant system prompts, multi-turn history, tool schemas. **Where it does not:** distinct documents per request.
+
+## Running out: preemption
+
+| Policy | Cost | Notes |
+|---|---|---|
+| **Admission control** | E's queue wait | Cheapest. Nothing running disturbed. |
+| **Recompute** | $C / P$ seconds | FLOPs paid twice, no host RAM, no PCIe. |
+| **Swap** | $2C \times 131{,}072 / B_{pcie}$ | PCIe bytes, needs host RAM. |
+
+**The crossover cancels $C$:**
+
+$$
+t_{\text{recompute}} < t_{\text{swap}} \iff P > \frac{B_{\text{pcie}}}{262{,}144}
+$$
+
+With $P = 20{,}000$ tok/s the threshold is **5.2 GB/s**. PCIe Gen4 is 24 GB/s → **swap wins**. Gen5 50 GB/s → swap wins wider. The victim length is irrelevant; it is a property of the machine.
+
+Worked: 900-token victim, $P = 20{,}000$ tok/s → recompute 45 ms. Swap: $2 \times 118$ MB ÷ 24 GB/s → 10 ms.
+
+**Eviction rules:** newest-first (least wasted work, risks starving long prompts), oldest-first, shortest-context, priority tiers. Pair newest-first with a cap on concurrent long requests.
+
+Preemption shows up as **p99 latency**, not average throughput.
+
+## Speed impact
+
+| Change | Effect |
+|---|---|
+| Paged vs contiguous | ~1–4× more concurrent requests (paper: waste 20% → 4%) |
+| The gather | ~1% of HBM bandwidth per decode step |
+| Block table | ~hundreds of bytes per request |
+| Tail waste | ≤ $(B-1)/B$ of one request |
+
+## Reference: one 8,192-token reservation
+
+Llama-3.1-8B: 8,192 × 131,072 = **1.07 GB per request**.
+
+| GPU | Pool for KV | Requests at 8,192 | Requests at 1,000 |
+|---|---|---|---|
+| T4 16 GB | ~6 GB | 5 | 45 |
+| L4 24 GB | ~10 GB | 9 | 76 |
+| A100 80 GB | ~45 GB | 42 | 360 |
+| H200 141 GB | ~95 GB | 88 | 740 |
+
+## Pitfalls
+
+1. **Paging is not oversubscription.** Full is full. It removes fragmentation, not demand.
+2. **Reserving on the ceiling** is the original sin; `max_model_len` is a knob, not a free win.
+3. **Shared blocks are read-only.** Skipping the refcount check is a silent data-corruption bug, not a crash.
+4. **Anything varying before the shared text** kills prefix caching entirely. Put variable content last.
+5. **Cache hits need the cache to survive.** Under memory pressure prefix blocks are evictable like any other.
+6. **Every attention backend needs a paged variant.** Contiguous-only kernels silently wrong, or rejected.

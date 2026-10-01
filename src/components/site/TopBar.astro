@@ -1,0 +1,83 @@
+---
+import Icon from '../Icon.astro';
+import { url } from '../../site';
+const path = Astro.url.pathname;
+const links = [
+  { href: 'learn/', label: 'Course' },
+  { href: 'labs/', label: 'Labs' },
+  { href: 'cheatsheets/', label: 'Cheat sheets' },
+  { href: 'tools/', label: 'Tools' },
+  { href: 'glossary/', label: 'Glossary' },
+  { href: 'notes/', label: 'My notes' },
+];
+const isActive = (href: string) => path.startsWith(url(href));
+---
+<header class="topbar">
+  <div class="inner">
+    <a class="wordmark" href={url('')} aria-label="Tokens per Second, home">
+      <svg class="glyph" viewBox="0 0 30 16" aria-hidden="true">
+        <rect x="0" y="1" width="11" height="6" rx="1" fill="var(--compute)" />
+        <rect x="12.5" y="1" width="2.6" height="6" rx="0.8" fill="var(--memory)" />
+        <rect x="16.6" y="1" width="2.6" height="6" rx="0.8" fill="var(--memory)" />
+        <rect x="20.7" y="1" width="2.6" height="6" rx="0.8" fill="var(--memory)" />
+        <rect x="24.8" y="1" width="2.6" height="6" rx="0.8" fill="var(--memory)" />
+        <rect x="12.5" y="9.5" width="2.6" height="5" rx="0.8" fill="var(--token)" />
+        <rect x="16.6" y="9.5" width="2.6" height="5" rx="0.8" fill="var(--token)" />
+        <rect x="20.7" y="9.5" width="2.6" height="5" rx="0.8" fill="var(--token)" />
+        <rect x="24.8" y="9.5" width="2.6" height="5" rx="0.8" fill="var(--token)" />
+      </svg>
+      <span>Tokens per Second</span>
+    </a>
+    <nav class="links" aria-label="Main">
+      {links.map((l) => <a href={url(l.href)} aria-current={isActive(l.href) ? 'page' : undefined}>{l.label}</a>)}
+    </nav>
+    <a class="resume" data-resume="hide" hidden href={url('learn/')}>
+      <Icon name="flag" size={15} />
+      <span class="resume-text"><span class="muted">Resume</span> <span data-resume-label></span></span>
+    </a>
+    <details class="mobile">
+      <summary aria-label="Menu"><Icon name="menu" size={20} /></summary>
+      <nav class="sheet" aria-label="Main (mobile)">
+        {links.map((l) => <a href={url(l.href)} aria-current={isActive(l.href) ? 'page' : undefined}>{l.label}</a>)}
+      </nav>
+    </details>
+  </div>
+</header>
+
+<style>
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    height: var(--bar-h);
+    background: rgb(14 17 22 / 0.92);
+    backdrop-filter: saturate(140%) blur(8px);
+    -webkit-backdrop-filter: saturate(140%) blur(8px);
+    border-bottom: 1px solid var(--rule);
+  }
+  .inner { max-width: 1320px; margin: 0 auto; height: 100%; display: flex; align-items: center; gap: 2rem; padding: 0 24px; }
+  .wordmark { display: flex; align-items: center; gap: 0.6rem; text-decoration: none; font-family: var(--font-display); font-size: 1.22rem; white-space: nowrap; letter-spacing: -0.01em; }
+  .glyph { width: 30px; height: 16px; }
+  .links { display: flex; gap: 1.4rem; font-size: 0.88rem; }
+  .links a { text-decoration: none; color: var(--text-2); padding: 0.3rem 0; position: relative; }
+  .links a:hover { color: var(--text); }
+  .links a[aria-current='page'] { color: var(--text); }
+  .links a[aria-current='page']::after { content: ''; position: absolute; left: 0; right: 0; bottom: -2px; height: 2px; background: var(--text); border-radius: 1px; }
+  .resume { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; text-decoration: none; color: var(--text); border: 1px solid var(--rule-2); border-radius: var(--radius); padding: 0.4rem 0.7rem; max-width: 330px; }
+  .resume:hover { border-color: var(--text-2); }
+  .resume .icon { color: var(--compute); flex: none; }
+  .resume-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .muted { color: var(--text-2); }
+  .mobile { display: none; margin-left: auto; position: relative; }
+  .mobile summary { list-style: none; cursor: pointer; padding: 0.4rem; display: flex; }
+  .mobile summary::-webkit-details-marker { display: none; }
+  .sheet { position: absolute; right: 0; top: calc(100% + 10px); background: var(--ground-2); border: 1px solid var(--rule-2); border-radius: 4px; padding: 0.4rem; display: grid; min-width: 200px; box-shadow: 0 12px 30px rgb(0 0 0 / 0.45); }
+  .sheet a { padding: 0.6rem 0.8rem; text-decoration: none; color: var(--text-2); }
+  .sheet a[aria-current='page'] { color: var(--text); }
+  @media (max-width: 1080px) { .links { gap: 1rem; } .resume { max-width: 200px; } }
+  @media (max-width: 900px) {
+    .links { display: none; }
+    .mobile { display: block; margin-left: 0; }
+    .resume { margin-left: auto; max-width: 46vw; }
+    .inner { gap: 0.75rem; padding: 0 16px; }
+  }
+  @media (max-width: 420px) { .wordmark span { display: none; } }
+</style>

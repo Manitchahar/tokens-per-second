@@ -1,0 +1,165 @@
+---
+title: 'Capstone: Design, build & defend a system'
+summary: 'The final project. Take a real SLO, a real model and a real budget, and design, build and price a complete inference system — then write the one page that defends it against an engineer who will poke holes in every number.'
+objectives:
+  - Start from a user-facing SLO and treat it as a hard constraint, not a target
+  - Derive the memory and cost budget arithmetically before benchmarking anything
+  - Build a measurable system that holds the SLO under a realistic workload
+  - Quantify every design choice against its cost in memory, latency or quality
+  - 'Defend the design in writing, including what would change your mind'
+---
+
+import CapstoneDesign from '@/components/viz/research-capstone/CapstoneDesign.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+This is the end of the course, and the one project that ties every module together. You will take a real service requirement — a model, an SLO, a traffic shape, a budget — and produce **a design that holds the SLO, a build that demonstrates it, and a written defense that survives scrutiny.**
+
+Nothing here is a toy. The SLO, the memory budget, the cost model, the workload: they are exactly what you would be handed on day one, and exactly what you will defend in a design review.
+
+<Callout type="mentor" title="How this is really done">
+  A strong inference system is designed **backwards from the SLO**. You pick the promise to the user (a latency target at a given load), and every other choice — model, precision, engine, batch, replicas — is decided by whether it lets you keep that promise at the lowest cost. Starting from the hardware and hoping an SLO falls out is how teams end up with fast, cheap systems that fail their users.
+</Callout>
+
+## The deliverable
+
+One repository, and one document that ties it together:
+
+1. **`design.md`** — the design document. SLO first, then the architecture, the memory budget, the cost model, and the alternatives you rejected with reasons.
+2. **`harness.py`** — your measurement harness (you built one in Module 6; reuse it).
+3. **`server/`** — a working implementation: an engine serving your model, meeting the SLO.
+4. **`benchmarks/`** — measured results: TTFT, TPOT, throughput, goodput, across your workload and a sweep.
+5. **`DEFENSE.md`** — the one page you present. The design in one defensible sentence, the evidence, and the measurement that would change your mind.
+
+<Callout type="real" title="The deliverable is a defense, not a demo">
+  Anyone can spin up an engine and show it generating text. What is rare, and what gets someone hired or promoted, is someone who can say: *here is the SLO, here is the arithmetic that shows it fits, here is the measurement that confirms it, here is what it costs, here is what I chose not to do and why, and here is the number that would make me change my mind.* That page is the capstone. The code is how you earned it.
+</Callout>
+
+## Step 1 · Fix the SLO and the workload (the constraint)
+
+Before anything else, write down the promise, precisely:
+
+- **The SLO**: e.g. p95 TTFT under 1 s, per-user decode at or above 30 tokens/s, sustained at a stated request rate.
+- **The workload**: prompt-length and output-length distribution, arrival pattern (open-loop, since real users do not wait for you), and the prefix-sharing fraction if you have one.
+- **The model and the budget**: which model, and roughly what you are allowed to spend.
+
+Turn this into a **goodput** target: throughput measured *only over requests that met the SLO* (Module 6). Goodput is the number your SLO actually cares about, and every optimization you do should increase it.
+
+<Callout type="pitfall" title="Two constraints people forget to state">
+  1. **The context length distribution**, not the average. Concurrency is set by the long tail (Module 8, Module 20): a few very long prompts can consume more KV memory than the typical request. A design sized on the average will OOM in production.
+  2. **The precision / quality bar**. If you quantize, what quality is acceptable (Module 11)? State the bar before you measure, or you will rationalize whatever the numbers say.
+</Callout>
+
+## Step 2 · The derived budget (no GPU, and it decides most things)
+
+Before you run anything, do the arithmetic that eliminates most designs. For your model, precision and GPU, compute:
+
+$$
+\begin{aligned}
+\text{weights} &= P \times b \\
+\text{reserve} &\approx 0.04 \times \text{mem} \\
+\text{kv\_per\_tok} &= 2 \times L \times H_{kv} \times d_h \times 2 \\
+\text{pool} &= \text{mem} - \text{weights} - \text{reserve} \\
+\text{max\_batch} &= \frac{\text{pool}}{\text{ctx} \times \text{kv\_per\_tok}}
+\end{aligned}
+$$
+
+and from the cost side (Module 25):
+
+$$
+\text{\$ per M tokens} = \frac{\text{GPU \$ per hour}}{(\text{goodput tok/s}) \times 3600} \times 10^6
+$$
+
+This step decides, with no experiments, whether the model fits at all, roughly how many users each GPU holds, and roughly what it costs. It is exact, cheap, and it is what makes your design defensible. Build it as a script so you can re-run it when the assumptions change.
+
+<Callout type="math" title="A design decided by arithmetic, not a benchmark">
+  Suppose the SLO is 30 tokens/s per user at a load that needs 4,000 concurrent streams, on 80 GB GPUs. Take Llama-3.1-8B in BF16: weights are 16 GB, so about 60 GB of pool, and at 128 KB of KV per token with 2,048-token contexts each stream costs about 0.26 GB. That is roughly 227 streams per GPU, so 4,000 streams needs **about 18 GPUs** (4,000 / 227, rounded up, with headroom). You have now sized the fleet from a spreadsheet, not from a benchmark — and you know the answer is sensitive to context length and precision, which is exactly what you will present as your risks.
+</Callout>
+
+## Step 3 · Build it and measure it
+
+Now build the real thing, then measure with your harness:
+
+1. Stand up the engine (vLLM or your mini-engine from Module 27) serving your model at your chosen precision.
+2. Run your workload at the SLO load point, and **sweep past it** to find where goodput peaks (Module 6). The peak is your operating point.
+3. Report p50/p95 TTFT, per-user TPOT, goodput, and cost per million tokens.
+4. Profile at least once (Module 12) so you can say what the bottleneck is at your operating point — memory-bound or compute-bound.
+
+Then, if you have budget, apply **one or two optimizations** from the course and show the goodput-per-dollar improvement: prefix caching if your traffic shares prefixes (Module 10), quantization if you need the memory (Module 11), speculative decoding if your output is long and structured (Module 16), disaggregation if prefill and decode fight (Module 21). Show each one's cost as well as its gain.
+
+<Callout type="intuition" title="Goodput is the number that ends arguments">
+  Throughput can always be raised by admitting more requests and letting latency explode. **Goodput** — tokens served within the SLO — cannot. When you present a design, lead with goodput and cost, not raw tokens/s, and every trade-off in the room becomes about the SLO, which is where it belongs.
+</Callout>
+
+## Step 4 · Defend it
+
+`DEFENSE.md` is one page. It must contain:
+
+- **The design in one sentence**: model, precision, engine, topology, and the SLO it holds.
+- **The evidence**: the goodput and cost you measured, at the stated load point.
+- **The arithmetic**: the derived budget, so a reader can check it.
+- **The alternatives you rejected**, each with a reason (a different engine, a different precision, a different topology).
+- **What would change your mind**: the measurement that would make you pick differently. This is the line that separates a design from a preference.
+
+<Callout type="mentor" title="Practice the hard question">
+  The real test of this project is the design review. Someone will ask: *what if your context doubles?* — you have the sensitivity. *Why not INT4?* — you have the quality bar. *Why not disaggregate?* — you have the comparison. *What if traffic triples?* — you have the scaling plan and the cost. A defense that cannot answer the second question is not a defense; it is a summary.
+</Callout>
+
+## The visual
+
+Here is the whole design as a live model: drag the model size, context and precision, and watch the memory budget, concurrency and cost move together. Notice how **weights decide what is possible and the KV cache decides how many users fit** — the two ideas from Modules 5 and 8 that quietly run the whole system.
+
+<Scrolly>
+  <CapstoneDesign client:visible slot="stage" />
+
+  <Step title="1. The SLO is the constraint">
+    Start from the promise, not the hardware: a latency target at a stated load. Everything else is downstream of it. This is the discipline Module 25 formalized as goodput — **maximize throughput subject to the SLO**, never trade the SLO away for throughput.
+  </Step>
+
+  <Step title="2. Weights decide what is possible">
+    The fixed cost. A 70B model in BF16 needs about 141 GB of weights, so it cannot live on one 80 GB GPU at all; in INT8 it still needs ~70 GB, leaving almost no room for KV. **Precision is a memory decision before it is a speed decision.**
+  </Step>
+
+  <Step title="3. The KV cache decides how many users fit">
+    The variable cost. Each token of context costs a fixed number of bytes (from your model&rsquo;s shape), and every user pays it per token. Double the context and you roughly halve your concurrency. This is why context length is a capacity column and not a footnote.
+  </Step>
+
+  <Step title="4. Replicas come from headroom">
+    Divide demand by per-GPU concurrency, then add headroom and round up. Do it at 70% utilization, not 100%: a system sized to the exact demand has no room for the next traffic spike (Module 23).
+  </Step>
+
+  <Step title="5. Quantization is a priced trade">
+    Fewer bits buys memory and bandwidth and costs measured quality. It is the right call when memory — not compute — is your constraint, which is the common case for large models on modest GPUs.
+  </Step>
+
+  <Step title="6. Hold the SLO, price the system, name your falsifier">
+    The finished design: a model, a precision, a topology, a cost, an SLO it holds, and the measurement that would change your mind. That last clause is what makes it engineering rather than taste.
+  </Step>
+</Scrolly>
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | The design starts from the SLO, the budget is derived arithmetically before benchmarking, goodput (not raw throughput) is the headline, at least one optimization is measured with its cost shown, alternatives are rejected with reasons, and the defense names the measurement that would change the author's mind. A reviewer could re-derive every number and would find no place where a guess was passed off as a measurement. |
+| **Proficient** | Meets all acceptance criteria: a working system holding the SLO, a correct derived budget, measured goodput and cost, one or two optimizations with honest costs, and a defense covering alternatives and risks. The sensitivity analysis may be shallow, but nothing is fabricated. |
+| **Developing** | The system works and the numbers are real, but the design is driven by the hardware rather than the SLO. Raw throughput is the headline instead of goodput, the budget was fitted to the measurement rather than derived before it, or optimizations are claimed without measuring their cost. |
+| **Beginning** | A model and a server with latency numbers attached, but no SLO, no budget, no cost, no alternatives considered, and no defense. It is a demo, not an engineering design, and would not survive a design review. |
+
+<KeyNotes>
+  1. Design **backwards from the SLO**: a latency promise at a stated load is the constraint, and every other choice is decided by whether it holds.
+  2. The **derived budget comes first**. Weights, KV and cost arithmetic eliminate most designs before you touch a GPU, and they make the design defensible.
+  3. Weights decide **what is possible**; the KV cache decides **how many users fit**. Context length is a capacity column, not a footnote.
+  4. Headline **goodput, not raw throughput** — throughput can be raised by breaking the SLO; goodput cannot.
+  5. Every optimization must be shown with **its cost**, in memory, latency or measured quality, not just its gain.
+  6. Size replicas at ~70% utilization with headroom, and sweep past the SLO load to find where goodput actually peaks.
+  7. The defense names the **alternatives rejected with reasons** and the **measurement that would change your mind**. That is what separates engineering from preference.
+  8. The deliverable is the defense: a design that holds its SLO, priced, evidenced, and stress-testable by someone who will poke holes in every number.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'In this capstone, what is the constraint the design starts from?', options: ['The cheapest GPU available', 'A user-facing SLO at a stated load', 'The fastest engine', 'The largest model that fits'], answer: 1, why: 'A strong design starts from the promise to the user: a latency target at a stated load. Every other choice is decided by whether it keeps that promise at the lowest cost.' },
+  { q: 'Llama-3.1-70B in BF16 needs about how many GB of weights (70.6B parameters × 2 bytes)?', numeric: true, answer: 141, tolerance: 2, unit: 'GB', why: '70.6e9 parameters × 2 bytes = 141.2e9 bytes ≈ 141 GB, so it cannot fit on a single 80 GB GPU in BF16.' },
+  { q: 'Why is goodput the right headline number instead of raw throughput?', options: ['It is easier to measure', 'Throughput can be raised by breaking the SLO, but goodput counts only tokens served within the SLO', 'Goodput is always larger', 'Throughput does not exist'], answer: 1, why: 'You can always admit more requests and inflate throughput by letting latency explode. Goodput counts only the work that met the SLO, so it cannot be gamed that way.' },
+  { q: 'Your design needs 4,000 concurrent streams and one A100 holds about 227 sequences at your context length. Roughly how many GPUs, before headroom?', numeric: true, answer: 18, tolerance: 2, unit: 'GPUs', why: '4,000 / 227 ≈ 17.6, so 18 GPUs at full capacity. In practice you would run at about 70% utilization, so more than that — headroom is not optional.' },
+  { q: 'What is the most important line in the defense?', options: ['A list of the libraries you used', 'The measurement that would change your mind', 'The team size', 'The total GPU count alone'], answer: 1, why: 'Naming the falsifier separates an engineering design from a preference. It tells the reviewer exactly what evidence would make you pick differently, which is what makes the rest of the design credible.' },
+]}/>

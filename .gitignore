@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.astro/
+.cache/
+logs/
+.impeccable/
+.claude/
+TASK.md
+FIXES.md
+*.log
+dist-pages/

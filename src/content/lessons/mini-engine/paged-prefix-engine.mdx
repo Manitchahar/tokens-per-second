@@ -1,0 +1,230 @@
+---
+title: 'Step 3: Paged KV & prefix caching'
+summary: 'Write the memory manager: a pool of fixed-size blocks, a block table that maps sequences onto them, and prefix hashing so a shared system prompt costs one copy instead of thousands. This is where PagedAttention stops being a paper and becomes about 200 lines.'
+objectives:
+  - Implement a block pool with O(1) allocation and freeing
+  - Build the block table and explain how attention gathers through it
+  - Compute fragmentation for contiguous versus blocked allocation and compare
+  - Implement prefix hashing so a block’s identity encodes its whole prefix
+  - Add reference counting so a shared block is evicted only when nobody uses it
+---
+import PagedKV from '@/components/viz/mini-engine/PagedKV.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Your scheduler allocates blocks and frees them. It has no idea what is inside a block, where it came from, or whether another request is using it too. All of that lives in the <Term t="kv-allocator">KV manager</Term> — and this is the component where Module 08 and Module 10 stop being ideas and become about 200 lines of code you can write in an afternoon.
+
+It is also the component with the highest ratio of memory saved to code written of anything in an engine.
+
+## The one tensor
+
+The whole KV cache is a single allocation:
+
+```python
+self.k_cache = torch.zeros(num_layers, num_blocks, block_size, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+self.v_cache = torch.zeros_like(self.k_cache)
+```
+
+That leading `num_blocks` axis is the entire design. A sequence's tokens are **not adjacent in memory**; they are a list of block ids. Everything else in this lesson follows from that one decision — including the freedom to share blocks between sequences, which turns out to be the biggest win of all.
+
+<Scrolly>
+  <PagedKV client:visible slot="stage" />
+
+  <Step title="1. One pool of blocks">
+    The cache is a grid of fixed-size blocks, 16 tokens each. Nothing about the pool knows about requests. It is just memory that can be handed out in uniform units.
+  </Step>
+
+  <Step title="2. Contiguous: the fragmentation tax">
+    If each request had to own one contiguous region, every one rounds up and wastes its tail — and because lengths are not multiples of anything, the waste compounds. Eight mixed-length requests consume far more of the pool than their tokens require.
+  </Step>
+
+  <Step title="3. Blocks: at most 15 wasted">
+    With 16-token blocks a request of any length costs $\lceil T/16 \rceil$ blocks. The waste is at most 15 tokens, in the last block only, and it never grows with context. **Fragmentation becomes a bounded constant instead of a function of your traffic.**
+  </Step>
+
+  <Step title="4. The block table">
+    One row per sequence, listing the physical blocks it occupies. Freeing a request is now: read its row, return those blocks to the free list. No searching, no coalescing, no compaction pass.
+  </Step>
+
+  <Step title="5. Attention gathers through it">
+    Because tokens are scattered, the attention kernel takes the block table as an index and gathers each sequence's blocks into the computation. To the kernel, attention is over one contiguous logical row; physically it is a gather. This is the PagedAttention kernel.
+  </Step>
+
+  <Step title="6. Prefix hashing">
+    Hash each block's tokens **together with its parent's hash**. Now a block's identity encodes everything before it. Two requests sharing a 1,000-token prompt produce identical hashes for the first 62 blocks, and reuse is a dictionary lookup.
+  </Step>
+
+  <Step title="7. A shared prefix">
+    Set the shared prefix and watch the pool: the violet blocks are referenced by every row of the block table. Eight requests with a 250-token system prompt now hold 250 tokens once, not eight times. Nothing was copied and nothing was recomputed.
+  </Step>
+
+  <Step title="8. Eviction under pressure">
+    When the pool is full you evict a block. If that block is shared, you have damaged requests you did not touch — so eviction must consult a reference count, and the usual policy is to keep the most-recently-used *fully private* blocks first.
+  </Step>
+</Scrolly>
+
+## The allocator, in full
+
+```python
+class KVManager:
+    def __init__(self, num_blocks, block_size=16, enable_prefix_caching=True):
+        self.free = deque(range(num_blocks))      # a free list, not a bitmap
+        self.page_table: dict[int, int] = {}     # block id -> refcount
+        self.block_table: dict[int, list[int]] = {}   # request id -> [block ids]
+        self.cache: dict[int, tuple[int, int]] = {}    # block hash -> (block id, refcount)
+        self.block_size = block_size
+
+    def allocate(self, req_id: int, num_tokens: int) -> list[int]:
+        """Grow request req_id's block table to hold num_tokens. O(blocks needed)."""
+        needed = (num_tokens + self.block_size - 1) // self.block_size
+        have = len(self.block_table.get(req_id, []))
+        out = self.block_table.setdefault(req_id, [])
+        while len(out) < needed:
+            if not self.free:
+                return []                       # signal failure; the scheduler preempts
+            b = self.free.popleft()
+            self.page_table[b] = 1
+            out.append(b)
+        return out
+
+    def free(self, req_id: int):
+        """O(1) amortised: one pass over this request's own row."""
+        for b in self.block_table.pop(req_id, []):
+            self.page_table[b] -= 1
+            if self.page_table[b] == 0:
+                self.free.append(b)
+```
+
+Three details carry the whole design:
+
+- **A free list, not a bitmap scan.** `popleft()` and `append()` are O(1). A bitmap means scanning for a free block on every allocation, and under pressure that scan is over the whole pool.
+- **`allocate` returns `[]` on failure** rather than raising or partially allocating. The scheduler treats an empty return as "preempt someone", which is the control flow from the last lesson.
+- **Reference counts, not ownership.** A block in use by three requests has count 3 and is freed only when the third one lets go. This is what makes prefix sharing safe.
+
+<Callout type="pitfall" title="The bug that corrupts output instead of crashing">
+  Forgetting to check the reference count when freeing. Evicting a block that another request is still pointing at does not raise — the memory is silently reused for a different sequence, and that request's attention then reads keys and values belonging to somebody else. You get **plausible, wrong tokens** with no error anywhere. If your engine's output ever degrades mysteriously under load, check refcounts before you check anything else.
+</Callout>
+
+## The fragmentation arithmetic, done properly
+
+Take 16 concurrent requests with lengths drawn from a realistic chat distribution: median 180 tokens, p90 1,200. Llama-3.1-8B, BF16, 128 KB per token.
+
+**Contiguous allocation.** Every request rounds up to a whole block anyway if you allocate in blocks, so the interesting comparison is against the *naive* case where each request reserves its worst case (`max_model_len`), because that is what you must do without paging:
+
+| Scheme | Tokens reserved per request | 16 requests |
+|---|---|---|
+| Reserve `max_model_len` = 8,192 | 8,192 | 131,072 tokens = **17.2 GB** |
+| Actual length (oracle) | median 180 | ~2,880 tokens = 0.38 GB |
+| Blocks of 16 | $\lceil 180/16 \rceil \times 16 = 192$ | ~3,072 tokens = 0.40 GB |
+
+So blocks recover essentially **all** of the oracle's efficiency: 3,072 against 2,880 is 6.7% overhead, and it is bounded at 15 tokens per request instead of growing with context. That is the whole claim of Module 08, and **17.2 GB versus 0.40 GB** is why it mattered — at 16 concurrent requests the naive scheme needs more memory than an entire H100 holds for KV.
+
+The residual waste for the eight mixed-length requests in the visual, which is where the number comes from:
+
+$$
+\text{waste} = 1 - \frac{\sum T_i}{\sum \lceil T_i/16 \rceil \cdot 16}
+= 1 - \frac{360}{432} = 16.7\%
+$$
+
+That looks high, and it is — but read the bound rather than the point: waste is at most $\frac{15n}{\sum T_i}$, which for these eight short requests is $\text{120/360} = 33\%$ and for real serving traffic with 4k contexts is a fraction of a percent. **The bound is bounded, and it shrinks as contexts grow.** That is the difference between a constant and a function of your traffic.
+
+<Callout type="math" title="The three allocations that look fine and are not">
+  1. **Per-request maximum.** Reserving `max_model_len` per request wastes the entire headroom of every short conversation, and it is the default in a surprising number of hand-rolled servers.
+  2. **Bucket by length class.** Rounding 1,050 tokens up to a 1,024-or-2,048 bucket wastes up to 48% on requests just over a boundary.
+  3. **Grow by doubling.** Reallocating and copying on every doubling is O(n log n) of memory traffic during a single request, on the critical path.
+  
+  Fixed-size blocks sidestep all three, which is why the idea is a page table rather than a clever heuristic.
+</Callout>
+
+## Prefix caching, derived
+
+Module 10's idea, made concrete. The hash is chained so that a block's identity depends on everything before it:
+
+$$
+\text{hash}_i = H(\text{token}_{16i \ldots 16i+15},\ \text{hash}_{i-1})
+$$
+
+```python
+def hash_block(self, req: Request, block_index: int, parent_hash: int) -> int:
+    lo = block_index * self.block_size
+    chunk = tuple(req.token_ids[lo:lo + self.block_size])
+    return hash((parent_hash, chunk))
+```
+
+Then prefill walks the blocks and, for each one, checks the cache before computing it:
+
+```python
+parent = 0
+matched = 0
+for i in range(total_blocks):
+    h = self.hash_block(req, i, parent)
+    hit = self.cache.get(h)
+    if hit is not None and self.page_table[hit[0]] >= 0:
+        req.blocks.append(hit[0])          # reuse: no compute, no allocation
+        self.page_table[hit[0]] += 1
+        parent = h
+        matched += 1
+    else:
+        break                              # a divergence ends the reusable prefix
+req.prefilled = matched * self.block_size
+```
+
+<Callout type="math" title="Reuse is block-aligned, and that matters">
+  With a 1,000-token shared system prompt and 16-token blocks, you reuse $\lfloor 1000/16 \rfloor = 62$ blocks — **992 tokens**, not 1,000. The remaining 8 tokens are inside block 63 and cannot be shared, because sharing a *partial* block would require read-modify-write on a block other sequences are using.
+</Callout>
+
+For **Llama-3.1-8B**, 62 blocks of 16 tokens hold 992 tokens, which is $\text{992} \times 131{,}072 \approx 130$ MB. At \$30/hour, one prefill of 992 tokens costs about 0.2 ms of H100, so one shared system prompt on a server doing 20 requests per second saves roughly 50 ms of GPU time per second. Modest. But on a server with a 2,000-token RAG context and 50 requests per second, it saves 125 shared blocks per request instead of 125 private ones, and — more importantly — it is the difference between fitting the KV pool and not fitting it.
+
+| Workload | Shared prefix | Blocks saved at 8 req/s |
+|---|---|---|
+| Chat, 200-token system prompt | 12 blocks | 84 |
+| Agent loop, 4k reused context | 250 blocks | 1,750 |
+| RAG, 2k retrieved context | 125 blocks | 875 |
+
+<Callout type="intuition" title="Prefix caching is nearly free, so turn it on">
+  The cost is a hash per block and a dict lookup — microseconds against a step measured in milliseconds. The benefit is a whole prefill. There is almost no workload where the answer is "no". The reason it was opt-in for years is that it interacts with eviction policy, not because the hashing is expensive: evict shared blocks carelessly and you make things worse.
+</Callout>
+
+## Choosing the block size
+
+| Block size | Wasted per request | Shared blocks at 1,000-token prefix | Gather cost |
+|---|---|---|---|
+| 8 | ≤ 7 tokens | 125 | more index entries |
+| **16** | **≤ 15 tokens** | **62** | **vLLM's default; a good balance** |
+| 32 | ≤ 31 tokens | 31 | fewer, larger entries |
+
+At 16 tokens and 128 KB per token for Llama-3.1-8B, one block holds 2 MB — large enough that the gather overhead is negligible, small enough that a short final chunk wastes little. That is why it is the default at the time of writing. It is a real parameter: change it and re-measure, because it moves both fragmentation and the size of the attention index your kernel has to walk.
+
+## Check yourself
+
+```python
+# invariants, asserted after every allocation
+assert len(self.free) + len(self.page_table) == self.num_blocks
+assert sum(self.page_table.values()) >= len(self.page_table)   # no block at 0 refs
+assert all(len(v) == math.ceil(reqs[i].num_tokens / 16)
+           for i, v in self.block_table.items())
+```
+
+Then run the experiment worth more than the code: take one request, prefill it, then issue eight near-identical requests and count how many blocks were actually **computed** versus **reused**. If reuse is zero, your hash is wrong — almost always because the parent hash is not being threaded through.
+
+<KeyNotes>
+  1. The KV cache is **one tensor with a `num_blocks` axis**. A sequence is a list of block ids, not a memory region.
+  2. Blocks of 16 tokens bound fragmentation to **at most 15 wasted tokens per request**, in the last block only, independent of context length.
+  3. The <Term t="block-table">block table</Term> makes freeing O(blocks) and requires no compaction. The <Term t="page-table">page table</Term> of reference counts is what makes sharing safe.
+  4. Attention gathers through the block table, so the kernel sees one logical contiguous row. **That gather is PagedAttention.**
+  5. Allocate returns `[]` on failure; the scheduler preempts. Allocating optimistically moves the failure into a kernel as an opaque OOM.
+  6. Prefix hashing chains a block's hash with its parent's, so a block's identity encodes its whole prefix and reuse is a dict lookup.
+  7. Reuse is **block-aligned**: 1,000 shared tokens reuse 62 blocks (992 tokens), because a partial block cannot be shared.
+  8. Never free a block without checking its reference count. Doing so produces **plausible, wrong output** rather than a crash.
+  9. Block size 16 is the sweet spot: 2 MB per block for Llama-3.1-8B, negligible gather cost, bounded waste.
+  10. Waste is bounded by $\frac{15n}{\sum T_i}$ — it **shrinks** as contexts grow, which is the whole advantage over reserving `max_model_len` per request.
+  11. Prefix caching costs a hash and a lookup and saves an entire prefill. Turn it on; the only real risk is eviction policy.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'With 16-token blocks, what is the maximum number of token slots wasted by a request of 1,050 tokens?', numeric: true, answer: 6, tolerance: 1, unit: 'tokens', why: 'ceil(1050/16) = 66 blocks = 1,056 slots. 1,056 − 1,050 = 6 tokens wasted, always in the last block only.' },
+  { q: 'Two requests share a 1,000-token prefix. How many blocks does the second one reuse?', numeric: true, answer: 62, tolerance: 1, unit: 'blocks', why: 'floor(1000/16) = 62 blocks = 992 tokens. Sharing is block-aligned, so 8 tokens of the prefix are inside block 63 and cannot be shared.' },
+  { q: 'Why must a KV manager track a reference count per block rather than just which request owns it?', options: ['To make freeing O(1)', 'Because prefix caching lets several requests reference the same block, and freeing it while another request still points at it silently corrupts that request’s attention', 'Because the GPU requires one owner per allocation', 'To choose the eviction policy'], answer: 1, why: 'With sharing, a block can be in use by many requests. Freeing it on the first release gives the memory to a new sequence while the others still read it — plausible wrong tokens, no crash. The count makes release safe.' },
+  { q: 'Your engine’s output degrades under load but never raises an exception. Which bug produces exactly this signature?', options: ['A missing torch.cuda.synchronize()', 'Freeing a shared block without checking its reference count, so a live request reads another sequence’s keys and values', 'An oversized max_num_seqs', 'A non-seeded sampler'], answer: 1, why: 'A refcount bug reuses memory that a running sequence still points at. Attention reads valid memory containing someone else’s K and V, so the model produces fluent nonsense rather than an error.' },
+  { q: 'Llama-3.1-8B on an H100 with a 52.7 GB KV pool at `max_model_len = 8192`. What is the maximum concurrency?', numeric: true, answer: 48, tolerance: 3, unit: 'requests', why: '52.7 GB / 131,072 bytes = 402k tokens of KV. Each request at 8,192 tokens needs 8,192 tokens of pool. 402k / 8,192 ≈ 49. This is the formula `max_model_len` exists to control.' },
+  { q: 'Why is a block size of 16 tokens a better default than 128?', options: ['Larger blocks are slower to gather', 'Smaller blocks waste less on the final partial block and allow finer-grained prefix sharing, while still being big enough that gather overhead is negligible', 'Block size does not affect memory use', '128 is not a valid block size'], answer: 1, why: 'Waste per request is bounded by block_size − 1, so 128 wastes up to 127 tokens per request. Prefix sharing is also coarser. At 16 tokens and 128 KB/token, a block is 2 MB, large enough that the gather is not the bottleneck.' },
+]} />

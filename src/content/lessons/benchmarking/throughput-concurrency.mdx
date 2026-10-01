@@ -1,0 +1,224 @@
+---
+title: 'Throughput, concurrency & Little’s law'
+summary: 'How many requests a GPU can retire per second, how many can be in flight at once, and the one law that ties the two together. Size any system from three numbers.'
+objectives:
+  - Define concurrency and distinguish it from batch size
+  - Compute a request’s service time and the GPU’s capacity in requests per second
+  - State Little’s law and use it to size the system you need
+  - Explain why utilisation near 100% causes latency to explode
+  - Decide how many replicas a target load requires, with headroom'
+---
+
+import LittleLaw from '@/components/viz/benchmarking/LittleLaw.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A GPU is rented by the hour whether it serves one request a second or a thousand. The only thing that changes is how many requests you can retire per second — and that number is **throughput**.
+
+But throughput alone is a trap. You can push any system to a beautiful throughput number by accepting every request and making everybody wait. The number that matters is how much of that throughput arrives *fast enough to be useful*.
+
+## Three words that are constantly confused
+
+| Word | Means | Changes when you... |
+|---|---|---|
+| **Concurrency** | Requests in flight right now (arrived, not finished) | add waiting requests |
+| **Batch size** | Requests the GPU processes in this one forward pass | the scheduler decides |
+| **Throughput** | Requests or tokens completed per second | arrive faster |
+
+Concurrency is a property of your *system*. Batch size is a property of *this step*. Throughput is an outcome.
+
+The relationship between them is exact: in one decode step of duration $t_{\text{step}}$ with batch $B$, the GPU retires $B$ requests' worth of one token, so
+
+$$
+\text{throughput} = \frac{B}{t_{\text{step}}}
+$$
+
+<Callout type="pitfall" title="Concurrency is not batch size">
+  If 200 requests are in flight and the engine can only fit 64 in one batch, you have concurrency 200 and batch size 64. The other 136 are **queued**.
+
+  This gap is where latency is born. It is also the number you tune to protect the SLO, which is why every serving engine exposes a `max_num_seqs` (a concurrency cap) rather than only a batch-size setting.
+</Callout>
+
+## One request's service time
+
+Before you can compute capacity, you need to know how much GPU time one request costs. That is its **service time**, and for an LLM request it has two parts:
+
+$$
+S = \underbrace{t_{\text{prefill}}}_{\text{one pass over the prompt}} + \underbrace{n_{\text{out}} \times t_{\text{step}}}_{\text{one step per output token}}
+$$
+
+Take Llama-3.1-8B on an H100, a 1,024-token prompt, 40 output tokens, batch 64:
+
+- Prefill: about $\text{1,024 tokens} \times 29\ \mu\text{s} = 30$ ms, call it **40 ms** with overhead.
+- Decode step at batch 64: the weights are read once for all 64, but so is 64 sequences' worth of KV cache. The step is **10.7 ms** — barely slower than batch 1's 7.5 ms, yet it produces 64 tokens.
+- Service time: $S = 40 + 40 \times 10.7 = 468$ ms.
+
+So this GPU retires
+
+$$
+\text{capacity} = \frac{1}{S} = \frac{1}{0.468\ \text{s}} \approx 2.1\ \text{requests/s}
+$$
+
+at that batch size. Now try the same arithmetic for an 8,192-token prompt: prefill alone is about 240 ms instead of 40, and the longer context makes every decode step read more KV cache too. **Your capacity is a function of your workload**, not a property of your GPU.
+
+<Scrolly>
+  <LittleLaw client:visible slot="stage" />
+
+  <Step title="1. One user, one request">
+    A single request in flight. Concurrency 1, per-user speed at its best, and the GPU is mostly idle — the curve starts at the bottom left.
+
+    The blue dot is where this configuration delivers: throughput in tokens per second.
+  </Step>
+
+  <Step title="2. Concurrency grows">
+    Drag the concurrency slider up. Each new request joins the *same* step, so the weights that were already being read from HBM get reused for free.
+
+    This is the whole economic argument for batching, and it is why the curve is so steep here.
+  </Step>
+
+  <Step title="3. Throughput climbs fast, then bends">
+    Going from 1 request in flight to 24 multiplies throughput by about **20×** — far more than proportionally, because the 16 GB weight read is amortized across everyone sharing the step.
+
+    Then it bends. Every additional request adds its own KV cache to the bytes the step must read, and at high batch the math catches up too. This is Module 02's two-speed-limits story playing out in a live system.
+  </Step>
+
+  <Step title="4. The GPU fills up">
+    Past the knee the step time grows roughly with batch size again. Throughput keeps climbing but with a much worse slope, and **per-user speed is falling steadily**.
+
+    The red dashed line is the out-of-memory boundary: this is where the KV cache no longer fits in 80 GB, and the engine has to start preempting and recomputing.
+  </Step>
+
+  <Step title="5. Saturation">
+    At the knee the GPU is doing everything it can. Adding more arrivals no longer produces more tokens — it only produces a longer queue.
+
+    Note what has not changed: TTFT per token of *work* is the same. The machine is fine. The system is overloaded.
+  </Step>
+
+  <Step title="6. Overload is a cliff, not a slope">
+    Push offered load to 100% and beyond. Throughput is pinned at capacity, but the queue grows without bound and latency goes to infinity.
+
+    This is the single most important operational fact in this module: **a system stays fast right up until it doesn't**. Capacity planning is about staying well away from that edge.
+  </Step>
+
+  <Step title="7. Little’s law ties it together">
+    The triangle is the classic queueing identity:
+
+    $$
+    L = \lambda \times W
+    $$
+
+    **requests in the system** = **arrival rate** × **time in the system**. It looks trivial because it is — and it converts your latency target straight into a sizing requirement.
+
+    With a latency budget $W$ and a known arrival rate $\lambda$, you know exactly how many requests the system must be able to hold. That number is your concurrency requirement.
+  </Step>
+
+  <Step title="8. Three numbers size a system">
+    Capacity = 1 ÷ service time, where service time comes from your prompt and output lengths plus the GPU you chose.
+
+    Multiply by your arrival rate to get required concurrency, divide that by what one GPU can hold, and you have your replica count. Then add headroom — because the edge is a cliff.
+  </Step>
+</Scrolly>
+
+## Little’s law, properly
+
+Little's law is one of the few exact results in performance engineering. It holds for **any** stable queue, no matter how bizarre the service distribution is:
+
+$$
+L = \lambda W
+$$
+
+- $L$ = mean number of requests in the system (arrived, not yet finished)
+- $\lambda$ = mean arrival rate (requests per second)
+- $W$ = mean time a request spends in the system (queueing **plus** service)
+
+<Callout type="math" title="Worked: size a service from a latency budget">
+  A product needs 12 requests per second, and users abandon if they wait more than 5 seconds for a full response.
+
+  **1. How many requests must the system hold at once?**
+  $$L = \lambda \times W = 12 \times 5 = 60 \text{ requests in flight}$$
+
+  **2. One H100, Llama-3.1-8B, batch 64, 1k prompts, 200-token answers.**
+  Prefill is about 40 ms, and each of the 200 decode steps costs 10.7 ms, so
+  $$S = 0.04 + 200 \times 0.0107 = 2.18\ \text{s}$$
+  One GPU therefore does $\tfrac{1}{2.18} = 0.46$ req/s.
+
+  **3. How many GPUs, at 60% target utilization?**
+  $$0.46 \times 0.60 = 0.275\ \text{req/s per GPU} \qquad 12 \div 0.275 = 43.6 \Rightarrow \mathbf{44\ \text{GPUs}}$$
+
+  **4. Does that hold up?** Only if 44 GPUs can hold 60 concurrent requests. Each request at 1,024 tokens needs about 0.13 GB of KV cache, so 60 of them is 8 GB — comfortably inside one 80 GB H100, four times over. Memory is not the binding constraint here; latency is.
+</Callout>
+
+The single most useful consequence: **if you know your arrival rate and your latency target, you know your required concurrency without knowing anything about your implementation.**
+
+## Why the edge is a cliff
+
+The reason overload is so violent is visible in the classic queueing result. For a simple M/M/1 queue (Poisson arrivals, one server, exponential service), the mean wait is
+
+$$
+W_{\text{queue}} = \frac{\rho}{1 - \rho} \times S
+$$
+
+where $\rho = \lambda/\mu$ is utilisation: arrivals divided by service rate.
+
+| Utilisation $\rho$ | Mean queue wait | Multiple of service time |
+|---|---|---|
+| 50% | $\tfrac{1.0}{1} \times S$ | 1× |
+| 80% | $\tfrac{4.0}{1} \times S$ | 4× |
+| 90% | $\tfrac{9.0}{1} \times S$ | 9× |
+| 95% | $\tfrac{19}{1} \times S$ | 19× |
+| 99% | $\tfrac{99}{1} \times S$ | 99× |
+
+<Callout type="intuition" title="Why engineers get burned by 95% utilisation">
+  At 95% utilisation the average request waits 19× longer in queue than it spends being served. A system that was 10× faster at 50% load is now *slower* than a modestly-sized system at 80%.
+
+  Real arrival processes are bursty, not Poisson, so the tail is even worse than this table. The engineering rule is simple and non-negotiable: **run at 50–70% average utilisation, and scale out on queue depth or p95 latency, never on CPU/GPU utilization.**
+</Callout>
+
+## Concurrency is your real dial
+
+Because batch size is chosen by the scheduler, the knob you actually control is **concurrency**: how many requests you allow to be in flight at once.
+
+- **More concurrency** → bigger batches → higher throughput and lower cost per token, but higher per-user TPOT.
+- **Less concurrency** → smaller batches → better per-user latency, lower throughput.
+
+There is no free choice, only a choice of where to sit. Module 07 takes this apart in detail: continuous batching, token budgets and preemption.
+
+<Callout type="real" title="What real engines expose">
+  At the time of writing, the main open engines expose a small set of concurrency and capacity knobs rather than a raw batch size:
+
+  - `max_num_seqs` — the concurrency cap: how many sequences may be resident.
+  - `max_num_batched_tokens` — the per-step token budget, which caps how much prefill and decode share a step.
+  - `gpu_memory_utilization` — the fraction of GPU memory the engine may pre-allocate for KV cache, and therefore an indirect concurrency limit.
+
+  Tuning these is a measurement problem, not a guessing problem. Module 09 does it against a real engine.
+</Callout>
+
+## Sizing checklist
+
+When someone asks "how many GPUs do I need?", you now have a method:
+
+1. **Get the workload shape.** Prompt-length distribution, output-length distribution, peak requests per second — not averages.
+2. **Measure service time at your target concurrency**, not at batch 1. Decode step time depends on batch and on context.
+3. **Capacity per GPU** = 1 ÷ service time, in requests per second. Convert to tokens per second if that is the unit you care about.
+4. **Replicas** = peak arrivals ÷ (capacity per GPU × target utilisation), with target utilisation at 0.5–0.7.
+5. **Check memory.** Concurrency × context × KV bytes per token must fit in GPU memory, or you are OOM at step 4. This is Module 05's memory math.
+6. **Re-measure after any change.** Every one of these numbers moves when you quantize, change model, or upgrade GPU.
+
+<KeyNotes>
+  1. **Concurrency** = requests in flight; **batch size** = requests in this step; **throughput** = requests or tokens retired per second. Only the first is yours to set directly.
+  2. Throughput from one step is $B / t_{\text{step}}$ — batch size over step time.
+  3. **Service time** $S = t_{\text{prefill}} + n_{\text{out}} \times t_{\text{step}}$, and **capacity = 1 ÷ S**. Both depend on your workload, so capacity is not a property of the GPU alone.
+  4. **Little's law: $L = \lambda \times W$.** Arrival rate times time in system equals requests in the system. It converts a latency target into a concurrency requirement with no knowledge of the implementation.
+  5. In M/M/1, mean queue wait is $\frac{\rho}{1-\rho} S$: 9× the service time at 90% utilization, 19× at 95%. Overload is a cliff.
+  6. Run at **50–70% utilization** and autoscale on queue depth or p95 latency, never on GPU utilization.
+  7. Concurrency above the batch size is queue, and queue is where latency comes from. `max_num_seqs` is the knob that bounds it.
+  8. Sizing = workload shape → measured service time → capacity → replicas ÷ 0.6 → verify memory fits. Re-measure after every change.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A service takes 250 requests per second and each request spends an average of 4 seconds in the system. By Little’s law, how many requests are in the system on average?', numeric: true, answer: 1000, tolerance: 30, unit: 'requests', why: 'L = λ × W = 250 × 4 = 1,000 requests in flight. This is your required concurrency for a 4-second latency budget.' },
+  { q: 'One GPU does 0.8 requests per second. You need 40 requests per second at 60% average utilization. How many GPUs do you need?', numeric: true, answer: 84, tolerance: 4, unit: 'GPUs', why: 'Usable capacity per GPU = 0.8 × 0.6 = 0.48 req/s. 40 ÷ 0.48 ≈ 83.3, so round up to 84 replicas.' },
+  { q: 'In an M/M/1 queue with service time S, the mean queue wait at 90% utilization is how many times S?', numeric: true, answer: 9, tolerance: 0.5, unit: '× S', why: 'W = ρ/(1−ρ) × S = 0.9/0.1 × S = 9 × S. At 95% it is 19×, which is why 95% utilization is operationally dangerous.' },
+  { q: 'Concurrency is 200 but the engine is running a batch of 64. What does that tell you?', options: ['The GPU is running at 75% efficiency', '136 requests are queued and that gap is where latency comes from', 'The batch size is wrong and should be 200', 'Nothing; the two numbers are the same'], answer: 1, why: 'Batch size is what fits in one step; concurrency is everything in flight. The 136 requests waiting are queued, and their wait time is most of the TTFT you observe.' },
+  { q: 'Your service needs 50 requests per second with a 2-second end-to-end budget. What concurrency must the system hold?', numeric: true, answer: 100, tolerance: 5, unit: 'requests', why: 'L = λ × W = 50 × 2 = 100 requests in flight. Size the replicas so 100 concurrent requests can be resident, and check that their KV cache fits in GPU memory.' },
+  { q: 'Why can a 95%-utilized system be slower end to end than a 50%-utilized one?', options: ['The GPU throttles at high load', 'At 95% utilization the mean queue wait is 19× the service time, so most latency is waiting, not working', 'Batch size shrinks automatically', 'Memory bandwidth drops with load'], answer: 1, why: 'M/M/1 queueing blows up as ρ → 1. Waiting time grows faster than throughput, so a busier system delivers worse latency for the same work. Scale on queue depth, not utilization.' },
+]} />

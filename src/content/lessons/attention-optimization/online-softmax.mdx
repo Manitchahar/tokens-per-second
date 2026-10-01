@@ -1,0 +1,272 @@
+---
+title: 'Attention’s memory problem & online softmax'
+summary: 'Why naive attention materialises two giant intermediate tensors it barely uses, how much memory and bandwidth that costs, and the one clever trick that removes them entirely: a softmax you can run one tile at a time.'
+objectives:
+  - Compute the size of the score and probability matrices for a real model, context length and GPU
+  - Explain why the intermediate is written once and read only once, and what that costs
+  - Derive the online softmax update rule for the running maximum m, sum ℓ and accumulator O
+  - Show that the online result is identical to the two-pass softmax, not an approximation
+  - Name the four IO-bound problems IO-aware fusion fixes, and which one it fixes
+---
+import AttentionMemory from '@/components/viz/attention-optimization/AttentionMemory.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is the sentence that launched a paper, a product category and this module: **an exact softmax of a row cannot be computed until you have seen the whole row.**
+
+Attention is built out of matmuls and a softmax, and matmuls are the easiest thing on a GPU. The softmax is the part that refuses to be tiled. That single refusal costs more memory than the KV cache, more bandwidth than the weights, and forces any long prompt to crash — not because the model is too big, but because an intermediate nobody needed was written to memory and kept there.
+
+This lesson finds that intermediate, prices it, and then shows you the trick that deletes it.
+
+## Attention, spelled out
+
+You built attention in Module 03. Let me write it once more, because every symbol in this module is one of these symbols.
+
+For a context of $T$ tokens, $n_q$ query heads and head dimension $d$, each head has queries $Q \in \mathbb{R}^{T \times d}$ and it attends to keys $K \in \mathbb{R}^{T \times d}$ and values $V \in \mathbb{R}^{T \times d}$. Three steps:
+
+$$
+S = \frac{QK^\top}{\sqrt{d}}, \qquad P = \operatorname{softmax}_{\text{row}}(S), \qquad O = PV
+$$
+
+$S$ is the **score matrix**: one number per (query, key) pair. $P$ is the **probability matrix**: each row sums to 1. $O$ is the **output**: one vector per query token.
+
+Note the shapes, because everything today follows from them. $Q$ is $T \times d$. $S$ is $T \times T$. **The matmul multiplied the token dimension by itself.** A tensor of $T \times d$ numbers became a tensor of $T \times T$ numbers, and since $T \gg d$ that is a jump of a factor of $T/d$ — thirty-two times more numbers for Llama-3.1-8B, because the hidden size is 4096 and the head dimension is 128.
+
+That is not an implementation detail. That is the shape of attention.
+
+<Callout type="math" title="The causal mask does not save you">
+  Half the $T \times T$ entries are masked out — token $i$ may not attend to token $j > i$. It is tempting to think this halves the memory. It does not, because you still *allocate* the full matrix. A sparse representation would help only if the kernel actually skipped the work, and that is a separate (much harder) optimisation.
+</Callout>
+
+## How big is it, really
+
+One layer, one head, $T = 8{,}192$, BF16 (2 bytes per number):
+
+$$
+\text{bytes} = T \times T \times 2 = 8{,}192^2 \times 2 = 134{,}217{,}728 \approx 134\ \text{MB}
+$$
+
+Now multiply by the two tensors ($S$ and $P$) and the 32 heads:
+
+$$
+134\ \text{MB} \times 2 \times 32 = 8.59\ \text{GB}
+$$
+
+**One layer. One forward pass.** Now the comparison that makes it vivid — the entire KV cache for that same context, all 32 layers:
+
+$$
+8{,}192 \times 131{,}072\ \text{bytes} = 1.07\ \text{GB}
+$$
+
+$$
+\frac{8.59\ \text{GB}}{1.07\ \text{GB}} = 8\times
+$$
+
+The intermediate for **one** layer is eight times the whole KV cache. Run it over all 32 layers and you have asked for 275 GB of transient memory on an 80 GB H100.
+
+<Callout type="intuition" title="The GPU does not care that you free it">
+  A Python or C++ programmer's instinct is: allocate, use, free. It works because CPU memory is unified, large, and cheap to give back. On a GPU the allocator hands out a slab and keeps it — PyTorch's caching allocator holds freed blocks for reuse precisely because releasing to the driver is slow. So an 8.6 GB spike at the peak of layer 1 is not simply returned before layer 2 asks; it competes with the KV cache, the weights and the activations for one flat pool of 80 GB.
+
+  This is why the failure mode is an OOM crash at a context length nowhere near where the arithmetic says you should fail, and why the crash is unpredictable across batch sizes. Module 08's memory planning is what you do when you cannot avoid the spike. **This lesson is how you avoid the spike.**
+</Callout>
+
+## It is also bandwidth
+
+Memory is not the only cost. Module 02's roofline told you attention's arithmetic intensity is $I = T/8$: at $T = 8{,}192$ that is 1,024 FLOP per byte — comfortably compute-bound on paper.
+
+But the roofline assumes you only move operands once. Eager attention moves the intermediate **four** times: write $S$, read $S$ to softmax, write $P$, read $P$ for the final matmul. So the real byte count is:
+
+$$
+B_{\text{real}} = \underbrace{4 T^2 n_q b}_{S \text{ and } P} + \underbrace{4 T d n_q b}_{Q, K, V, O}_{\text{actually needed}}
+$$
+
+At $T = 8{,}192$, $n_q = 32$, $b = 2$, $d = 128$:
+
+$$
+B_{\text{real}} = 4 \times 8{,}192^2 \times 32 \times 2 = 17.2\ \text{GB per layer}, \qquad F = 4 T^2 d n_q = 1.37\ \text{TFLOP}
+$$
+
+On an H100, moving those 17.2 GB takes $B/P = 5.1$ ms, while the arithmetic takes $F/P = 1.4$ ms. **The memory move is 3.8× longer than the math.** The workload is memory-bound, not compute-bound, and the roofline's $T/8$ is a lie caused entirely by the intermediate.
+
+<Scrolly>
+  <AttentionMemory client:visible slot="stage" />
+
+  <Step title="1. Q, K and V sit in HBM">
+    Everything attention starts from is small. For 8,192 tokens these three tensors are about 67 MB per layer — comparable to one layer's weights, and nothing unusual. **No problem here yet.**
+  </Step>
+
+  <Step title="2. One matmul writes S">
+    $S = QK^\top/\sqrt{d}$ turns a $T \times d$ tensor into a $T \times T$ tensor. At 8,192 tokens that is 4.3 GB per layer for $S$ alone, and it has just been written to memory in full.
+  </Step>
+
+  <Step title="3. Softmax reads S, writes P">
+    The normalisation reads all of $S$ back and writes a second tensor of identical size. Now **two** giant tensors are live at once — 8.6 GB for this layer.
+  </Step>
+
+  <Step title="4. The last matmul reads P">
+    $O = PV$ reads $P$ once, and then $S$ and $P$ fall out of scope. They were read exactly once, and they were written exactly once. **The best possible ratio is 1 read per write, and we already hit it.** The problem is not a redundant copy; the problem is that the copy should never have happened.
+  </Step>
+
+  <Step title="5. Count what that costs">
+    Four transfers of a $T \times T$ tensor, per head, per layer: 17.2 GB per layer at this context. Slide $T$ up and watch it go quadratic while the KV cache beside it grows linearly.
+  </Step>
+
+  <Step title="6. The intermediate dwarfs the cache">
+    Set $T$ to 8,192 and look at the ratio: the peak intermediate for one layer is **8× the entire KV cache**. This is why a 32-layer model that stores 1 GB of KV needs 275 GB of transient memory for the same context.
+  </Step>
+
+  <Step title="7. Never write the tile">
+    The fix: do not materialise $S$ at all. Take a block of 128 queries and 128 keys, compute that tile's scores **in SRAM** where they are already 32 KB, and consume it before moving on. Nothing is written to HBM, so there is no spike and no extra traffic.
+  </Step>
+
+  <Step title="8. Carry three vectors between tiles">
+    The obstacle is that softmax needs the whole row. The <Term t="online-softmax">online softmax</Term> answers it: carry a running maximum $m$, a running sum $\ell$ and a running output $O$, and rescale them each tile. That is the entire remaining chapter.
+  </Step>
+</Scrolly>
+
+## Why tiling is not just allowed but necessary
+
+The arithmetic says the fix must be *exact* — a fused attention kernel that approximated the softmax would change model outputs, and you would spend the rest of the course debugging quality regressions (Module 11's whole subject). So the question is whether an exact row-wise softmax can be computed incrementally.
+
+It can. This is the one genuinely clever piece of mathematics in this module, so let us do it slowly.
+
+### The problem
+
+Row $s = (s_1, \dots, s_T)$, and you want $p_i = e^{s_i} / \sum_j e^{s_j}$.
+
+### The blocker
+
+To normalise $p_i$ you need the denominator $\sum_j e^{s_j}$, and to compute that you need every $s_j$. So one tile $[s_1 \dots s_{64}]$, on its own, cannot produce a correct answer.
+
+### The way out
+
+Keep two extra numbers per row and treat them as part of the answer-so-far:
+
+- $m$ — the maximum seen so far.
+- $\ell$ — the sum of $e^{s_j - m}$ over what you have seen.
+
+Both are *sufficient statistics*: whatever order the $s_j$ arrive in, when you have seen all of them, $m$ and $\ell$ are exactly what the two-pass softmax would have. That is the key claim, and it is easy to prove: the maximum is order-independent by definition, and
+
+$$
+\ell = \sum_{j \in \text{seen}} e^{s_j - m} = \frac{\sum_{j \in \text{seen}} e^{s_j}}{e^m}
+$$
+
+so $\ell$ tracks the denominator rescaled to the current maximum. Re-scaling by a new $m$ is exactly the operation you already performed in Module 01's safe-softmax trick, where you subtracted the max to stop $e^x$ overflowing FP16.
+
+### Merging two partial results
+
+Suppose you have processed a prefix and have $(\ell_1, m_1)$, and now you process a tile and get $(\ell_2, m_2)$. Both are normalised to their *own* maxima. To combine them into a state normalised to $m = \max(m_1, m_2)$:
+
+$$
+\ell = \ell_1 e^{m_1 - m} + \ell_2 e^{m_2 - m}
+$$
+
+Every term from the first group was scaled by $e^{m_1 - m}$ and is now scaled by $e^{m_2 - m}$ instead. One multiply, one exponential, one add. **This merge rule is associative, so it does not matter how the work is split** — one block, four blocks, or four thousand. The result is bit-for-bit the same as the two-pass version, up to floating-point rounding.
+
+<Callout type="intuition" title="A rescalable sum is the whole trick">
+  Notice what makes this work: the running sum $\ell$ is stored in a *shifted* form, so that when the shift changes, correcting it costs one multiplication instead of a recomputation. $\ell$ is not the true sum of exponentials — it is the true sum **with respect to the current $m$** — and that single fact is what turns a global reduction into a streaming one.
+
+  This is a general pattern worth carrying: a reduction is fusable into a producer only if the reduction has a compact sufficient statistic that can be cheaply re-based. Module 13's Triton reductions are the same idea in a different costume.
+</Callout>
+
+## You also have to carry the output
+
+The merge rule above gives you $m$ and $\ell$. But the last matmul is $O = PV$, and to accumulate $O$ across tiles you need each tile's contribution expressed against the *final* maximum too — otherwise an early tile computed under a small $m_1$ is over-weighted relative to a later tile computed under a large $m_2$.
+
+So we carry a third piece of state per query row: $O$, the running output. Each tile does:
+
+$$
+\boxed{
+\begin{aligned}
+m_{\text{new}} &= \max(m,\ \max_j s_j) \\
+\ell_{\text{new}} &= \ell\, e^{m - m_{\text{new}}} + \sum_j e^{s_j - m_{\text{new}}} \\
+O_{\text{new}} &= O\, e^{m - m_{\text{new}}} + \sum_j e^{s_j - m_{\text{new}}}\, v_j
+\end{aligned}
+}
+$$
+
+Every line has the same shape: *rescale what you had, add what you just computed, rebased to the new maximum.* Three vectors — $m$, $\ell$ and $O$ — sized $[B_r]$ and $[B_r \times d]$. Nothing else.
+
+That is the entire online softmax, and it is why FlashAttention is exact.
+
+<Callout type="math" title="The accumulation is the same matmul">
+  Look closely at the third line. $\sum_j e^{s_j - m_{\text{new}}}\, v_j$ is precisely the tile's own $P V$ partial product. So the fused kernel still does matmuls — it just does the small ones, on data that never left SRAM, and never writes the result anywhere except into the accumulator. **No work was removed, only the memory traffic was.**
+</Callout>
+
+```python
+# One tile of the online softmax, in PyTorch. This is the heart of a fused kernel.
+def update(m, l, O, s, v):
+    """m, l: [Br] running max & sum. O: [Br, d] running output. s: [Br, Bc] scores."""
+    m_new = torch.maximum(m, s.max(dim=-1).values)          # 1. new max
+    corr = torch.exp(m - m_new)                              # 2. rescale factor
+    p = torch.exp(s - m_new[..., None])                      # 3. tile probabilities
+    l_new = l * corr + p.sum(dim=-1)                         # 4. running sum
+    O_new = O * corr[..., None] + p @ v                      # 5. running output
+    return m_new, l_new, O_new
+
+# Init: m = -inf (nothing seen yet), l = 0, O = 0.
+# After every tile: (m, l, O) = update(m, l, O, s_tile, v_tile)
+# Finish:  O /= l[:, None]     <- the division deferred from every matmul to once, at the end
+```
+
+Note the last line. The final normalisation by $\ell$ happens **once**, after the last tile. In the naive version it happens once per row as well — but there it was applied to a matrix that had to exist in memory to be divided. Here it is applied to the output, which is $T \times d$, not $T \times T$.
+
+## What that buys, in numbers
+
+Take Llama-3.1-8B, one layer, $T = 8{,}192$, 32 heads, BF16.
+
+| | Eager | Fused (FlashAttention) | Ratio |
+|---|---|---|---|
+| Peak extra memory | 8.59 GB | 67 MB ($O$ + tile) | **128×** |
+| HBM traffic, intermediate | 17.2 GB | 0 | — |
+| Arithmetic | 1.37 TFLOP | 1.37 TFLOP | 1× |
+
+The traffic reduction is total: **the intermediate is never written, so it is never read**. What remains in HBM is exactly $Q$, $K$, $V$ and $O$ — the tensors that genuinely have to be somewhere.
+
+Peak memory falls from $O(T^2)$ to $O(T \cdot d)$ per head. At long context that is the difference between a crash and a working prefill.
+
+<Callout type="real" title="What this is worth in practice">
+  FlashAttention was published by Tri Dao and colleagues in 2022 as an exact attention algorithm that never materialises the $T \times T$ matrix. The paper reports 2–4× faster attention than prior implementations and, more importantly for serving, removes the long-context memory constraint entirely: with the standard tiling, memory is linear in $T$ and 8K-to-32K context stops being a special case. At the time of writing it is the default attention path in most production stacks, and it is the reason long-context features became practical rather than exotic.
+</Callout>
+
+## The four problems this fixes
+
+IO-aware fusion is a general technique from Module 02's roofline, and it names four separate pathologies. FlashAttention is not a special case; it is one of the four, and the other three are worth knowing because you will meet them again:
+
+1. **Redundant memory traffic** — reading an operand multiple times. *What FlashAttention fixes:* $S$ and $P$ each moved exactly once, and then not at all.
+2. **Materialisation of intermediates** — writing a temporary to HBM that only the next op needs. *What FlashAttention fixes:* the $T \times T$ tensors are simply never created.
+3. **Low occupancy / insufficient parallelism** — a kernel that cannot fill the machine. *Not* a FlashAttention problem, but it is the reason its tile sizes are chosen the way they are: the $B_r \times B_c$ tile must be shaped to keep every SM busy, which is a scheduling constraint disguised as a numerical one.
+4. **Kernel launch overhead** — the gap between tiny kernels. *Not* this lesson; it is Module 15's entire subject, and FlashAttention's benefit there is simply that it is *one* kernel instead of three.
+
+<Callout type="pitfall" title="Fusing is not free, and the trade is register pressure">
+  Keeping $m$, $\ell$ and $O$ live across the whole tile loop costs registers. Register-limited occupancy is the main reason FlashAttention's tile sizes are tuned per GPU rather than universal, and why an H100 kernel and a T4 kernel do not use the same $B_r$ and $B_c$. If you port a tile size from one architecture to another and it is slower, this is the first thing to check — not your memory system.
+</Callout>
+
+<Callout type="pitfall" title="Numerical stability is not optional">
+  The running maximum only saves you if you initialise it to $-\infty$, not to 0. With $m = 0$ as the start and all scores strongly negative, $\ell$ starts at 0 and the first tile's contribution is scaled by a factor that assumes a larger maximum existed — you get a systematically wrong $\ell$. Initialising `m = -inf` makes the first merge produce `corr = exp(-inf - m_new) = 0`, which correctly annihilates the empty initial state. This is a real bug that passes a smoke test and fails on real data.
+</Callout>
+
+## The plan for the next lesson
+
+You now have the whole idea in your hands: a streaming softmax whose state is three small vectors, so the big tensor never exists. What remains is to turn that into an actual kernel, and the tile loop has real subtleties — the causal mask, choosing $B_r$ and $B_c$, what happens on the diagonal, and how the two matmuls per tile become one fused pass over SRAM.
+
+That is the next lesson. The lab after it puts real numbers behind all of this: measuring an eager attention against fused implementations, on a real GPU, and explaining the gap you find.
+
+<KeyNotes>
+  1. Attention's score matrix is $T \times T$, so it has $T/d$ times as many numbers as its inputs. For Llama-3.1-8B that is 32× — one layer's intermediate at 8,192 tokens is 8.6 GB against a 1.07 GB KV cache.
+  2. Eager attention moves the intermediate **four** times: write $S$, read $S$, write $P$, read $P$. Each tensor is read exactly once, so the problem is not a redundant copy — it is that the copy should never have happened.
+  3. Real bytes are $B_{\text{real}} = 4T^2 n_q b + 4T d n_q b$, which at $T = 8{,}192$ makes attention memory-bound by 3.8× on an H100. The roofline's $T/8$ intensity assumes operands are moved once.
+  4. A row softmax looks global because you need the denominator, but the pair $(\ell, m)$ is a **sufficient statistic**: it is order-independent and re-basable in one multiply, so the reduction can be streamed.
+  5. The merge rule $\ell = \ell_1 e^{m_1 - m} + \ell_2 e^{m_2 - m}$ is associative, so tiles can be combined in any order and the result equals the two-pass softmax exactly, up to rounding.
+  6. The full online update carries **three** vectors per query row: $m$, $\ell$ and $O$. Every line is the same shape — rescale the old state, add the new tile, rebase to the new maximum.
+  7. The tile's contribution $\sum_j e^{s_j - m_{\text{new}}} v_j$ is just its own $PV$. No arithmetic was removed; only the memory traffic was.
+  8. Fused attention drops peak extra memory from $O(T^2)$ to $O(Td)$ — 8.59 GB down to 67 MB per layer at 8,192 tokens, a 128× reduction — and drops intermediate HBM traffic to exactly zero.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B, one layer, 32 heads, T = 8192 tokens, BF16. How many bytes does the probability matrix P alone occupy?', numeric: true, answer: 4294967296, tolerance: 400000000, unit: 'bytes', why: 'P is T x T x 32 heads x 2 bytes = 8192² × 32 × 2 = 67,108,864 × 64 = 4,294,967,296 bytes = 4.29 GB. With S resident too, the peak is 8.59 GB.' },
+  { q: 'Same setup. The KV cache for 8192 tokens across all 32 layers is 131,072 bytes per token. What is the peak of S + P divided by the KV cache, as a ratio?', numeric: true, answer: 8, tolerance: 1, unit: 'x', why: 'S + P = 2 × 8192² × 32 × 2 = 8.59 GB. KV = 8192 × 131,072 = 1.07 GB. 8.59 / 1.07 ≈ 8. So the intermediate for ONE layer is eight times the entire KV cache.' },
+  { q: 'In the online softmax, you have processed a tile and are merging it into a running state. What must you carry between tiles?', options: ['The full row of scores', 'The running maximum m, the running sum ℓ, and the output accumulator O', 'Only the maximum', 'The probability matrix P'], answer: 1, why: 'Three vectors: m so exponentials never overflow, ℓ as the rescaled denominator, and O as the rescaled PV accumulator. Each is O(T) or O(T·d), never O(T²).' },
+  { q: 'Why must the running maximum be initialised to −infinity rather than 0?', options: ['Because 0 is not representable', 'Because with m = 0 the first merge scales an empty state by a factor that assumes a larger maximum existed, giving a wrong ℓ', 'Because the softmax requires positive values', 'It does not matter'], answer: 1, why: 'With m = −inf the first correction factor is exp(−inf − m_new) = 0, which correctly annihilates the empty initial state. With m = 0 the state is treated as if a maximum had already been seen, so ℓ comes out systematically wrong.' },
+  { q: 'Eager attention writes S, reads it for softmax, writes P, and reads P for the final matmul. How many times is the score tensor transferred across the memory bus?', numeric: true, answer: 4, tolerance: 0, unit: 'transfers', why: 'Four transfers of the T x T tensor: write S, read S, write P, read P. Each individual tensor is read exactly once, so this is not redundant traffic — it is traffic for a tensor that should never have existed.' },
+  { q: 'A fused attention kernel runs the online softmax instead. How much of the intermediate does it write to HBM?', options: ['None — it is computed in SRAM and consumed immediately', 'One copy of S, for debugging', 'Half of S, thanks to the causal mask', 'One copy of P, reused across tiles'], answer: 0, why: 'Zero. The tile of scores exists only in on-chip SRAM and is consumed into the accumulator. Because it is never written, it is never read — the intermediate traffic is exactly 0, not merely reduced.' },
+]} />

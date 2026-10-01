@@ -1,0 +1,142 @@
+---
+title: The four numbers you will live by
+summary: Latency, throughput, memory and cost. Drag one slider, batch size, and watch all four move against each other. This is the central trade-off of inference.
+objectives:
+  - Define latency, throughput, memory and cost for an LLM service
+  - Explain why serving many users at once barely slows each decode step
+  - Explain why the KV cache, not the model, limits how many users fit on a GPU
+  - Compute cost per million tokens from a GPU's hourly price and its throughput
+---
+import BatchTradeoff from '@/components/viz/trace/BatchTradeoff.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every decision you will ever make as an inference engineer (which GPU, which engine setting, whether to quantize, how many replicas) moves four numbers. Learn them now and the rest of the course is about moving them in your favor.
+
+1. **Latency**: how long *one user* waits.
+2. **Throughput**: how much work the system does *for everyone*, per second.
+3. **Memory**: whether it all fits on the GPU.
+4. **Cost**: dollars per unit of work.
+
+The punchline, which you will discover yourself in a minute, is that **they fight each other**. Improving one usually hurts another. Knowing exactly how is the whole craft.
+
+## One slider to rule them all
+
+The simulator below models a real setup: **Llama-3.1-8B** (8 billion weights, stored in 16-bit format so 16 GB) on one **NVIDIA H100** GPU (80 GB of memory). The math behind it is the same math you will derive by hand in Module 5. Nothing here is magic.
+
+The key control is **batch size**: how many users' requests the GPU works on *in the same step*. Scroll through the story, then drag the sliders yourself.
+
+<Scrolly>
+  <BatchTradeoff client:visible slot="stage" />
+
+  <Step title="1. One user">
+    Start with one user. To produce *one* token, the GPU must read **all 16 GB of weights** from its memory, because every weight participates in computing the next token.
+
+    Look at the top trace. The long blue span is that read. The amber math span is a sliver. The GPU spends almost the entire step waiting on memory.
+  </Step>
+
+  <Step title="2. Latency">
+    **Latency** is how long a user waits. For generation, the key latency is the time per output token: one decode step. Here it is about **7.5 ms**, or roughly **130 tokens per second** for this user. Faster than anyone can read.
+
+    The H100 reads memory at 3.35 TB/s. We get about 80% of that in practice. 16 GB ÷ 2.7 TB/s ≈ 6 ms, plus ~1.5 ms of fixed overhead per step.
+  </Step>
+
+  <Step title="3. Add users: throughput">
+    Now put **16 users** in the same step. The weights still need reading, but only **once**: every weight, once in the chip, is used for all 16 users' math. The step gets only slightly slower, yet it now produces **16 tokens**.
+
+    **Throughput**, tokens per second for everyone combined, jumped about 15×. This is **batching**, and it is the most important optimization in inference.
+  </Step>
+
+  <Step title="4. Many users">
+    At **96 users** a new cost appears: the lighter blue span. Each user has their own **KV cache** (their conversation's memory), and every step must read all of them too. Per-user speed drops to around 80 tok/s, but total throughput is around 7,800 tok/s.
+
+    Look at the curve at the bottom. Moving right (more throughput) always moves you down (slower for each user). That curve is the **latency–throughput trade-off**.
+  </Step>
+
+  <Step title="5. Memory runs out">
+    Here are 256 users with 4,096 tokens of context each. Every token of every conversation needs 128 KB of KV cache. 256 × 4,096 × 128 KB ≈ **137 GB**. The GPU has 80.
+
+    **Out of memory.** In practice it is almost never the model that limits how many users fit. It is the KV cache. That is why Modules 5, 8 and 10 are all about KV memory.
+  </Step>
+
+  <Step title="6. Cost">
+    A GPU rents for a fixed price per hour (we assume \$2.50 for an H100), whether it produces 100 tokens a second or 10,000. So **cost per token = price per hour ÷ tokens per hour**.
+
+    At batch 1 that is about **\$5 per million tokens**. At batch 96 it is about **\$0.09**, almost 60× cheaper on the *same GPU*. Try the sliders: find the cheapest setting that still gives each user at least 50 tokens per second.
+  </Step>
+</Scrolly>
+
+## The four numbers, precisely
+
+### 1. Latency (per user)
+
+For an LLM, latency is split in two, because users experience two waits:
+
+- **Time to first token** (<Term t="ttft">TTFT</Term>): from sending the request to seeing the first word. Dominated by queueing plus prefill.
+- **Time per output token** (<Term t="tpot">TPOT</Term>): the gap between words once streaming starts. Equal to one decode step.
+
+Total time for a response of $n$ tokens is roughly:
+
+$$
+T_{\text{total}} \approx \text{TTFT} + (n - 1) \cdot \text{TPOT}
+$$
+
+### 2. Throughput (for everyone)
+
+Throughput is output tokens per second summed over all users. In one decode step with batch size $B$, the GPU produces $B$ tokens, so:
+
+$$
+\text{throughput} = \frac{B}{t_{\text{step}}}
+$$
+
+and each individual user sees $\frac{1}{t_{\text{step}}}$ tokens per second. As $B$ grows, $t_{\text{step}}$ grows slowly (more KV to read, eventually more math), so throughput rises while per-user speed falls.
+
+### 3. Memory
+
+A GPU's memory must hold:
+
+$$
+\text{memory} = \underbrace{\text{weights}}_{\text{fixed}} + \underbrace{B \times \text{context} \times \text{KV bytes per token}}_{\text{grows with users and length}} + \text{workspace}
+$$
+
+The weights are paid once. The KV cache is paid **per user, per token**. We derive the *128 KB per token* figure for Llama-3.1-8B in Module 5. It comes straight from the model's shape.
+
+### 4. Cost
+
+$$
+\text{\$ per million tokens} = \frac{\text{GPU \$ per hour}}{\text{throughput (tokens/s)} \times 3600} \times 10^6
+$$
+
+<Callout type="math" title="Check it yourself">
+  At batch 96 the model gives about 7,800 tokens/s. Per hour: 7,800 × 3,600 ≈ 28 million tokens. \$2.50 ÷ 28 million × 1 million ≈ **\$0.09 per million tokens**. At batch 1 (about 133 tokens/s) it is \$2.50 ÷ (133 × 3,600) × 10⁶ ≈ **\$5.20**.
+</Callout>
+
+## Why they fight
+
+- **Latency vs throughput.** Bigger batches mean more tokens per step (good for throughput and cost) but a longer step (bad for each user's latency).
+- **Throughput vs memory.** More users means more KV cache. Memory caps your batch size, and therefore your throughput.
+- **Everything vs cost.** You can always buy lower latency with more GPUs running smaller batches. You pay for it.
+
+<Callout type="real">
+  Real services pick a point on the curve with a **latency target**, an SLO such as "each user gets at least 30 tokens/s and the first token within 1 s", then maximize throughput (and so minimize cost) *subject to* that target. You will formalize this as **goodput** in Module 6.
+</Callout>
+
+<Callout type="pitfall">
+  Beginners often report only one number. "My server does 10,000 tokens/s!" is meaningless without saying the per-user latency and the batch size. A system can always look fast on one number by sacrificing another. Always report all four.
+</Callout>
+
+<KeyNotes>
+  1. **Latency** is per user: TTFT (wait for the first token) and TPOT (time per token while streaming).
+  2. **Throughput** = batch size ÷ step time. Batching reuses each weight read for many users, so throughput rises almost linearly at first.
+  3. Decode for one user is memory-bound: 16 GB of weights read to make one token. That is why batching is nearly free until KV reads or math catch up.
+  4. **Memory** = weights + (users × context × KV bytes per token) + workspace. The **KV cache**, not the model, usually limits how many users fit.
+  5. **Cost per million tokens** = GPU $/hour ÷ (tokens/s × 3,600) × 10⁶. Batching can cut it by 50× on the same hardware.
+  6. The four numbers trade off. Real systems maximize throughput subject to a latency target.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'You raise the batch size from 8 to 64. What usually happens?', options: ['Per-user speed rises and throughput falls', 'Per-user speed falls a little and throughput rises a lot', 'Both rise', 'Nothing, batch size does not matter for decode'], answer: 1, why: 'The weights are read once per step regardless of batch size, so more users share the same read. Throughput rises strongly; each step gets a bit longer, so per-user speed drops slightly.' },
+  { q: 'Why is one-user decode so wasteful on a big GPU?', options: ['The tensor cores are too slow', 'The GPU reads every weight to produce a single token, so it mostly waits on memory', 'The tokenizer is slow', 'The KV cache is too large'], answer: 1, why: 'All 16 GB are streamed from memory to do very little math (for one token). The math units sit idle most of the step: memory-bound.' },
+  { q: 'A GPU costs $2 per hour and produces 5,000 tokens per second at your chosen batch size. What is the cost per million tokens (in dollars)?', numeric: true, answer: 0.111, tolerance: 0.006, unit: '$', why: '5,000 × 3,600 = 18 million tokens per hour. $2 ÷ 18 = $0.111 per million tokens.' },
+  { q: 'What usually stops you from increasing batch size forever?', options: ['The model weights get bigger', 'The KV cache for all users stops fitting in GPU memory', 'The network', 'Python is too slow'], answer: 1, why: 'Each user adds context × KV-bytes-per-token of memory. With long contexts this runs into the GPU memory limit long before anything else.' },
+  { q: 'Which statement is a complete performance report?', options: ['12,000 tokens/s', 'p95 TTFT 450 ms', '12,000 tokens/s total at batch 128, with p95 TTFT 450 ms and 60 tokens/s per user, on one H100', 'It feels fast'], answer: 2, why: 'Throughput alone can be inflated by hurting latency, and latency alone by hurting throughput. A useful report gives both, plus the setup.' },
+]} />

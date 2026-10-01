@@ -1,0 +1,221 @@
+---
+title: 'Step 2: Continuous batching scheduler'
+summary: 'Write the component that decides who runs next. You will build a scheduler with a waiting queue, admission, a token budget, preemption and O(1) frees — and watch the idle tail of static batching disappear as the batch is re-formed at every step.'
+objectives:
+  - Explain why static batching wastes GPU time on a mixed-length workload
+  - 'Write a scheduler loop: free, admit, chunk, preempt, run, emit, record'
+  - Bound a prefill so one long prompt cannot stall everyone’s decode
+  - Choose a preemption policy and defend it with a starvation argument
+  - Predict the effect of a scheduling change on TTFT and TPOT before measuring
+---
+import ContinuousBatching from '@/components/viz/mini-engine/ContinuousBatching.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Your runner can generate tokens for any set of sequences. It has no idea who should be in that set. That decision — repeated tens of thousands of times a second on a busy server — is the <Term t="scheduler">scheduler</Term>, and it is the single most consequential piece of Python in a serving system.
+
+This is the lesson where Module 07's ideas stop being a diagram and become code you can run.
+
+## Two lists, and a loop
+
+A scheduler holds exactly two collections of requests:
+
+- the **waiting** queue: admitted by the API server, not yet prefilled
+- the **running** batch: prefilled, producing one token per iteration
+
+Everything else in a scheduler is bookkeeping on the boundary between them.
+
+```python
+class Scheduler:
+    def __init__(self, max_num_seqs=256, max_num_batched_tokens=8192, kv_manager=None):
+        self.waiting: list[Request] = []
+        self.running: list[Request] = []
+        self.max_num_seqs = max_num_seqs
+        self.max_batched_tokens = max_num_batched_tokens
+        self.kv = kv_manager
+
+    def add_request(self, req):          # called by the API server
+        self.waiting.append(req)
+
+    def schedule(self) -> Batch:
+        """One engine iteration. Returns exactly what the runner should execute."""
+        self.free_finished()             # 1
+        self.admit()                     # 2
+        self.chunk_prefills()            # 3
+        self.preempt_if_needed()         # 4
+        return self.build_batch()        # 5
+```
+
+The <Term t="iteration">iteration</Term> is that call, once per token of every running sequence. Note what is *not* in it: no model code, no memory allocation policy, no HTTP. The scheduler is pure bookkeeping, which is exactly why it can be pure Python without hurting anyone.
+
+<Scrolly>
+  <ContinuousBatching client:visible slot="stage" />
+
+  <Step title="1. Static batching: four at a time">
+    The simplest thing that batches: take four requests, run them to completion together. The GPU is fully occupied — nobody can complain about utilisation. But every user waits for the slowest member of their group, and they have no idea why.
+  </Step>
+
+  <Step title="2. The idle tail">
+    A short answer finishes at step 6 of 11. Its slot is then occupied by a request producing nothing, while three long answers continue. Hatched means exactly that: memory held, GPU time wasted. Under mixed lengths this tail is a large fraction of the machine.
+  </Step>
+
+  <Step title="3. Slots, not groups">
+    Continuous batching redefines the batch as a set of **slots**. Membership is not a property of the batch, because the batch does not persist — it is re-derived at each step boundary from whoever is running right now.
+  </Step>
+
+  <Step title="4. Re-formed at every step">
+    A sequence that emits its stop token is removed and its blocks freed at that boundary. A waiting request is admitted into the free slot immediately, so its prefill starts on the very next iteration. The 8-request workload finishes in far fewer iterations than two rigid groups would need.
+  </Step>
+
+  <Step title="5. The token budget is a lever">
+    `max_num_batched_tokens` caps the tokens one iteration may process. Decode claims its share first; whatever remains is the prefill chunk. Lowering the budget shortens the longest possible stall on decode, at the cost of slower long prompts.
+  </Step>
+
+  <Step title="6. Chunked prefill">
+    A prompt longer than the remaining budget is not run whole. It is prefilled in chunks across several iterations, so it becomes a series of ordinary steps instead of one giant one. Everyone keeps generating throughout.
+  </Step>
+
+  <Step title="7. What the queue is telling you">
+    The occupancy strip is the health check. Slots filling and emptying is a scheduler working. A bar pinned at the top while the waiting count climbs is a system at capacity — throughput looks fine and latency is about to diverge.
+  </Step>
+</Scrolly>
+
+## The five functions, in order
+
+**1. Free.** Remove finished sequences and return their blocks. This must be O(1) per request, which is a consequence of the block table from Module 08: you do not search the pool, you read the request's row.
+
+**2. Admit.** While there is room in `max_num_seqs` and budget in `max_num_batched_tokens`, move requests from waiting to running and allocate their first block.
+
+```python
+def admit(self):
+    budget = self.max_num_batched_tokens
+    while self.waiting and len(self.running) < self.max_num_seqs:
+        req = self.waiting[0]
+        need = min(req.prompt_len - req.prefilled, budget)
+        if need <= 0:
+            break
+        if not self.kv.allocate(req, need):
+            break                      # no memory: this request waits
+        self.running.append(self.waiting.pop(0))
+        budget -= need
+```
+
+<Callout type="pitfall" title="The bug that makes a scheduler look fine">
+  Admitting a request *without checking that its blocks were allocated*, then discovering the failure later. A scheduler that admits on intent and allocates optimistically will happily run a batch that cannot fit, and the OOM will surface inside a CUDA kernel as an opaque message. **Allocate first, admit second.** The KV manager's `allocate` returning a falsy value must be the only way a request is refused.
+</Callout>
+
+**3. Chunk.** If a request's remaining prompt exceeds the budget, prefill only part of it and remember where it stopped. This is Module 10's chunked prefill, and it is the difference between a scheduler that degrades gracefully and one that has a latency cliff.
+
+**4. Preempt.** If admission failed for want of memory, evict a running sequence. Which one is a policy decision, and the default should be **LIFO: evict the most recently admitted.**
+
+**5. Run.** Build the batch: one row per running sequence for decode, plus the prefill chunks as extra rows. Pass it to the runner. Record the metrics.
+
+<Callout type="intuition" title="Why LIFO, not FIFO">
+  Evicting the newest request protects long-running conversations. A request that has been decoding for 900 steps and is nearly finished should not be thrown out to serve one that has been running 3 steps — that one can wait, and waiting is cheap for it. FIFO preemption starves exactly the requests that have already paid the most latency, and it is the classic way to make a tail latency problem worse. vLLM evicts in reverse-admission order by default.
+</Callout>
+
+## Watch one admission happen
+
+Numbers make the loop concrete. Take the configuration from Step 2 of the visual: `max_num_seqs = 8`, `max_num_batched_tokens = 512`, pool of 25,100 blocks.
+
+The scheduler starts this iteration with 6 running sequences and 5 waiting. After one finishes, the 5 survivors claim one decode token each, leaving **507** of the 512 for prefill:
+
+| Order | Action | Tokens used | Budget left | Result |
+|---|---|---|---|---|
+| 1 | free | — | 512 | one finished → 5 running, its blocks returned |
+| 2 | decode rows | 5 | 507 | the 5 running sequences each claim one token |
+| 3 | admit `w1`, prompt 300 | 300 | 207 | fits whole; `w1` prefills and starts decoding |
+| 4 | admit `w2`, prompt 1,200 | 207 | 0 | budget short → take a **207-token chunk** |
+| 5 | admit `w3` | 0 | 0 | `need <= 0`: stop admitting |
+
+Total this iteration: $\text{5} + 300 + 207 = 512$ exactly, and `w2` resumes next iteration with 993 tokens left to prefill. Now suppose the implementation *checked* the budget after admitting rather than charging it — `w2` would take its full 1,200-token prompt, and the iteration would process $\text{5} + 300 + 1{,}200 = 1{,}505$ tokens, **almost three times the cap**. That is the bug the assert catches:
+
+```python
+assert sum(r.tokens_this_step for r in batch) <= self.max_num_batched_tokens
+```
+
+The fix is to charge the budget before admitting, not after:
+
+```python
+def admit(self, budget):
+    while self.waiting and len(self.running) < self.max_num_seqs:
+        req = self.waiting[0]
+        need = min(req.prompt_len - req.prefilled, budget)
+        if need <= 0:
+            break                                   # budget exhausted: no more admissions
+        if not self.kv.allocate(req, need):         # memory check first
+            break
+        self.running.append(self.waiting.popleft())
+        budget -= need                             # and debit immediately
+```
+
+Charge first, allocate second, admit third. Every ordering error here shows up as a batch that overruns its budget by one request, which in production is a latency spike attributed to nothing in particular.
+
+<Callout type="intuition" title="Why the budget must be a hard cap, not a target">
+  A budget that is "approximately" respected is not respected at all, because the overshoot is unbounded in request size. With a target, one 512-token prefill can arrive beside 200 decode rows and the step takes three times as long as every user was promised. **The budget exists to bound the worst case, and a bound that can be exceeded is not a bound.**
+</Callout>
+
+## What preempting costs
+
+Preemption has two implementations and the choice is a real trade:
+
+| Policy | Mechanism | Cost when triggered |
+|---|---|---|
+| **Recompute** | free the blocks, re-prefill from tokens if rescheduled | FLOPs: one prefill of the whole prefix |
+| **Swap** | copy the blocks to host memory, free them, copy back later | PCIe bandwidth, and host RAM |
+
+Recompute wins whenever the model is compute-rich and memory-poor, which is the normal case for decode. That is why it is the more common default: evicting a 4,000-token request costs one prefill of 4,000 tokens — a few hundred milliseconds of compute shared across the batch — while swapping costs a 512 MB round trip over PCIe.
+
+<Callout type="math" title="Preemption is a symptom, not a bug">
+  Eviction happens when $\text{demand} > \text{supply}$, where supply is `pool_blocks × 16` tokens. Once your scheduler is preempting on every iteration, you are past capacity and **no scheduling policy will save you**: the only fixes are more KV memory, shorter contexts, a smaller `max_model_len`, or fewer requests. `preemption_count` climbing on a dashboard means the operator question, not the engineering one.
+</Callout>
+
+## Predict before you measure
+
+Every knob in the scheduler has a predictable sign on each latency metric. Write this down before you touch anything:
+
+| Change | TTFT | TPOT | Throughput | Memory |
+|---|---|---|---|---|
+| Raise `max_num_batched_tokens` | ↑ (more queueing behind a longer prefill) | ↓ (decode wins a bigger share) | ↑ | — |
+| Lower `max_num_batched_tokens` | ↓ | ↑ | ↓ | — |
+| Raise `max_num_seqs` | ↑ | ↑ | ↑ | ↑ |
+| Enable prefix caching | ↓ sharply on shared prefixes | ~unchanged | ↑ | ↓ (blocks shared) |
+| Add a 0.9 V0 / chunk budget | ↓ | ~unchanged | ~unchanged | ↓ |
+
+<Callout type="real" title="The single knob most people get wrong">
+  `max_model_len` is not a safety limit, it is the **concurrency setting**. It determines the worst-case blocks per request, and worst-case blocks per request divided into your pool *is* your maximum concurrency. Setting it to the model's maximum trained context, as the default does, can cut your concurrent users by 8× for no benefit at all. Set it to your measured p99 of `prompt + max_new_tokens`.
+</Callout>
+
+## Check yourself
+
+```python
+# invariants your scheduler must never violate
+assert len(batch) <= self.max_num_seqs
+assert sum(len(r.tokens_this_step) for r in batch) <= self.max_num_batched_tokens
+assert all(r.blocks_allocated for r in self.running)
+assert self.kv.blocks_used() <= self.kv.total_blocks
+```
+
+Then run one experiment that teaches you more than any amount of reading: **set `max_num_seqs` to 1** and measure throughput, then to 256. The ratio is the raw, un-fudged value of everything this lesson describes, measured on your own hardware.
+
+<KeyNotes>
+  1. A scheduler holds two lists — **waiting** and **running** — and its job is moving requests across the boundary. Everything else is bookkeeping.
+  2. The batch is **not** a persistent group. It is re-derived at every step boundary, so a finished sequence frees its slot on the very next iteration.
+  3. Static batching wastes the idle tail of short requests. On a mixed-length workload that tail is a large fraction of the machine.
+  4. Allocate blocks **before** admitting. A scheduler that admits optimistically OOMs inside a kernel instead of refusing politely.
+  5. The token budget bounds how long any single prefill can stall decode. Without it, one long prompt is everybody else's latency spike.
+  6. Preempt **LIFO**. Evicting the newest protects long-running conversations from being starved; FIFO preemption makes tails worse.
+  7. Recompute preemption costs FLOPs and swap preemption costs PCIe bandwidth. Decode is usually compute-rich, so recompute is the cheaper default.
+  8. Preemption means you are past capacity. No policy fixes it — add KV memory, shorten contexts, or lower `max_model_len`.
+  9. `max_model_len` is the concurrency knob, not a safety limit: `max_concurrency ≈ pool_blocks / ceil(max_model_len / 16)`.
+  10. Charge the token budget **before** admitting, not after. Checking after lets one prompt triple the iteration, and a bound you can exceed is not a bound.
+  11. Every scheduling knob has a **predictable sign** on TTFT and TPOT. Write the prediction down before you measure, or you will not know whether a change helped.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why is continuous batching dramatically better than static batching on a workload with mixed output lengths?', options: ['It uses faster kernels', 'Because finished sequences free their slots immediately instead of waiting for the slowest member of their group', 'It reads the weights fewer times per second', 'Because it sorts requests by length first'], answer: 1, why: 'Static batching holds a finished request’s slot (and its KV memory) until the whole group ends. Continuous batching re-forms the batch each step, so short requests are cheap and nothing waits on a slow neighbour.' },
+  { q: 'What is the standard preemption policy in a vLLM-style scheduler, and why?', options: ['FIFO, because fairness matters most', 'LIFO / newest-first, to protect long-running conversations from being starved', 'Random, to avoid systematic bias', 'Largest-context-first, to minimise total bytes'], answer: 1, why: 'A request that has already decoded 900 steps has paid the most latency and is nearly finished. Evicting the newest protects it, and the newly arrived request can afford to wait.' },
+  { q: 'Your batch has 32 running sequences and `max_num_batched_tokens` is 512. How many tokens are available for prefill this iteration?', numeric: true, answer: 480, tolerance: 8, unit: 'tokens', why: 'Decode claims one token per running sequence: 32. The remaining 512 − 32 = 480 tokens are the prefill chunk. This is why a long prompt is chunked rather than run whole.' },
+  { q: 'Your scheduler admits a request, then finds out the KV allocation failed. What should it do, and why does the order matter?', options: ['Admit anyway and let the runner fail fast', 'Allocate first and admit only on success, so refusal happens in the scheduler instead of as an OOM inside a kernel', 'Retry with a smaller context automatically', 'Drop the oldest running sequence to make room'], answer: 1, why: 'Allocation failure is a normal control-flow event in a scheduler. If you admit before allocating, the failure surfaces deep in a CUDA kernel as an opaque message with no request identity attached.' },
+  { q: 'Your 80 GB H100 has a 52 GB KV pool of blocks of 16 tokens for Llama-3.1-8B (128 KB/token). At `max_model_len = 32,768`, what is the maximum concurrency?', numeric: true, answer: 12, tolerance: 1, unit: 'requests', why: 'Pool tokens = 52 × 10⁹ ÷ 131,072 ≈ 397k tokens ≈ 24,800 blocks. At 32,768 tokens each request needs 32,768/16 = 2,048 blocks. 24,800 ÷ 2,048 ≈ 12. Dropping `max_model_len` to 8,192 gives 512 blocks per request and ≈ 48 requests — four times the concurrency for one flag.' },
+  { q: 'You lower `max_num_batched_tokens` from 4096 to 512. What happens to decode latency and throughput?', options: ['Both improve', 'TPOT rises and throughput falls, because decode competes for a smaller share of each iteration', 'TPOT falls and throughput rises', 'Neither changes; the budget only affects prefill'], answer: 1, why: 'A smaller budget means the prefill chunk is smaller, so a decode step is followed sooner by the next one. That helps TTFT but adds overhead per iteration and reduces the work done per step.' },
+]} />

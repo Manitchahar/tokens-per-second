@@ -1,0 +1,199 @@
+---
+title: 'Workloads, warm-up & reproducible runs'
+summary: 'A benchmark is only as good as the workload you fed it and the rig you ran it on. Learn to build a representative workload, warm up properly, and repeat enough to know which differences are real.'
+objectives:
+  - Explain why an un-warmed benchmark reports a number that does not exist
+  - Build a workload from a real prompt and output-length distribution, not one sentence
+  - 'Control the variables that silently change a measurement: seed, versions, clocks, other tenants'
+  - Decide how many repeats a given effect size needs
+  - Recognise when two numbers are not comparable and say why'
+---
+
+import RunVariance from '@/components/viz/benchmarking/RunVariance.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Someone hands you two numbers: "the old engine did 4,200 tokens per second, the new one does 4,700." One of them is a lie, or both are, or they measured different things.
+
+Inferring an optimization from an unrepeatable measurement is the single most common way competent people waste a month. This lesson is the discipline that prevents it.
+
+## Warm-up: your first measurement is a lie
+
+Before a GPU has run a given shape of work even once, it has paid a pile of one-off costs:
+
+- **Kernel compilation.** PyTorch compiles and caches kernels per shape and dtype. The first call through a new shape pays JIT or cache-miss cost — sometimes seconds.
+- **Memory allocation.** The caching allocator has to grow its pools. Early allocations hit `cudaMalloc`, which is slow and synchronising.
+- **Cache filling.** L2 is cold, so the first pass reads every weight from HBM.
+- **Autotuning.** If the kernel does runtime autotuning, it measures candidate algorithms on your first call.
+- **Clock ramp.** The GPU boosts its clocks over the first few hundred milliseconds of load. A cold T4 sits at a lower clock than a warm one.
+
+None of these happen in production, where the server is busy from the first second. So the number they produce is **not a property of your system** — it is a property of starting up.
+
+<Callout type="math" title="What warm-up is worth">
+  From the visual: the first iteration costs about **100% more** than steady state — 9.4 ms versus 7.2 ms. If you time 5 requests and the first one is 50 ms of cold-start noise, your mean is off by roughly 10%, and your p95 is off by a factor of two.
+
+  The rule that works: **discard everything until the curve is flat.** Not "average it in" — discard it.
+</Callout>
+
+How much warm-up? Run iterations until the measured time stops changing. In practice:
+
+- **Fixed workload benchmarks:** 10–20 warm-up iterations, then time 50–200.
+- **First-token/short-request benchmarks:** more, because you are often measuring a cold path. Warm until p50 of the last two batches of 10 agrees within a few percent.
+- **Multi-process or multi-GPU rigs:** warm *every* worker, or your measurement is a mixture of hot and cold workers.
+
+<Scrolly>
+  <RunVariance client:visible slot="stage" />
+
+  <Step title="1. One run is a single sample">
+    Each dot is one complete run of an identical workload. If you only ever run something once, you have one sample from a distribution whose width you have never seen.
+
+    You cannot tell a real 5% improvement from a lucky Tuesday.
+  </Step>
+
+  <Step title="2. Repeat the identical thing">
+    Twelve repeats of the exact same code, prompt, model and GPU. Nothing changed between them except that they are different draws.
+
+    Nine of them land in a tight cluster near 7 ms. That cluster is your real system.
+  </Step>
+
+  <Step title="3. The spread is real, not noise">
+    One run at 11.8 ms sits far above the rest. It is the kind of thing that happens: another process on the GPU, a background compile, a page fault, a clock dip.
+
+    You cannot delete it from reality, but you can refuse to let one sample set your conclusion. **The median ignores it; the mean does not.**
+  </Step>
+
+  <Step title="4. Warm-up is its own curve">
+    The amber curve is time per iteration against iteration number. It starts at about twice steady state and decays over roughly ten iterations.
+
+    This is why "measure 10 requests and divide" is wrong in both directions: the mean is inflated by the cold start, and the sample is far too small to see a 5% effect.
+  </Step>
+
+  <Step title="5. Why the mean misleads">
+    The dashed amber line is the mean, dragged upward by the outlier. The green marker is the median, sitting on the cluster.
+
+    Here the mean is about 6% above the median. On a noisier machine, or with 5% of runs being pathological, that gap can be 30% — and it will always push in the pessimistic direction, because slow things are slow in many more ways than fast things are fast.
+  </Step>
+
+  <Step title="6. Report the shape">
+    The trustworthy summary of a timing run is a **median plus a tail**: "7.2 ms median, 11.8 ms at the slowest of 12". Two numbers, both meaningful, and together they tell a reader whether your rig is trustworthy at all.
+  </Step>
+
+  <Step title="7. Fix the harness before the system">
+    If your own repeats of the *same* thing disagree by more than a few percent, no comparison you make with that harness will mean anything.
+
+    Warm up until flat, repeat at least five times, report median and p95, and pin everything that can drift — seed, library versions, GPU clocks, and make sure nobody else is on the GPU.
+  </Step>
+</Scrolly>
+
+## The workload is half the measurement
+
+Most misleading benchmarks are not bad code. They are **representative of nothing**.
+
+A benchmark with one prompt and one output length measures exactly one point in a two-dimensional space you actually live in. Real traffic varies in prompt length, output length, and content — and each of those changes the answer.
+
+### The two axes that matter
+
+| Axis | Effect on measurements | What real traffic looks like |
+|---|---|---|
+| **Prompt length** | Drives TTFT and prefill cost; attention cost grows superlinearly past a few thousand tokens | Log-normal-ish: a short chat majority, a long tail of 8k–100k documents |
+| **Output length** | Drives E2E linearly via $(n-1)\times$TPOT; drives KV cache size linearly | Often close to log-normal, with a few very long generations |
+
+<Callout type="pitfall" title="The synthetic-prompt trap">
+  Benchmarking with `"Hello, my name is"` measures short-prompt, short-output work. Almost every real application is long-prompt or long-output, sometimes both. The gap is not subtle:
+
+  - Prefill cost scales roughly linearly with prompt length, and attention superlinearly.
+  - KV cache per request scales with *both* lengths, so it sets your concurrency, which sets throughput.
+
+  A benchmark that ignores length distribution will pick a configuration that is optimal for a workload you do not have. This is the most common way a well-tuned system underperforms in production.
+</Callout>
+
+### Building a representative workload
+
+You do not need perfect realism. You need a workload whose *summary statistics* match production on the axes that matter:
+
+1. **Take a sample of real prompts** if you possibly can — even 100 anonymized ones beats any synthetic set. Strip the personal data and the cache hits, and keep the lengths.
+2. **If you cannot**, synthesize from the *shape* of your traffic: pick a length distribution, a content mix (code, prose, structured output), and a stop condition.
+3. **Model output length explicitly.** Do not hard-code `"Sure! Here's..."` — generate until a realistic length. Most harnesses parameterize this as an `--output-len` or use a real generation with a max-token cap and an early-stop.
+4. **Report the distribution**, not just the mean: report median and p90 prompt length, and mean output length.
+
+<Callout type="intuition" title="Why length distribution, not length average">
+  Suppose two workloads both average 1,000 prompt tokens. In one, every prompt is 1,000. In the other, half are 50 and half are 1,950. The average TTFT is similar, but the second is much worse in practice: the long half dominates the p95, drives KV memory, and sets your concurrency cap.
+
+  The *distribution* is the workload. An average is a summary that hides the thing that will page you.
+</Callout>
+
+## Control the variables that move under you
+
+A benchmark is an experiment. Everything that changes between the "before" and "after" other than the thing you are testing is a confound.
+
+| Variable | Why it moves the number | How to control it |
+|---|---|---|
+| **Warm-up state** | First calls pay compile/allocate | Discard warm-up; measure steady state |
+| **GPU clocks** | Boost/thermal state changes throughput 10–30% | Long warm-up, lock clocks if you can, interleave A/B |
+| **Other tenants** | Any other process steals SMs and bandwidth | Dedicated GPU, check `nvidia-smi` before and after |
+| **Library versions** | A different PyTorch or CUDA can change kernels | Pin versions; log them in the report |
+| **Seed & sampling** | Different sampled tokens → different output lengths → different work | Fix seed and temperature, or set deterministic greedy decoding |
+| **Prompt content** | Different content can hit prefix-cache or not | Same prompts for A and B, in the same order |
+| **Batching/scheduling** | Run order changes batch composition | Same arrival pattern, same order |
+
+The one people forget is **run order**. If you benchmark A for 10 minutes, then B for 10 minutes, the GPU is hotter for B and its clocks are lower. The fix is either to lock clocks, or to **interleave**: run A, B, A, B in short bursts so both experience the same thermal and cache conditions.
+
+<Callout type="real" title="What production-grade benchmarking rigs do">
+  At the time of writing, mature setups share a few habits that are worth copying regardless of tooling:
+
+  - **Interleaved A/B** at fine granularity, not A-then-B blocks.
+  - **Clock locking** where the hardware permits it, or a long warm-up soak to reach a steady thermal state.
+  - **Many repeats with reported distributions**, not a single headline number.
+  - **The full config captured in the result**: model revision, quantization, engine flags, batch/concurrency settings, workload file.
+  - **A results file you can diff against the previous run**, so a regression is visible as a diff rather than a feeling.
+
+  This is exactly what the project at the end of this module asks you to build.
+</Callout>
+
+## How many repeats do you need?
+
+The honest answer: enough that the difference you care about is larger than the spread you measure. A rule of thumb that works:
+
+- If run-to-run spread is about 2–3% (well-controlled rig), then a 10% effect is real after 3–5 repeats.
+- If the spread is 10%+ (noisy rig), you need many more repeats, and you should first fix the rig.
+
+A cheap, rigorous way: run both configurations interleaved 20+ times each, take medians, and check whether the distributions overlap. If the 5th percentile of A is above the 95th percentile of B, the difference is real regardless of how many samples you took.
+
+<Callout type="math" title="The 2× rule of thumb">
+  If the thing you are trying to detect is a fraction $\delta$ of the baseline, and your per-run coefficient of variation is $c$, then roughly $k \approx (2c/\delta)^2$ interleaved runs per arm separate the two reliably.
+
+  Example: you want to detect a 5% change ($\delta = 0.05$) on a rig with $c = 0.03$. Then $k \approx (2 \times 0.03/0.05)^2 \approx 1.4$, so a handful of runs is plenty — *if* the rig is that clean. If $c$ were 0.15, you'd need $k \approx 36$. **The first job is lowering $c$, not raising $k$.**
+</Callout>
+
+## The meta-rule
+
+> **A benchmark is a claim about a specific system, on specific hardware, under a specific workload, at a specific moment. A result without all four is a number, not a finding.**
+
+When you report a benchmark, the sentence you write should be checkable by someone else. Not:
+
+> "Continuous batching is 12× faster."
+
+But:
+
+> "On one H100, Llama-3.1-8B BF16, 200 concurrent requests with a mixed 1k-prompt/200-output workload, continuous batching reached 6,100 output tok/s at p95 TPOT 24 ms, versus 700 tok/s at p95 TPOT 8 ms without it, median of 5 interleaved runs after 20 warm-up iterations."
+
+The second one is a finding. The first is a vibe.
+
+<KeyNotes>
+  1. **Warm-up is not optional.** First calls pay kernel compilation, allocation, cold caches and clock ramp. Discard iterations until the curve is flat.
+  2. A single run cannot support a conclusion. Repeat at least 5 times; report **median + tail**, not a mean.
+  3. The **mean is dragged upward by outliers**; the median ignores them. For timing, the median is the honest summary.
+  4. The **workload is half the measurement**. Its two critical axes are prompt length and output length, and their *distributions* — not their averages — determine what you actually optimized for.
+  5. Match production on length distributions and content mix. A benchmark with one short prompt optimizes for a workload you do not have.
+  6. Interleave A/B runs so both see the same thermal and cache state; block A-then-B biases against whichever ran second.
+  7. Lock or soak the clocks, dedicate the GPU, and pin library versions, seed and sampling — every uncontrolled variable is a confound.
+  8. A result is only a finding when it names the system, hardware, workload and moment. Everything else is a number.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Ten repeated runs of an identical workload give times: 7.0, 7.1, 7.2, 7.1, 7.0, 7.3, 7.1, 7.2, 7.1, 15.4 ms. Which single number best represents steady-state performance?', options: ['The mean, 7.95 ms', 'The median, 7.1 ms', 'The maximum, 15.4 ms', 'The minimum, 7.0 ms'], answer: 1, why: 'Nine of ten runs sit at 7.0–7.3 ms; the 15.4 ms is an outlier (interference, a compile, a clock dip). The median (7.1 ms) describes the system. The mean (7.95) is inflated by the outlier.' },
+  { q: 'You want to detect a 4% performance change. Your rig’s per-run coefficient of variation is about 3%. Roughly how many interleaved runs per arm does the 2× rule suggest?', numeric: true, answer: 2, tolerance: 1.5, unit: 'runs per arm', why: 'k ≈ (2c/δ)² = (2×0.03/0.04)² = 2.25, so about 2–3 runs per arm suffice — because the rig is clean. Had c been 0.15, you would need ≈56. The first job is lowering c.' },
+  { q: 'Which is the strongest reason to sweep prompt length rather than benchmark a single fixed prompt?', options: ['It is faster to run', 'Prompt length drives prefill cost and KV memory, and long prompts dominate the tail of real traffic', 'Long prompts always return more tokens', 'Fixed prompts disable the KV cache'], answer: 1, why: 'Prefill scales with prompt length (attention superlinearly at long context), and KV memory per request scales with it too — so prompt length sets both TTFT and your concurrency ceiling. Real traffic has a long tail of long prompts.' },
+  { q: 'You time 20 requests including a 300 ms first-call warm-up and the rest are 7 ms. What is wrong with reporting the mean?', options: ['The mean is always too low', 'The mean is inflated by the warm-up outlier, describing a startup cost that does not exist in production', 'Nothing, the mean is fine', 'The mean cannot be computed from timing data'], answer: 1, why: 'The mean mixes a one-time startup cost into every steady-state sample, overstating steady-state time. Discard warm-up iterations; steady state is the mean of the remaining 19 (~7 ms).' },
+  { q: 'Two engines are benchmarked: engine A first for 10 minutes, then engine B for 10 minutes. B measures slower. What is the most likely confound?', options: ['B is a worse engine', 'The GPU is hotter by the time B runs, so its clocks are lower — a thermal bias against whichever runs second', 'B used a smaller batch', 'The tokenizer ran slower for B'], answer: 1, why: 'Sequential A-then-B blocks bias against the second arm through heat and clock ramp. Interleave in short bursts, or lock clocks, so both arms see the same conditions.' },
+  { q: 'How many tokens of KV cache does a single request use at 8,192 total context for Llama-3.1-8B in BF16 (128 KB/token)?', numeric: true, answer: 1.05, tolerance: 0.08, unit: 'GB', why: '8192 tokens × 128 KB = 1,048,576 KB ≈ 1.05 GB. This is per request; at high concurrency it is what fills (or overflows) the GPU.' },
+]} />

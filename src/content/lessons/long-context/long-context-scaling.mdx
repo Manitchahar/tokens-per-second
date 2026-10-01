@@ -1,0 +1,234 @@
+---
+title: 'What breaks at long context'
+summary: 'Long context is not one problem, it is three, and they arrive at different lengths and need different fixes. You will derive where each one starts hurting, learn why "just use a smaller window" is a product decision rather than an engineering one, and see what a model actually does when it cannot find the answer near the end of its context.'
+objectives:
+  - Compute KV memory, prefill time and decode step time at any context length from the formulas you already own
+  - Name the three walls of long context and the context length at which each one bites
+  - Explain why attention quality degrades before the arithmetic does, and what lost-in-the-middle means
+  - Decide whether a given long-context request should be served, truncated, or evicted
+  - Distinguish the fixes that help all three walls from the ones that help exactly one
+---
+import ContextWalls from '@/components/viz/long-context/ContextWalls.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Somebody asks a model to read a 90,000-word contract and answer one question about clause 47. The model has a 128,000-token window, so it fits. The numbers all pass: the cache fits on an H200, the prefill finishes in eleven seconds, the decode step stays under fifty milliseconds.
+
+And then it answers with the wrong clause.
+
+Nothing crashed. No number failed. The arithmetic was fine and the answer was still wrong, which is a harder thing to debug than an out-of-memory error and a far more expensive one, because it ships.
+
+That gap between "the request fits" and "the request works" is what this lesson is about. We will start with the arithmetic you already own, push it until it breaks, and then look at the one failure mode that no formula predicts.
+
+## Everything scales with the same three numbers
+
+You have already derived, twice, the arithmetic of a long request. Let me put the pieces on one page, because the whole lesson is just pushing them to larger arguments.
+
+**Memory** is linear in context. From Module 05, one token of context costs $b_{kv} = 2 L H_{kv} D b$ bytes, and a conversation of $T$ tokens costs $T b_{kv}$. For Llama-3.1-8B in BF16, with 32 layers, 8 key/value heads, head dimension 128 and 2 bytes per number, that is **131,072 bytes**. No new physics.
+
+**Prefill** is quadratic, because attention is. A prompt of $n$ tokens costs $n^2 \cdot 4 d L$ FLOPs of attention on top of the $n \cdot 2P$ FLOPs of projections, and those are not the same order.
+
+**Decode** is linear and relentless. Each step reads the weights once and the *whole* cache of every conversation in the batch, again and again, for as many steps as the answer takes.
+
+Now push them. On one H100 with 32 conversations at 8,192 tokens each — a completely ordinary setup — everything is comfortable. At 32,768 tokens the same service is visibly worse. At 131,072 tokens it is impossible. And the reason it is impossible is not one wall. It is three, stacked, each with a different personality.
+
+<Scrolly>
+  <ContextWalls client:visible slot="stage" />
+
+  <Step title="1. A service that fits">
+    One H100, 32 conversations, 4,096 tokens each. That is 16.1 GB of weights, 3.2 GB of workspace and 17.2 GB of cache — 36.5 GB of 80, comfortably inside. **Every panel on this canvas is healthy.** This is the picture you have been carrying since Module 05, and it is worth internalising before we break it.
+  </Step>
+
+  <Step title="2. The cache grows linearly">
+    Slide out to 32,768 tokens and nothing has *failed*, but every number is eight times worse and all three are worse at once. The model did not change. The hardware did not change. **The same arithmetic, evaluated at a bigger argument, is the entire problem** — which is why long context is an arithmetic problem before it is an engineering one.
+  </Step>
+
+  <Step title="3. Wall one: memory">
+    At 128K, those 32 caches alone want **549 GB**. There is no card with 549 GB. Memory is the first wall because it is the only one that is a hard refusal: an <Term t="oom">out of memory</Term> error, a failed request, nothing learned. It is also the easiest to predict, since you have had the formula since Module 05.
+  </Step>
+
+  <Step title="4. Wall two: prefill arithmetic">
+    The attention term $n^2 \cdot 4 d L$ only overtakes the projection term $n \cdot 2P$ at $T = P / 2dL$ — about **30,600 tokens** for Llama-3.1-8B. Past that line, a growing share of prefill is the quadratic attention matrix. This is a compute wall: it is slow, it is expensive, but it completes.
+  </Step>
+
+  <Step title="5. Wall three: decode bandwidth">
+    The per-sequence cache read overtakes the weight read when $T b_{kv} = P b$ — about **122,500 tokens**. Below that line the cache is noise next to the weights; above it, every single token you generate pays more for the cache than for the model. This is the most expensive wall, because unlike the other two it charges you again for every token of the answer.
+  </Step>
+
+  <Step title="6. All three, together">
+    Back to 32K, where nothing has crashed. All three effects are already present, all three get worse together, and no fix touches more than one of them. **That is the actual difficulty of long context** — not that each problem is hard, but that they are separate problems sharing one symptom.
+  </Step>
+
+  <Step title="7. Three different problems">
+    Memory is binary and static: it either fits or it does not, and you know before the request arrives. Prefill is one expensive event, paid once, at the start. Decode is a permanent tax on every token for the rest of the conversation. Fixing one buys you nothing against the other two.
+  </Step>
+</Scrolly>
+
+## Wall one, properly: the memory cliff
+
+Memory is the wall everyone meets first, so let me be precise about its shape. From Module 05's division, the conversations a card can hold is:
+
+$$
+N_{\max} = \left\lfloor \frac{(M - W - S) \times 0.9}{T \cdot b_{kv}} \right\rfloor
+$$
+
+For Llama-3.1-8B in BF16 on an H100: $M = 80$ GB, $W = 16.06$ GB, $S = 3.2$ GB, so the budget is **54.7 GB**, which is 417,000 context tokens.
+
+| Context per conversation | KV per conversation | Conversations on one H100 | On an H200 141GB |
+|---|---|---|---|
+| 4,096 | 537 MB | **101** | 199 |
+| 8,192 | 1.07 GB | **50** | 99 |
+| 32,768 | 4.29 GB | **12** | 24 |
+| 131,072 | 17.2 GB | **3** | 6 |
+
+Now the sentence that should worry a product manager: at 32,768 tokens, one H100 serves **twelve users**. At 131,072 tokens, **three**. A single H200 — a card that costs roughly double — serves twenty-four and six. The context length you chose in the product spec is a direct multiplier on your per-token cost, with no offsetting benefit anywhere in the system.
+
+<Callout type="intuition" title="The cliff is closer than the headline suggests">
+  It is tempting to say "128K works". It works for exactly three conversations. The failure is not gradual: at 134,000 tokens the answer is three, and at 136,000 it is still three, and then at some point just past it the answer is two and your fourth user gets an error. A capacity cliff with a hard edge on it.
+
+  Compute your maximum context from $N_{\max} \geq$ your concurrency target, before you ship the window size. That single division has saved more deployments than any kernel.
+</Callout>
+
+<Callout type="pitfall" title="The window is not a promise, it is a budget">
+  A model's *trained* context length — 128K for Llama-3.1, 32K for some Qwen2.5 variants — is a capability claim, not a serving configuration. Serving at 128K means deciding that three simultaneous 128K conversations is an acceptable product. Read the two numbers separately: what the model can read, and what you can afford to keep.
+
+  And mind the interaction with <Term t="paged-attention">KV blocks</Term> from Module 08: blocks are allocated as context grows, so a service near its limit does not degrade gracefully, it fails.
+</Callout>
+
+## Wall two: the quadratic in the prompt
+
+Now the arithmetic, not the memory. Prefill of $n$ tokens costs:
+
+$$
+\text{FLOPs} = 2Pn + 4 n^2 d L
+$$
+
+Projection terms first, attention second. Set them equal to find where the second starts to matter:
+
+$$
+4n^2 d L = 2Pn \quad\Longrightarrow\quad n^* = \frac{P}{2 d L} = \frac{8.03\times 10^9}{2 \times 4096 \times 32} \approx 30{,}600 \text{ tokens}
+$$
+
+<Callout type="math" title="Two more in your head">
+  **Llama-3.1-70B.** $n^* = 70.6\times 10^9 / (2 \times 8192 \times 80) = 53{,}900$ tokens. Bigger models push the wall *out*, because the parameters grow faster than the hidden size times the depth.
+
+  **Qwen2.5-0.5B.** $n^* = 0.49\times 10^9 / (2 \times 896 \times 24) = 11{,}400$ tokens. Smaller models hit it *sooner* — 0.5B models are cheap on memory and awkward on arithmetic, which is the mirror image of the 70B's problem.
+</Callout>
+
+Past $n^*$, attention is the majority of prefill and no amount of faster tensor cores fully saves you, because attention at long length has poor arithmetic intensity compared with a large GEMM. FlashAttention (Module 09) fixed the *memory traffic* of attention — the score matrix no longer has to be materialised — but it did not change the FLOP count. **It is a traffic optimization, not an arithmetic one**, and the wall is an arithmetic wall.
+
+Here is the honest size of it. Prefill time is linear in $n$ plus quadratic, divided by achieved FLOP/s:
+
+| Prompt | Llama-8B on H100 | On A100 | On T4 |
+|---|---|---|---|
+| 512 | 16 ms | 26 ms | 124 ms |
+| 4,096 | 0.14 s | 0.22 s | 1.0 s |
+| 32,768 | 1.28 s | 1.8 s | 8.3 s |
+| 131,072 | 12.1 s | 17.6 s | 66 s |
+
+Read the last row again: **a 128K prompt on a T4 takes over a minute of the entire GPU.** Not per user — total, exclusive, while everybody else waits (which is Module 10's <Term t="head-of-line-blocking">head-of-line blocking</Term>, and Module 21's subject).
+
+## Wall three: the tax on every token
+
+The subtlest wall, and the one that hurts a real service most, because it is a per-token cost rather than a per-request cost.
+
+A decode step reads the weights once — 16.1 GB for Llama-3.1-8B, constant, shared by the whole batch — and then reads the KV cache of every conversation in the batch. So:
+
+$$
+t_{\text{step}} = \frac{P b}{BW \cdot \text{MBU}} + \frac{B \cdot T \cdot b_{kv}}{BW \cdot \text{MBU}}
+$$
+
+On an H100 at 80% of 3.35 TB/s, the weight read alone is **6.0 ms**. The cache read per conversation at 32,768 tokens is 4.29 GB / 2.68 TB/s = **1.6 ms**. So at 32K with a batch of 32, each step spends 6.0 ms on weights and 51 ms on cache: the cache is **89% of the traffic**.
+
+| Context | KV read, one sequence | As a share of a 32-batch step | Step time | Per-user speed |
+|---|---|---|---|---|
+| 4,096 | 0.20 ms | 51% | 12.3 ms | 81 tok/s |
+| 8,192 | 0.40 ms | 68% | 18.8 ms | 53 tok/s |
+| 32,768 | 1.60 ms | 89% | 57.0 ms | 18 tok/s |
+| 131,072 | 6.40 ms | 97% | 211 ms | 4.7 tok/s |
+
+<Callout type="intuition" title="Why this wall is the dangerous one">
+  Memory fails loudly and prefill fails slowly, but this wall fails *quietly and permanently*. Nothing crashes at 32,768 tokens. The request is accepted, the answer comes back, and it comes back at 18 tokens per second while your marketing says 130.
+
+  The engine will not tell you it is in trouble, because from its point of view it is faithfully reading a cache that is now larger than the model. **The user sees slowness; the dashboard sees nothing.** This is the failure mode you detect by computing it in advance, not by reading a log.
+</Callout>
+
+<Callout type="math" title="The crossover that decides whether long context is even worth it">
+  Set the two reads equal: $T b_{kv} = P b$, so
+
+  $$
+  T_{\text{crossover}} = \frac{2 \times 8.03\times 10^9}{131{,}072} \approx 122{,}500 \text{ tokens}
+  $$
+
+  Below 122,500 tokens, reading the cache costs less than reading the weights, and the context length is nearly free in bandwidth terms. Above it, every token of context is a permanent addition to every step. **This single number is the honest upper bound on useful context for an 8B model**, and it is a bandwidth number, not a memory number — which surprises people, because memory is the constraint they worry about.
+</Callout>
+
+## The wall no formula predicts
+
+Everything above is arithmetic, and arithmetic you can plan around. Here is the failure that is not.
+
+Give a model a long document and a question about something in the middle. Ask it something it can in principle answer. Measure the accuracy against the same question asked about content near the beginning or near the end, where it has been trained to attend well. The middle is measurably, reproducibly worse.
+
+This is usually called <Term t="lost-in-the-middle">lost in the middle</Term>. The broad shape is well established: retrieval accuracy against a long context is roughly U-shaped, strongest at the start of the context, dipping in the middle, and recovering toward the end. It is not a bug in any particular engine and it is not caused by the cache. It is a property of how models were trained and of the attention mechanism's bias toward nearby and early positions.
+
+<Callout type="real" title="What this looks like in an application">
+  A RAG system retrieves ten chunks and concatenates them. Put the chunk containing the answer first and accuracy is much better than if you put it sixth. Same chunks, same model, same total tokens, same cost — **different answer**. Any production RAG pipeline that shuffles its context is leaving quality on the table for free.
+</Callout>
+
+So there is a fourth wall, which is not a wall of the system at all but of the model's use of it: **the context can be full of the answer and the model still fail to use it.** And here is the trap for an engineer specifically: you cannot detect this from any metric the serving stack produces. Latency is normal. Memory is fine. Throughput is fine. The answer is wrong.
+
+<Callout type="mentor" title="How to defend against it, in order of cost">
+  1. **Put the important thing at both ends.** Restate the question before the long context and again after it. This costs a handful of tokens and is the single highest-value thing you can do.
+  2. **Reorder retrieved chunks by relevance, most relevant first.** Free, and the chunk at the front is the one most reliably used.
+  3. **Query-aware compression.** Drop chunks, keeping the ones that look relevant to the question. You are trading a little recall for a shorter context, which also relieves all three walls above.
+  4. **Do not simply raise `--max-model-len`.** A bigger window that the model cannot use is a capacity cost with no quality benefit. Fix the placement first; then consider a larger window.
+</Callout>
+
+## What actually fixes what
+
+Here is the map, and it is worth keeping for the rest of the module.
+
+| Fix | Wall 1 memory | Wall 2 prefill | Wall 3 decode | Lost in the middle |
+|---|---|---|---|---|
+| FP8 / INT8 KV cache | **halves it** | no change | **halves it** | no change |
+| Shorter max context | **linear cut** | **linear cut** | **linear cut** | no change |
+| Chunked prefill (Module 10) | no change | bounds the stall | no change | no change |
+| FlashAttention (Module 09) | helps activations | **cuts traffic, not FLOPs** | helps a little | no change |
+| More GPUs, tensor parallel | no change | **splits the FLOPs** | adds interconnect cost | no change |
+| Better placement / reordering | no change | no change | no change | **yes** |
+
+<Callout type="intuition" title="Read the table as an argument for a smaller window">
+  Every row that helps the arithmetic — FP8 KV, shorter contexts, chunked prefill — is a decision about **how much context you offer**, and none of them touches lost-in-the-middle. Meanwhile the only thing that fixes lost-in-the-middle, reordering, changes nothing at all about cost.
+
+  That is the strategic shape of long context: capacity work and quality work are almost entirely separate problems. Teams that treat "we need 128K" as one problem end up buying a faster GPU to solve what was actually a prompt-assembly bug.
+</Callout>
+
+And the one lever that helps everything at once is the one Module 21 exists for: **do not keep the KV cache on the GPU that is computing with it.** Spreading a model across cards splits the prefill FLOPs; and if the cache lives somewhere other than beside the compute, memory stops being a wall at all. That is the subject of the next lesson.
+
+<Callout type="recap" title="The whole lesson in three sentences">
+  Memory, prefill arithmetic and decode bandwidth each break at a *different* context length — 13,000, 30,600 and 122,500 tokens for Llama-3.1-8B on an H100 — and no single fix addresses more than one of them.
+
+  Only one of the three is loud: memory refuses, prefill is slow, and decode is merely slow in a way nothing reports.
+
+  And all three are arithmetic. The failure that is *not* arithmetic — the model not using the context it was given — is the one that costs you the most, and the one no dashboard will ever show you.
+</Callout>
+
+<KeyNotes>
+  1. Three walls, three different context lengths: **memory** (about 13K tokens for 32 conversations on an H100), **prefill arithmetic** (30,600), **decode bandwidth** (122,500).
+  2. Memory is linear and predictable: 32 conversations at 32,768 tokens is 137 GB of cache, which is more than any card has. At 128K, an H100 serves three users.
+  3. Prefill's wall is $T = P/(2dL)$, where the quadratic attention term overtakes the projections. Bigger models push it out; smaller models pull it in — Qwen2.5-0.5B hits it at 11,400 tokens.
+  4. A 128K prompt takes **12 seconds** of an H100 and **over a minute** of a T4, all of it exclusive.
+  5. Decode's wall is $T = 2P/b_{kv}$ — a *bandwidth* crossover, not a memory one. Below it, context is nearly free in bandwidth terms; above it, every generated token pays for the whole cache again.
+  6. At 32K with a batch of 32, the cache is **89% of the traffic** in a decode step, and per-user speed has fallen to 18 tok/s while every dashboard still looks healthy.
+  7. <Term t="lost-in-the-middle">Lost in the middle</Term> is not arithmetic: retrieval accuracy against long context is U-shaped, and a document's middle is used worst. No serving metric detects it.
+  8. The cheapest and highest-value defence is placement — restate the question at both ends, and sort retrieved chunks by relevance with the best one first.
+  9. Capacity fixes and quality fixes are **separate problems**. Raising `--max-model-len` solves neither the U-shaped curve nor the reason you wanted the context.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B in BF16 on one H100. At what context length does the KV read per decode step overtake the read of all the weights?', numeric: true, answer: 122500, tolerance: 6000, unit: 'tokens', why: 'Set T · b_kv = P · b, so T = 2 × 8.03e9 ÷ 131,072 ≈ 122,500 tokens. It is a bandwidth crossover: below it the cache is cheaper than the weights, above it every token pays for the whole cache again.' },
+  { q: '32 conversations share one H100, each at 32,768 tokens of context, with Llama-3.1-8B in BF16. How many of them fit in the KV budget?', numeric: true, answer: 12, tolerance: 2, unit: 'conversations', why: 'Budget = (80 − 16.06 − 3.2) × 0.9 = 54.7 GB. Each conversation needs 32,768 × 131,072 = 4.29 GB. So 54.7 ÷ 4.29 = 12 conversations. This is the capacity cliff: at 8K the same card holds 50.' },
+  { q: 'At what prompt length does prefill’s quadratic attention term overtake its projection term for Llama-3.1-8B?', numeric: true, answer: 30600, tolerance: 2000, unit: 'tokens', why: 'Set 4n²dL = 2Pn, so n = P / (2dL) = 8.03e9 ÷ (2 × 4096 × 32) ≈ 30,600 tokens. Beyond it, attention is the majority of prefill FLOPs, and FlashAttention does not help because it cuts traffic, not arithmetic.' },
+  { q: 'A RAG pipeline retrieves eight chunks and shuffles them randomly before assembling the prompt. Accuracy is mediocre. Which change is both free and most likely to help?', options: ['Raise --max-model-len to 128K', 'Sort the chunks by relevance, most relevant first, and restate the question after the context', 'Switch the KV cache to FP8', 'Move to a larger GPU'], answer: 1, why: 'Lost in the middle means retrieval accuracy is U-shaped in context position: the beginning and end are used well, the middle badly. Ordering the best chunk first and repeating the question at the end exploits that, and costs no memory, bandwidth or FLOPs.' },
+  { q: 'Which of these three failures is the hardest to detect from the serving stack?', options: ['Out of memory from the KV cache exceeding the card', 'Decode steps getting slower as context grows, because nothing reports it as an error', 'Prefill taking twelve seconds on a 128K prompt', 'A scheduler dropping requests'], answer: 1, why: 'Memory fails loudly and prefill is visible in TTFT. But decode bandwidth degradation is a silent, permanent slowdown: the request is accepted, latency is normal-ish, no error is logged, and users just see 18 tok/s instead of 130. Detect it by computing it in advance.' },
+  { q: 'An 8B model’s decode bandwidth wall sits at about 122,500 tokens. What happens above it, for a service that holds 32 conversations?', options: ['Nothing, because memory has already failed long before', 'The KV read exceeds the weight read, so each step is dominated by cache traffic and per-user speed keeps falling as context grows', 'The model runs out of KV blocks and must start evicting', 'Prefill becomes the bottleneck'], answer: 1, why: 'Above the crossover the cache term dominates t_step = (Pb + B·T·b_kv)/(BW·MBU). At 32K it is already 89% of the traffic, giving 18 tok/s per user. Nothing crashes — that is what makes it the dangerous wall.' },
+]} />

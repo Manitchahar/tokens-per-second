@@ -1,0 +1,285 @@
+---
+title: Build a KV cache yourself
+summary: 'Sixty lines of PyTorch that turn a model into a model plus a cache, with a test that proves the cached and uncached logits agree. This is the machinery every later optimization in the course modifies.'
+objectives:
+  - Allocate one flat cache tensor per request and write a single row per token
+  - Explain why keys must be rotated before they are stored, and what breaks otherwise
+  - Compute the byte offset of any (layer, head, token) entry in the cache
+  - Prove a cached forward pass matches an uncached one, and read the expected error
+  - Name the four things a production cache adds on top of this
+---
+import CacheWrite from '@/components/viz/kv-cache/CacheWrite.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Everything so far in this module has been arithmetic. This lesson is the code — and it is short, which is the surprise. There is no clever data structure: a flat tensor, a cursor, and one row written per token. If you can hold this in your head, every later module is a variation on it. Continuous batching is "one cache per batch row". Paged attention is "this buffer, chopped into blocks". Prefix caching is "don't write the rows you already have". Speculative decoding is "write four rows in a step".
+
+## The structure
+
+<Scrolly>
+  <CacheWrite client:visible slot="stage" />
+
+  <Step title="1. One buffer, allocated once">
+    For each layer: two tensors shaped **key heads × max length × head dim**, one for K and one for V. They are allocated when the request starts, filled with zeros, and then never reallocated. Moving them would mean copying the entire history.
+  </Step>
+
+  <Step title="2. Prefill fills the first rows">
+    The prompt's keys and values are written in one contiguous copy into rows 0 to *p*. After this the buffer has a valid prefix and a tail of zeros, and attention can already read the prefix.
+  </Step>
+
+  <Step title="3. Decode writes row *t*">
+    Each new token produces one key and one value per layer. Compute them, **rotate the key for its position**, then store at index *t* and advance the cursor. One row, one write, no allocation.
+  </Step>
+
+  <Step title="4. Write is O(1), read is O(t)">
+    The write never grows: 128 KB, every step, for ever. The read grows by one row each step. That asymmetry is the whole performance story of decode, and the reason attention kernels for decode look nothing like prefill kernels.
+  </Step>
+
+  <Step title="5. The trap: `torch.cat`">
+    Appending by concatenation produces the *identical tensor* and copies the entire history on every step. Over 1,024 steps it moves 524,800 rows where 1,024 would do — 512× the memory traffic, and it throws away the entire benefit.
+  </Step>
+
+  <Step title="6. Is it actually correct?">
+    Run the same sequence with and without the cache. Same tokens, and the logits differ only in the last few digits: about 10⁻⁵ in FP16, 10⁻⁶ in FP32. That is floating-point summation order, not logic.
+  </Step>
+
+  <Step title="7. The part that still hurts">
+    A static buffer is mostly zeros. Reserve 8,192 rows, use 1,024, and 87% of the memory you set aside is empty — for *every* request. That waste is not an implementation detail; it is the reason PagedAttention exists in Module 08.
+  </Step>
+</Scrolly>
+
+## Now write it
+
+### Three invariants
+
+Everything in a correct implementation follows from three rules.
+
+1. **Allocate once, never move.** No `torch.cat`, no `torch.stack`, no list of blocks that gets rebuilt. Preallocate `max_len` rows and fill them.
+2. **Rotate before storing.** <Term t="rope">RoPE</Term> is applied to the key at its own position, and *then* the rotated key goes in the cache. Caching the unrotated projection makes the cache useless, because the rotation can only be applied to a vector that is still attached to its input.
+3. **Write at *t*, read 0 … *t*.** The cursor is the length of the conversation. Everything below it is valid; everything above it is zeros. Attention over `cache[:, :, :t]` is exactly the causal mask, expressed as a slice.
+
+<Callout type="intuition" title="Why a flat tensor, not a list">
+  A list of per-token tensors would be just as correct and roughly 100× slower. The attention kernel wants to walk the whole history as one strided, coalesced read — from Module 02, that is the difference between one 128-byte fetch and thirty-two. A flat tensor of shape key heads × max length × head dim gives exactly that walk, and it is why the cache is described by a shape rather than by a data structure.
+</Callout>
+
+### The shapes, and the address arithmetic
+
+One tensor for K and one for V, per layer. With the batch dimension added for later:
+
+$$
+\text{cache}[L, B, H_{kv}, \text{MAXLEN}, D] \qquad \text{contiguous, BF16 or FP8}
+$$
+
+Every entry has an address, and writing one row is just computing four offsets. For the K tensor, the element at layer $\ell$, batch row $b$, head $h$, token $t$, dimension $d$:
+
+$$
+\text{offset}(\ell, b, h, t) = b_{kv} \cdot \left[\Big(\ell \cdot 2 + j\Big) H_{kv} + h\right] \cdot \text{MAXLEN} \cdot D + t \cdot D + d
+$$
+
+where $j$ is 0 for K and 1 for V, and $b_{kv}$ is the number of bytes per number. Because token index $t$ appears **last**, consecutive tokens are contiguous in memory, so reading the whole history is one long sequential walk with a fixed stride of $H_{kv} \cdot D \cdot b_{kv}$. That is exactly the access pattern the memory system is best at.
+
+<Callout type="pitfall" title="Shape order is a convention, and it is a load-bearing one">
+  Some kernels index the cache as key heads × max length × head dim; others as max length × key heads × head dim. Both are defensible. The one thing you must not do is mix them — a transposed cache still produces correct-looking text at short context and quietly degrades as it grows, because the attention kernel is reading a strided mess. If you swap a model's cache layout, re-run the equivalence test from this lesson. That is what it is for.
+</Callout>
+
+### The code
+
+A complete two-layer toy transformer with a switch for the cache. It runs on the CPU in about a second, on purpose: you should be able to read all of it.
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+B, D, H, HKV, L, V = 1, 32, 4, 2, 2, 50     # batch, hidden, q heads, kv heads, layers, vocab
+HEAD = D // H
+
+
+def rope(x, pos, base=10_000.0):
+    """Rotate the pairs of x by an angle that grows with pos.  x: [..., t, d]."""
+    h = x.shape[-1] // 2
+    inv = 1.0 / (base ** (torch.arange(0, h, dtype=torch.float32) / h))
+    ang = pos.to(torch.float32)[:, None] * inv[None, :]          # [t, h]
+    c, s = torch.cos(ang), torch.sin(ang)
+    x1, x2 = x[..., :h], x[..., h:]
+    return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
+
+
+def attend(q, K, V):
+    """q: [B, H, t, D].  K, V: [B, HKV, s, D].  Causal, with GQA broadcast."""
+    rep = H // HKV
+    if rep > 1:
+        K, V = K.repeat_interleave(rep, dim=1), V.repeat_interleave(rep, dim=1)
+    scores = (q @ K.transpose(-1, -2)) / math.sqrt(D)
+    t, s = q.shape[-2], K.shape[-2]
+    mask = torch.ones(t, s, dtype=torch.bool).tril(diagonal=s - t)
+    scores = scores.masked_fill(~mask, float("-inf"))
+    return torch.softmax(scores, dim=-1) @ V
+
+
+class Layer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.Wq = nn.Linear(D, D, bias=False)
+        self.Wk = nn.Linear(D, HKV * HEAD, bias=False)
+        self.Wv = nn.Linear(D, HKV * HEAD, bias=False)
+        self.Wo = nn.Linear(D, D, bias=False)
+
+    def q(self, x, pos):
+        b, t, _ = x.shape
+        return rope(self.Wq(x).view(b, t, H, HEAD).transpose(1, 2), pos)
+
+    def kv(self, x, pos):
+        """Project and rotate here, so what we return is safe to store."""
+        b, t, _ = x.shape
+        k = self.Wk(x).view(b, t, HKV, HEAD).transpose(1, 2)
+        v = self.Wv(x).view(b, t, HKV, HEAD).transpose(1, 2)
+        return rope(k, pos), v
+
+    def out(self, a):
+        b = a.shape[0]
+        return self.Wo(a.transpose(1, 2).reshape(b, -1, D))
+
+
+class Cache:
+    """One flat tensor for K and one for V, all layers. One row written per token."""
+
+    def __init__(self, n_layers, max_len):
+        self.k = torch.zeros(n_layers, B, HKV, max_len, HEAD)
+        self.v = torch.zeros_like(self.k)
+        self.t = 0                                     # positions currently valid
+
+    def prefill(self, l, k, v, p):
+        self.k[l, :, :, :p] = k
+        self.v[l, :, :, :p] = v
+        self.t = p
+
+    def append(self, l, k_new, v_new):
+        """k_new, v_new: [B, HKV, 1, HEAD] — one token, one layer, one row."""
+        self.k[l, :, :, self.t:self.t + 1] = k_new
+        self.v[l, :, :, self.t:self.t + 1] = v_new
+        self.t += 1
+        return self.k[l, :, :, :self.t], self.v[l, :, :, :self.t]
+
+
+emb = nn.Embedding(V, D)
+head = nn.Linear(D, V, bias=False)
+layers = nn.ModuleList([Layer() for _ in range(L)])
+```
+
+Two drivers, and the only difference between them is how they get K and V.
+
+```python
+def naive(seq):
+    """No cache at all: the whole sequence is recomputed on every call."""
+    x = emb(seq)
+    pos = torch.arange(seq.shape[1])
+    for layer in layers:
+        q, (k, v) = layer.q(x, pos), layer.kv(x, pos)
+        x = x + layer.out(attend(q, k, v))
+    return head(x)
+
+
+def prefill(ids, cache):
+    """Every prompt token at once. Fills the cache as a side effect."""
+    x = emb(ids)
+    pos = torch.arange(x.shape[1])
+    for l, layer in enumerate(layers):
+        q, (k, v) = layer.q(x, pos), layer.kv(x, pos)
+        cache.prefill(l, k, v, x.shape[1])
+        x = x + layer.out(attend(q, k, v))
+    return head(x)[:, -1]
+
+
+def decode(nxt, cache):
+    """One token. Computes one row and reads the history back."""
+    x = emb(nxt)                                    # [B, 1, D]
+    pos = torch.tensor([cache.t])
+    for l, layer in enumerate(layers):
+        q, (k, v) = layer.q(x, pos), layer.kv(x, pos)
+        K, V = cache.append(l, k, v)
+        x = x + layer.out(attend(q, K, V))
+    return head(x)[:, -1]
+```
+
+Look how little changed. `prefill` and `decode` are the same loop; the cache is the only difference, and the difference is one line.
+
+### Prove it
+
+This is the test to keep. It is the same idea you will use to check any cache you ever write, borrow or debug.
+
+```python
+ids = torch.randint(0, V, (1, 5))                  # a five-token "prompt"
+cache = Cache(L, max_len=32)
+
+prefill(ids, cache)                                 # fills rows 0..4
+nxt = torch.randint(0, V, (1, 1))                  # pretend we sampled one
+step = decode(nxt, cache)                           # writes row 5, reads 0..5
+
+full = torch.cat([ids, nxt], dim=1)                 # the same six tokens
+plain = naive(full)[:, -1]                          # recomputed from scratch
+
+print("rows written          ", cache.t)                       # 6
+print("max |logit difference|", (step - plain).abs().max().item())
+print("same argmax token     ", torch.equal(step.argmax(-1), plain.argmax(-1)))
+```
+
+You will see something like **1.8e-06** for the difference and `True` for the argmax. Now make the test fail on purpose, because a test that has never failed teaches you nothing:
+
+- Store the key **before** `rope` in `Layer.kv`. The numbers change, and at five tokens the output is still plausible. Extend the sequence to 200 tokens and it degrades.
+- Change the cache layout to `HKV, max_len, ...` without transposing the attention read. It still runs. It just gets slower, quietly.
+- Forget `cache.t += 1`. Every step overwrites the same row and the model answers with a stutter.
+
+<Callout type="mentor">
+  A cache bug is not a crash. It is a model that is slightly, subtly wrong, and the wrongness grows with context length, which is precisely where nobody tests. **Any time you touch a cache, run the equivalence test at two context lengths: one short and one long.** The short one catches logic errors; the long one catches layout and masking errors.
+</Callout>
+
+### Batching: where the cursor stops being one number
+
+With one sequence, `cache.t` is a single integer. With a batch of 32, it cannot be, because sequence 7 might be at token 200 while sequence 30 has only just started. So the cache grows a **length per batch row**:
+
+```python
+# A batch needs a length per row, because requests join at different times.
+self.k       = torch.zeros(n_layers, B, n_kv, max_len, d_head)   # [L, B, Hkv, T, D]
+self.lengths = torch.zeros(B, dtype=torch.long)                  # valid rows in each row
+
+def append(self, layer, k_new, v_new):            # k_new: [B, n_kv, 1, d_head]
+    for b in range(B):                            # or one vectorised scatter
+        i = int(self.lengths[b])
+        self.k[layer, b, :, i:i + 1] = k_new[b]
+    self.lengths += 1                             # finished requests leave the batch
+```
+
+Then attention reads rows 0 to `int(self.lengths.max())` and masks out everything above each row's own length. The alternative — left-padding every sequence to the longest in the batch — wastes bandwidth on padding and needs the same mask, so engines avoid it. This per-row bookkeeping is the first thing Module 07's scheduler has to manage, and the reason batch memory is `max length × batch` rather than `sum of lengths`.
+
+<Callout type="real" title="What a production cache adds on top of this">
+  **A pool, not an allocation.** Real engines reserve one large block of GPU memory at startup and hand out slices of it, so requests never call the allocator (Module 08, paged attention).
+  **Block tables instead of one cursor.** Because sequences differ in length, production caches map rows through a table of fixed-size blocks, and the attention kernel gathers through that table rather than reading one contiguous run (Module 08).
+  **A chosen format.** The cache is often FP8 or INT8 even when the weights are BF16, halving the dominant consumer of memory (Module 11).
+  **Captured graphs.** A decode step is thousands of tiny kernels, and a fixed shape lets the whole step be captured and replayed with no launch overhead (Module 15).
+  **A specialised attention kernel.** Decode attention is a long, thin, memory-bound reduction, not a square GEMM, so it wants its own kernel (Module 14).
+  **Prefix sharing.** Rows for a shared system prompt are written once and referenced by many requests (Module 10).
+
+  In HuggingFace Transformers the same object is `past_key_values`, threaded through `model(input_ids=..., past_key_values=cache, use_cache=True)`; `StaticCache` preallocates as above and `DynamicCache` grows a list of blocks. The invariants are identical.
+</Callout>
+
+<KeyNotes>
+  1. Allocate the cache **once** per request, shaped key heads × max length × head dim, per layer. Never reallocate, never `torch.cat`.
+  2. **Rotate before storing.** RoPE is applied to the key at its position, and only then does it go in the cache. Caching the unrotated projection is the classic silent bug.
+  3. Write at index *t*, read 0 … *t*. The slice `cache[:, :, :t]` **is** the causal mask.
+  4. Token index last in the shape means consecutive tokens are contiguous, so reading the history is one coalesced strided walk.
+  5. The write is one row, O(1) and constant for the life of the request. The read is O(t). Everything downstream inherits that asymmetry.
+  6. Prove correctness by comparing against `use_cache=False`: same tokens, and logits agreeing to about 10⁻⁶ in FP32. Always test at two context lengths.
+  7. `torch.cat` every step copies 1 + 2 + … + t rows: **524,800 rows** for a 1,024-token request where 1,024 would do.
+  8. Batched caches need a length **per row**, not one cursor, plus a mask — which is why batch memory is `max length × batch`.
+  9. A static buffer is mostly empty: 8,192 rows reserved, 1,024 used, 87% wasted per request. Paged attention exists to fix precisely this.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A KV buffer has shape [32 layers, 1 batch, 8 heads, 8192 rows, 128 dims] in BF16. What is the total size of the K tensor for all 32 layers, in GB?', numeric: true, answer: 0.537, tolerance: 0.05, unit: 'GB', why: 'K alone: 32 × 8 × 8,192 × 128 × 2 bytes = 5.37 × 10⁸ bytes = 0.54 GB. K and V together are 1.07 GB, which is exactly 8,192 rows × 131,072 bytes per token from the memory-math lesson.' },
+  { q: 'In that same layout, what is the element offset of layer 2, head 3, token 5, dimension 0 in the K tensor?', numeric: true, answer: 36700800, tolerance: 20000, unit: 'elements', why: 'offset = [(layer × 2 + j) × heads + head] × MAXLEN × D + token × D, with j = 0 for K. = [(2 × 2 + 0) × 8 + 3] × 8,192 × 128 + 5 × 128 = 35 × 1,048,576 + 640 = 36,700,800.' },
+  { q: 'Why must the rotary position embedding be applied before a key is written to the cache?', options: ['To save memory, because rotated keys are shorter', 'Because the rotation encodes the position, and it can only be applied while the key is still attached to its input', 'Because unrotated keys are BF16 and rotated ones are FP8', 'To make the attention scores smaller'], answer: 1, why: 'RoPE rotates a vector in isolation using only its own position. Once stored unrotated, there is no way to recover the rotated key without re-reading the input — which is exactly the recomputation the cache exists to avoid.' },
+  { q: 'You append with torch.cat on every step of a 1,024-token generation. How many cache rows get copied in total?', numeric: true, answer: 524800, tolerance: 5000, unit: 'rows', why: '1 + 2 + … + 1,024 = 1,024 × 1,025 / 2 = 524,800 rows. The request needed 1,024, so concatenation costs 512× the memory traffic and undoes the entire benefit of caching.' },
+  { q: 'What does reading cache[:, :, :t] accomplish, and why is there no separate mask?', options: ['Nothing; attention always needs a mask', 'It returns exactly the valid prefix, so the causal mask is expressed as the slice itself', 'It rotates the keys in place', 'It pads the sequence to max_len'], answer: 1, why: 'Rows 0 to t-1 are the whole conversation so far and everything above is zeros. Every token in the query is allowed to attend to all of them, which is precisely what causal attention means for the last token.' },
+  { q: 'Why does a batched KV cache need a separate length for each sequence in the batch?', options: ['Because sequences have different vocabularies', 'Because sequences in a batch reach different lengths, so one shared cursor would overwrite other rows', 'Because the GPU requires uniform tensors', 'To allow different batch sizes per step'], answer: 1, why: 'Sequence 7 may be at token 200 while sequence 30 has just started. A single shared cursor would write into rows another sequence still needs. Engines keep a length per row and mask the padding, which is why batch memory scales with the longest sequence rather than the average.' },
+] } />

@@ -1,0 +1,114 @@
+---
+title: 'Lab: Compile & capture a decode loop'
+summary: 'Measure what one kernel launch costs on your own machine, count the launches in a real decode step, and then apply both fixes — torch.compile and a CUDA graph — while watching the CPU bill collapse. The point of the lab is the verdict, not the speed-up: whether your configuration was launch-bound at all.'
+objectives:
+  - 'Measure the per-launch CPU cost of your machine and the kernel count of a real decode step'
+  - 'Decide from measurement whether a configuration is launch-bound or GPU-bound'
+  - 'Apply torch.compile to a forward step and read its graph-break count'
+  - 'Capture a decode step in a CUDA graph, replay it, and verify the output is correct'
+  - 'Sweep the batch size and find the crossover where the GPU bill overtakes the CPU bill'
+colab: 15-compile-decode.ipynb
+---
+
+import ModeMatrix from '@/components/viz/compilation/ModeMatrix.tsx';
+
+Everything in this module has been arithmetic on an assumed **6 microseconds per launch**. This lab replaces that assumption with your own measurement, and then asks the only question that matters: *was this configuration ever paying that tax?*
+
+You will work with **Qwen2.5-0.5B-Instruct** on a free Colab T4 — 0.49B parameters, 24 layers. The absolute times are far smaller than for an 8B model, but the ratios transfer directly, because both the kernel count and the launch cost are independent of the arithmetic precision.
+
+<Colab nb="15-compile-decode.ipynb" />
+
+## The goal
+
+By the end you will have four measured numbers, and a verdict built out of them:
+
+| Number | What it is | From |
+|---|---|---|
+| `launch_us` | CPU microseconds for one kernel launch, on your machine | Part 1 |
+| `n_kernels` | Kernel launches in one decode step | Part 1 |
+| `cpu_ms` / `gpu_ms` | The two pipelines, timed separately | Part 1 |
+| `ratio` | `cpu_ms / gpu_ms` — above 1 means launch-bound | Part 1 |
+
+Then you apply both fixes and re-measure the same four numbers, and check whether the step got faster.
+
+## Part 1 · The two columns
+
+Open the notebook and run the setup cells, then **Part 2**. The notebook counts kernels with the PyTorch profiler and times the CPU side with `perf_counter` and **no synchronisation**, which is the measurement from Lesson 15.1.
+
+Watch what it prints. Two outcomes, and both are good news:
+
+**If `ratio > 1`** — your CPU bill is the longer pipeline, and this model is launch-bound. Every one of the three levers in this module applies to you directly, and Parts 2 and 3 will show real gains. This is the expected result for a 0.5B model, because 24 layers of small kernels is exactly the shape Lesson 15.1 identified as dangerous.
+
+**If `ratio < 1`** — the GPU finishes faster than the CPU can describe the work, so the queue never empties. Compilation and graphs will still make the model faster, but barely, because they remove time that was never on the critical path. This is a genuinely useful result: you now know *not* to bother, and you know it from measurement.
+
+<Callout type="try" title="Record these, they are yours">
+  Write down your `launch_us` and your `ratio`. Compare `launch_us` to the 6 µs the lessons assume — a shared cloud vCPU can easily be twice as slow as a bare-metal desktop core. Every prediction in this module used 6 µs, and now you have the number that makes your predictions true on *your* machine.
+</Callout>
+
+## Part 2 · Compile the forward step
+
+Run **Part 3** in the notebook. It calls `torch.compile(model)` and times the compiled step twice: once for the CPU issue time, once for the GPU.
+
+Check three things in the output:
+
+1. **Did the kernel count fall?** The lesson predicts about 9 elementwise kernels per layer becoming 5. If your count did not move at all, you hit graph breaks.
+2. **Did the per-launch cost fall?** From about 6 µs to about 2 µs, because a C++ loop issues the kernels instead of the Python interpreter. This is the invisible half of the benefit and the bigger one.
+3. **What does `torch._dynamo.explain` say?** The notebook prints `graph_count` and `graph_break_count`. Count your breaks. Most people find at least one, and it is nearly always a `.item()` that was written for logging.
+
+<Callout type="pitfall" title="If the compile makes things slower">
+  Do not panic and do not disable it — find out which of the three failure modes from Lesson 15.2 you hit. If the step got *slower* and the GPU bill rose, a fused kernel is spilling to HBM because its working set stopped fitting in SRAM, and it will be visible as a longer kernel in your profile. If the step got slower and the CPU bill rose, you are recompiling continuously, which means a shape is varying in a way you did not anticipate.
+</Callout>
+
+## Part 3 · Capture a CUDA graph
+
+Run **Part 4**. This is the largest lever in the module, and it is also the one with the most rules, so the notebook implements all three of them:
+
+1. **Warm up on a side stream** for three iterations before capturing. Without this the graph captures cuBLAS workspace creation and autotuning, and replays garbage.
+2. **Allocate a static input buffer** and copy data into it before each replay, because the graph has the address baked in.
+3. **Accept that this graph is only valid for batch 1**, because the shapes are baked in too.
+
+Then the correctness check, which is the part people skip and should not: the notebook replays the graph and compares its logits against the eager result. They should match to within reduction-order noise. If they do not, your warm-up was insufficient — that is a real bug you would otherwise ship.
+
+<Callout type="intuition" title="What you should see when the graph replays">
+  The CPU issue time collapses to a few microseconds, because a replay is one API call. The **GPU time should be essentially unchanged** — a graph never makes the GPU do less work, and it never moves fewer bytes. If your GPU time also dropped dramatically, something is wrong with your measurement rather than your graph. That invariance is the whole lesson: a CUDA graph is a CPU-side optimisation and nothing else.
+</Callout>
+
+## Part 4 · The verdict
+
+Run **Part 5** and **Part 6**. The first prints all three modes side by side; the second sweeps the batch size from 1 to 32 and prints which side is the bottleneck at each point.
+
+Read the sweep carefully, because it is the crossover from Lesson 15.1 in measured form. The CPU column should stay **roughly flat** as the batch grows, because the launch bill depends on the kernel count and not on how many sequences are decoding. The GPU column grows, because the KV cache you must read grows with it. Where they cross is the batch at which extra users stop being free.
+
+<ModeMatrix client:visible />
+
+<Callout type="recap" title="The habit this lab is really for">
+  Two lines of code — `bench_cpu` and `bench_gpu` — tell you whether any of this module's machinery can help your configuration. Fill in both columns before you touch a knob. A number with one column filled in is a guess, and most of the embarrassing optimisation stories in this field are one-column guesses that turned out to be optimising the side of the step that was not the bottleneck.
+</Callout>
+
+## Check yourself
+
+1. What was your `launch_us`, and how does it compare to the 6 µs the lessons assumed? What does a large discrepancy tell you about which machine you should be measuring on?
+2. Was your configuration launch-bound (`ratio > 1`) or GPU-bound? What is the evidence?
+3. Did `torch.compile` reduce the kernel count? If not, what did `explain()` say about graph breaks, and which line caused them?
+4. Did the graph output match the eager output? If not, which of the three capture rules did you violate?
+5. From the batch sweep, at what batch did the GPU bill overtake the CPU bill, and does that match the crossover formula from Lesson 15.1?
+6. Look at your three-mode table. If the graphed step is barely faster than the eager step, what does that tell you about where your time actually goes?
+
+## Going further
+
+If your configuration *was* launch-bound and you want to push further, these are the next three things an inference engineer tries, in order:
+
+- **Move sampling inside the graph**, so the output is one token id per sequence instead of the full logits. This shrinks the copy-out from 8 MB to 128 bytes and removes a host sync from the step.
+- **Bucket your batch sizes** and capture one graph per bucket, trading a little GPU work for CPU work you did not need.
+- **Try `mode="max-autotune"`**, which benchmarks Triton matmul configurations for your exact shapes. The win shows up on prefill and large batches, where the GEMMs dominate — not on the decode step you have been measuring here.
+
+<KeyNotes>
+  1. `bench_cpu` times how long the CPU takes to *say* what to do, with no synchronisation; `bench_gpu` times the actual work. Their ratio is the launch-bound test from Lesson 15.1, and it is two lines of code.
+  2. Measure `launch_us` on the machine you deploy on. The lesson's 6 µs is a typical server core, and a shared cloud vCPU can be several times worse.
+  3. `torch.compile` should reduce both the kernel count and the per-launch cost. If the kernel count did not move, you have graph breaks — read them off with `torch._dynamo.explain`.
+  4. Always warm up on a side stream before capture, or the graph bakes in cuBLAS workspace creation and replays garbage.
+  5. A graph is valid only for the shapes it was captured with. The output must match the eager result, and if it does not, the warm-up was wrong.
+  6. After capture the **GPU time should be unchanged**. A graph removes the CPU bill and nothing else; a large drop in GPU time means your measurement is wrong, not your graph.
+  7. The CPU bill is flat in batch size and the GPU bill grows with the KV cache. Where they cross is the crossover batch, and it is the number that tells you how far you can scale concurrency for free.
+  8. If your configuration was never launch-bound, all of this module buys you very little — and knowing that early, from measurement, is the real outcome of the lab.
+</KeyNotes>

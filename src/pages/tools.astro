@@ -1,0 +1,223 @@
+---
+import Base from '../layouts/Base.astro';
+import { GPUS, MODELS } from '../components/viz/lib/perfModel';
+import { url } from '../site';
+
+// One source of truth: the calculators read the same spec numbers the diagrams do.
+const payload = {
+  gpus: GPUS.map((g) => ({ id: g.id, name: g.name, mem: g.mem, bw: g.bw, flops: g.flops, price: g.price })),
+  models: MODELS.map((m) => ({ id: m.id, name: m.name, params: m.params, layers: m.layers, hidden: m.hidden, heads: m.heads, kvHeads: m.kvHeads, headDim: m.headDim })),
+};
+
+const FORMATS = [
+  { id: 'fp32', label: 'FP32', bytes: 4 },
+  { id: 'bf16', label: 'BF16 / FP16', bytes: 2 },
+  { id: 'fp8', label: 'FP8 / INT8', bytes: 1 },
+  { id: 'int4', label: 'INT4 / FP4', bytes: 0.5 },
+];
+const KV_FORMATS = [
+  { id: 'bf16', label: 'BF16 / FP16 (2 B)', bytes: 2 },
+  { id: 'fp8', label: 'FP8 (1 B)', bytes: 1 },
+  { id: 'int4', label: 'INT4 (0.5 B)', bytes: 0.5 },
+];
+
+const g = payload.gpus;
+const m = payload.models;
+---
+
+<Base title="Tools" description="Calculators for model memory, KV cache size, the roofline, and inference cost. The same numbers the course derives by hand.">
+  <div class="page">
+    <h1>Tools</h1>
+    <p class="lead">
+      Four calculators, built from the same formulas you derive by hand in the course and the same spec numbers the diagrams use. Every result shows its working, so you can check it against your own arithmetic rather than trust it.
+    </p>
+
+    <!-- ─────────────────────────── 1. model memory -->
+    <section class="tool" id="memory">
+      <h2><span class="n">01</span> Model memory</h2>
+      <p class="sub">Weights = billions of parameters × bytes per parameter. Add the KV cache and you have what the GPU must hold before it starts.</p>
+      <div class="grid">
+        <label class="f">
+          <span>Model</span>
+          <select data-m-model>
+            {m.map((x) => <option value={x.id}>{x.name}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>Precision</span>
+          <select data-m-prec>
+            {FORMATS.map((f) => <option value={f.id} selected={f.id === 'bf16'}>{f.label}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>KV cache precision</span>
+          <select data-m-kv>
+            {KV_FORMATS.map((f) => <option value={f.id} selected={f.id === 'bf16'}>{f.label}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>Average context (tokens)</span>
+          <input type="number" data-m-ctx value="2048" min="128" max="131072" step="128" />
+        </label>
+        <label class="f">
+          <span>Concurrent sequences</span>
+          <input type="number" data-m-batch value="16" min="1" max="4096" step="1" />
+        </label>
+      </div>
+      <div class="out" data-m-out></div>
+    </section>
+
+    <!-- ─────────────────────────── 2. kv cache -->
+    <section class="tool" id="kv">
+      <h2><span class="n">02</span> KV cache</h2>
+      <p class="sub">Bytes per token = 2 (K and V) × layers × KV heads × head dim × bytes. This is the number that decides how many people one GPU can serve.</p>
+      <div class="grid">
+        <label class="f">
+          <span>Model</span>
+          <select data-k-model>
+            {m.map((x) => <option value={x.id}>{x.name}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>KV precision</span>
+          <select data-k-prec>
+            {KV_FORMATS.map((f) => <option value={f.id} selected={f.id === 'bf16'}>{f.label}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>Context per sequence (tokens)</span>
+          <input type="number" data-k-ctx value="4096" min="128" max="131072" step="128" />
+        </label>
+        <label class="f">
+          <span>Sequences</span>
+          <input type="number" data-k-n value="32" min="1" max="8192" step="1" />
+        </label>
+        <label class="f">
+          <span>GPU</span>
+          <select data-k-gpu>
+            {g.map((x) => <option value={x.id} selected={x.id === 'h100'}>{x.name}</option>)}
+          </select>
+        </label>
+      </div>
+      <div class="out" data-k-out></div>
+    </section>
+
+    <!-- ─────────────────────────── 3. roofline -->
+    <section class="tool" id="roofline">
+      <h2><span class="n">03</span> Roofline</h2>
+      <p class="sub">Time ≥ max(FLOPs ÷ peak FLOP/s, bytes ÷ bandwidth). Which of the two terms is larger is the whole answer.</p>
+      <div class="grid">
+        <label class="f">
+          <span>GPU</span>
+          <select data-r-gpu>
+            {g.map((x) => <option value={x.id} selected={x.id === 'h100'}>{x.name}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>Operation</span>
+          <select data-r-op>
+            <option value="decode" selected>Decode matrix × vector (1 token)</option>
+            <option value="prefill">Prefill matrix × matrix (512 tokens)</option>
+            <option value="attn">Attention, 4,096-token context</option>
+            <option value="act">Elementwise (SiLU, add)</option>
+          </select>
+        </label>
+      </div>
+      <div class="out" data-r-out></div>
+    </section>
+
+    <!-- ─────────────────────────── 4. cost -->
+    <section class="tool" id="cost">
+      <h2><span class="n">04</span> Cost per million tokens</h2>
+      <p class="sub">Decode time is set by weight bytes, so batching barely slows a step while multiplying its output. That is where the money is.</p>
+      <div class="grid">
+        <label class="f">
+          <span>Model</span>
+          <select data-c-model>
+            {m.map((x) => <option value={x.id}>{x.name}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>GPU</span>
+          <select data-c-gpu>
+            {g.map((x) => <option value={x.id} selected={x.id === 'h100'}>{x.name}</option>)}
+          </select>
+        </label>
+        <label class="f">
+          <span>Users in the batch</span>
+          <input type="number" data-c-batch value="64" min="1" max="2048" step="1" />
+        </label>
+        <label class="f">
+          <span>Average context (tokens)</span>
+          <input type="number" data-c-ctx value="2048" min="128" max="131072" step="128" />
+        </label>
+        <label class="f">
+          <span>Precision</span>
+          <select data-c-prec>
+            {FORMATS.map((f) => <option value={f.id} selected={f.id === 'bf16'}>{f.label}</option>)}
+          </select>
+        </label>
+      </div>
+      <div class="out" data-c-out></div>
+    </section>
+
+    <p class="foot">
+      Prices are illustrative on-demand rates, not quotes. The arithmetic is the course's; treat the numbers as a shape, not a quote. If a result surprises you, the <a href={url('learn/gpu-first-principles/two-speed-limits/')}>roofline lesson</a> is where to check it.
+    </p>
+  </div>
+</Base>
+
+<style>
+  .page { max-width: 1000px; margin: 0 auto; padding: 3rem 24px 0; }
+  h1 { font-size: clamp(2.3rem, 5vw, 3.4rem); margin-bottom: 0.8rem; }
+  .lead { color: var(--text-2); max-width: 64ch; }
+  .foot { margin: 3rem 0 0; padding-top: 1.4rem; border-top: 1px solid var(--rule); color: var(--text-3); font-size: 0.88rem; max-width: 70ch; }
+
+  .tool { margin-top: 3.2rem; padding-top: 1.6rem; border-top: 1px solid var(--rule); }
+  h2 { font-size: 1.7rem; display: flex; align-items: baseline; gap: 0.7rem; }
+  .n { font-family: var(--font-mono); font-size: 0.8rem; color: var(--compute); }
+  .sub { color: var(--text-2); font-size: 0.95rem; max-width: 68ch; margin-bottom: 1.4rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.9rem 1.1rem; margin-bottom: 1.3rem; }
+  .f { display: grid; gap: 0.3rem; font-size: 0.78rem; }
+  .f > span { color: var(--text-3); }
+  .f select, .f input {
+    font: 500 0.92rem var(--font-sans);
+    color: var(--text);
+    background: var(--ground-2);
+    border: 1px solid var(--rule-2);
+    border-radius: 3px;
+    padding: 0.45rem 0.6rem;
+    width: 100%;
+    font-variant-numeric: tabular-nums;
+  }
+  .f select:hover, .f input:hover { border-color: var(--text-3); }
+
+  /* The results are injected by script, so they carry no scope attribute: these
+     rules have to be global to reach them. */
+  :global(.out) { display: grid; gap: 0.9rem 1.6rem; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  :global(.cell) { display: grid; border-left: 2px solid var(--rule-2); padding-left: 0.75rem; }
+  :global(.cell dt) { font-size: 0.7rem; color: var(--text-3); }
+  :global(.cell dd) { margin: 0.15rem 0 0; font-family: var(--font-mono); font-size: 1.05rem; color: var(--k, var(--text)); font-variant-numeric: tabular-nums; }
+  :global(.cell dd small) { display: block; font-family: var(--font-sans); font-size: 0.7rem; color: var(--text-3); margin-top: 0.1rem; }
+  :global(.cell.k-compute) { --k: var(--compute); }
+  :global(.cell.k-memory) { --k: var(--memory); }
+  :global(.cell.k-token) { --k: var(--token); }
+  :global(.cell.k-comm) { --k: var(--comm); }
+  :global(.cell.k-error) { --k: var(--error); }
+  :global(.work) { grid-column: 1 / -1; white-space: nowrap; overflow-x: auto; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-3); line-height: 1.8; }
+
+  :global(.fits) { display: flex; flex-wrap: wrap; gap: 0.4rem 0.5rem; }
+  :global(.chip) { font-family: var(--font-mono); font-size: 0.76rem; padding: 0.2rem 0.5rem; border-radius: 3px; border: 1px solid var(--rule-2); color: var(--text-3); }
+  :global(.chip.yes) { border-color: var(--token); color: var(--token); }
+  :global(.chip.no) { border-color: var(--error); color: var(--error); }
+
+  @media (max-width: 640px) { .page { padding: 2rem 16px 0; } }
+</style>
+
+
+<script>
+  import { mountTools } from '../scripts/tools';
+  mountTools();
+</script>
+

@@ -1,0 +1,123 @@
+---
+title: 'Lab: Your first GPU inference server'
+summary: 'Put everything from this module together on a real GPU: load a model, watch prefill versus decode, stream tokens, serve it over HTTP, and measure the latency–throughput trade-off as a real client experiences it.'
+objectives:
+  - Load an open model, predict its memory footprint first, and check your prediction against reality
+  - Measure time to first token and time per output token separately, and explain why they differ
+  - Serve the model over HTTP with streaming, concurrency and the operational endpoints
+  - Reproduce the latency–throughput trade-off with your own numbers
+colab: 04-first-model.ipynb
+---
+
+Four modules of theory, and now: a model on a GPU, talking, streaming, served over HTTP, with numbers you measured yourself.
+
+This lab has two notebooks. **04a** is the model itself — loading, tokenizing, generating, streaming, and watching the GPU. **04b** puts it behind HTTP and measures what serving actually costs. Both run on a free Colab **T4 (16 GB)** with Qwen2.5-0.5B-Instruct, so neither needs a credit card.
+
+<Colab nb="04-first-model.ipynb" />
+
+## What you will do in 04a
+
+### 1. Predict before you load
+
+Section 1 asks you to compute `parameters × bytes per weight` for Qwen2.5-0.5B **before** downloading it. Write the number down. Section 2 then prints the measured figure and the error between them. Doing this correctly on the first try is the point — it is the arithmetic from lesson 04.1.
+
+<Callout type="real" title="Why FP16 and not BF16 on a T4">
+  The T4 is a Turing GPU: FP16 tensor cores, but **no native BF16** and no FP8. So the notebook uses `torch.float16`. On an A100 or H100 you would use BF16. Both are 2 bytes per weight, so every memory calculation in this course is identical — only the hardware support differs.
+</Callout>
+
+### 2. Load, and read the config back
+
+Section 2 loads the model and prints `model.config`: layers, hidden size, query heads, KV heads, vocabulary. Those are the numbers you estimated in lesson 04.1. **Check them against your prediction.** `num_key_value_heads` in particular explains your KV cache size — the GQA factor from the lesson, made concrete.
+
+### 3. Tokenize, and see the chat template
+
+Section 3 shows how text becomes integers, token by token. Section 4 shows the text that *actually* enters the model after `apply_chat_template` — note it is longer than your raw question, and that the extra tokens are control markers. The model never sees your letters.
+
+### 4. Measure TTFT and TPOT, separately
+
+Section 5 is the measurement the whole module has been building toward. It sweeps prompt length and reports time to first token and time per output token.
+
+<Callout type="try" title="The result to look for">
+  As the prompt grows 64×, **TTFT grows substantially and TPOT barely moves.** Every decode step reads the same ~1 GB of weights no matter how long your prompt is, so a long prompt is a prefill problem, never a decode problem. If your table does not show this, something is wrong with your measurement.
+</Callout>
+
+### 5. Watch memory climb
+
+Section 6 runs one long generation and prints memory before and after, next to the predicted KV growth from `context × bytes_per_token`. Memory goes up and stays up. That stair-step is the subject of Module 05.
+
+### 6. Look at a distribution, not just a token
+
+Section 8 prints the top-8 next-token probabilities, then the same logits at three temperatures, with an "effective options" column (the exponential of the entropy — how many tokens are genuinely live). Then it generates the same prompt five times at temperature 1.2. Sampling stops being a black box.
+
+## What you will do in 04b
+
+Open the second notebook once 04a has run to the end — it reloads the model, and doing both at once will strain the T4.
+
+<Colab nb="04-server.ipynb" title="Open the server lab notebook" />
+
+### 1. Read the server before you run it
+
+Section 2 defines a complete FastAPI server. Read it first. It is the code from lesson 04.4 with the real-world correctness fixes:
+
+- `generate` runs on its own thread and the async side awaits a queue. **Calling it directly inside `async def` blocks the event loop** and the whole server stops answering. That is the single most common bug in a first FastAPI LLM server.
+- `max_tokens` is clamped server-side, because the client is not trusted.
+- `worker.join()` sits in a `finally`, so a disconnected client cannot leak a GPU thread.
+- `/health` never touches the GPU.
+
+### 2. Call it three ways
+
+Sections 4, 5 and 6 call the server non-streaming, streaming with `requests`, and through the **OpenAI client with only a base URL changed**. That third one is the point of the OpenAI-compatible shape: your server is now a drop-in replacement for a hosted API.
+
+### 3. Compare streaming against blocking
+
+Section 5 measures both on the same prompt. The GPU work is identical. The difference in time-to-first-token is the entire user-facing benefit of streaming, in milliseconds, on your hardware.
+
+### 4. Reproduce the trade-off
+
+Section 7 sweeps concurrency from 1 to 8 and prints TTFT, TPOT, aggregate throughput and KV cache for each level.
+
+<Callout type="intuition" title="What your table should show">
+  **Aggregate throughput rises with concurrency** — the weights are read once for several tokens instead of once each. **Per-user TPOT gets worse**, and TTFT rises as requests queue. This is the latency–throughput trade-off from Module 00, and you have just measured it on real hardware. Every serving configuration in the rest of the course is a point on this curve.
+</Callout>
+
+### 5. Find your concurrency ceiling
+
+Section 8 computes how many conversations fit in your remaining GPU memory at 2,048 tokens each, and checks it against what actually allocated. Section 5 of 04a gives you the same number from first principles. Do they agree? If not, the KV cache also has to hold the prefill activations — which is exactly the kind of detail Module 05 is about.
+
+### 6. Break the clamp and the health check
+
+Section 9 asks for 100,000 tokens and shows you receiving the server's ceiling. Your turn then asks you to make `/health` touch the GPU and re-run the sweep. Work out why that is a serious bug in a multi-replica deployment before you look at the hint.
+
+## Check yourself
+
+- You predicted Qwen2.5-0.5B's weights memory before loading it. How far off were you, and why?
+- At 2,048 tokens of context, how many conversations fit alongside the weights on a T4? Does the formula agree with the measurement?
+- TTFT rose with prompt length but TPOT did not. Explain this in one sentence using "each decode step reads the same weights".
+- Streaming and non-streaming did identical GPU work. Where did the extra waiting in the blocking version go?
+- As concurrency went from 1 to 8, aggregate throughput roughly tripled while TPOT roughly tripled too. Explain why those are not contradictory.
+- Your server's `/health` returns instantly. Why would routing health checks through the GPU be dangerous under load?
+
+## Write these down
+
+Module 05 assumes you have the first two; Module 06 assumes all of them.
+
+| Number | From |
+|---|---|
+| `weights_GB` — measured, and your prediction's error | 04a §1–2 |
+| `kv_bytes_per_token` | 04a §6 |
+| `TTFT_ms` at a short and at a long prompt | 04a §5 |
+| `per_token_ms` and `tokens_per_second` | 04a §5 |
+| `bandwidth_floor_ms` and your decode efficiency | 04a §9 |
+| `max_concurrency` at 2,048 tokens | 04b §8 |
+| TTFT / TPOT / aggregate throughput at concurrency 1 and 8 | 04b §7 |
+
+<KeyNotes>
+  1. Predict `parameters × bytes per weight` before downloading anything. The T4 has no native BF16, so use FP16 — the memory arithmetic is identical either way.
+  2. The T4 is the smallest useful inference GPU: 16 GB, ~320 GB/s. Every lesson in the course holds on it; only the numbers change.
+  3. TTFT grows with prompt length; TPOT barely moves. A long prompt is a prefill problem. Measure them separately, always.
+  4. Memory climbs one step per generated token and never returns until the request ends. Confirm it against `context × kv_bytes_per_token`.
+  5. An inference server exists to load the model **once**. Loading takes seconds; generating takes milliseconds.
+  6. `generate` must never run on an async event loop — it blocks every other request. Run it on a thread, join it in a `finally`, and clamp `max_tokens` server-side.
+  7. Streaming and blocking do identical GPU work; streaming wins purely on time to first token. An OpenAI-compatible endpoint means existing apps switch by changing a base URL.
+  8. Concurrency raises aggregate throughput and worsens per-user latency, because weights are shared but KV caches are not. Measure both; never optimise one alone.
+</KeyNotes>

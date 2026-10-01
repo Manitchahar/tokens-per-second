@@ -1,0 +1,205 @@
+---
+title: 'Reading a real engine’s codebase'
+summary: 'How to navigate a codebase of hundreds of thousands of lines without reading it. You will learn the six boxes every LLM serving engine is made of, the file each one lives in, and an order to read them in that turns a wall of Python into a diagram you already understand.'
+objectives:
+  - Name the six boxes a serving engine is built from, and say which one owns the GPU
+  - Map each box to the directory and file it lives in inside a real engine
+  - Explain why the engine core must run between GPU steps, and what that costs
+  - Read an unfamiliar codebase by following a request, not by reading top to bottom
+  - Recognise the framework-to-engine gap and list what fills it
+---
+import EngineMap from '@/components/viz/mini-engine/EngineMap.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is a number that should stop you. `vllm` is a mature, widely deployed inference engine, and its `vllm/v1/` tree contains on the order of a hundred thousand lines of Python. You cannot read that. Nobody reads that. Yet in a few focused hours you can understand its entire architecture well enough to change its scheduling policy and predict what your change does to p99 latency.
+
+The trick is that almost none of those lines are load-bearing for understanding. A serving engine is the same six boxes in every project that has ever shipped one. Learn the boxes, learn where they live, and the codebase stops being a wall and becomes a map with you holding the pen.
+
+This lesson gives you the map. The four lessons after it fill in the boxes one at a time, and by the end you will have written a working one.
+
+## Start from the tutorial, not the repo
+
+The fastest way into an engine is to notice what a **tutorial** shows you and ask what is missing. Almost every LLM example you have ever seen looks like this:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct").cuda()
+
+ids = tok("Hello", return_tensors="pt").to("cuda")
+for _ in range(50):
+    out = model.generate(ids, max_new_tokens=1, past_key_values=cache, use_cache=True)
+    cache = out.past_key_values
+    ids = out.logits[:, -1:].argmax(-1)
+```
+
+That code is a correct, complete, production-grade **model runner**. It reads the weights, maintains a KV cache, samples a token. Everything about the transformer is in there and none of it is wrong.
+
+Now count what it does **not** have. There is one request, so there is no queue. There is one sequence, so the batch is always size 1. There is a single caller, so nothing contends for memory. There is no HTTP layer, so no streaming. And `generate()` owns the loop, so nothing can choose who goes next.
+
+<Callout type="intuition" title="The gap you already know how to fill">
+  Every one of those missing pieces is something this course has taught you separately: batching and scheduling (Module 07), PagedAttention (Module 08), the anatomy of a vLLM request (Module 09), prefix caching (Module 10), metrics (Module 24). A serving engine is not new physics. It is those lessons, assembled, each one with a real name and a real file.
+</Callout>
+
+## The six boxes
+
+<Scrolly>
+  <EngineMap client:visible slot="stage" />
+
+  <Step title="1. The tutorial's whole world">
+    One prompt in, one loop, one token at a time. Everything on this diagram is dim because none of it has been built yet: no queue, no server, no shared memory. This is a correct program and a terrible server.
+  </Step>
+
+  <Step title="2. The API server owns the port">
+    An HTTP handler validates the request and applies the chat template, the tokenizer turns text into IDs, and a stream writer turns IDs back into text on the way out. It never touches a GPU. Everything it does is Python, running on a CPU, at the mercy of the GIL.
+  </Step>
+
+  <Step title="3. The engine core owns the GPU">
+    The middle column is the part that must decide and run, once per iteration, between GPU steps. Everything in it is either Python bookkeeping or a GPU launch. That is the reason for the split: keep the slow language off the fast loop.
+  </Step>
+
+  <Step title="4. The model runner owns the weights">
+    This box holds the weights, builds the batch, calls the model, and writes the new keys and values into the cache. It is the thinnest and least interesting file in the engine, because Module 03 already taught you what is inside it.
+  </Step>
+
+  <Step title="5. The KV manager owns memory">
+    The interesting one. Blocks of 16 tokens, a table per request saying where its blocks live, prefix sharing by hash, eviction when the pool runs dry. PagedAttention from Module 08 is not a feature here; it is the entire design of this box.
+  </Step>
+
+  <Step title="6. The scheduler owns everything else">
+    Short, pure Python, and the component that decides who waits. It admits from the waiting queue, chunks prefills, preempts when memory is short, and hands the model runner an exact list of sequences. Every latency number in this course is an output of this box.
+  </Step>
+
+  <Step title="7. Read it in this order">
+    Scheduler first, then the KV manager, then the runner, then the API layer. Reading from the outside in is backwards: the API layer is where you already know what to expect, and the scheduler is where the decisions live. Two thousand lines and you have the architecture.
+  </Step>
+</Scrolly>
+
+<Callout type="real" title="Where these boxes actually live in vLLM">
+  At the time of writing, vLLM's current-generation engine has a recognisable layout, and the names move between releases — but the six boxes do not:
+
+  | Box | Lives in | Rough size | Language |
+  |---|---|---|---|
+  | HTTP + tokenizer + stream | `vllm/entrypoints/` | large, mostly plumbing | Python |
+  | Scheduler | `vllm/v1/core/sched/scheduler.py` | a few hundred lines | Python |
+  | KV manager | `vllm/v1/core/kv_cache_manager.py` + `kv_cache_utils.py` | a few hundred lines | Python |
+  | Model runner | `vllm/v1/worker/gpu_model_runner.py` | the biggest file in the tree | Python + kernels |
+  | Attention backends | `vllm/v1/attention/backends/` | where FlashAttention gets called | Python + CUDA/C++ |
+
+  The ratio is the lesson. **The scheduling logic that decides your users' experience is the smallest code in the repository, and the file that decides nothing user-visible is the largest.**
+</Callout>
+
+## The rule that makes reading tractable
+
+Two sentences, and they are enough:
+
+1. **Follow a request, never the file tree.** Pick one request. Find where it enters, find where it is queued, find where it is put into a batch, find where the batch is executed, find where its token is written back. That path is maybe 2,000 lines and it touches every box.
+2. **Ignore anything that does not change on the critical path.** Custom quantization schemes, multimodal encoders, LoRA adapters, speculative decoding, tensor-parallel sharding: all real, all interesting, none of them needed to understand how a request is served.
+
+<Callout type="pitfall" title="Two ways people lose a whole afternoon here">
+  **Reading alphabetically.** `attention.py` before `scheduler.py` teaches you about kernels before you know why anyone is calling them. You end up with detail and no model to hang it on.
+
+  **Reading the tests first.** Tests are where the invariants live, and they are unreadable without the invariants. Read them *after*, as a check on your understanding: if you cannot predict what a test asserts, you have not understood the box yet.
+</Callout>
+
+## Find the loop first
+
+In any codebase, the highest-value thing you can locate is **the loop that runs once per token**. It is usually short, it is usually near the middle of the scheduler file, and everything else hangs off it. In vLLM it is `Scheduler.schedule()` followed by the runner's execute. In SGLang it is the overlap scheduler's event loop. In llama.cpp it is `llama_decode` being called in a loop by the server task.
+
+Search for the loop first with three greps, in this order:
+
+```bash
+# 1. who is called once per step?
+grep -rn "def step\|def schedule\|def _step" --include=*.py .
+
+# 2. who runs a forward pass?
+grep -rn "\.forward(\|execute_model\|run_model" --include=*.py .
+
+# 3. who owns memory and frees it?
+grep -rn "free(\|alloc\|block_table" --include=*.py . | head -40
+```
+
+The first hit that mentions batch membership is your loop. From there, one `git blame` on the line that builds the batch tells you which pull request introduced the current policy, and the pull request's description is usually a better explanation than the code.
+
+<Callout type="try" title="A 40-minute reading exercise">
+  Clone `vllm`. Open `vllm/v1/core/sched/scheduler.py`. Give yourself 40 minutes and answer exactly four questions, writing the answers down in prose:
+
+  1. Where does a request first appear in this file, and what is it called there?
+  2. What are the two collections of sequences, and what moves between them?
+  3. Name every condition that can cause a request to be skipped this iteration.
+  4. What happens to a running sequence that has run out of memory?
+
+  If you can answer all four, you understand the engine. Everything else in the repository is detail hanging off these answers.
+</Callout>
+
+## What to write down
+
+Reading code fails when you try to hold it in your head. Write instead, in this order:
+
+| Write | What it captures |
+|---|---|
+| The six boxes, one line each | the architecture |
+| The loop, in pseudocode | the control flow |
+| Every place memory is allocated or freed | the invariants |
+| Every counter incremented per iteration | the future metrics |
+
+That last row is the one people skip and it is the most valuable. If you cannot name the counters, you cannot build Module 24's dashboard, and if you cannot build the dashboard you cannot tell whether your engine is healthy. An engine's counters are a design decision made long before anyone needed them.
+
+## Use git as a documentation source
+
+The most underused trick in reading a codebase is that the history is usually better written than the code. A scheduling policy change is one commit, and its message explains the *why* in a sentence the source never will.
+
+```bash
+# who wrote this policy, and why?
+git log -L :schedule:vllm/v1/core/sched/scheduler.py --oneline | head -40
+
+# the commit that introduced the token budget, with its full message
+git log --all --grep="max_num_batched_tokens" --format="%h %s%n%b" | head -60
+
+# a single line's history — finds the PR that set the policy
+git blame -L 200,260 vllm/v1/core/sched/scheduler.py
+```
+
+`git log -L :function:file` is the one to learn. It prints the history of a single function, so you can watch a policy evolve: which lines are three years old and load-bearing, and which are six months old and still settling. Code that keeps changing is code nobody fully understands yet — a fact worth knowing before you edit it.
+
+<Callout type="intuition" title="Read the tests third, not first">
+  A test file is an executable specification of an invariant. Once you can predict what `test_scheduler.py` asserts about preemption, you understand the scheduler well enough to change it. Before that, the tests are noise with names you do not yet understand. The order is **code, then tests, then history** — and history last, because it explains a design that may since have changed.
+</Callout>
+
+## Know what is version-specific
+
+Engine internals move. Directory names change, class names change, the API server and engine core have been threads, then processes, then separate executables. If you memorise paths you will be wrong within a year.
+
+What does **not** move is the division of labour, because physics forces it:
+
+| Box | Why it exists | Still there in five years? |
+|---|---|---|
+| Something must own the HTTP socket | sockets need a process | yes |
+| Something must decide batch membership per step | scheduling is where latency is won | yes |
+| Something must hold the weights and run the forward pass | only one thing can hold 16 GB | yes |
+| Something must own KV memory and free it | memory must be reclaimed | yes |
+
+So learn the **roles** and look up the **paths** when you need them. When an old issue names a class you cannot find, that is a version difference and not a misunderstanding — and knowing the difference is the lesson of this one.
+
+<KeyNotes>
+  1. A serving engine is the same **six boxes** in every project that ships one: HTTP, tokenizer/stream, scheduler, KV manager, model runner, sampler.
+  2. Exactly one box owns the GPU state: the <Term t="engine-core">engine core</Term>. Everything in it runs between GPU steps, so Python there is latency.
+  3. The engine core and the API server are separate processes in vLLM's current-generation engine. The split is the point, not the mechanism.
+  4. The scheduling logic is the **smallest** code in the repository and the model runner is the **largest**. Code size and decision importance are unrelated.
+  5. Read by following one request from HTTP entry to streamed token. That path is roughly 2,000 lines and touches every box.
+  6. Find the per-token loop first, with three greps: `def step|schedule`, `.forward(|execute_model`, `free(|alloc|block_table`.
+  7. Ignore multimodal, LoRA, quantization variants, speculative decoding and tensor parallelism until the six boxes make sense. They are detail, not architecture.
+  8. Write down the counters each iteration increments. You cannot build a dashboard for an engine whose metrics you never noticed.
+  9. Use `git log -L :function:file` to watch a policy evolve. Code that keeps changing is code nobody fully understands yet.
+  10. Learn the **roles**, look up the **paths**. Directory and class names are version-specific; the division of labour is forced by physics and will not change.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A serving engine is split into an API server and an engine core. Why?', options: ['The API server needs the tokenizer and the engine core does not', 'The engine core must run between GPU steps, so keeping the HTTP layer out of it keeps Python off the critical path', 'To allow the engine core to use more CPU cores', 'Because HTTP does not support streaming'], answer: 1, why: 'The engine core decides and runs once per iteration. Anything slow and Python-shaped on that path lands directly in inter-token latency. The split is a latency decision.' },
+  { q: 'In a mature engine like vLLM, roughly how many lines of Python make up the architecture you need to understand to predict a scheduling change?', options: ['About 100,000 — read it all', 'About 2,000 — the rest is detail', 'About 500 — it is mostly C++', 'About 20,000 — you need the attention backends too'], answer: 1, why: 'Following one request from HTTP entry to streamed token touches every box in roughly 2,000 lines. Everything else (multimodal, LoRA, quantization variants, tensor parallelism) hangs off those boxes rather than being required to understand them.' },
+  { q: 'You want to understand how vLLM decides who generates next. Which file should you open first?', options: ['vllm/entrypoints/openai/serving_chat.py', 'vllm/v1/core/sched/scheduler.py', 'vllm/v1/worker/gpu_model_runner.py', 'the attention backend'], answer: 1, why: 'The scheduler decides batch membership, which is the decision you are asking about. The runner is where it executes and the entrypoints are where you already know what to expect. Read from the decisions outwards.' },
+  { q: 'An engine increments these counters once per iteration: running count, waiting count, KV usage percentage, preemptions, tokens processed. What have you just built?', options: ['A debug log', 'The raw material of every serving dashboard, decided before anyone needed it', 'A profiling harness', 'A CUDA graph'], answer: 1, why: 'These are the standard serving metrics: batch size, queue depth, cache pressure, preemption count and throughput. Naming them while reading the code is what lets you build Module 24 dashboards for an engine you have never seen before.' },
+  { q: 'Why is the model runner the largest file in the engine while the scheduler is among the smallest?', options: ['The runner was written last and never cleaned up', 'The runner contains batched GEMMs, attention backends, sampling and memory layouts; the scheduler is short pure-Python bookkeeping', 'The runner is generated code', 'The scheduler is a well-known algorithm with one published implementation'], answer: 1, why: 'File size tracks how many hardware details a component must handle, not how much it decides. The scheduler decides almost everything user-visible in a few hundred lines of logic.' },
+  { q: 'How many separate user-visible decisions does the code in the box diagram make per token, expressed as the number of boxes in the engine core column?', numeric: true, answer: 4, tolerance: 0, unit: 'boxes', why: 'The engine core column holds four boxes: scheduler, KV manager, model runner and sampler. Every one of them runs on every token of every request.' },
+]} />

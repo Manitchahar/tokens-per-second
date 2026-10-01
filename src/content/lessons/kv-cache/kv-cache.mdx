@@ -1,0 +1,243 @@
+---
+title: 'The KV cache: remember, don’t recompute'
+summary: 'Exactly what gets stored, how many bytes it is, and why one decode step writes a single row and reads the whole thing back. The 128 KB per token that decides how many conversations fit on your GPU is derived here, from the model’s shape.'
+objectives:
+  - State exactly which per-token values the KV cache holds, and which it does not
+  - Compute KV cache bytes per token for any model from its layers, KV heads and head dim
+  - Explain why grouped-query attention made long contexts affordable
+  - Explain why cached keys must be stored after the rotary position embedding is applied
+  - Work out how much the cache adds to the bytes a decode step must read
+---
+import KVCache from '@/components/viz/kv-cache/KVCache.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The previous lesson ended with a promise: replace recomputation with storage. This lesson builds the storage, and it is smaller than most people expect — a few numbers per token per layer, in a flat buffer, with a cursor that moves one row per generated token. Everything complicated about serving LLMs later in this course is a consequence of where you put that buffer and how you carve it up.
+
+But first: what exactly is worth remembering?
+
+## What attention actually needs from history
+
+In *Attention from scratch: Q, K and V* (Module 03) you built the one piece of machinery this whole module exists to serve. Inside a layer, every token's vector $x$ is projected three ways:
+
+$$
+Q = x W_Q, \qquad K = x W_K, \qquad V = x W_V
+$$
+
+and attention mixes the values according to how strongly the queries match the keys. Two things follow immediately, and they are the entire design of the cache.
+
+**First, only K and V are needed from the past.** A token's output at layer $\ell$ depends on earlier tokens only through their $K$ and $V$ at that same layer. Nothing else about an old token is ever read again. So the cache stores exactly two vectors per token per layer, and nothing more — not the residual stream, not the MLP output, not the attention output.
+
+**Second, K and V for a given token never change.** They are a function of that token and the layer's own weights, both of which are fixed during inference. Once computed, they are correct forever. This is the fact that makes caching legal at all.
+
+<Callout type="intuition" title="A library, not a notebook">
+  Think of the cache as a card catalogue. The token is the question, and K and V are the two cards filed under it. When a new token arrives you file one new card and then look at the whole drawer. You never rewrite a card, and you never need to: the words on it were always going to be those words.
+</Callout>
+
+The visual below builds the drawer. Scroll through it, then change the model and the cache format with the controls.
+
+<Scrolly>
+  <KVCache client:visible slot="stage" />
+
+  <Step title="1. A step needs the whole history">
+    One new token arrives. To produce its output, attention must compare its query against the key of **every** token seen so far, and then mix their values. There is no way to answer that question without the history.
+  </Step>
+
+  <Step title="2. Keys and values, per layer">
+    Inside one layer, the cache is two grids. For Llama-3.1-8B: 8 key heads of 128 numbers, and 8 value heads of 128 numbers. **One row per token.** Layer 0 has its own pair of grids, layer 1 its own, and so on for all 32 layers.
+  </Step>
+
+  <Step title="3. So store them">
+    Those 4,096 numbers per layer per token are written into a buffer instead of being discarded. 32 layers later you have the whole cache. This is *the* KV cache, and it is the only thing that survives between decode steps.
+  </Step>
+
+  <Step title="4. A step writes exactly one row">
+    The new token needs its own K and V computed, and that is all. One row is written, at index *t*, and the cursor advances. **The write is O(1)** — its cost does not depend on how long the conversation already is.
+  </Step>
+
+  <Step title="5. A step reads the whole thing back">
+    Attention then reads all *t* rows. This is the asymmetry that defines the workload: a tiny write, a large read, repeated hundreds of times. Module 14 is entirely about making that read fast.
+  </Step>
+
+  <Step title="6. The bytes it costs">
+    Weights are a fixed 16.1 GB every step. The cache adds 64 MB at 512 tokens — invisible. Switch the context to 64K and the cache is 8 GB, a third of all the traffic. Drag the slider: the bar is the true cost of remembering.
+  </Step>
+
+  <Step title="7. It only ever grows">
+    Nothing frees a row while the request is alive. Each generated token adds one row of 128 KB for Llama-3.1-8B, permanently, until the request finishes and the rows are recycled. Memory is a function of total context, and it is **linear**.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### The formula, and where 128 KB comes from
+
+Per token, per layer: $H_{kv}$ keys of dimension $D$ and $H_{kv}$ values of dimension $D$. At $b$ bytes per number:
+
+$$
+\text{bytes per token} = \underbrace{2}_{K \text{ and } V} \times \underbrace{L}_{\text{layers}} \times \underbrace{H_{kv}}_{\text{KV heads}} \times \underbrace{D}_{\text{head dim}} \times \underbrace{b}_{\text{bytes per number}}
+$$
+
+<Callout type="math" title="Worked: Llama-3.1-8B in BF16">
+  Its public config: 32 layers, 32 query heads, 8 key/value heads, head dimension 128, 4,096 hidden. At 2 bytes per number:
+
+  $$
+  2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\ \text{bytes} = \mathbf{128\ KB}
+  $$
+
+  Follow the same arithmetic for any model: it is *only* the shape of the model. Nothing about the prompt, the temperature, or the batch size changes it.
+</Callout>
+
+| Model | Layers | KV heads | Head dim | KV bytes/token (BF16) | At 8,192 tokens |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 2 | 64 | **12 KB** | 96 MB |
+| Llama-3.2-3B | 28 | 8 | 128 | **112 KB** | 896 MB |
+| Llama-3.1-8B | 32 | 8 | 128 | **128 KB** | 1.0 GB |
+| Qwen2.5-32B | 64 | 8 | 128 | **256 KB** | 2.0 GB |
+| Llama-3.1-70B | 80 | 8 | 128 | **320 KB** | 2.5 GB |
+| Llama-3.1-405B | 126 | 8 | 128 | **504 KB** | 4.0 GB |
+
+Two things to notice. The 8B model's 128 KB per token is the number the *Big Picture* module already used, now derived. And the cost scales **linearly in layers**, which is why the 405B model's cache is brutal even though its context window is similar: at 128K tokens its cache alone is 66 GB, more than a whole H100.
+
+### GQA is the reason this is affordable
+
+<Callout type="intuition">
+  Full multi-head attention gives every query head its own key and value. Llama-3.1-8B has 32 query heads, so plain MHA would need $B = 2 \times 32 \times 32 \times 128 \times 2 = 512$ KB per token — **four times** the 128 KB above. Llama-3.1-70B, with 64 query heads sharing 8 key/value heads, would need 2.6 MB per token.
+
+  <Term t="gqa">Grouped-query attention</Term> lets several query heads read one shared key/value head. It costs a little quality and saves 4× to 8× of the memory that a cache is made of. It is why 8B and 70B models can hold long conversations at all.
+</Callout>
+
+The arithmetic generalises: **cache size scales with the number of KV heads, not the number of query heads.** When you read a model card, the KV-head count is the one number in the attention block that tells you how much memory conversations will cost you.
+
+### Position is baked into the keys
+
+One subtlety that catches everyone writing their own cache. In *Embeddings & positions* (Module 03) you met <Term t="rope">RoPE</Term>: query and key vectors are rotated by an angle that depends on the token's position, so that the dot product $q \cdot k$ naturally rewards nearby tokens.
+
+The rotation happens **after** the projection, and the rotated key is what gets stored:
+
+$$
+k_i = R(i)\,(x_i W_K)
+$$
+
+Why does the order matter? Because the rotation is the *only* place position enters, and it is applied to a single vector in isolation. If you cached the unrotated $x_i W_K$, you could never recover $k_i$ later without also re-reading $x_i$ — which is exactly the recomputation we are trying to eliminate. So: **project, rotate, then write.** Anything already in the cache carries its position.
+
+<Callout type="pitfall" title="Consequences of position-baked keys">
+  A cache entry is only valid at the position it was created for. That means you cannot shuffle rows, you cannot insert a token in the middle, and you cannot reuse a cache built at a different offset. Every design that treats the cache as a movable object — paged blocks, prefix sharing, chunked prefill — has to respect this. It is a real constraint, and it is the reason some engines store keys **before** rotation and rotate at read time instead, trading a little compute for flexibility.
+</Callout>
+
+### What a decode step now has to move
+
+From the previous lesson, a decode step for one user reads all the weights. Add the cache, and the traffic per step is:
+
+$$
+B_{\text{step}} = \underbrace{2P}_{\text{weights}} + \underbrace{T \cdot \text{KV bytes per token}}_{\text{cache}}
+$$
+
+For Llama-3.1-8B on an H100, using 80% of its 3.35 TB/s plus 1.5 ms of fixed overhead:
+
+| Context $T$ | Cache read | Total read | Cache share | Step time |
+|---|---|---|---|---|
+| 1,024 | 128 MB | 16.2 GB | 0.8% | 7.6 ms |
+| 4,096 | 512 MB | 16.6 GB | 3.1% | 7.7 ms |
+| 8,192 | 1.02 GB | 17.1 GB | 6.0% | 7.9 ms |
+| 32,768 | 4.10 GB | 20.2 GB | 20% | 9.1 ms |
+| 131,072 | 16.1 GB | 32.2 GB | 50% | 13.9 ms |
+
+Read the last column. Decode does **not** get slower because of the recomputation — it gets slower because the cache has to be read, and the cache grows by exactly one row per token you generate. Set the two terms equal to find where the cache becomes the dominant read:
+
+$$
+T_{\text{crossover}} = \frac{2P}{\text{KV bytes per token}} = \frac{16.06 \times 10^{9}}{131{,}072} \approx 122{,}500\ \text{tokens}
+$$
+
+At 122K tokens of context, reading a conversation costs more memory than reading the entire model. Before that, the cache is a rounding error next to the weights, which is why short conversations feel like pure weight-reading — and why people are sometimes surprised that long-context serving is slow even at batch size one.
+
+### The memory bill, one level up
+
+$$
+\text{KV memory} = \underbrace{B}_{\text{sequences}} \times \underbrace{T}_{\text{context}} \times \underbrace{2 L H_{kv} D b}_{\text{per token}}
+$$
+
+Llama-3.1-8B, BF16, 8,192 tokens per conversation: exactly 1 GB each. On an 80 GB H100, once you subtract the 16.1 GB of weights, the workspace and your headroom, there is room for roughly **50 sequences** — not 50 times more throughput than one, because you also have to read all those caches. The next lesson does this arithmetic properly for every model and GPU you care about, and finds the one number that predicts your capacity better than anything else.
+
+### Writing one yourself
+
+The whole thing is small enough to write from scratch. Here is a cache, a write, and the attention that reads it back.
+
+```python
+import math
+import torch
+
+class KVCache:
+    """Preallocated K and V for every layer. One row written per generated token."""
+
+    def __init__(self, n_layers, n_kv, d_head, max_len, dtype=torch.float32, device="cpu"):
+        self.k = torch.zeros(n_layers, n_kv, max_len, d_head, dtype=dtype, device=device)
+        self.v = torch.zeros_like(self.k)
+        self.t = 0                                  # positions currently valid
+
+    def append(self, layer, k_new, v_new):
+        """k_new, v_new: [n_kv, d_head] for ONE token. Writes a row, returns the history."""
+        self.k[layer, :, self.t] = k_new
+        self.v[layer, :, self.t] = v_new
+        self.t += 1
+        return self.k[layer, :, : self.t], self.v[layer, :, : self.t]
+
+    def prefill(self, layer, k, v, p):
+        """k, v: [n_kv, prompt, d_head]. Fills rows 0..p-1 in one copy."""
+        self.k[layer, 0, :, :p] = k
+        self.v[layer, 0, :, :p] = v
+        self.t = p
+
+
+def attend(q, K, V):
+    """q: [n_kv, d_head]. K, V: [n_kv, t, d_head]. No mask: t is exactly all the past."""
+    scores = (K * q).sum(-1) / math.sqrt(q.shape[-1])   # [n_kv, t]
+    probs = torch.softmax(scores, dim=-1)               # [n_kv, t]
+    return torch.einsum("ht,htd->hd", probs, V)         # [n_kv, d_head]
+```
+
+```python
+L, H, D, T = 4, 8, 16, 6
+cache = KVCache(L, H, D, T)
+cache.t = 3                                        # pretend prefill filled 3 rows
+
+K, V = cache.append(0, torch.randn(H, D), torch.randn(H, D))   # writes row 3
+print(cache.k.shape, cache.t)                     # (4, 8, 6, 16)  4
+print(K.shape)                                    # (8, 4, 16)  -> 4 positions of history
+print(attend(torch.randn(H, D), K, V).shape)      # (8, 16)
+```
+
+Three things to notice. `K.shape` is `[heads, t, dim]` — the **length is the cache cursor**, not the preallocated size. `attend` needs no causal mask, because everything returned is genuinely in the past. And `append` touches one row, so its cost is independent of *t*: the write is O(1), the read is O(t).
+
+<Callout type="pitfall" title="The three ways people break a cache">
+  1. **`torch.cat` every step.** Appending with `torch.cat` allocates a fresh tensor and copies the entire history each step, so memory traffic becomes quadratic and you lose all the benefit. Write into a preallocated buffer at index *t* instead.
+  2. **Storing keys before RoPE.** The classic silent bug. It produces plausible-looking text that drifts from the reference as context grows.
+  3. **Sharing a cache across sequences.** The cursor is global, so request B's rows land on top of request A's. One cache per sequence, or per batch row.
+</Callout>
+
+<Callout type="real" title="What real code calls this">
+  In HuggingFace Transformers the cache is passed through the model as `past_key_values` and read back with `DynamicCache.from_legacy_cache(...)`; `model(input_ids=next_token, past_key_values=cache, use_cache=True)` is one decode step. Every framework exposes the same idea under a different name: vLLM and SGLang keep the cache in a preallocated pool and hand attention kernels a block table (Module 08); llama.cpp stores it in a single flat typed array sized at load time. When you read any of them, look for three things: a buffer shaped by layers, a length cursor, and a write at index *t*.
+</Callout>
+
+<Callout type="mentor">
+  The number to have in your head for the rest of the course: **128 KB per token for an 8B model in BF16**. Divide any memory budget by it and you get the number of context tokens you can hold at once — for one user or for a thousand. Everything from here is a consequence of that division.
+</Callout>
+
+<KeyNotes>
+  1. The cache holds **only K and V**, per token, per layer. Nothing else about an old token is ever read again.
+  2. $\text{bytes/token} = 2 \times L \times H_{kv} \times D \times b$. For Llama-3.1-8B in BF16 that is **131,072 bytes = 128 KB**.
+  3. It scales with **KV heads, not query heads**. GQA therefore shrinks the cache 4× to 8× versus full multi-head attention, which is what makes long contexts affordable.
+  4. A decode step **writes one row** (O(1)) and **reads all rows** (O(t)). That asymmetry is the defining shape of the workload.
+  5. Keys must be cached **after** RoPE, so cached entries carry their position and cannot be reordered or re-positioned.
+  6. Decode traffic is $B = 2P + T \times b_{kv}$. On Llama-3.1-8B the cache overtakes the weights at about **123K tokens** of context.
+  7. Total cache memory is $B \times T \times \text{bytes/token}$: linear in users, linear in context, and never freed until the request ends.
+  8. Write into a preallocated buffer at index *t*. Never `torch.cat`, or the traffic goes quadratic and you have lost the whole idea.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A model has 32 layers, 8 key/value heads of dimension 128, and stores its cache in BF16. How many bytes does one token of context cost?', numeric: true, answer: 131072, tolerance: 2000, unit: 'bytes', why: '2 (K and V) × 32 layers × 8 heads × 128 dims × 2 bytes = 131,072 bytes = 128 KB.' },
+  { q: 'Llama-3.1-8B serves a batch of 32 conversations, each at 4,096 tokens, with a BF16 cache. How much KV memory is that, in GB?', numeric: true, answer: 17.2, tolerance: 0.6, unit: 'GB', why: '4,096 tokens × 131,072 bytes = 537 MB per conversation, so 32 of them is 17.2 GB — more than the 16.1 GB of weights. At 8,192 tokens each it would be 34.4 GB and nothing else would fit.' },
+  { q: 'Why must a key be cached after the rotary position embedding is applied?', options: ['Because RoPE is faster in BF16', 'Because the rotation depends only on that token and its position, so the rotated key is final — caching earlier would force recomputation', 'Because pre-RoPE keys use more memory', 'To keep the cache sorted by position'], answer: 1, why: 'RoPE rotates a single vector in isolation. Once rotated at its own position, k is correct forever. Cache the unrotated projection and you would have to re-read the input to rotate it later, which is the recomputation the cache exists to avoid.' },
+  { q: 'In one decode step, how much of the KV cache is written?', options: ['One row: the new token’s K and V', 'Every row, recomputed', 'Nothing, the weights cover it', 'Half, alternating K and V'], answer: 0, why: 'Only the new token is new, so only its K and V are computed and stored. The write is one row at index t, which is why writes are O(1) while reads are O(t).' },
+  { q: 'Llama-3.1-8B uses 32 query heads and 8 key/value heads. How much smaller is its cache than full multi-head attention would need?', numeric: true, answer: 4, tolerance: 0.1, unit: '×', why: 'The ratio of query heads to KV heads is 32 / 8 = 4. MHA would need 512 KB per token instead of 128 KB.' },
+  { q: 'Which statement about a decode step is true?', options: ['It is compute-bound, because one token needs 16 GFLOP', 'It is memory-bound: it reads all the weights plus the whole cache', 'It is compute-bound when the batch is large', 'It does not read memory at all, because the cache is on chip'], answer: 1, why: '16.1 GB of weights plus T × 128 KB of cache must move for about 16 GFLOP of arithmetic — roughly 1 FLOP per byte, far left of the ridge point. The cache makes the memory read larger, never the arithmetic bigger.' },
+] } />

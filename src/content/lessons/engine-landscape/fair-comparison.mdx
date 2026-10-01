@@ -1,0 +1,213 @@
+---
+title: 'How to compare engines fairly'
+summary: 'Four projects each ran a benchmark and each declared a winner. Most of them were wrong. This lesson gives you the harness contract — the six things that must be identical before two engines'' numbers mean anything — and shows you how much a single uncontrolled knob can move a conclusion.'
+objectives:
+  - Name the six items of a harness contract and say what each one controls for
+  - Explain why a closed-loop load generator flatters a slow engine and an open-loop one does not
+  - Compute the queue wait from offered load, service time and concurrency, and locate the load at which your SLO breaks
+  - Enforce quality parity so that a faster engine is not just doing less work
+  - Decide whether to hold engine flags identical or let each engine keep its best settings
+  - State the run-to-run spread a claimed effect must beat before you believe it
+---
+
+import FairHarness from '@/components/viz/engine-landscape/FairHarness.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You now know more about inference engines than almost anyone who writes about them. You know that vLLM's ideas — paged KV blocks, continuous batching, prefix caching — come from Modules 08, 07 and 10. You know what a decode step costs. And you know exactly how to measure one.
+
+Which makes the next question unavoidable. **Four teams have each measured their engine. Which one is fastest?**
+
+There is no answer, and that is the lesson. Not because the question is hard, but because the question as posed is not well defined. Four teams ran four different experiments and got four different numbers, and each of them is a true statement about *their* experiment. The engine was never the only thing that differed.
+
+<Callout type="mentor" title="You will do this in your first month on the job">
+  A very common engineering failure is picking a tool from a chart of numbers that were measured under six different conditions. It looks like rigour and it is the opposite: every cell in that table has a different meaning, and the shape of the chart is a record of the experimenters' choices, not of the software.
+</Callout>
+
+The fix is not a better benchmark. It is a **contract**: a short list of things you promise to hold identical across every arm of the comparison. Everything in this lesson is that list.
+
+## The harness contract
+
+<Scrolly>
+  <FairHarness client:visible slot="stage" />
+
+  <Step title="1. Four wins, four different questions">
+    Every row is a true measurement. None of them is comparable to any other, because each was measured under its own harness. The bars are drawn hatched because they carry no shared meaning yet: `9,000 tok/s` from one harness and `9,000 tok/s` from another are two unrelated facts.
+  </Step>
+
+  <Step title="2. Pin the workload">
+    The first item is the workload. A chat product with a 500-token shared system prompt, a document tool with 24,000-token prompts and an overnight summarisation job are three different systems asking three different questions of a scheduler. Switch the profile above and watch the ranking change. **No engine property changed — only the experiment.**
+  </Step>
+
+  <Step title="3. Pin the arrival pattern">
+    A <Term t="closed-loop-load">closed-loop</Term> generator keeps N requests in flight and issues the next one only when one finishes. A slow engine automatically gets fewer requests per second, so it is quietly given easier conditions and the queue never forms. An <Term t="open-loop-load">open-loop</Term> generator issues on a fixed schedule regardless. Same server, same workload, opposite conclusion.
+  </Step>
+
+  <Step title="4. Pin the load point">
+    Every comparison lives at some <Term t="offered-load">offered load</Term>, and load is where engines actually differ. It is also the easiest thing to leave unpinned, because "as much as possible" sounds fair. It is not: it is a different load for every engine, and it rewards whichever one degrades most quietly.
+  </Step>
+
+  <Step title="5. Pin the quality bar">
+    Every engine must produce the same tokens. Not similar ones — the same ones. Hold the sampling parameters fixed, check the streams actually match, and only then read the timings. An engine that is "30% faster" because it skipped work is not faster, and you will never notice if you do not check.
+  </Step>
+
+  <Step title="6. Let each engine keep its best settings">
+    This is the item people get wrong in both directions. Same naive flags on every engine measures *your flags*, not the engines. Each engine at its own best settings measures the engines — but then you are no longer running one experiment, you are running four, and every one needs re-running when the software moves.
+  </Step>
+
+  <Step title="7. Pin the version and measure warm">
+    Defaults move. So do default backends, and at the time of writing even default dtypes. Pin every version and record it. Measure after compilation, allocation and clock ramp have finished — and report the <Term t="warm-state">cold start</Term> separately, because it is a real and different number and averaging it in flatters nobody.
+  </Step>
+</Scrolly>
+
+## Worked example: what one unpinned knob is worth
+
+Take the `chat` profile in the visual: **Llama-3.1-8B on one H100**, 512-token prompts with a 512-token shared system prompt, 2,048 tokens of context per stream, 16 concurrent streams, 256 tokens generated, and a promise of first token within 800 ms.
+
+Compute one decode step from Module 02's arithmetic:
+
+$$
+t_{\text{step}} = \frac{\text{weights} + \text{KV read}}{\text{bandwidth} \times \text{MBU}} + t_{\text{overhead}}
+$$
+
+$$
+\text{weights} = 8.03\times 10^9 \times 2 = 16.06\ \text{GB}
+$$
+
+$$
+\text{KV read} = \underbrace{512 \times 131{,}072}_{\text{shared prefix, stored and read once}} + \underbrace{16 \times 1{,}536 \times 131{,}072}_{\text{each stream's own tokens}} = 0.07 + 3.22 = 3.29\ \text{GB}
+$$
+
+$$
+t_{\text{step}} = \frac{16.06 + 3.29}{3.35 \times 0.78} + 1.5\ \text{ms} = 7.4\ \text{ms} + 1.5\ \text{ms} = 8.9\ \text{ms}
+$$
+
+So each user gets $\frac{1}{0.0089} \approx 112$ tokens/s and the engine delivers $\frac{16}{0.0089} \approx 1{,}800$ tokens/s. Prefill of 512 tokens is compute-bound, so:
+
+$$
+t_{\text{prefill}} = \frac{2 \times 8.03\times 10^9 \times 512}{989\times 10^{12} \times 0.55} = 15.1\ \text{ms} \quad (\text{plus } 2\ \text{ms})
+$$
+
+Now the piece that decides the verdict. Service time per request is prefill plus every decode step it will ever run:
+
+$$
+S = 0.017 + 256 \times 0.0089 = 2.30\ \text{s}
+$$
+
+Queue wait for a request arriving at <Term t="offered-load">offered load</Term> $\rho$, against $B = 16$ equal servers, is the Module 06 result divided by the number of servers:
+
+$$
+W_q \approx \frac{\rho}{1-\rho} \cdot \frac{S}{B} = \frac{\rho}{1-\rho} \times \frac{2.30}{16}
+$$
+
+And time to first token is the wait plus the prefill:
+
+| Offered load $\rho$ | Queue wait | TTFT | Against a 800 ms promise |
+|---|---|---|---|
+| 0.50 | 144 ms | 161 ms | passes with room |
+| 0.60 | 215 ms | 232 ms | passes |
+| 0.80 | 574 ms | 591 ms | passes |
+| **0.82** | 654 ms | **671 ms** | **last passing point** |
+| **0.85** | 814 ms | **831 ms** | **fails** |
+| 0.90 | 1,293 ms | 1,310 ms | fails badly |
+
+<Callout type="math" title="Read the table before you look at any engine">
+  Between $\rho = 0.82$ and $\rho = 0.85$ — a **3.7% move on one knob** — this server goes from meeting its promise to breaking it. No engine changed. No model changed. No hardware changed. Only the number of requests you decided to send per second.
+
+  Now imagine the comparison you were going to write up: engine A measured at $\rho = 0.7$, engine B at $\rho = 0.9$. A wins comfortably. A also happens to have been measured at a load where it passes its SLO, and B at a load where nothing could pass. The chart shows a quality difference. It shows a choice of test conditions.
+</Callout>
+
+This is why <Term t="slo">the SLO is part of the experiment</Term> and not part of the conclusion. You cannot compare engines by throughput alone, because throughput does not know what you promised.
+
+## The three comparisons that are different experiments
+
+Being precise about this is most of the job.
+
+<Callout type="real" title="Same flags vs each engine's best settings">
+  **Comparison A — identical flags.** Every engine gets the same naive configuration: default block size, default scheduling, default attention backend, no prefix caching. This is a perfectly good experiment and it answers exactly one question: *what happens if we deploy all of these the way we deploy our current one?* The answer is usually "they are all roughly the same", because the defaults are conservative and the per-step cost is dominated by weights and KV reads that every engine shares.
+
+  **Comparison B — each engine at its best settings.** Each engine gets the configuration its own documentation recommends, prefix caching on, tuned memory budget, its preferred attention backend, and for an ahead-of-time engine a plan built for your GPU. This answers the question you actually have: *which engine should we run?* It also costs you four tuning projects and an obligation to re-run everything when any of them ships a release.
+
+  Run **A** to decide whether the choice matters at all. If the answer is "they are within 10% of each other", stop, and choose on the columns you cannot benchmark: build time, hardware support, model coverage, operational familiarity. Only run **B** when A has told you the difference is worth an engineering project.
+</Callout>
+
+## Quality parity, concretely
+
+The cheapest and most commonly skipped control:
+
+```python
+# every engine, every run, always
+GEN = dict(temperature=0.0, top_p=1.0, seed=0, max_tokens=256, stream=True)
+```
+
+Greedy decoding (temperature 0) makes the output a deterministic function of the weights and the arithmetic. Two engines running the same weights with the same greedy settings must emit the same token sequence. If they do not, one of them is computing in lower precision than you thought, or using a different kernel path with different rounding, or serving a different revision of the model.
+
+<Callout type="pitfall" title="Three ways parity gets broken without you noticing">
+  1. **Different model revision.** `main` moved between your two runs. Pin a commit hash, not a branch name. This has bitten more benchmarks than any other cause.
+  2. **Different numerics by design.** A quantized engine and an FP16 engine will not agree token for token, and neither is wrong — they are different systems. Decide whether quality is part of your contract; if it is, compare against a quality bar (Module 11's job), not token for token.
+  3. **Different prompt.** A chat template applied by the server adds role tokens you never typed, and a prefix cache can make the server's idea of the prompt differ from yours. Send the fully-formatted prompt string and disable prefix caching for parity runs.
+</Callout>
+
+## How big a difference has to be
+
+Before you believe a difference, you need to know how much the experiment moves when you do nothing. That is the <Term t="run-to-run-spread">run-to-run spread</Term>, and measuring it takes one extra run of the identical configuration.
+
+If rig noise has standard deviation $c$ and you want to detect an effect $\delta$, the number of repeats you need is roughly:
+
+$$
+k \approx \left(\frac{2c}{\delta}\right)^2
+$$
+
+| Rig noise $c$ | Effect $\delta$ | Repeats needed |
+|---|---|---|
+| 5% | 20% | 1 |
+| 5% | 10% | 1 |
+| 5% | 5% | 4 |
+| 5% | 2% | 25 |
+
+<Callout type="math" title="The honest reading of a 6% win">
+  Suppose vLLM measured 6% more tokens/s than the alternative across four runs each. With $c \approx 5\%$, $\delta = 6\%$ and $k \approx (2 \times 5/6)^2 \approx 2.8$, so three or four repeats is defensible — but the margin is thin, the conclusion is provisional, and one thermal excursion would erase it.
+
+  The correct report is "6%, confidence low, re-measure before deciding", not "vLLM is faster". Conversely, if the rig noise is 1% because you interleaved the runs and locked clocks, a 6% effect is real and you can act on it. **Reducing the noise is almost always cheaper than repeating a noisy experiment**, and interleaving is the cheapest lever there is.
+</Callout>
+
+## What you can measure, and what you must derive
+
+There is one more thing to be honest about, and it matters more than it first appears. **You cannot benchmark everything.** You cannot run TensorRT-LLM on an Apple Silicon laptop. You cannot run llama.cpp's Metal backend on a T4. You cannot build an execution plan on a machine you do not own. And nobody can afford to re-benchmark every engine every month.
+
+So a real comparison has three kinds of column, and the discipline is to keep them apart:
+
+| Kind | Example | Confidence |
+|---|---|---|
+| **Measured** | output tok/s, p95 TTFT, goodput, cold start | High, if the contract held |
+| **Derived** | weight and KV memory, step time, feasibility at a given context | Exact, from arithmetic you did yourself |
+| **Structural** | build step required, needs CUDA, quantization format, model coverage | Certain, from documentation at the time of writing |
+
+<Callout type="pitfall" title="Never put a measured number and a guess in the same cell">
+  The failure mode is a spreadsheet with a bold `1,800 tok/s` in one column and a confident `~2,000 tok/s` in the next, presented as a ranking. The reader cannot tell which is a measurement, and you cannot tell them yourself six weeks later.
+
+  Keep them in separate columns, label each one, and let the measured columns decide between candidates that the structural columns have already narrowed to two. That is the whole method, and it is what the project at the end of this module builds.
+</Callout>
+
+<Callout type="recap" title="The one-sentence version">
+  Two engines are comparable when, and only when, they have been measured under the same workload, the same arrival pattern, the same offered load, the same quality bar, the same amount of tuning and the same versions — and when you compare the resulting <Term t="goodput">goodput</Term> against the same SLO. Anything else is a comparison of experiments.
+</Callout>
+
+<KeyNotes>
+  1. A benchmark result is a claim about a **system, on hardware, under a workload, at a moment**. An engine comparison is a claim about four systems, so the confounds come with it.
+  2. The harness contract has six items: workload, arrival pattern, offered load, quality bar, tuning, versions and warm state. Anything not on the contract is free to vary, and will.
+  3. Offered load is $\rho$, and queue wait is $\frac{\rho}{1-\rho} \cdot S/B$. For a chat service $S \approx 2.3$ s and $B = 16$, the promise flips between $\rho = 0.82$ and $\rho = 0.85$ — a 3.7% move on the knob.
+  4. Closed-loop load generation flatters a slow engine, because offered load falls when the server slows. Open-loop generation does not, and is the honest choice when the queue is the thing under test.
+  5. Quality parity means the same tokens out: temperature 0, pinned revision, fully formatted prompt sent from the client. A faster engine that emits different tokens is not faster.
+  6. Identical flags measure your configuration; each engine's best settings measure the engines. Run the first to see whether the difference is worth the second.
+  7. Nothing is a result until the effect exceeds the run-to-run spread. With $k \approx (2c/\delta)^2$ repeats, a 6% effect against 5% rig noise needs three or four runs and still deserves the word "provisional".
+  8. Split every column into **measured**, **derived** and **structural**. Mixing them is how a spreadsheet turns six unknowns into a confident ranking.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Two engines are benchmarked at offered loads of 0.7 and 0.9 respectively. What is the most likely explanation for a 20% reported difference?', options: ['One engine has a better attention kernel', 'The engine measured at 0.9 was penalised by queueing that the engine at 0.7 never experienced, so the difference is partly the test, not the software', 'One engine used a larger block size', 'The model was served at different precision'], answer: 1, why: 'Queue wait grows as rho/(1-rho). At 0.7 it is 2.3x S/B; at 0.9 it is 9x S/B. The engine measured at 0.9 spent most of its time in the queue, which is a property of the offered load, not of its kernels.' },
+  { q: 'A server has service time S = 2.30 s, admits B = 16 concurrent streams, and is driven at offered load rho = 0.80. Approximately what is the queue wait, in milliseconds?', numeric: true, answer: 574, tolerance: 45, unit: 'ms', why: 'W = rho/(1-rho) x S/B = 0.8/0.2 x 2.30/16 = 4 x 0.1438 = 0.574 s = 574 ms. This is the term that turns a passing service into a failing one.' },
+  { q: 'Why does a closed-loop load generator tend to flatter a slow engine?', options: ['It uses shorter prompts', 'It only issues the next request when one finishes, so a slow server automatically receives fewer requests per second and never builds a queue', 'It measures TTFT more accurately', 'It warms the GPU more'], answer: 1, why: 'Offered load is an output of the generator rather than an input. When the server slows, arrival rate falls with it and the queue stays empty. Open-loop generation fixes the arrival rate, so the queue forms and the degradation becomes visible.' },
+  { q: 'You found vLLM 6% faster than an alternative, with a run-to-run spread of about 5%. What is the correct conclusion?', options: ['vLLM is 6% faster', 'The result is provisional: with k = (2c/delta)^2 you need roughly three or four interleaved repeats, and the margin is thin', 'The test is invalid, throw it away', 'Run more repeats until the 6% becomes 20%'], answer: 1, why: 'k = (2 x 5/6)^2 = 2.8, so three or four repeats. But a 6% effect against 5% noise is barely outside it. The right move is usually to reduce the rig noise by interleaving runs, not to repeat a noisy experiment more times.' },
+  { q: 'Two engines must serve a 32B model on a single 24 GB consumer GPU. Neither can be benchmarked head to head on the hardware you have. Which column type belongs in the matrix?', options: ['Measured', 'Derived', 'Structural', 'Average'], answer: 2, why: 'It is a structural fact — quantization format and weight footprint — not something you measured on hardware you do not own. Weight arithmetic gives you the derived column (32.8e9 x 0.5 bytes = 16.4 GB, which fits), and the structural column records that only one engine has that path.' },
+  { q: 'Your rig has 2% run-to-run spread. You want to claim a 4% improvement. Using k = (2c/delta)^2, about how many repeats per configuration do you need?', numeric: true, answer: 1, tolerance: 0.6, unit: 'repeats', why: 'k = (2 x 2 / 4)^2 = 1. A 4% effect against 2% noise is twice the spread, so it clears the bar with one repeat per arm — provided the runs are interleaved. Anything smaller would need many more.' },
+]} />

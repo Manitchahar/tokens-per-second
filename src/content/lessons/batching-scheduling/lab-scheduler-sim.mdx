@@ -1,0 +1,208 @@
+---
+title: 'Lab: Build a scheduler simulator'
+summary: Write your own model of a serving scheduler in Python, then drive it through workloads that break it — too many seats, too few, ragged lengths, a prefill storm — until you can predict any configuration’s behaviour from first principles.
+objectives:
+  - Implement the retire → schedule → step loop of a continuous-batching engine
+  - Compute TTFT, TPOT, throughput and seat waste from a simulated run
+  - Reproduce the static-batching tail and show continuous batching removes it
+  - Predict how seat count, context length and arrival rate change each of the four numbers
+  - Identify which configuration wins for a given workload, and say why
+---
+import SchedulerLab from '@/components/viz/batching-scheduling/SchedulerLab.tsx';
+
+Everything in this module has been a model someone else wrote. This lab is yours. You will implement a scheduler small enough to read in one sitting — a few dozen lines that reproduce the behaviour of a real engine closely enough to predict its four numbers — and then you will drive it into the corners where production systems break.
+
+No GPU required: this is a simulation lab. Nothing here waits on hardware, and everything runs in a few seconds.
+
+<Scrolly>
+  <SchedulerLab client:visible slot="stage" />
+
+  <Step title="1. The workload is yours to design">
+    Every request here has an arrival time, a length and a priority. Change any of them and the timeline redraws. Notice that the hatched section — the waiting — is always the thing that grows first.
+  </Step>
+
+  <Step title="2. Watch the seats">
+    The bar under the timeline is how many seats are in use each step. That single number, its average, tells you whether your engine is starved or saturated, and those two problems look identical from the outside.
+  </Step>
+
+  <Step title="3. The four numbers">
+    Steps to finish, tokens produced, average wait and worst wait. A configuration is good when it finishes fast, produces everything, and keeps the worst wait small. Those goals conflict, and finding out where is the lab.
+  </Step>
+
+  <Step title="4. Break it: too few seats">
+    Drag the seat count down to 2. Almost everyone waits nearly the whole run, the worst wait climbs into the hundreds of steps — and the GPU never idles for a moment. This is **saturation**: the batch is full and the step time is the constraint. Adding seats will not help; shortening the step would.
+  </Step>
+
+  <Step title="5. Break it: too many seats">
+    Now drag seats up to 24 with only twelve requests. The average wait drops to zero, which looks perfect — but half the seats are empty for the entire run and you paid for all of them. This is **starvation**: not enough traffic to fill the capacity you bought.
+  </Step>
+
+  <Step title="6. Make the queue deep">
+    Pull "arrivals every" down to a few steps, so requests arrive faster than they finish. Now the extra seats fill up, the average batch climbs, and the average wait becomes the thing worth optimising. The best seat count depends entirely on this slider — which is why "how many seats" is never a question you can answer without a workload.
+  </Step>
+
+  <Step title="7. Make it ragged, then compare engines">
+    Push raggedness up and flip between static and continuous. Static holds a seat for every finished request until its slowest member ends; continuous hands that seat to the next arrival on the very next step. Same workload, same tokens, fewer steps to finish.
+  </Step>
+
+  <Step title="8. Find the best configuration yourself">
+    That is the exercise. For a workload where TTFT matters more than throughput, find the seat count that finishes fastest while keeping the worst wait under a number you are willing to promise a user. Write down which two measurements decided it.
+  </Step>
+</Scrolly>
+
+## What you will build
+
+### 1. The engine loop
+
+Start from the loop from 07.2 and make it runnable. This is the whole thing:
+
+```python
+def step(self):
+    # 1. retire: free the seat of anything finished or cancelled
+    for req in [r for r in self.running if r.done or r.cancelled]:
+        self.running.remove(req)
+
+    # 2. schedule: fill freed seats from the waiting queue
+    for req in self.waiting:                # already in policy order
+        if len(self.running) >= self.seats:
+            break
+        if self.kv_free() < req.blocks:
+            break                           # memory budget, not just seat budget
+        self.admit(req)
+
+    # 3. run one step: every running sequence produces exactly one token
+    for req in self.running:
+        req.produced += 1
+        if req.produced >= req.want:
+            req.done = True
+```
+
+Then the loop that drives it:
+
+```python
+def run(self):
+    self.admit_all_possible()               # step 2, once at t=0
+    while self.running or self.ready_waiting():
+        self.step()
+        self.t += 1
+        self.admit_late_arrivals()          # new requests show up over time
+    return self.report()
+```
+
+### 2. The four numbers
+
+```python
+def report(self):
+    ttft = [r.admitted - r.arrived for r in self.reqs if r.admitted is not None]
+    return {
+        "steps":        self.t,
+        "tokens":       sum(r.want for r in self.reqs if not r.cancelled),
+        "avg_ttft":     sum(ttft) / len(ttft),
+        "p99_ttft":     percentile(ttft, 99),
+        "avg_batch":    sum(self.batch_log) / len(self.batch_log),
+        "seat_waste":   1 - useful_seat_steps / total_seat_steps,
+    }
+```
+
+Write `percentile` yourself with nearest-rank (sort, then index at `ceil(p/100 * n)`). You will use it for every measurement for the rest of the course.
+
+### 3. Reproduce the tail
+
+The first experiment, and the one that proves your engine is correct.
+
+**Task A.** Generate eight requests with lengths 96, 40, 72, 28, 60, 84, 52, 88. Run them through a *static* batcher (cut the list into groups of 8, run each group for `max(want)` steps). Then run them through your continuous engine with 8 seats.
+
+**Expected output:**
+
+| | Static | Continuous |
+|---|---|---|
+| Steps | 96 | 96 |
+| Seat-steps paid | 768 | 520 |
+| Seat-steps producing a token | 520 | 520 |
+| Seat steps that produced nothing | 248 (32%) | 0 |
+| Average batch | 8.00 (fixed) | 5.42 of 8 |
+
+Note that the **step count is identical**. Continuous batching does not shorten the longest request — it just stops paying for the other seven. If your static number is not 96 or your seat-waste not 32%, fix your code before continuing: every later experiment depends on this one.
+
+<Callout type="try" title="Do not skip Task A">
+  It takes five minutes and it is the difference between a simulator and a plausible-looking loop. If the tail does not appear in Task A, it will not disappear when you go looking for it later, and you will spend an hour debugging the wrong thing.
+</Callout>
+
+### 4. Break it on purpose
+
+Now the real lab. Four experiments, each with a prediction you write down **before** you run it.
+
+**Task B — too few seats.** Twelve requests, 120 tokens each, 2 seats. Predict `steps`, `avg_ttft` and `p99_ttft`. Then run it.
+
+Expect: steps ≈ 720, and p99 waits in the hundreds of steps. The GPU is busy the whole time; almost nobody is being served. This is saturation.
+
+**Task C — too many seats.** The same twelve requests, 24 seats.
+
+Expect: steps ≈ 120 and avg_ttft = 0 (everyone starts immediately). But look at the average batch: it is **12 sequences in a 24-seat engine, so about half the seats are idle for the entire run**. The step costs the same at 12 sequences as at 24 — the weight read is paid either way — so you bought nothing and wasted half the machine. This is the mistake that costs real money: someone raised `max_num_seats` to be safe and doubled their GPU bill.
+
+(For a 12-request workload this is the worst case, because there is no queue to refill the seats. Once requests arrive faster than they finish, the extra seats fill up and the comparison changes — which is why "how many seats" has no answer without a workload.)
+
+**Task D — ragged lengths.** Twelve requests whose lengths follow a heavy tail: eleven around 30 tokens and one of 400. Sweep the seat count from 1 to 12.
+
+Measured, from the simulator:
+
+| Seats | Steps | avg TTFT | p99 TTFT | avg batch |
+|---|---|---|---|---|
+| 1 | 745 | 416 | 709 | 1.00 |
+| 2 | 435 | 116 | 274 | 1.71 |
+| 3 | 428 | 55 | 127 | 1.74 |
+| 6 | 400 | 18 | 57 | 1.86 |
+| 12 | 400 | 0 | 0 | 1.86 |
+
+Two things to take from it. First, **the returns collapse**: 1 → 2 seats is a 42% cut in steps, 6 → 12 seats saves nothing at all. The floor is the 400-token request, and once the seats outnumber the requests there is nothing left to fill them. Second, **average batch never exceeds 1.86**, even at 12 seats. That is heavy-tailed traffic: for most of the run the GPU is serving a couple of sequences, and the tail dominates everything.
+
+**Task E — the prefill storm.** Ten short requests arriving steadily, plus one 4,000-token prompt arriving at step 20.
+
+Predict what happens to the short requests' inter-token gaps. Then implement a simple prefill cost (roughly `2 × params × prompt_tokens / FLOPs`) added to the step where it is admitted, and see the queue behind it.
+
+Expect: a visible stall, and the short requests' TPOT to jump by the prefill's duration. This is Task E of 07.3 in miniature.
+
+### 5. The policy experiment
+
+**Task F.** Decide your convention and be consistent: in the code above, `priority` sorts ascending, so **lower means served earlier**. Give half the requests `priority=0` (high) and half `priority=1` (low), then run FIFO and priority.
+
+Expect: the priority run is **worse overall** — the low-priority requests' mean and p99 both go up — while the high-priority ones are better off. That is the trade, stated in two columns. Then confirm that adding aging — `effective_priority = priority - waited // 50` — pulls the low-priority p99 back down without moving the high-priority p50 much.
+
+Record all four: mean, p99, high-priority p50, low-priority p99. You now have the data for a fairness trade-off argument you can make in a design review.
+
+### 6. The deliverable
+
+Fill in this table with your measured numbers, then answer the question underneath it:
+
+| Config | steps | avg TTFT | p99 TTFT | avg batch | seat waste |
+|---|---|---|---|---|---|
+| 2 seats, uniform | | | | | |
+| 6 seats, uniform | | | | | |
+| 24 seats, uniform | | | | | |
+| 6 seats, ragged | | | | | |
+| 6 seats + priority | | | | | |
+| 6 seats + aging | | | | | |
+
+**Question.** For a chat service where 90% of requests are under 200 tokens and TTFT matters more than throughput, which row do you pick, and what did you give up? Justify it with two of the columns, not with taste.
+
+<Callout type="recap" title="What this lab is really about">
+  Every number in serving is a consequence of one loop and three limits. The loop decides who runs; the limits decide how many can. Once you can simulate the loop, you can predict any configuration before you ever touch a GPU — which is exactly what you want when the question is "what happens if I turn this knob".
+</Callout>
+
+## Check yourself before moving on
+
+- Why does the same workload finish in fewer steps with 6 seats than with 24? (Hint: it is not because 24 seats are slower.)
+- Your engine reports avg_batch of 0.4 and an empty queue. Which of the three scheduler knobs from 07.3 would you turn, and which would make things worse?
+- A preemption happens on step 300 of a request that has streamed 150 tokens. What is the total extra work, and why is the answer not zero?
+- You double `max_num_seqs` and p99 TTFT doubles too. Name the two mechanisms that could explain it.
+
+<KeyNotes>
+  1. The whole engine is retire → schedule → one step → repeat, and everything else is bookkeeping.
+  2. Always measure four numbers: steps, avg TTFT, p99 TTFT, avg batch. Seat waste tells you if the batch is full.
+  3. Static batching's tail must appear in your simulator (Task A) before any other result means anything.
+  4. Too few seats is saturation (everyone waits); too many seats is starvation (half the GPU idles). They look the same from outside.
+  5. Ragged lengths drain the batch at the end, which is when a smaller seat count can win.
+  6. Priority raises the mean and p99 for the low tier while helping the high tier; aging removes the starvation it creates.
+  7. Preemption costs exactly the tokens the evicted sequence had already streamed, because it must replay them.
+  8. Simulate before you deploy: the loop plus the three limits predict any configuration, on paper, in seconds.
+</KeyNotes>

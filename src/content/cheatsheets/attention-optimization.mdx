@@ -1,0 +1,171 @@
+---
+title: 'Module 14 · Attention Optimization'
+module: attention-optimization
+---
+
+## The shapes, and why they matter
+
+| | Prefill | Decode |
+|---|---|---|
+| Query rows | $T$ | **1** |
+| Score shape | $T \times T$ | one row of length $T$ |
+| Peak extra memory | $O(T^2)$ naive, $O(B_r d)$ fused | $O(B_r d)$ |
+| Bound by | compute (after fusion) | **bandwidth** |
+| Kernel family | FlashAttention | FlashDecoding, paged |
+
+## Eager attention: what it costs
+
+$$
+\text{peak} = 2 \times n_q \times T^2 \times b \qquad \text{(S and P both resident)}
+$$
+
+$$
+\text{traffic} = \underbrace{4 T^2 n_q b}_{S,\ P} + \underbrace{4 T d n_q b}_{Q,\ K,\ V,\ O}
+$$
+
+Llama-3.1-8B, one layer, $n_q = 32$, $d = 128$, BF16:
+
+| $T$ | $S+P$ peak (1 layer) | traffic (1 layer) | whole KV cache (32 layers) |
+|---|---|---|---|
+| 2,048 | 1.07 GB | 2.15 GB | 268 MB |
+| 4,096 | 4.29 GB | 8.59 GB | 537 MB |
+| 8,192 | 17.2 GB | 34.4 GB | 1.07 GB |
+| 16,384 | 68.7 GB | 137 GB | 2.15 GB |
+
+- The intermediate for **one layer** is 8× the entire KV cache at $T = 8{,}192$.
+- Each tensor is read **exactly once**, so this is not redundant traffic — it is traffic for a tensor that should never have existed.
+- Real intensity $I = \dfrac{4T^2 d n_q}{4T^2 n_q b + 4T d n_q b}$, not the roofline's $T/8$. Eager attention is memory-bound at long context *because of* the intermediate.
+
+## The online softmax
+
+**State:** three vectors per query row — $m$ (max), $\ell$ (sum), $O$ (output). Nothing else.
+
+$$
+\begin{aligned}
+m_{\text{new}} &= \max(m,\ \max_j s_j) \\
+\ell_{\text{new}} &= \ell\, e^{m - m_{\text{new}}} + \sum_j e^{s_j - m_{\text{new}}} \\
+O_{\text{new}} &= O\, e^{m - m_{\text{new}}} + \sum_j e^{s_j - m_{\text{new}}}\, v_j
+\end{aligned}
+$$
+
+Finish once: $O \gets O/\ell$.
+
+**Merge rule** for two partials:
+
+$$
+\ell = \ell_1 e^{m_1 - m} + \ell_2 e^{m_2 - m}, \qquad m = \max(m_1, m_2)
+$$
+
+Associative ⇒ **exact**, not approximate. Only the floating-point order changes.
+
+**Init $m = -\infty$, never 0.** Then the first correction is $\exp(-\infty - m) = 0$, cleanly annihilating the empty state. With $m = 0$ the state is treated as if a maximum had been seen, and $\ell$ comes out wrong whenever scores are negative.
+
+## FlashAttention
+
+```python
+m = -inf; l = 0; O = 0
+load Q_tile -> SRAM                       # Br x d, stays for the whole loop
+for each key tile j:
+    S = Q_tile @ K_j.T / sqrt(d)           # in SRAM, NEVER stored
+    S = causal_mask(S, j)
+    m, l, O = online_update(m, l, O, S, V_j)
+O /= l                                     # once, at the end
+```
+
+| $B_r$ / $B_c$ | Tile bytes | Peak extra, one program |
+|---|---|---|
+| 32 | 4 KB | ~25 KB |
+| **64** | **8 KB** | **~45 KB** |
+| 128 | 32 KB | ~100 KB (occupancy cost) |
+
+$$
+\text{peak} \approx B_r d \cdot 2 + 2 B_c d \cdot 2 + 3 B_r d \cdot 4
+$$
+
+**Constant in $T$.** A 100,000-token prefill does not OOM. That flatness is the whole point.
+
+**Causal saving:** tiles computed $= n(n+1)/2$ of $n^2$ ⇒ **~half the FLOPs, free**.
+
+**Back to your turn:** the backward pass **recomputes** $S$ from $Q, K, V$ and the saved $(m, \ell)$ — same store-the-statistics trade as the KV cache. Inference only needs forward.
+
+## Decode attention
+
+$$
+I_{\text{decode}} = \frac{4 n_q d}{4 n_{kv} d} = \frac{n_q}{n_{kv}} = \textbf{group factor}
+$$
+
+$d$ and the 2-for-K-and-V cancel completely.
+
+| Model | $n_q$ | $n_{kv}$ | Intensity | H100 ridge = 295 |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 14 | 2 | 7 | 42× below |
+| Llama-3.2-3B | 24 | 8 | 3 | 98× below |
+| **Llama-3.1-8B** | 32 | 8 | **4** | **74× below** |
+| Llama-3.1-70B | 64 | 8 | 8 | 37× below |
+
+**Independent of context length.** Decode attention is bandwidth-bound permanently; no kernel fixes this because there is no intermediate to fuse.
+
+**Why fused does not help decode:** prefill wins by removing $O(T^2)$ traffic. Decode computes a single row of length $T$ — nothing to remove. Its only lever is parallelism.
+
+## Split-K / FlashDecoding
+
+$$
+m = \max_j m_j, \qquad \ell = \sum_j \ell_j e^{m_j - m}, \qquad O = \sum_j O_j e^{m_j - m}, \qquad \text{out} = O/\ell
+$$
+
+Same merge rule, $n_s$ partials. **Exact.** Split count $n_s$ is tuned from batch size and context — at large batch the machine is already full and splitting only adds combine overhead.
+
+## KV bytes per token (the constant)
+
+$$
+\boxed{\text{bytes/token} = 2 \times L \times n_{kv} \times d_{head} \times b}
+$$
+
+| Model | $L$ | $n_{kv}$ | $d$ | Bytes/token (BF16) |
+|---|---|---|---|---|
+| Llama-3.1-8B | 32 | 8 | 128 | **131,072** (128 KiB) |
+| Llama-3.1-70B | 80 | 8 | 128 | **327,680** (320 KiB) |
+| Qwen2.5-0.5B | 24 | 2 | 64 | 12,288 (12 KiB) |
+
+## Backends
+
+| Backend | Mechanism | Wins at |
+|---|---|---|
+| Eager | materialises $S$, $P$ | nowhere; correctness reference only |
+| FlashAttention-2 | fused tile loop, no intermediate | prefill; decode at large batch |
+| FlashDecoding | + split-K | decode at small batch / long context |
+| Paged | block-table walk + gather | decode under PagedAttention (~1% overhead) |
+| SGLang radix | indexes block table directly, **no gather** | prefix-heavy decode |
+| Vendor (FlashInfer, CUTLASS, TRT-LLM) | hand-tuned per arch | your GPU, once measured |
+
+**No universal winner.** The right answer depends on **shape**: batch, context, prefill vs decode. Measure with your real traffic mix (Module 06).
+
+## Decision rules
+
+1. Long-context prefill OOMs? → **Fused attention**. Non-negotiable.
+2. Decode slow at low batch, long context? → **Split-K**, tune $n_s$.
+3. Decode slow under PagedAttention? → try a **radix/no-gather** backend.
+4. Never hand-roll a kernel that the framework already ships fused. `scaled_dot_product_attention` *is* FlashAttention.
+5. Verify before you time. Always.
+
+## Pitfalls
+
+1. **`m` initialised to 0, not $-\infty$.** Passes on positive scores, silently wrong on negative ones. Always $-\infty$.
+2. **FP16 accumulator.** Rounding over thousands of tiles reads as a quality regression, not a bug. Keep `acc`, `m`, `l` in FP32.
+3. **Missing the scaling factor.** Dropping $1/\sqrt{d}$ in the score. Output is finite and plausible; quality just quietly worse.
+4. **Missing causal mask.** No crash, especially not in decode. Silently broken causality.
+5. **Copying a tile size between GPUs.** Register budgets differ; occupancy collapses. Tune per architecture.
+6. **Quoting eager attention as the baseline for decode.** There is no $T^2$ to remove — you will measure ~0% and conclude fusion is pointless *for decode*, which is true and not a general conclusion.
+7. **Believing "masked ⇒ free".** The mask saves FLOPs, not memory. The full matrix is still allocated in eager mode.
+
+## Reference numbers
+
+| Quantity | Value |
+|---|---|
+| H100 ridge point | ~295 FLOP/byte |
+| Decode intensity, Llama-3.1-8B | 4 FLOP/byte (**74× below ridge**) |
+| KV read, 8,192 tok, 32 layers | 1.07 GB → 320 µs on an H100 |
+| Fused peak, $B_r = B_c = 64$ | ~45 KB, independent of $T$ |
+| Paged gather overhead | ~1% of a decode step |
+| Eager peak, 8,192 tok, 1 layer | 17.2 GB (**8× the whole KV cache**) |
+| Causal FLOP saving | ~50% |

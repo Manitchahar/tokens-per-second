@@ -1,0 +1,260 @@
+---
+title: 'Multi-LoRA serving'
+summary: 'LoRA makes a specialist model cost a fraction of a percent of the base it modifies. Serving many of them turns that into a memory story: one frozen base amortised across every tenant, a per-request cost that is almost nothing, and one batch-mixing tax that everybody forgets until they measure it.'
+objectives:
+  - Derive the parameter count of a LoRA adapter from r, input width and output width
+  - Compute the adapter share of a base model across ranks and target matrices
+  - Explain why rank is quoted against hidden width rather than against the matrix
+  - Compute the memory of serving N adapters over one base at a given precision
+  - Explain why a batch mixing several adapters is slower than a homogeneous one
+---
+import MultiLora from '@/components/viz/specialized-workloads/MultiLora.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Imagine you run a summarisation API for forty companies. Full fine-tuning gives you forty models, which means forty times the weights, forty GPUs, and a bill you cannot defend to a finance team. The obvious fix — a smaller base model — costs you quality on exactly the domain your customers pay for.
+
+The <Term t="lora">LoRA</Term> answer is that the specialists are tiny. Each one is under half a percent of the base model, so you load one base once and swap a 65 MB file per request. The arithmetic that makes this work is small, and this lesson is mostly about doing it properly — and about the one cost that does not show up in the parameter count.
+
+## A low-rank correction
+
+LoRA's observation is that a fine-tuned model's *update* to the original weights is low-rank. Not the weights themselves — those are full-rank — but the delta $\Delta W$ that fine-tuning adds.
+
+The trick is to never materialise $\Delta W$. Instead of learning an $(out \times in)$ matrix, learn two thin ones:
+
+$$
+W' = W_0 + \Delta W = W_0 + BA, \qquad A \in \mathbb{R}^{r \times in}, \quad B \in \mathbb{R}^{out \times r}
+$$
+
+The base $W_0$ stays frozen. Only $A$ and $B$ train. The rank $r$ is the knob: $r = 0$ is the base model exactly, and $r \geq \min(in, out)$ can express any update at all.
+
+<Callout type="intuition" title="Why low rank is a reasonable bet">
+  A fine-tune usually changes a model's *style and behaviour* far more than its knowledge. Style is a low-dimensional shift; knowledge is high-dimensional. So the useful part of a fine-tune tends to live in a small number of directions, and a rank-16 update has enough room to capture it. That is an empirical observation, not a theorem — but it is why $r$ in the single digits to low tens works so widely.
+</Callout>
+
+## The parameter arithmetic
+
+This is the whole economics, so let me derive it rather than quote it.
+
+For a matrix of shape $(out, in)$, the base holds $in \cdot out$ parameters. The adapter holds:
+
+$$
+\underbrace{r \cdot in}_{A} + \underbrace{out \cdot r}_{B} = \boxed{r(in + out)}
+$$
+
+Take Llama-3.1-8B: 32 blocks, hidden width $d = 4096$, intermediate 14336, and GQA with 8 KV heads of 128 dims so the key and value projections are 1024 wide rather than 4096.
+
+One attention projection, 4096 × 4096, at $r = 16$:
+
+$$
+r(d + d) = 16 \times 8192 = 131{,}072 \text{ parameters}
+$$
+
+$$
+\text{share of the matrix it modifies} = \frac{131{,}072}{16{,}777{,}216} = \boxed{0.78\%}
+$$
+
+Now scale to the whole model. Adapting all four attention projections in every block:
+
+$$
+32 \times 2 \times \underbrace{r(d+d)}_{q,o} + 32 \times 2 \times \underbrace{r(1024 + d)}_{k,v}
+= 32 \times 2 \times 16 \times 8192 + 32 \times 2 \times 16 \times 5120
+$$
+
+$$
+= 8{,}388{,}608 + 5{,}242{,}880 = \boxed{13.6\text{M}}
+$$
+
+And the feed-forward pair, which is where the parameters actually are:
+
+$$
+32 \times \Big(r(14336 + 4096) + r(4096 + 14336)\Big) = 32 \times 2 \times 16 \times 18432 = \boxed{18.9\text{M}}
+$$
+
+Together:
+
+$$
+13.6\text{M} + 18.9\text{M} = 32.5\text{M}, \qquad \frac{32.5\text{M}}{8.03\text{B}} = \boxed{0.41\%}
+$$
+
+<Callout type="math" title="Why rank is quoted against hidden width">
+  People say "rank 16 on a 4096-wide model", and the shorthand $r/d$ is not the real ratio. The real ratio is $r(in+out)/(in \cdot out)$, which for a square matrix is $2r/d$ — twice the shorthand. It matters because the shorthand makes rank look cheaper than it is. For a rectangular matrix like the feed-forward up-projection it is worse still: $r(14336+4096)/(14336 \cdot 4096)$ is $3r/14336$, about a quarter of $r/d$.
+
+  **Compute $r(in+out)/(in\cdot out)$, always.** The shorthand is a label, not a measurement.
+</Callout>
+
+Here is the whole table, so you can see how each knob moves:
+
+| rank $r$ | attention only | + feed-forward | share of base | size at BF16 |
+|---|---|---|---|---|
+| 1 | 0.85M | 2.0M | 0.025% | 4 MB |
+| 4 | 3.4M | 8.1M | 0.101% | 16 MB |
+| 8 | 6.8M | 16.3M | 0.202% | 33 MB |
+| **16** | **13.6M** | **32.5M** | **0.405%** | **65 MB** |
+| 32 | 27.3M | 65.0M | 0.810% | 130 MB |
+| 64 | 54.5M | 130M | 1.619% | 260 MB |
+
+Linear in $r$, as it must be. Which rank you need is an evaluation question, not an arithmetic one — but the table tells you what each choice costs before you run the evaluation.
+
+<Scrolly>
+  <MultiLora client:visible slot="stage" />
+
+  <Step title="1. One adapter is a low-rank correction">
+    The base matrix is frozen and shared. **Every tenant uses the same weights**; what differs is a pair of thin matrices added to them. This is the entire idea.
+  </Step>
+
+  <Step title="2. The arithmetic: r × (in + out)">
+    Two thin matrices instead of one wide one. Move the rank slider and watch the adapter's size against the base — at $r = 16$ it is well under half a percent.
+  </Step>
+
+  <Step title="3. How small is small">
+    One projection: 131K adapter parameters against 16.8M base parameters. **A specialist costs 0.78% of what it modifies**, which is why a fleet of them is affordable.
+  </Step>
+
+  <Step title="4. Adapting everything vs adapting a little">
+    Attention-only is 13.6M parameters; adding the feed-forward pair takes it to 32.5M. Attention-only is usually enough for format and style. **The feed-forward pair costs more and buys more capacity.**
+  </Step>
+
+  <Step title="5. What it costs to serve many tenants">
+    The base is 16.06 GB. Sixteen adapters at $r=16$ add 1.04 GB — **6.5% more memory for sixteen extra models.**
+  </Step>
+
+  <Step title="6. The base is the asset">
+    Raise the adapter count and the base share of memory stays above 79% even at 64 adapters. **The base is loaded once and amortised across everything**; that is the economic argument.
+  </Step>
+
+  <Step title="7. A batch of mixed tenants">
+    Decode batches mix tenants, and the engine groups rows by adapter into separate GEMMs. More groups means smaller GEMMs and wasted bandwidth. **This is the real per-tenant cost.**
+  </Step>
+
+  <Step title="8. Choosing a rank">
+    Pick what the task needs. Style and format changes saturate at $r = 8$; new capability needs more, and you will discover that in evaluation, never in throughput.
+  </Step>
+</Scrolly>
+
+## The memory of a fleet
+
+Now the deployment question. You can serve any adapter that is resident, and you cannot know which one the next request needs, so **every adapter you might serve must be loaded**. Total memory is:
+
+$$
+M_{\text{total}} = \underbrace{P_{\text{base}} \cdot b}_{\text{base}} + \underbrace{N \cdot P_{\text{lora}} \cdot b}_{\text{adapters}}
+$$
+
+For Llama-3.1-8B at BF16 on an A100 (80 GB):
+
+| adapters | base | adapters | total | base share |
+|---|---|---|---|---|
+| 1 | 16.06 GB | 0.07 GB | 16.13 GB | 99.6% |
+| 8 | 16.06 GB | 0.52 GB | 16.58 GB | 96.9% |
+| 16 | 16.06 GB | 1.04 GB | 17.10 GB | 93.9% |
+| 32 | 16.06 GB | 2.08 GB | 18.14 GB | 88.5% |
+| 64 | 16.06 GB | 4.16 GB | 20.22 GB | 79.4% |
+
+Read the last column. Even at 64 adapters, nearly four fifths of the memory is the base model. **The marginal cost of a tenant is tens of megabytes.** Compare that to 16 GB — the cost of a second full replica — and the argument is finished.
+
+<Callout type="real" title="What this actually replaces">
+  Multi-LoRA exists because it turns "N models" into "1 model + N small files". The alternative for forty tenants is either forty replicas (forty times the memory, forty times the cold-start cost, forty times the operational surface) or one mediocre multi-tenant model (no specialisation at all). The base-share column is the number that makes the trade obvious.
+</Callout>
+
+### Adapters can be quantized too
+
+An adapter is a tiny, well-conditioned set of matrices, so 8-bit or even 4-bit adapters work well — and this multiplies the fleet size you can serve. Holding the base at BF16 and shrinking only the adapters:
+
+| adapters | adapter precision | adapters' bytes | total | fleets per A100 |
+|---|---|---|---|---|
+| 64 | BF16 | 4.16 GB | 20.22 GB | 3 |
+| 64 | 4-bit | 1.04 GB | 17.10 GB | 4 |
+| 128 | 4-bit | 2.08 GB | 18.14 GB | 4 |
+
+Note the ceiling: even at 128 four-bit adapters the total is still dominated by the 16 GB base, and the number of complete fleets you can hold barely moves. **Adapters are so cheap that quantizing them buys you tenants, not capacity.** To hold genuinely more tenants you quantize the *base* too — which is Module 11's quantization applied to a workload where one set of weights is shared by everyone.
+
+## The cost nobody budgets: batch mixing
+
+Memory is the number everyone calculates. This is the one they forget.
+
+In a serving engine a decode step reads the weights once for the whole batch (Module 05). If all 32 sequences in the batch want the same adapter, that is one ordinary GEMM with 32 rows — optimal, memory-bound, exactly the shape you tuned for in Modules 06 and 09.
+
+Now suppose those 32 sequences belong to four different tenants. The engine must group the rows by adapter:
+
+| adapters in the batch | rows per GEMM | slowdown |
+|---|---|---|
+| 1 | 32 | 1.00× |
+| 2 | 16 | 1.06× |
+| 4 | 8 | 1.21× |
+| 8 | 4 | 1.47× |
+| 16 | 2 | 1.96× |
+
+The mechanism: memory-bound GEMMs get their bandwidth utilisation from having enough rows to saturate every memory transaction. Below roughly 8–16 rows the kernel starts leaving bandwidth idle, and the step slows down even though it moves exactly the same bytes.
+
+<Callout type="pitfall" title="Adapter count and batch size are the same dial">
+  This is the trade nobody puts in a slide. Spreading a fixed batch across many adapters is *exactly* equivalent to shrinking the batch, because the weight read is per-GEMM and you now pay it four times instead of once. **If you have 100 tenants, serving 4 concurrently per step is the same as serving 16 tenants at batch 4.**
+
+  The mitigations are all routing decisions: group requests by adapter (cache-aware routing, Module 23), size the engine so each adapter's concurrency is reasonable, or accept a larger adapter footprint to keep batches dense.
+</Callout>
+
+<Callout type="intuition" title="Why this compounds with prefix caching">
+  There is a helpful interaction. Requests for the same adapter are also likely to share a system prompt, so they hit the same prefix cache (Module 10). That both cuts prefill and makes affinity routing doubly valuable: **sending a request to the replica that already has its adapter *and* its prefix cached is the single biggest latency win available in a multi-adapter deployment.**
+</Callout>
+
+## Choosing the configuration
+
+If you are deploying this, the decisions in order:
+
+| decision | default | when to change |
+|---|---|---|
+| target matrices | attention + FFN | attention-only if memory-bound and the task is format/style |
+| rank $r$ | 16 | 8 for pure style, 32–64 for new capability |
+| adapter precision | 8-bit | 4-bit when fleet size is the constraint |
+| base precision | BF16 or FP8 | 4-bit only if you have measured the quality cost (Module 11) |
+| batching | group by adapter | only when adapter count per batch is small |
+
+The most common production mistake is choosing $r$ by what the memory budget allows rather than by what the task needs. Rank is a *modelling* decision made in evaluation; the memory consequence is secondary and, as the table above shows, tiny.
+
+```python
+# The whole serving contract: one base, N adapters, swap per request.
+class MultiLoRAServer:
+    def __init__(self, base_path, adapter_dir):
+        self.base = load_model(base_path)              # loaded once
+        self.adapters = {
+            name: load_lora(path)                     # rank r, small
+            for name, path in list_adapters(adapter_dir)
+        }
+
+    def generate(self, tenant: str, prompt: str) -> str:
+        # Attach this tenant's adapter, generate, detach. The base is untouched.
+        with self.base.use_adapter(self.adapters[tenant]):
+            return self.base.generate(prompt)
+
+    def prefill_estimate(self, tenant: str, prompt_tokens: int) -> float:
+        # Identical for every tenant: the adapter does not change prefill FLOPs.
+        # It changes decode quality, not decode cost.
+        return 2 * BASE_PARAMS * prompt_tokens / (GPU_FLOPS * MFU)
+```
+
+That last method is worth pausing on, because it is true and it surprises people: **a LoRA adapter does not make generation faster or slower in any way the decode-step model can see.** It adds $r(in+out)$ multiply-accumulates per adapted matrix — vanishing next to reading the base weights — and it changes what the model *says*. Adapter latency is a memory-footprint and batching question, not an arithmetic-intensity question.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. A 4096 × 4096 projection gets a rank-16 adapter. How many parameters does the adapter hold, and what fraction of the base matrix is that?
+  2. Adapting only the attention projections of Llama-3.1-8B at $r = 16$ gives 13.6M parameters. Show the arithmetic, including why the K and V projections contribute differently from Q and O.
+  3. You serve 32 adapters at $r=16$ on an A100 in BF16. Total memory, and what fraction of it is the base?
+  4. Your decode batch of 32 contains 8 different tenants. What is the slowdown versus a homogeneous batch, and what is the underlying mechanism?
+  5. A LoRA adapter adds 32.5M parameters of multiply-accumulates per token. Compute that against the base model's ~8 billion multiply-accumulates per token, and explain why it does not show up in latency.
+</Callout>
+
+<KeyNotes>
+  1. LoRA learns a rank-$r$ update $BA$ rather than a full $\Delta W$, so an adapter on an $(out \times in)$ matrix holds exactly $r(in + out)$ parameters.
+  2. For Llama-3.1-8B, a rank-16 adapter over all attention and feed-forward projections is 32.5M parameters — **0.41% of the base**, 65 MB at BF16.
+  3. The real ratio is $r(in+out)/(in\cdot out)$, which for a square matrix is $2r/d$ — twice the usual $r/d$ shorthand. The shorthand is a label, not a measurement.
+  4. Serving $N$ adapters costs $P_{base} \cdot b + N \cdot P_{lora} \cdot b$. At 64 rank-16 adapters the base is still 79% of memory, so a tenant costs tens of megabytes instead of 16 GB.
+  5. Adapters quantize well, so 4-bit or 8-bit adapters multiply the fleet size you can hold — a global win, since quantizing the base affects every tenant equally.
+  6. The cost that is easy to miss is batch mixing: rows must be grouped by adapter into separate GEMMs, and a GEMM of 2–4 rows wastes bandwidth, so spreading a batch across tenants is equivalent to shrinking the batch.
+  7. Adapter count per step and batch size are the same dial. If you have 100 tenants at batch 32, you are running batch 4 with four weight reads — group by adapter or shrink the fleet.
+  8. A LoRA adapter adds $r(in+out)$ FLOPs per adapted matrix, which is negligible against reading the base weights. Adapter latency is a memory and batching question, not an arithmetic-intensity one.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A rank-16 LoRA adapter is applied to a 4096 × 4096 projection. How many parameters does the adapter hold?', numeric: true, answer: 131072, tolerance: 2000, unit: 'params', why: 'r(in + out) = 16 × (4096 + 4096) = 16 × 8192 = 131,072. The base matrix holds 4096 × 4096 = 16,777,216, so the adapter is 0.78% of it — the same order as the well-known "r/d" shorthand, which understates it by 2×.' },
+  { q: 'Llama-3.1-8B, rank 16, adapters on all attention and feed-forward projections. Approximately what share of the base model is that?', numeric: true, answer: 0.41, tolerance: 0.04, unit: '%', why: 'Attention: 32 × (2 × 16 × 8192 + 2 × 16 × 5120) = 13.6M. Feed-forward: 32 × 2 × 16 × 18432 = 18.9M. Total 32.5M against 8.03B parameters = 0.405%. K and V are narrower (1024, from 8 KV heads × 128) than Q and O (4096), which is why the attention total is not simply 4 × 131K × 32.' },
+  { q: 'You serve 64 rank-16 adapters over one BF16 Llama-3.1-8B base on an A100. What fraction of the 20.2 GB total is the base model?', numeric: true, answer: 79, tolerance: 3, unit: '%', why: 'Base 16.06 GB / total 20.22 GB = 79.4%. This is the economic argument for multi-LoRA: the marginal cost of a tenant is tens of megabytes against the 16 GB a second full replica would need.' },
+  { q: 'Why is spreading one decode batch across many adapters slower than a homogeneous batch?', options: ['Each adapter needs its own copy of the weights in memory', 'Rows must be grouped per adapter into separate GEMMs, and small-row GEMMs leave bandwidth idle', 'The adapter arithmetic adds enough FLOPs to become compute-bound', 'Adapters disable prefix caching'], answer: 1, why: 'The base weight read happens once per GEMM, so grouping a batch of 32 into 8 adapters means 8 weight reads instead of 1. And once each GEMM has only a few rows it cannot saturate memory transactions, so the same bytes take longer. Adapter count per step and batch size are effectively the same dial.' },
+  { q: 'A rank-16 adapter on Llama-3.1-8B adds ~32.5M multiply-accumulates per token. The base model needs ~8B per token. Roughly what is the ratio?', numeric: true, answer: 0.004, tolerance: 0.001, unit: '', why: '32.5M / 8.03B = 0.004, or 0.4%. Decode is memory-bound, so what matters is bytes moved, and the adapter’s extra FLOPs are four thousandths of a percent of the work — it does not appear in latency at all. Adapter cost shows up in memory footprint and batching, not arithmetic.' },
+]} />

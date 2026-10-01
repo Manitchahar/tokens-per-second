@@ -1,0 +1,169 @@
+---
+title: 'N-gram, Medusa, EAGLE & MTP'
+summary: 'Every speculative decoding method is a point on one plane: acceptance rate against draft cost ratio. This lesson works through the whole family — free table lookups, a small draft model, extra heads on the target, hidden-state prediction, and multi-token prediction — and shows how each one moves along a real accuracy-for-compute frontier.'
+objectives:
+  - Place every drafting method on the acceptance-versus-cost plane and read which win
+  - Explain how prompt lookup and n-gram drafting work, and the traffic they suit
+  - Describe what Medusa adds to the target model and what it costs to train
+  - Explain why EAGLE predicts hidden states rather than tokens, and why that raises acceptance
+  - Explain how MTP turns drafting into a single forward pass instead of a sequence
+---
+import SpecMethods from '@/components/viz/speculative-decoding/SpecMethods.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The previous lesson reduced speculative decoding to two numbers: how often a draft is accepted, $a$, and what one drafted token costs, $\rho$. That reduction is the point of this lesson. Once you insist on those two numbers, every published method stops being a separate idea and becomes a **point on a plane**.
+
+- **N-gram and prompt lookup** sit far left: nearly free, and right often enough on predictable text.
+- **A small draft model** sits mid-plane: a real forward pass, a high acceptance rate.
+- **Medusa, EAGLE and MTP** cluster on the right: each trades training work or architectural complexity for a higher acceptance rate at a controlled cost.
+
+The break-even line $a = \rho$ cuts across it. Which side a method lands on depends on your text as much as on the method — which is exactly why the same engine should not enable speculation for every request.
+
+## The free methods
+
+Start with the two that use no neural network at all.
+
+**N-gram drafting** keeps a map from short token contexts to what followed them, updated as tokens are generated. When the current context matches a key seen before, it proposes the continuation it saw. It costs a hash lookup. It works well on code, structured output and templated text, where phrasing repeats heavily, and poorly on open-ended prose where the same 3-gram rarely recurs.
+
+**Prompt lookup** (see <Term t="prompt-lookup-decoding">prompt lookup decoding</Term>) is dumber and often better. Before drafting, scan the prompt and the already-generated output for the longest suffix that matches the current context, and copy what followed it there. Zero parameters, zero arithmetic, and on tasks that quote or edit existing text — RAG summarisation, code editing, document question-answering — it can have a surprisingly high acceptance rate for reasons that have nothing to do with model quality.
+
+<Callout type="intuition" title="Why copying works on some prompts">
+  If the answer to "what comes next" already appears earlier in the context, then a retrieval step is a perfect predictor. Ask a model to edit a document and it often copies the replacement phrasing from the instruction. Ask it to write a poem about entropy and nothing repeats, and lookup has nothing to find.
+
+  The first case is a large fraction of real production traffic — structured extraction, template filling, code edits, agent loops re-sending the same context. **For that traffic, prompt lookup alone can be worth enabling.**
+</Callout>
+
+## The small draft model
+
+The general case: a much smaller model from the same family proposes tokens for the target. Llama-3.2-1B drafting Llama-3.1-8B is the canonical example.
+
+The acceptance rate is high — around 0.7 on typical chat — because the draft is genuinely the same model, just smaller. It is the method with no sharp specialisation: it is decent at everything, and it costs $\rho$ of a target decode step, where $\rho$ is roughly the parameter ratio plus the shared per-step overhead.
+
+This is the workhorse. When you have one GPU, one model, and mixed traffic, this is the configuration to try first.
+
+## What acceptance looks like in practice
+
+The abstract $a$ hides something worth seeing concretely: **where the accepted run ends**. On a templated translation task the drafter agrees for most of a block; on free-form prose the run is usually short, and often the very first token is already wrong.
+
+Two patterns explain almost all of the variance you will see when you measure this yourself:
+
+- **Syntactic runs.** Once the model has started a line of code or a list item, the continuation is highly constrained and the drafter tracks the target for several tokens. Long runs cluster here.
+- **The high-entropy first token.** After a question mark, or at the start of a sentence, the distribution is genuinely wide. This is where blocks break immediately — and it is why short, choppy exchanges speculate worse than long, flowing ones even at the same model.
+
+So acceptance is not a property of a model alone, nor of a task label alone. It is a property of **the model's uncertainty at each position**, which is why a temperature setting, a system prompt, or a different output length all move it.
+
+<Callout type="try" title="Measure it the cheap way first">
+  Before you wire anything up, take 200 real completions from your own logs, strip the returned text down to token ids, and for each position record whether the model's top-1 token was also in its top-5. That is a crude upper bound on what *any* drafter could have achieved, computable in one offline pass with no second model.
+
+  If that ceiling is below about 0.5, no drafter will get you above the break-even line for a $\rho$ of 0.125, and you have learned something valuable for the cost of an afternoon.
+</Callout>
+
+## Medusa: heads on the target
+
+<Scrolly>
+  <SpecMethods client:visible slot="stage" />
+
+  <Step title="1. One plane, six points">
+    Every method is a point: acceptance across, cost up. The diagonal is $a = \rho$, the line where speculation exactly breaks even. Anything to its lower-left wins; anything upper-right loses.
+  </Step>
+
+  <Step title="2. The free methods">
+    Prompt lookup and n-gram sit at almost zero cost. They win on anything with repetition in it, because a near-zero cost needs only a little accuracy to clear the line.
+  </Step>
+
+  <Step title="3. The small draft model">
+    A 1B drafting an 8B costs about $\rho = 0.125$ of a target step and is accepted around 72% of the time. Comfortably past the line, which is why this is the default choice.
+  </Step>
+
+  <Step title="4. Medusa">
+    Extra linear heads bolted onto the target that jump from the final hidden state straight to the next few tokens. No second model to hold in memory, but it must be trained, and it predicts from a single hidden state rather than a full forward pass.
+  </Step>
+
+  <Step title="5. EAGLE">
+    Predicts the next **hidden state** instead of the next token, then lets the target model verify a second block in parallel. More context per draft means the highest acceptance of the cheap methods.
+  </Step>
+
+  <Step title="6. MTP">
+    Trains the model to emit several future blocks in one forward pass, so drafting is one widened step rather than a sequence of them. The per-token cost falls sharply; the training objective has to change.
+  </Step>
+
+  <Step title="7. A frontier, not a ranking">
+    No method dominates. Move up the cost axis and you buy accuracy; there is a real exchange rate between them. Choose the corner that matches your traffic and your budget.
+  </Step>
+
+  <Step title="8. Text decides which corner">
+    Drag the predictability slider. The same method swings from 2× to below 1× as the text gets less repetitive — so acceptance must be measured on **your** prompts, not on a benchmark.
+  </Step>
+</Scrolly>
+
+Medusa's idea is that the expensive part of a forward pass — the 32 transformer blocks — is not needed to make a rough guess. You already computed the final hidden state for the last token; a couple of small trained heads read it and propose the next $\gamma$ tokens directly. That is the whole of <Term t="medusa">Medusa</Term>.
+
+The payoff is memory: there is no second model to load, which matters a lot when you are near the memory limit (Module 05's memory math). The costs are that the heads need training data and a training run, and that they predict from one hidden state, so their acceptance is lower than a full small model gets.
+
+## EAGLE: predict the state, not the token
+
+EAGLE makes a sharper observation. Tokens are a lossy view of what the model knows; the **hidden state** is the full-width vector the next layer consumes. Two models producing the same token can have quite different hidden states, and the draft is better if it can predict the thing the verifier actually reads.
+
+So <Term t="eagle">EAGLE</Term> trains a small network to predict the *next hidden state* from the current one, appends that prediction to the target's input, and runs the target again. The target is now verifying a block built from predicted states, and because states carry more information than tokens, the acceptance rate is the highest of the cheap methods.
+
+The cost is a second training process and a slightly more intricate serving loop, because the target has to be invoked in a way that consumes the predicted state.
+
+## Lookahead decoding: no model at all, and no training
+
+There is one more method worth knowing because it is cheap in a different way. <Term t="lookahead-decoding">Lookahead decoding</Term> takes positions the target model *already computed* — during prefill, or during earlier decode steps — and speculates several tokens ahead from them using a fixed number of Jacobi-style refinement iterations, producing several candidate continuations in parallel.
+
+The key property: it needs **no second model and no training**. It reuses the target's own forward passes as the source of guesses. Acceptance is lower than a trained drafter's, but $\rho$ is also low, so it lands in a useful corner of the plane for workloads where you want speculation without adding a model to memory.
+
+<Callout type="intuition" title="How it works without anything to predict with">
+  Jacobi iteration is the trick: take a rough guess for positions $i+1, i+2, \dots$, push all of them through the model **in parallel**, and use the resulting logits as better guesses. Repeating a few times sharpens them. Because all guesses are refined simultaneously, you pay for a handful of wide forward passes instead of $\gamma$ narrow ones — and every pass is the model you already have loaded.
+
+  The cost is that those wide passes are not free either, so $\rho$ lands somewhere between prompt lookup and a real draft model.
+</Callout>
+
+<Callout type="real" title="What this means for you as an inference engineer">
+  The distinction that actually matters operationally is **which method requires training**. Prompt lookup and n-gram drafting need nothing — you can enable them on any checkpoint today. A small draft model only needs a compatible smaller model, which most families already ship (Llama-3.2-1B for Llama-3.1-8B, Qwen2.5-0.5B for Qwen2.5-7B). Medusa, EAGLE and MTP need a trained artefact per model, per draft length.
+
+  So the first question is not "which is fastest" but **"which can I ship without a training budget"**. For most teams the honest answer is prompt lookup or n-gram first, a draft model second, and the trained heads only once you have measured that speculation matters to your SLO.
+</Callout>
+
+## MTP: many tokens per forward pass
+
+Every method above still drafts **sequentially**: token 2's draft needs token 1's draft. That is $\gamma$ separate small forward passes, and it is why $\rho$ does not shrink as fast as the parameter ratio suggests.
+
+<Term t="multi-token-prediction">Multi-token prediction</Term> attacks exactly that. The model is trained with additional heads that predict token $t+2$, $t+3$, $t+4$ directly from the same hidden state, so all $\gamma$ drafts come out of **one** forward pass. Drafting cost stops being proportional to $\gamma$ and becomes roughly a single step regardless.
+
+This gives the lowest cost per drafted token of the trained methods, paired with a high acceptance rate, and it is the direction the large model families have actually taken — the public Llama and Qwen checkpoints from the last couple of years ship with multi-token prediction heads for exactly this reason.
+
+The trade is training. MTP changes the model's objective, so you cannot bolt it onto an arbitrary existing checkpoint and expect it to work; you either use a checkpoint that was trained with it, or you train the heads yourself.
+
+## Choosing, from the plane
+
+A practical order, cheapest commitment first:
+
+1. **Measure $a$ for prompt lookup on your traffic.** If it clears a small $\rho$, you have won several times over with no training and no second model. This is the highest-leverage five minutes in this module.
+2. **If not, get a small draft model.** Same family, one size down. This is the general-purpose answer and the one most engines default to.
+3. **If you are memory-constrained, train Medusa heads.** Same memory profile as the target, lower acceptance.
+4. **If you can afford the training and need the last 20%, EAGLE.** Highest acceptance among cheap methods.
+5. **If you are training the model anyway, ship MTP heads.** Free drafting cost at inference, and the heads come with the checkpoint.
+
+Whichever you choose, the two numbers from the last lesson still do the deciding: $a$ comes from your traffic, $\rho$ comes from your hardware, and you win exactly when $a > \rho$.
+
+<KeyNotes>
+  1. Every drafting method reduces to a point on one plane: acceptance rate $a$ across, draft cost ratio $\rho$ up. The diagonal $a = \rho$ is the break-even line.
+  2. Prompt lookup and n-gram drafting run no network at all, so their $\rho$ is nearly zero and they only need a little accuracy to win — on repetitive, extractive or template-like traffic they can be surprisingly effective.
+  3. A small draft model from the same family is the general-purpose choice: $\rho \approx 0.125$ for 1B drafting 8B, acceptance around 0.72, no training required.
+  4. Medusa adds trained heads to the target that predict future tokens from the final hidden state, saving the memory of a second model but predicting from less context.
+  5. EAGLE predicts the next **hidden state** rather than the next token, giving the draft more information and the highest acceptance of the cheap methods, at the cost of a second training process.
+  6. MTP trains heads that emit several future tokens in a single forward pass, so drafting cost stops scaling with $\gamma$; it requires a checkpoint trained for it.
+  7. No method dominates the others — they trade cost against accuracy along a frontier, so the right choice depends on your traffic and your budget.
+  8. The first practical question is "which can I ship without a training budget", not "which is fastest": free methods today, a draft model next, trained heads only after measurement.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Every speculative decoding method can be characterised by which pair of numbers?', options: ['Parameters and context length', 'Acceptance rate a and draft cost ratio rho', 'Gamma and batch size', 'Accuracy and recall'], answer: 1, why: 'The whole design space reduces to how often the draft is right and what one drafted token costs. Speedup > 1 exactly when a > rho, so those two numbers determine everything.' },
+  { q: 'A 1B model drafts an 8B model. The cost ratio rho is about 0.125. For speculation to be faster, the acceptance rate must be:', numeric: true, answer: 12.5, tolerance: 1.5, unit: '%', why: 'The rule is a > rho. rho = 0.125 = 12.5%, so the acceptance rate must exceed 12.5%. A real 1B drafting an 8B gets around 70%, far above this line, which is why the configuration works.' },
+  { q: 'Why is prompt lookup decoding particularly effective on tasks like editing an existing document?', options: ['It uses less GPU memory than any other method', 'The replacement text usually already appears in the context, so a retrieval step is close to a perfect predictor', 'It runs the target model twice', 'It uses greedy decoding'], answer: 1, why: 'Prompt lookup finds the longest matching suffix and copies what followed. When the answer already exists in the context, copying is correct by construction. That is why extractive and template tasks favour it over any neural drafter.' },
+  { q: 'What does EAGLE predict that Medusa does not?', options: ['A larger number of tokens per block', 'The next hidden state rather than the next token', 'The attention weights', 'A different sampling temperature'], answer: 1, why: 'EAGLE drafts by predicting the hidden state the next layer consumes, which carries more information than a token id. The target then verifies a block built from predicted states. That extra information is why its acceptance rate is the highest of the cheap methods.' },
+  { q: 'What is the main advantage of MTP over a small draft model?', options: ['Higher acceptance rate at any cost', 'All gamma drafts come from one forward pass instead of gamma sequential steps, so drafting cost stops scaling with gamma', 'It requires no training', 'It works without a GPU'], answer: 1, why: 'A small draft model must run sequentially because each draft needs the previous one. MTP heads emit several future tokens from a single hidden state in one pass, so the draft cost is roughly one step no matter how many tokens you propose.' },
+  { q: 'An n-gram drafter runs on code and structured output with acceptance around 0.8, but on open-ended creative prose with acceptance around 0.25. With rho = 0.01 for n-gram, which traffic should you enable it on?', numeric: true, answer: 1, tolerance: 0, unit: 'traffic stream', why: 'On the code traffic, a = 0.8 is far above rho = 0.01, so it wins decisively. On prose, a = 0.25 still clears rho = 0.01, so both streams benefit, but the code stream benefits far more. If the acceptance on prose had fallen below 1%, that stream should not speculate.' },
+]} />

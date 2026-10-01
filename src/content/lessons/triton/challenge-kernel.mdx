@@ -1,0 +1,268 @@
+---
+title: 'Challenge: Optimize a real inference kernel'
+summary: 'Take a real, memory-bound operation from a transformer decode step and carry it from correct to measurably faster than PyTorch — with a harness, a roofline argument, and a written case for every decision you make.'
+objectives:
+  - Pick an operation with genuine headroom and justify the pick with a roofline calculation
+  - Write a correct Triton kernel and prove it against PyTorch at several shapes
+  - Fuse the operation's elementwise chain into one launch and count what that removes
+  - Autotune the block size and warps, and explain why the winner differs by shape
+  - Measure with an honest harness and report achieved bandwidth against the roofline
+  - 'Write an engineering case: what you changed, what it cost, and when it would not apply'
+colab: 13-challenge-kernel.ipynb
+---
+
+You have written three kernels. This project asks the question that separates someone who can write Triton from someone who can optimize with it: **can you take a real operation from a real model, make it faster than PyTorch, and prove it?**
+
+The deliverable is not a kernel. It is a **case**: an artifact another engineer can read, run, and check, containing a measurement they could have taken themselves.
+
+## Choose your target
+
+You may optimize any **one** of these. Each is a real, memory-bound operation from the Llama decode path, each has genuine headroom, and each fails differently.
+
+| Option | The operation | Why it is memory-bound | Difficulty |
+|---|---|---|---|
+| **A (recommended)** | **SiLU-gated MLP** — `silu(gate) * up` | ~3 FLOPs per 6 bytes moved | Medium |
+| **B** | **Fused RMSNorm + residual add** | ~4 FLOPs per 6 bytes | Easy |
+| **C** | **Fused top-p sampling** over the vocabulary | reductions over 128K logits | Hard |
+
+**Take option A.** It is the single biggest fusion win in a decoder layer, it appears in every LLaMA-family model, and it has a clean roofline story. Option B is nearly free and makes a fine first attempt if you want a gentler project. Option C is the hardest and the most valuable, but do not start there.
+
+<Colab nb="13-challenge-kernel.ipynb" />
+
+<Callout type="real" title="Why the SiLU-gated MLP, specifically">
+  Modern LLaMA-style models do not use a plain MLP. They use a **gated** one: two parallel projections (a *gate* and an *up*), the gate passed through a SiLU activation, the two multiplied together, and only then projected back down.
+
+  ```
+  gate = x @ W_gate          # [B, 14336]
+  up   = x @ W_up            # [B, 14336]
+  h    = silu(gate) * up     # the elementwise part — THIS is what you optimize
+  out  = h @ W_down          # [B, 4096]
+  ```
+
+  The two GEMMs are cuBLAS's job and you will not beat them. The middle line — `silu(gate) * up` — is three elementwise operations on a `[B, 14336]` tensor, and in eager PyTorch it launches **three or more kernels**, each making a full round trip through HBM.
+
+  For Llama-3.1-8B at batch 1 that is 3 launches and roughly 6 tensor traversals, to produce a 28 KB result. The arithmetic is trivial. The cost is entirely structural — which means it is entirely yours to win.
+</Callout>
+
+## The roofline case, before you write a line
+
+**Do this first, on paper.** It is the part that separates an engineer from a code-gamer, and it takes ten minutes.
+
+<Callout type="math" title="Price the operation: Llama-3.1-8B, batch 1, FP16">
+  The tensor is `[1, 14336]` FP16. Per element: 2 bytes.
+
+  - **Arithmetic.** SiLU is $x \cdot \sigma(x)$: about 3 FLOPs (one exp, a divide, a multiply). The multiply by `up` is 1 more. So **≈ 4 FLOPs per element**.
+  - **Bytes.** Read `gate` (2 B), read `up` (2 B), write `h` (2 B) = **6 bytes per element**.
+  - **Arithmetic intensity.** $\frac{4 \text{ FLOP}}{6 \text{ bytes}} \approx \mathbf{0.67}$ FLOP/byte.
+
+  Now the ridge. An H100's ridge is $\frac{989 \times 10^{12}}{3.35 \times 10^{12}} \approx 295$ FLOP/byte. A T4's is about 203. **You are roughly 300× below the ridge on both.**
+
+  **Conclusion: this operation is memory-bound, by a wide and non-negotiable margin.** Its runtime is set by bytes moved, and the only two things that can improve it are (a) move fewer bytes and (b) stop wasting time on launches. Compute the kernel better and you will gain nothing.
+
+  On an H100 at 3.35 TB/s, the fused floor is $\frac{86{,}016 \text{ bytes}}{3.35 \times 10^{12}} \approx 26$ **ns**. At 60% efficiency, about 43 ns — and a launch is 5,000 ns. **You are ~100× launch-bound at batch 1.** Write that down; it is the hypothesis your results must confirm or refute.
+</Callout>
+
+## The deliverable
+
+One repository-quality artifact:
+
+1. **`kernel.py`** — the Triton kernel, autotuned, with a drop-in `fused_swiglu(gate, up)` that matches PyTorch numerically.
+2. **`bench.py`** — the honest harness from Lesson 13.4 (warmup, L2 flush, CUDA events, median), sweeping batch and reporting GB/s, TFLOP/s, and % of the roofline.
+3. **`RESULTS.md`** — the write-up, containing:
+   - Your roofline argument (the table above, filled in with your numbers).
+   - A results table: PyTorch vs yours, at batch 1 / 8 / 32 / 256, with speedup and % of peak.
+   - Your autotuning result: which `BLOCK_SIZE` won, per shape, and why it differs.
+   - The launch-count comparison, measured with the profiler.
+   - **A paragraph on where your kernel stops winning**, and why.
+4. **`fused_swiglu.py`** or a module export — the thing someone else would import.
+
+<Callout type="intuition" title="The paragraph in point 3 is the one that matters">
+  Anyone can produce a speedup number. The sentence *"my kernel is 4.1× faster at batch 1 and breaks even at batch 256, because below batch ~64 the launch count dominates and above it both versions are at the memory wall"* is what an inference engineer actually delivers. It tells the next person when to use your work and when not to.
+
+  If your kernel wins everywhere, you have probably found a bug or measured wrong. Check.
+</Callout>
+
+## Step 1 · Get it correct first
+
+Before any timing: correctness. A fast wrong kernel is worth nothing.
+
+```python
+@triton.jit
+def swiglu_kernel(gate_ptr, up_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    g = tl.load(gate_ptr + offs, mask=mask)
+    u = tl.load(up_ptr + offs, mask=mask)
+    # SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+    act = g / (1.0 + tl.exp(-g))
+    tl.store(out_ptr + offs, act * u, mask=mask)
+```
+
+That is the whole kernel, and it is already the fused version. Three operations, one launch.
+
+**Requirements before you proceed:**
+
+- It matches `torch.nn.functional.silu(gate) * up` to within FP16 tolerance **at every batch you will benchmark**, including batch 1.
+- It handles a non-multiple-of-`BLOCK` length correctly (use 14,337 or similar to prove it).
+- It works in both FP16 and FP32, and you report the max absolute error for each.
+
+<Callout type="try" title="Correctness questions to answer before timing">
+  1. Why is `g / (1 + tl.exp(-g))` numerically safe for FP16? What is the largest magnitude `g` can hold, and does `exp(-g)` overflow for large positive `g` or large negative `g`? Which direction is the risk, and is it harmless?
+  2. If you feed `g = -1000` in FP16, what does `exp(1000)` return, and what does `g / inf` give? Is the answer correct?
+  3. `silu(gate) * up` in PyTorch eager launches more than one kernel. Use the profiler to count exactly how many, and explain each one.
+</Callout>
+
+## Step 2 · Count the launches you removed
+
+Measure, do not estimate.
+
+**Requirements:**
+- Profile `F.silu(gate) * up` and your fused kernel with `torch.profiler`, counting distinct CUDA kernels for each.
+- For each version, compute total bytes moved, assuming the intermediate is materialized.
+- Show the time saved at batch 1 and explain the gap in terms of launch overhead.
+
+<Callout type="math" title="The arithmetic you should find">
+  At batch 1, `[1, 14336]` FP16 = 28,672 bytes per tensor.
+
+  - **PyTorch eager:** `silu(gate)` reads 28,672 and writes 28,672 (launch 1); `* up` reads 28,672 + 28,672 and writes 28,672 (launch 2). Total ≈ **143,360 bytes**, 2+ launches.
+  - **Fused:** reads `gate` and `up`, writes `h`: **86,016 bytes**, 1 launch.
+
+  So you should have removed roughly **57 KB of traffic and at least one launch per MLP**, per layer. An 8B model has 32 layers, so per generated token you have removed roughly **1.8 MB of HBM traffic and dozens of launches**. Check your measurement against this.
+
+  If your measured byte count disagrees with this, trust the measurement — and find out why. Eager PyTorch may be fusing something behind your back, in which case your speedup will be smaller and you need to know that.
+</Callout>
+
+## Step 3 · Autotune, and explain the answer
+
+Add `@triton.autotune` over `BLOCK_SIZE` and `num_warps`.
+
+**Requirements:**
+- At least 6 configurations, from 128 to 8192.
+- `key=['n']` (or better, key on something that actually varies slowly — see below).
+- Report which config wins at each batch size.
+- **Explain why the winner moves.** If it does not move, explain why not.
+
+<Callout type="pitfall" title="Choosing a bad `key` will destroy your performance">
+  `n = batch × 14336` changes on **every call** in a real serving workload, because batch changes constantly with continuous batching. If you put `n` in `key`, Triton re-runs its entire tuning sweep on every new batch — seconds of overhead, repeatedly, in production.
+
+  The right key is the *shape family*, not the exact size. Options:
+  - Key on `BLOCK_SIZE`-independent properties that change rarely.
+  - Or quantize: pass `key=['size_bucket']` where `size_bucket = 1 << (n.bit_length())`, so tuning happens once per order of magnitude.
+
+  This is a real production concern, not an academic one, and explaining it is part of the deliverable.
+</Callout>
+
+## Step 4 · Benchmark honestly, and sweep
+
+Use the harness. No shortcuts.
+
+**Requirements:**
+- Warm up, flush L2 (a 128 MB buffer), time with CUDA events, report the **median** over ≥100 reps.
+- Sweep batch: 1, 8, 32, 256, 1024.
+- Report, per cell: PyTorch time, Triton time, speedup, achieved GB/s, and % of the T4's ~320 GB/s.
+- Run the whole sweep **twice** and confirm the numbers agree within your stated run-to-run spread.
+
+<Callout type="math" title="Budget your sweep so you actually re-run it">
+  Cost is $\text{cells} \times (\text{warmup} + \text{reps}) \times t$. With 5 batch cells, 100 warmup + 200 reps, and a worst-case 5 ms per run (batch 1024 in eager PyTorch), that is 5 cells × 300 runs = 1,500 runs, each 5 ms, so about 7.5 s for the PyTorch arm. Cheap.
+
+  Aim for a sweep you can re-run in **under a minute**. A sweep you do not re-run after every change goes stale, and a stale benchmark is worse than none — it is confidently wrong.
+</Callout>
+
+## Step 5 · Find and report where it stops winning
+
+This is the part that separates a good submission from a great one, and it is the part most people skip.
+
+**Requirements:**
+- Plot or tabulate speedup against batch. Find the crossover where your kernel stops beating PyTorch.
+- Explain the crossover in terms of the roofline. At what batch does the data become large enough that launch overhead stops mattering and you are purely bandwidth-bound?
+- Report your best achieved bandwidth as a **percentage of the T4's ~320 GB/s peak**.
+- State honestly whether your kernel beats PyTorch at large batch, and if not, why not.
+
+<Callout type="intuition" title="What a good answer looks like">
+  A strong result: *"My fused kernel is 3.8× faster at batch 1 (launch-bound: 1 launch vs 3), matches PyTorch at batch 256, and is 6% slower at batch 1024 because PyTorch's TensorIterator already fuses `silu*mul` into a single vectorized kernel at that size and my BLOCK_SIZE leaves a ragged tail. My 84% of peak bandwidth is close to the practical ceiling for a 3-stream kernel on a T4. I would ship it for batch ≤ 128 and keep PyTorch above that."*
+
+  That paragraph contains a crossover, a mechanism, a number, and a shipping recommendation. It is what a reviewer's "should we merge this" question is actually asking.
+</Callout>
+
+## Extend it (pick at least two)
+
+- **Fuse the whole MLP**: the two up-projections' SiLU-and-multiply *plus* the down-projection's input read, saving another round trip. This is closer to what production kernels do.
+- **A two-stage version**: split `n` so each program handles a contiguous chunk sized to fill the SMs exactly, eliminating the ragged tail you probably found in Step 5.
+- **Vectorized loads**: force 128-bit accesses by having each program handle `BLOCK` elements as a contiguous vector, and report whether it moved GB/s.
+- **A backward pass**: implement the Triton kernel for the gradient too. This is where Triton's real value shows — PyTorch's autograd through three separate ops keeps three graphs alive, yours keeps one.
+- **An FP8 variant**: on hardware that supports it. On a T4, FP8 has no hardware support, so instead quantize the *intermediate* to FP16 with a scale and show the traffic halving.
+- **A different target**: do option B or C from the table and compare the difficulty.
+
+## Check yourself
+
+Before you call it done, answer these. A "no" anywhere means the work is not finished.
+
+1. Does your kernel match PyTorch at every shape you benchmark, including a ragged length and both dtypes?
+2. Can you state, in one sentence, **why** this operation is memory-bound — with the arithmetic, not the adjective?
+3. Did you measure the PyTorch launch count, or did you estimate it?
+4. Does your autotune `key` survive a workload where batch changes every step? Explain why.
+5. Have you run the sweep twice and confirmed it agrees with itself?
+6. Do you have a batch size at which your kernel **loses** to PyTorch, and do you know why?
+7. What is your best achieved bandwidth as a percentage of peak, and what does that number tell you about whether more tuning would help?
+8. Could a colleague who has never seen your code read `RESULTS.md` and reach the same "should we ship this?" decision?
+
+## Acceptance criteria
+
+**Correctness**
+- `fused_swiglu` matches `F.silu(gate) * up` within FP16 tolerance at every benchmarked shape.
+- Correct on a ragged length (not a multiple of `BLOCK_SIZE`) and in both FP16 and FP32.
+- Max absolute error reported per dtype.
+
+**Analysis**
+- A roofline argument with arithmetic: intensity computed, ridge compared, memory-bound conclusion drawn.
+- Measured (not estimated) launch counts for both versions, and total bytes moved.
+- Autotuning result reported per shape, with an explanation of why the winner moves (or does not).
+- An explicit statement of where the kernel stops winning, with the crossover batch and its mechanism.
+
+**Measurement**
+- Harness includes warmup, L2 flush, CUDA events, and a median over ≥100 reps.
+- Batch sweep across at least 5 values, with GB/s and % of peak per cell.
+- Sweep run twice; run-to-run spread stated.
+
+**Communication**
+- `RESULTS.md` states the shipping recommendation in one sentence, with a number attached.
+- Every claim in the write-up is traceable to a measurement in `bench.py`.
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | The roofline argument predicts the result *before* measuring, and the measurement confirms it. The crossover batch is located empirically and explained mechanistically. Autotuning is analysed, not just run. The write-up says where the kernel should **not** be used and why. The sweep was run twice and agrees with itself. |
+| **Proficient** | Meets all acceptance criteria. Correct kernel, real speedup at small batch, honest benchmark, crossover identified. Autotuning is used and reported but the explanation is thin. |
+| **Developing** | Kernel is correct and faster at batch 1, but the benchmark lacks L2 flushing or uses a mean, or the crossover is asserted rather than located. The roofline discussion is present but the arithmetic is not worked through. |
+| **Beginning** | Reports a speedup from a benchmark with no warmup or no synchronization, or launches too few programs to be meaningful, or a correctness failure is not caught. |
+
+<Callout type="mentor" title="The habit that separates the top band">
+  Everyone in the top band does the same unglamorous thing: **they run it twice and check that it agrees with itself.**
+
+  A benchmark you have only run once is a hypothesis. The moment you run the whole sweep twice and your medians land within your stated spread, it becomes an instrument — and an instrument is what you are being paid to build. Module 06 taught this for services; it applies, unchanged, to kernels.
+</Callout>
+
+## Where this goes next
+
+You now have the whole toolkit: the grid model, reductions, fusion, and honest measurement.
+
+- **Module 14 (Attention Optimization)** — FlashAttention is this exact technique at its largest scale: a memory-bound operation made memory-*efficient* by fusing passes and keeping intermediates on-chip. You are ready for it.
+- **Module 15 (Compilation & CUDA Graphs)** — `torch.compile` with its Triton backend generates this class of kernel for you from PyTorch source. Now you can read what it produces, and debug it when it is slow.
+- **The engine landscape** — vLLM, SGLang and TensorRT-LLM all ship Triton kernels written exactly this way. At the time of writing, reading one of those kernels is the natural next exercise.
+
+Keep your harness. Every kernel you write for the rest of the course goes through it.
+
+<KeyNotes>
+  1. Price the operation **before** you write it: FLOPs per element, bytes per element, arithmetic intensity, ridge. Intensity of ~0.7 against a ridge near 200 says memory-bound with certainty.
+  2. At batch 1 a `[1, 14336]` FP16 intermediate is 28 KB — about 100× launch-bound. **That is why fusion wins here**, and it is a structural fact, not a tuning accident.
+  3. Correctness first. A fast wrong kernel is worth nothing; prove it against PyTorch at every shape you will time, including a ragged length and both dtypes.
+  4. Fusion removed roughly **57 KB and a launch** per MLP. An 8B model does this 32 times per token — about 1.8 MB of HBM traffic removed per generated token.
+  5. Your autotune `key` must survive **changing batch**. Keying on `n` re-tunes on every step in a real serving workload; key on a shape bucket instead.
+  6. Report achieved **GB/s and % of peak**, never microseconds alone. Above ~70% of peak you are done; below 30% there is a bug or a launch-bound problem.
+  7. Find the batch size where your kernel **loses** to PyTorch, and explain the crossover mechanistically. That boundary is the most valuable sentence in your write-up.
+  8. If your kernel wins at every batch, you have probably measured wrong. Check the flush and the synchronize before you celebrate.
+  9. **Run the sweep twice.** Agreement with itself is what separates a benchmark from a guess.
+  10. The deliverable is the *case*, not the kernel: a roofline argument, measured launch counts, a located crossover, and a shipping recommendation with a number attached.
+</KeyNotes>

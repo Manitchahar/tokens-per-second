@@ -1,0 +1,199 @@
+---
+title: 'Securing an inference service'
+summary: 'An inference endpoint is a compute tenant, not a web page: it holds other people’s words in GPU memory and can be made to reproduce its own weights. Walk the path hop by hop and put a control at every one.'
+objectives:
+  - Identify the untrusted inputs at each hop of the inference request path
+  - Explain why inference endpoints are unauthenticated-compute and brute-forceable
+  - Separate confidentiality, integrity and availability risk, and treat them differently
+  - Apply per-tenant quotas, cache namespacing and slot hygiene as security controls
+  - Write a threat model that names assets, trust boundaries and residual risk'
+---
+import TrustBoundary from '@/components/viz/observability-reliability/TrustBoundary.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is the sentence that should make an inference engineer sit up: **it is established that sampling a language model enough times, with carefully chosen inputs, can reconstruct its weights.** Not approximate them — reconstruct them, to usable fidelity. The model is a large file of numbers, and a sufficiently determined caller who can query the endpoint many times can get it out one completion at a time.
+
+That single result reframes the problem. An inference endpoint is not a web page that returns text. It is a **compute tenant** that holds other people's words in GPU memory, accepts arbitrary text from strangers, and has a <Term t="weight-extraction">weight-exfiltration path</Term> baked into its design.
+
+## Three questions, not one
+
+Security review tends to arrive as a single question — "is it secure?" — and gets a single answer. It is more useful as three, because the mitigations barely overlap:
+
+| Question | What it means here | The main controls |
+|---|---|---|
+| **Confidentiality** | Whose data could I see or leak? | Tenant isolation, cache namespacing, log redaction, TLS, KV slot zeroing |
+| **Integrity** | Whose data could I change, and did you run what you think you ran? | Model pinning, digest verification, immutable deployments, signed images |
+| **Availability** | Can someone make me stop serving, and for how much money? | Per-key quotas, admission control, max_model_len, rate limits, budgets |
+
+Availability is where an inference service is most exposed, because the attack is **free**: no exploit, just an API key and a for-loop.
+
+<Callout type="intuition" title="The availability economics of a public endpoint">
+  A replica with 24 slots and a 1.89 s mean service time does **12.7 requests per second**. A single key with no per-key cap can hold all 24 slots with 8-second requests — 3 requests per second of pure capture, about a quarter of the replica — and that key can run the loop for as long as it likes, from anywhere, at no cost to the attacker.
+
+  Now do the uncomfortable arithmetic. 3 requests per second is 10,800 requests per hour, all of them yours, all of them billed at your GPU rate. The attack is not a vulnerability report; it is a line item.
+</Callout>
+
+<Scrolly>
+  <TrustBoundary client:visible slot="stage" />
+
+  <Step title="1. Walk the path, hop by hop">
+    Seven hops: client, edge, router, engine, KV cache, weights, logs. Each is a place something can be taken, and each has a control that is cheap now and expensive later.
+  </Step>
+
+  <Step title="2. The edge — who is calling">
+    The edge accepts arbitrary bytes from anyone with a key, and the key is usually the only thing standing between the internet and a GPU.
+
+    Authentication is table stakes. **Quotas are the actual control.**
+  </Step>
+
+  <Step title="3. The gateway — amplification">
+    A gateway that turns one client request into sixty backend calls is an amplification primitive, and it is the first thing an attacker will build because it multiplies every downstream limit they have to defeat.
+  </Step>
+
+  <Step title="4. The router and the cache">
+    The prefix cache is keyed by token blocks. **If the key does not include the tenant, one tenant reads another's cached prefix.** No exploit, no skill — just a missing string in a dictionary key.
+  </Step>
+
+  <Step title="5. The engine — quotas are security">
+    Concurrency caps, `max_model_len` and token budgets are usually filed under "performance tuning". They are availability security, and the tuning review is where they should be argued for.
+  </Step>
+
+  <Step title="6. The KV cache is memory with a lifetime">
+    KV slots outlive the requests that created them. Reuse without zeroing, or scope without a tenant namespace, and one conversation's state is handed to another's.
+  </Step>
+
+  <Step title="7. The weights are the asset">
+    Sampling-based extraction of model weights is a known result. Anyone who can query an endpoint many times is a potential exfiltration attempt, and the mitigation is rate limiting, output caps and — where the model is a trade secret — not serving it to untrusted callers at all.
+  </Step>
+
+  <Step title="8. Your logs are a copy of the weights">
+    Prompts, completions, trace attributes and error bodies all contain the conversation in plaintext. Redaction is a compliance control, not a nicety.
+  </Step>
+
+  <Step title="9. Layered defences, in the order that pays">
+    Authentication, then quotas, then admission control, then isolation, then encryption, then logging discipline. Cheapest and most effective first, so the expensive controls are never the only thing standing between you and a bad day.
+  </Step>
+</Scrolly>
+
+## Authentication, authorization, and the key in the repo
+
+The mechanics are familiar and the failure modes are not:
+
+- **Authenticate at the edge, never in the engine.** The engine should not be reachable from the internet. It sits on an internal network and trusts only the gateway. A public engine port is a bypass of every control on this page.
+- **Per-key quotas, always.** Tokens per minute and concurrent requests per key. This is the single highest-value control on the page, and it is one config line.
+- **Rotate keys, scope them, and expire them.** A key found in a git history is a permanent, invisible, unbudgeted consumer of your GPU.
+- **Never accept the model name from the client.** If the endpoint is multi-model, the client must reference a *deployment* by ID. Let a caller name the model and you have given them a way to load something large into your memory budget — or nothing at all, depending on your resolver.
+
+<Callout type="pitfall" title="The multi-tenant prompt leak, concretely">
+  Two tenants share a prefix cache. Tenant A's first 200 tokens are a company system prompt, cached under a key derived from the token ids. Tenant B sends the same 200 tokens — found in a public repository, or simply guessed — and gets a 100% prefix-cache hit.
+
+  That is not a theoretical issue: it is a cache key collision with a privacy consequence, it is entirely your bug, and the fix is to include the tenant in the cache key. Do it before you need to, because retro-fitting namespace isolation to a running cache means flushing it during an incident.
+</Callout>
+
+## What is the KV cache, from a security perspective?
+
+Everything else in this module has an obvious owner and a normal defence. The KV cache is different, because it is **GPU memory with an unusually long lifetime and no built-in access control**. The control that addresses this is called <Term t="kv-isolation">KV cache isolation</Term>, and it is the one most often missing.
+
+The properties that matter:
+
+1. **It outlives the request.** Blocks are freed when a request completes and are then reused by someone else. A block freed without being zeroed still holds the previous conversation's key and value tensors.
+2. **It is shared by construction.** That is the entire point of PagedAttention (Module 08) — one physical pool, many logical sequences. Sharing is the feature.
+3. **It is the largest thing in memory**, so it is the thing an attacker wants to make you allocate.
+
+The controls:
+
+| Control | What it prevents |
+|---|---|
+| Include tenant/deployment in the block namespace | Cross-tenant reads through a block table |
+| Zero a block on free if it held sensitive data | Residue visible to the next sequence that lands on it |
+| Per-tenant share of the total block pool | One tenant evicting everyone else's cache |
+| `max_model_len` and a per-request token budget | A single request allocating a pathological block count |
+| Never persist KV to disk unencrypted | A core dump or a checkpoint becomes a data breach |
+
+## Integrity: running what you think you ran
+
+Integrity failures in inference are quieter and more expensive than availability failures, because nobody notices for months.
+
+- **Pin model revisions by digest**, not by tag. A tag is mutable; a content digest is not. Resolve the digest at deploy time and bake it into the deployment spec.
+- **Verify digests on pull and on load.** A corrupted or substituted weight file can produce subtly degraded output — wrong answers, not an error — and that is the worst kind of bug.
+- **Immutable deployments.** If the running model config can be edited in place, there is no way to know after an incident what was actually serving.
+- **Signed images and dependencies**, the same discipline as any other service. A model server holds the most valuable asset in the building; it should be the hardest thing in the building to modify.
+
+<Callout type="mentor" title="The supply-chain question to ask in every design review">
+  *"If someone wanted to change what this model produces, or what it costs to run, what would they have to touch?"*
+
+  The answer should be: an immutable image digest, a signed artifact, and a deploy that goes through review. If the answer involves a tag, a YAML file anyone can edit, or a runtime flag on the command line, the integrity story is not written yet.
+</Callout>
+
+## Logging, tracing, and the copies nobody counts
+
+Your observability stack — which this module has spent five lessons building — is also the largest uncontrolled copy of your users' data in the system.
+
+Everything below lands in logs or trace attributes by default:
+
+- prompt and completion text,
+- API keys in headers and query strings,
+- `error` fields containing upstream request URLs with tokens,
+- user identifiers in `user_id` labels and path params,
+- trace attributes attached by library defaults you never inspected.
+
+<Callout type="pitfall" title="Five things that will leak if you do nothing">
+  1. **API keys in access logs.** If you log headers, you log `Authorization`. Redact at the logger, not at the reader.
+  2. **Prompts in error messages.** An exception whose message interpolates the prompt writes user content into your log aggregator, and from there into the hands of anyone with a log query.
+  3. **Full request bodies in traces.** Span attributes are not automatically redacted, and trace backends are usually less protected than the primary database.
+  4. **Unbounded retention.** Thirty days of every conversation in a log store is thirty days of breach surface with no product value.
+  5. **Span names built from user data.** If a span's name is assembled from the first characters of the prompt, you have put user content into your index, your metrics labels and your billing.
+
+  The discipline is **allow-list, not redact**: only attributes you have explicitly decided are safe are recorded. A denylist of things to redact loses to every new field you add next quarter.
+</Callout>
+
+## The threat model, in a page
+
+A <Term t="threat-model">threat model</Term> is a short document that names four things. It does not need to be long to be useful.
+
+1. **Assets** — what is worth stealing or destroying? Here: user prompts and completions, the model weights, the GPU capacity, and the API keys.
+2. **Attackers** — who, and what can they do? External unauthenticated; external authenticated (a paying customer with a key); insider (a tenant attacking another tenant); supply chain (a compromised dependency or image).
+3. **Trust boundaries** — where does untrusted input become trusted? At the edge, at the tenant boundary, and at the point where a request becomes a KV allocation.
+4. **Residual risk** — what you are *not* fixing, and why you accepted it.
+
+<Callout type="try" title="The five-minute version you can run today">
+  Answer these four and you have a threat model. Each should be one sentence, and each should name a number.
+
+  1. **If our most expensive tenant disappeared overnight, what would our burn rate be?** This bounds how fast an attacker can cost you.
+  2. **If someone sent 10,000 requests with a 128k-token prompt each, what stops them?** Name the control and the number.
+  3. **If a new engineer joined, could they read another tenant's prompts?** Follow the KV block table and the cache key, and answer yes or no.
+  4. **Where does a user’s prompt exist in plaintext on our infrastructure?** List every copy: logs, traces, backups, the block pool.
+
+  If any answer is vague, the vague thing is your next incident.
+</Callout>
+
+<Callout type="recap" title="Security for an inference service, in one list">
+  1. **Authenticate at the edge only.** The engine is internal and trusts the gateway.
+  2. **Per-key quotas are the control**, not authentication. Rate limits and concurrency caps.
+  3. **Tenant belongs in the cache key** and in the KV namespace. Always. Retro-fitting this during an incident means flushing the cache.
+  4. **Pin model revisions by digest** and make deployments immutable, so you can prove what was serving.
+  5. **Allow-list what you log and trace** — prompts, keys and error bodies leak by default.
+  6. **Availability is the most exposed property**, because the attack is free: an unauthenticated loop against a GPU.
+  7. Remember that **sampling can reconstruct weights**. Rate limits and output caps are the mitigation; for a trade-secret model, the mitigation is not serving untrusted callers.
+</Callout>
+
+<KeyNotes>
+  1. An inference endpoint is a **compute tenant**, not a web page: it holds other people's words in GPU memory, accepts arbitrary text, and has a demonstrated weight-exfiltration path.
+  2. Split the review into **confidentiality, integrity and availability** — the mitigations barely overlap, and availability is where inference is most exposed.
+  3. **Availability attacks are free**: 3 requests per second of 8-second requests holds all 24 slots of a replica — a quarter of its capacity — indefinitely, for the price of a valid key.
+  4. **Authenticate at the edge only**, give every key a token-rate and concurrency quota, and never let the client choose a model by name.
+  5. **Put the tenant in the prefix-cache key and the KV namespace.** Without it, a public prompt can hit another tenant's cached prefix — a confidentiality bug with no exploit required.
+  6. KV blocks **outlive their requests**: zero on free where sensitive, cap per tenant, and never persist the pool unencrypted.
+  7. Pin model **digests**, not tags, and keep deployments immutable — otherwise nobody can prove what was serving after an incident.
+  8. **Allow-list telemetry**: prompts, `Authorization` headers, error bodies and user ids all reach logs and traces by default, and your observability stack is the largest uncontrolled copy of user data you have.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A replica has 24 concurrency slots and a mean service time of 1.89 s. A key with no per-key concurrency cap holds all 24 slots with 8-second requests. Roughly how many requests per hour does that one key take off you?', numeric: true, answer: 10800, tolerance: 300, unit: 'requests/hour', why: '24 slots ÷ 8 s = 3 requests per second, and 3 × 3,600 = 10,800 requests per hour, all billed at your rate, for free to the attacker. Compare that with the replica\'s real capacity of 12.7 req/s: one uncapped key can hold a quarter of it indefinitely. This is why per-key concurrency quotas are the highest-value control on the page — they turn a free attack into a bounded one.' },
+  { q: 'Two tenants share a prefix cache. Tenant A’s first 200 tokens are a confidential system prompt, cached under a key derived from the token ids. Tenant B sends the same 200 tokens. What happens, and what is the fix?', options: ['Nothing — the cache stores no text, only keys and values', 'Tenant B gets a 100% prefix-cache hit on A’s prefix, because the cache key contains no tenant; fix by including the tenant in the key and in the KV namespace', 'B’s request is rejected because the cache is full', 'B gets a hit but the tokens are re-encoded'], answer: 1, why: 'The cache key is derived from token ids, and identical tokens produce an identical key regardless of who sent them. That is a cross-tenant confidentiality bug with no attacker skill required. The fix is namespacing the key by tenant — and it must be done before launch, because retro-fitting it during an incident means flushing the whole cache.' },
+  { q: 'Why does the paper-thin “the attacker could sample our weights out” result change how you should run a public endpoint?', options: ['It means you must switch to a larger model', 'It means output caps, rate limits and access control are confidentiality controls, not just availability ones', 'It means you should disable streaming', 'It means quantization removes the risk'], answer: 1, why: 'Weight reconstruction turns the endpoint into a data exfiltration channel for the model itself. That makes output-length caps and request-rate limits confidentiality controls with a security purpose, and it means a model that is a genuine trade secret should not be served to untrusted callers at all — that is the real mitigation, not a bigger rate limit.' },
+  { q: 'A replica has 24 concurrency slots and a mean service time of 1.89 s, so it does 12.7 requests per second at full occupancy. A single valid API key sends requests that each take 8 seconds, and there is no per-key concurrency cap. Holding all 24 slots, what request rate is that key sustaining?', numeric: true, answer: 3, tolerance: 0.1, unit: 'req/s', why: 'All 24 slots held by 8-second requests is 24 ÷ 8 = 3 requests per second — about a quarter of the replica\'s 12.7 req/s of real capacity, taken by one key, indefinitely and for free. Multiply by 3,600 and you get 10,800 requests per hour, every one of them billed at your rate. This is why a per-key concurrency cap is the highest-value single line on the whole page.' },
+  { q: 'What is the difference between tagging a model as `llama-3.1-8b:latest` and pinning it by content digest?', options: ['The digest loads faster', 'The digest guarantees the exact weights you reviewed are the weights serving, while a tag can be moved under you between deploys', 'Tags cannot be used in production', 'Digests disable caching'], answer: 1, why: 'Tags are mutable pointers. A tag can be re-pushed by anyone with registry write access, and your running service will pick up different weights at the next pull or restart with no change in your config. A content digest is the identity of the artifact, so it makes the integrity question — "what was actually serving?" — answerable after the fact.' },
+  { q: 'Which control is the most commonly forgotten on an inference endpoint?', options: ['TLS', 'A per-key concurrency and token-rate quota', 'Password hashing', 'MFA'], answer: 1, why: 'TLS and authentication are usually present because they are universal checklist items. Per-key quotas are specific to compute services, they are usually filed under "performance tuning" rather than security, and without them a single valid key is an unlimited, unbudgeted consumer of your GPUs.' },
+  { q: 'Why is an allow-list better than a redact-list for telemetry fields?', options: ['Allow-lists are faster to evaluate', 'A redact-list must be updated for every new field, and every field you forget becomes user data in your log store forever; an allow-list fails closed', 'Redact-lists cannot match text', 'Allow-lists compress better'], answer: 1, why: 'The failure mode is asymmetric. A missing redaction rule is silent and permanent — the data is already in the log store and in every downstream system that indexed it. An allow-list fails closed: a new attribute is not recorded until someone decides it should be, which converts an incident into a code review.' },
+] } />

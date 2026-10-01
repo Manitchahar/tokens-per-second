@@ -1,0 +1,193 @@
+---
+title: 'Module 15 · Compilation & CUDA Graphs'
+module: compilation
+---
+
+## The two pipelines
+
+A decode step is **not** a sum. The CPU describes the step while the GPU executes it, so:
+
+$$
+t_{\text{step}} = \max\left(t_{\text{cpu}},\ t_{\text{gpu}}\right) + t_{\text{sync}}
+$$
+
+- $t_{\text{cpu}} = N_{\text{kernels}} \times c_{\text{launch}}$
+- $t_{\text{gpu}} = \dfrac{B}{\text{bandwidth} \cdot \text{MBU}}$, where $B$ = weights + KV cache
+- $t_{\text{sync}} \approx 0.2$ ms — reading sampled token ids back. Never overlapped.
+
+**The rule:** two columns always. How much data moves, and how much code runs. One column filled in is a guess.
+
+## The launch bill
+
+A launch costs ~**6 µs** of CPU on a server core (3 µs bare-metal, 20 µs a busy laptop). Four parts, in order:
+
+1. Python — interpret, look up the method, build the tuple
+2. The dispatcher — pick a C++ kernel, walk autograd
+3. The caching allocator — find or reserve the output tensor
+4. `cudaLaunchKernel` — write into the stream queue
+
+| Model | Layers | Launches | CPU | GPU | Verdict (H100, b1) |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 420 | **2.5 ms** | 0.37 ms | launch-bound 6.9× |
+| Llama-3.2-3B | 28 | 488 | **2.9 ms** | 2.4 ms | launch-bound 1.2× |
+| Llama-3.1-8B | 32 | 556 | 3.3 ms | **6.0 ms** | GPU-bound 1.8× |
+| Qwen2.5-32B | 64 | 1,100 | 6.6 ms | **24.4 ms** | GPU-bound 3.7× |
+| Llama-3.1-70B | 80 | 1,372 | 8.2 ms | **52.7 ms** | GPU-bound 6.4× |
+
+Launch count follows **layers**; bytes follow **parameters**. Small-and-deep is the dangerous shape.
+
+## The crossover batch
+
+Set the two pipelines equal. Below the crossing, extra users are nearly free:
+
+$$
+B^{*} = \frac{t_{\text{cpu}} \cdot \text{BW} \cdot \text{MBU} - W}{T \cdot k}
+$$
+
+With $W$ = weight bytes, $T$ = context, $k$ = KV bytes per token per sequence.
+
+**Qwen2.5-0.5B on an H100 → about 459 users** at 1,024 context.
+
+## The three levers
+
+| Lever | What it does | CPU bill | GPU bytes |
+|---|---|---|---|
+| **Fusion** | 9 elementwise kernels per layer → 5 | 556 → 420 | 33.75 → 22 units |
+| **torch.compile** | C++ issues the kernels, no Python | 6 µs → 2 µs per launch | small extra saving |
+| **CUDA graph** | record once, replay as one call | everything → ~8 µs | **unchanged** |
+
+All three attack one bill. The last is the biggest and the most conditional.
+
+## The fusion arithmetic
+
+One decoder layer, counting in **units** of one hidden row (4,096 BF16 = 8,192 bytes):
+
+| Eager kernel | units |
+|---|---|
+| RMSNorm | 2.00 |
+| split into heads | 3.75 |
+| RoPE on Q / on K | 2.00 / 0.50 |
+| residual add | 3.00 |
+| RMSNorm | 2.00 |
+| SiLU(gate) | 7.00 |
+| × up | 10.50 |
+| residual add | 3.00 |
+| **total** | **33.75** → 22 fused |
+
+At 512 tokens through 32 layers that is 4.53 GB → 2.95 GB, or 1.69 ms → 1.10 ms. Against a 15.1 ms prefill, fusion is worth **3.9%**.
+
+**Honest summary: on a dense model, fusion's byte saving is a few percent. The launch saving is the real one.**
+
+## `torch.compile`
+
+Four stages:
+
+1. **Dynamo** — runs your Python with proxy tensors, records the operators
+2. **Guards** — check dtypes, shapes, device, flags; a miss means recompile
+3. **Inductor** — emits fused Triton kernels and C++ glue
+4. **C++ launcher** — calls them, ~2 µs instead of ~6
+
+**Causes of a graph break** (a *silent downgrade*, not an error):
+
+- `.item()`, `.tolist()`, or any tensor value read on the host
+- `print(t)` or formatting a tensor
+- Data-dependent control flow (`while cache.get_seq_length() < n`)
+- An op with no symbolic form
+- Mutating a Python object (appending to a list)
+- Mixed dtypes or devices across branches
+
+**Debugging, in order:**
+
+```python
+compiled = torch.compile(model, fullgraph=True)      # make breaks errors
+from torch._dynamo.explain import explain
+rep = explain(model)(ids, past_key_values=cache, use_cache=True)
+print(rep.graph_count, rep.graph_break_count, rep.break_reasons)
+```
+
+Recompile storms: `dynamic=True`, `torch._dynamo.mark_dynamic(t, 0)`, and `torch._dynamo.config.cache_size_limit` (default 8 — past it, Dynamo gives up and falls back to eager).
+
+**Modes:** default (1.05–1.5× GPU-bound), `reduce-overhead` (adds CUDA graphs), `max-autotune` (benchmarks matmuls; helps prefill, not decode).
+
+**Compile the forward step, not `generate()`.**
+
+## CUDA graphs
+
+```python
+# warm up on a side stream — mandatory
+s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(3): step(static_in, cache)
+torch.cuda.current_stream().wait_stream(s); torch.cuda.synchronize()
+
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):        # records; executes nothing
+    static_out = step(static_in, cache)
+
+static_in.copy_(new_data)        # same address, new contents
+g.replay()                       # one API call, every kernel
+```
+
+**The static-address rule.** Arguments are resolved to device addresses at capture time, so every buffer must be allocated once. This is why replay is fast (nothing left to decide) and why the graph cannot be pointed at new memory.
+
+**Sample inside the graph.** Llama-3.1-8B at batch 32: full logits are 8.21 MB (3 µs of traffic, but a 200 µs host sync); one sampled id per sequence is **128 bytes**.
+
+**Padding.** A graph captured at 64 run at 33 wastes `1 - 33/64 = 48%` of the GPU work. Worth it only when the CPU was the bottleneck.
+
+**Graph pool.** Graphs write to fixed addresses, so graph-captured KV needs a **separate non-preemptible pool** — memory the scheduler cannot reclaim, and a real cause of OOM under load.
+
+## When it pays
+
+Same H100, 6 µs launch, 1,024 context, +0.2 ms sync:
+
+| Configuration | GPU (all modes) | Eager | Best | Gain |
+|---|---|---|---|---|
+| Qwen2.5-0.5B, b1 | 0.37 ms | 2.72 ms | **0.57 ms** | 4.8× |
+| Qwen2.5-0.5B, b128 | 0.97 ms | 2.72 ms | **1.17 ms** | 2.3× |
+| Qwen2.5-0.5B, b512 | 2.77 ms | 2.97 ms | 2.97 ms | 1.0× |
+| Llama-3.1-8B, b1 | 6.0 ms | 6.2 ms | 6.2 ms | **1.0×** |
+| Llama-3.1-8B, b64, 4k ctx | 18.8 ms | 19.0 ms | 19.0 ms | **1.0×** |
+
+**A graph is a CPU optimisation only.** If the GPU was already the longer pipeline, it buys nothing.
+
+## Measuring
+
+```python
+# CPU: how long to SAY it. No sync — the queue absorbs the work.
+torch.cuda.synchronize(); t0 = time.perf_counter()
+for _ in range(50):
+    with torch.inference_mode():
+        model(ids, past_key_values=cache, use_cache=True)
+t_issue = (time.perf_counter() - t0) / 50
+torch.cuda.synchronize()
+
+# GPU: the actual work
+s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+s.record()
+for _ in range(50):
+    with torch.inference_mode(): model(ids, past_key_values=cache, use_cache=True)
+e.record(); torch.cuda.synchronize()
+t_gpu = s.elapsed_time(e) / 50
+```
+
+`launch_bound ⟺ t_issue > t_gpu`.
+
+## Four ways to fool yourself
+
+1. **Profiling only the GPU.** Never look at the CPU track and a launch-bound config reads as "slow GPU".
+2. **Timing a loop without synchronising**, with the result unused — some builds make that a no-op.
+3. **Comparing across layer counts.** The CPU term is not a constant; a 32→24 layer change moves it 25%.
+4. **Believing a launch cost measured on an idle laptop.** Measure where you deploy.
+
+## Cheat sheet of cheat sheets
+
+| Question | Answer |
+|---|---|
+| Am I launch-bound? | `t_issue > t_gpu` — measure both |
+| Does compilation help? | Only if the CPU was the longer pipeline |
+| Does a CUDA graph help? | Same test; it only touches the CPU side |
+| Why did fusion barely help? | On dense models its byte saving is a few percent; the launch saving is the real one |
+| Graph breaks? | `fullgraph=True` first, then `explain()` |
+| Capture failed or replayed garbage? | You skipped the side-stream warm-up |
+| OOM under load but not idle? | The non-preemptible graph pool |
+| Wrong results from a graph? | Insufficient warm-up, or buffers sized for a smaller batch |

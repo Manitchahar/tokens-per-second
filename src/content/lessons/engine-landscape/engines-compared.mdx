@@ -1,0 +1,181 @@
+---
+title: 'vLLM, SGLang, TensorRT-LLM & llama.cpp'
+summary: 'Four engines that all solve the same problem, built on three genuinely different ideas. You learn what each one optimises, why its advantage is real, and where it stops being an advantage — so you can pick on evidence instead of on reputation.'
+objectives:
+  - Name the one idea each of the four engines is built around, and the traffic each one suits
+  - Decompose a decode step into memory traffic, compute and CPU overhead, and say which part each engine attacks
+  - Derive the fixed-cost floor of a decode step and the per-step launch cost that a compiled plan removes
+  - Decide from arithmetic whether a model fits in memory under 16-bit and under 4-bit weights
+  - Explain why an ahead-of-time engine's advantage is conditional on its build staying valid
+  - Choose an engine for a stated workload and defend it with derived and structural evidence
+---
+import EngineAtlas from '@/components/viz/engine-landscape/EngineAtlas.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson handed you a ruler: a harness contract, and the discipline to refuse a comparison that does not meet it. Now you have four engines to compare, and they are not variations on a theme. They are four different answers to the question **who decides what runs next**.
+
+You have already met vLLM directly, in Module 09. You have met its two central ideas — paged KV blocks in Module 08 and continuous batching in Module 07 — and you have seen what they buy. The other three you have met in pieces: RadixAttention in Module 10, a build-then-replay loop in Module 15's CUDA graphs, and 4-bit weights in Module 11. What you have not done is put them side by side and ask which one is *for you*.
+
+<Callout type="mentor" title="What this lesson is not">
+  This is not a ranking. There is no chart here with four bars and a winner, because any such chart would be measuring a workload and presenting it as a property. What follows is a description of the design each engine commits to, and the traffic that design is good for. The previous lesson gave you the rules; this one gives you the subjects.
+</Callout>
+
+## One step, four engines
+
+Everything an inference engine does, it does inside the decode loop you have been measuring since Module 02. For each token: read the weights, read every sequence's KV cache, do the math, sample, repeat. Four engines run that same loop. What differs is **how much of each step is spent waiting for the CPU**.
+
+<Scrolly>
+  <EngineAtlas client:visible slot="stage" />
+
+  <Step title="1. One step, four engines">
+    Each bar is one forward pass: the memory traffic in blue, the math in amber, and the hatched slice where the **GPU is idle waiting for the CPU**. Every bar is scaled against the slowest engine's whole step, so the idle slices are directly comparable. Look at how different the shapes are, and notice that the gap between first and last is not a constant factor — it changes with the workload.
+  </Step>
+
+  <Step title="2. What an engine actually does">
+    An <Term t="inference-engine">inference engine</Term> is not the model and not the <Term t="kernel">kernels</Term>. It is the machinery around them: a <Term t="scheduler-stage">scheduler stage</Term> on the CPU that decides which running sequences continue and which waiting ones join, a manager that allocates and frees KV blocks, and a launcher that issues a few hundred kernels. A forward pass is hundreds of launches, and **the GPU cannot start kernel $k+1$ until the CPU has issued it**. That fixed cost is the hatched slice, and it is the single most engine-defining number on the screen.
+  </Step>
+
+  <Step title="3. vLLM: the general-purpose one">
+    <Term t="vllm">vLLM</Term> is the widest-used of the four and the one you are most likely to meet. Paged KV blocks and continuous batching do the memory work, and the loop is driven from Python. Its strength is **breadth**: nearly every model architecture, the largest ecosystem, the most documentation, and a tuning surface deep enough to lose a week in. Its cost is that the CPU side of the step is real, and it is why the per-user latency at small batch is not as low as a compiled engine's.
+  </Step>
+
+  <Step title="4. SGLang: prefix-heavy traffic">
+    <Term t="sglang">SGLang</Term> came out of the same lineage, and its distinguishing idea is <Term t="radixattention">RadixAttention</Term>: the prefix cache is a <Term t="radix-attention">radix tree</Term> the attention kernel walks directly, so a shared system prompt or a multi-turn history is read once with no gather copy. The step gets **shorter in bytes**, not shorter in launches. Switch the workload to `latency` and you will see its overhead is comparable to vLLM's; what changes is how much memory traffic a request with a 2,000-token shared prefix actually costs.
+  </Step>
+
+  <Step title="5. TensorRT-LLM: pay for the build">
+    <Term t="tensorrt-llm">TensorRT-LLM</Term> runs an <Term t="ahead-of-time-compile">ahead-of-time compile</Term> before it serves anything. It traces the model, fuses operators, autotunes kernels for one exact configuration of model, precision, GPU and parallel layout, and emits an <Term t="execution-plan">execution plan</Term>. The plan replays with very few launches, so the hatched slice nearly vanishes — switch to `bulk batch` and watch its idle share fall to almost nothing while the others stay visible. You pay for this in build time, and the plan is **invalid the moment the model, precision, GPU or parallel layout changes**.
+  </Step>
+
+  <Step title="6. llama.cpp: the 4-bit answer">
+    <Term t="llama-cpp">llama.cpp</Term> is the outlier: portable, no CUDA requirement, and built around <Term t="ggml">GGUF</Term> and <Term t="weight-only-quant">4-bit weights</Term>. On an NVIDIA card serving an unquantized model it will usually lose — it reaches a smaller fraction of peak bandwidth and pays a larger fixed cost than the GPU-native engines. Where it wins is the case **nothing else can serve at all**. The `4-bit edge` workload is the point: a 32B model in 16.4 GB on a 24 GB card, or a laptop with no GPU.
+  </Step>
+
+  <Step title="7. Which column decides it">
+    Never start from the throughput column. Start from the columns you can **derive**: weights, KV pool, does it fit at all. Then apply the hard constraints — a build step you cannot run, hardware you do not own, a model with no support. Only among the survivors do the measured columns decide, and even then the answer depends on which workload is selected. This ordering is the project at the end of this module.
+  </Step>
+</Scrolly>
+
+## The fixed-cost floor, derived
+
+The arithmetic that explains the hatched slice is short, and you have all of it.
+
+A decode step of Llama-3.1-8B on an H100 must read its weights:
+
+$$
+\text{weights} = 8.03\times 10^9 \times 2 = 16.06\ \text{GB}
+$$
+
+At an achievable 78% of 3.35 TB/s:
+
+$$
+t_{\text{weights}} = \frac{16.06}{3.35\times 0.78} = 6.1\ \text{ms}
+$$
+
+That is a **floor**. No engine goes below it, because every one of them must read the whole weight tensor once per generated token. It is the reason a 70B model on one H100 delivers about 22 tokens/s to a single user no matter which engine you choose.
+
+On top of that floor sits the launch cost. A forward pass is roughly 300 kernel launches — attention, MLP, norms, samplers, and the small elementwise glue between them — and each launch costs about 5–10 µs of CPU time before the GPU sees it:
+
+$$
+t_{\text{launch}} \approx 300 \times 7\ \mu\text{s} = 2.1\ \text{ms}
+$$
+
+<Callout type="math" title="Why the floor matters more at small batch than at large batch">
+  At batch 1 the step is 6.25 ms of memory traffic plus 2.1 ms of launches, so the launch cost is **25% of the step**. At batch 64 the GPU work has grown to 12.7 ms, the launches are still 2.1 ms, and their share has fallen to about **14%**. Fixed costs do not get relatively smaller as you serve more people — they get absolutely constant, and the denominator grows.
+
+  So the per-user latency advantage of a compiled engine is largest exactly where it hurts most: the single-stream interactive case. And the total throughput advantage is largest exactly where the CPU is already saturated by a large batch. **This is why "which engine is faster" has no single answer, and why a benchmark that does not say the batch size is not reporting a fact about the engine.**
+</Callout>
+
+## llama.cpp, derived: the 4-bit argument
+
+The llama.cpp case is not really about speed. It is about a hard constraint, and hard constraints are arithmetic.
+
+Qwen2.5-32B in BF16 needs:
+
+$$
+32.8\times 10^9 \times 2 = 65.6\ \text{GB}
+$$
+
+An L4 has 24 GB. The model does not fit, and no amount of scheduling changes that — this is the memory edge from Module 06, and it is not negotiable. In 4-bit the same weights need:
+
+$$
+32.8\times 10^9 \times 0.5 = 16.4\ \text{GB}
+$$
+
+Now add a 4% reserve for the CUDA context, graphs and workspace, about 1 GB, and 16.4 + 1.0 = 17.4 GB against 24 GB. There is room left for roughly 6.6 GB of KV cache. At Qwen2.5-32B's 64 layers, 8 KV heads and head dim 128 in BF16, that is 131,072 bytes per token, so:
+
+$$
+\text{pool} = \frac{6.6\times 10^9}{131{,}072} \approx 50{,}000\ \text{tokens of context}
+$$
+
+About 48 full 1,024-token conversations, or a handful of long ones. It fits, and it is the difference between a working feature and a refusal.
+
+<Callout type="pitfall" title="4-bit buys memory, not speed, and the two are not the same claim">
+  Halving the weight bytes halves the *weight traffic*, which at batch 1 is the whole step — so on a memory-bound decode it does look like a big speedup. But 4-bit quantization also needs dequantisation work on the way in, and it changes the output. Greedy decoding at 4 bits will not produce the same tokens as FP16. So "quantized is faster" and "quantized is accurate enough" are two separate claims, and the second is the one from Module 11 that you have to earn.
+</Callout>
+
+## The OpenAI-compatible API, and why it matters
+
+All four of these engines serve an <Term t="openai-compatible-api">OpenAI-compatible API</Term>. Same request shape, same response shape, same streaming protocol, same `/v1/models`.
+
+This is the most underrated fact in the whole landscape. It means the engines are **substitutable at the edge of your system**: you point a client at a different base URL and it works. You can A/B two engines behind one interface, run a shadow deployment, or migrate one workload at a time.
+
+<Callout type="real" title="Why you can A/B, and what still bites">
+  The wire format is portable. Everything behind it is not. The tokenization must be identical (same tokenizer files, same revision), the sampling must be pinned (temperature 0, fixed seed), the chat template must be the same — a server that applies its own template adds role tokens you never sent, and then your parity check fails for a reason that has nothing to do with the engine.
+
+  Portability at the API boundary means you *can* run the experiment. It does not mean the experiment is free.
+</Callout>
+
+## Which one, then
+
+Here is the honest summary. Every row is a design commitment, and design commitments have conditions.
+
+| | vLLM | SGLang | TensorRT-LLM | llama.cpp |
+|---|---|---|---|---|
+| **Core idea** | paged blocks + continuous batching, scheduled in Python | radix-tree prefix cache walked in-kernel | build once, replay an execution plan | 4-bit weights, portable, no CUDA needed |
+| **Fixed cost per step** | highest of the GPU-native three | similar to vLLM | **lowest** — few launches | high |
+| **Prefix reuse** | block-level, copy-on-write | **best** — tree walked directly | block-level, copy-on-write | limited; whole-sequence cache |
+| **4-bit** | supported | supported | supported | **native and the reason it exists** |
+| **Runs without an NVIDIA GPU** | no | no | no | **yes** |
+| **Build step** | none | none | **yes, per configuration** | none |
+| **Where it is strongest** | breadth: most models, most docs | prefix-heavy: agents, multi-turn chat, few-shot | fixed shape on one GPU: lowest latency, highest throughput | fitting a big model on small or non-NVIDIA hardware |
+
+<Callout type="intuition" title="The decision, in the order you should make it">
+  1. **Does it fit?** Weights plus a reserve against your GPU's memory, in the precision you need. This is arithmetic, and it eliminates candidates before anything is benchmarked. Most "which engine" questions die here.
+  2. **Is there a hard constraint you cannot satisfy?** A model with no kernel support. A hardware you do not own. A build you cannot run in your deployment pipeline.
+  3. **Which design matches your traffic?** Prefix-heavy → SGLang. One shape, latency-critical, stable config → TensorRT-LLM. Everything else, or maximum model coverage → vLLM. Non-NVIDIA or memory-starved → llama.cpp.
+  4. **Only now, measure.** And measure under the contract from the previous lesson.
+
+  Steps 1 and 2 need no GPU. They eliminate most of the field for free, and they are the steps teams skip.
+</Callout>
+
+<Callout type="pitfall" title="Four mistakes you will see people make">
+  1. **Benchmarking on hardware nobody will deploy on.** A chart of engine throughput on a T4, used to choose between engines for an H100 fleet, measures the wrong thing. `max_num_seqs` defaults differ by hardware, and so do the sensible settings.
+  2. **Treating TensorRT-LLM's win as unconditional.** Its advantage is a build you did ahead of time. Change the dtype, or the batch cap, or the parallel layout, and you rebuild — minutes to hours. That is a *pipeline* cost, and it belongs in the comparison.
+  3. **Comparing an engine's default to another engine's tuned.** Same naive flags on all four measures your ignorance; it does not measure the engines. This is Comparison A from the last lesson, and it is the more common one.
+  4. **Assuming the newest release is the best one.** Engines move fast, and a release that is fastest on a benchmark is not the one your team can operate. Operational familiarity is a real column, and it is a real cost.
+</Callout>
+
+<Callout type="recap" title="The one-sentence version">
+  vLLM is the general-purpose engine you will meet most, SGLang wins on prefix-heavy traffic because its cache is a tree the kernel walks, TensorRT-LLM wins on a fixed configuration because it compiles the step away, and llama.cpp wins when the model has to fit somewhere nobody else can put it — and on any given workload at least one of those advantages is worth nothing to you.
+</Callout>
+
+<KeyNotes>
+  1. An engine is the machinery around the model: a CPU **scheduler stage**, a KV manager, and a launcher. The GPU is idle for a fixed slice of every step while that CPU works, and how small that slice is the most engine-defining number there is.
+  2. A decode step has a hard floor set by reading the weights: 16.06 GB at 78% of an H100's bandwidth is **6.1 ms**, and no engine beats it. Per-user latency is bounded by physics before it is bounded by software.
+  3. Launch cost is roughly 300 kernels × 5–10 µs ≈ **2.1 ms per step** — about 25% of a batch-1 step and about 14% of a batch-64 step. Fixed costs are constant, so they matter most when the GPU work is smallest and a user is waiting longest.
+  4. vLLM's design commitment is **breadth**: paged blocks, continuous batching, Python scheduling, near-universal model coverage. It is the safe default, and "safe default" is a real answer.
+  5. SGLang's <Term t="radixattention">RadixAttention</Term> makes the step cheaper **in bytes** rather than in launches: a shared prefix is read once because the kernel walks the tree. It wins on prefix-heavy traffic, not on raw per-step cost.
+  6. TensorRT-LLM's plan removes launches almost entirely, which is the lowest fixed cost of the four — paid for with a build that is invalidated by any change to model, precision, GPU or parallel layout. Treat that build as part of the cost.
+  7. llama.cpp's case is a **hard constraint**, not a speed claim: 32B in 4-bit is 16.4 GB and fits a 24 GB card, where BF16 at 65.6 GB does not. It is the answer when the question is "can this run at all".
+  8. Decide in this order: does it fit (arithmetic), then hard constraints, then which design matches your traffic, and only then measure. Most engine comparisons die at the first step and never need a benchmark.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What is the hard floor on a batch-1 decode step for Llama-3.1-8B in BF16 on an H100?', numeric: true, answer: 6.1, tolerance: 0.5, unit: 'ms', why: '16.06 GB of weights at 78% of 3.35 TB/s = 16.06/2.613 = 6.1 ms. No engine goes below this, because the weights must be read once per generated token regardless of the engine.' },
+  { q: 'Why does an ahead-of-time engine like TensorRT-LLM have a larger advantage at batch 1 than at batch 64?', options: ['Its kernels are better at small batch', 'It removes per-step launch overhead, which is a fixed cost: roughly 2.1 ms on a batch-1 step but the same 2.1 ms on a much larger batch-64 step', 'It uses less memory so it fits more sequences', 'It avoids the KV cache entirely'], answer: 1, why: 'The advantage is the elimination of roughly 300 kernel launches. That is ~2.1 ms regardless of batch. On this model at 2,048 tokens of context that is 25% of a batch-1 step (2.1 of 8.35 ms) and 14% of a batch-64 step (2.1 of 14.8 ms). The saving is identical; the denominator is what changes.' },
+  { q: 'Qwen2.5-32B in 4-bit must run on a 24 GB L4. About how much memory is left for the KV cache after the weights and a 4% (~1 GB) reserve?', numeric: true, answer: 6.6, tolerance: 0.6, unit: 'GB', why: '32.8e9 x 0.5 = 16.4 GB of weights. 24 - 16.4 - 1.0 = 6.6 GB. In BF16 the same model needs 65.6 GB and does not fit at all — this is a hard-constraint calculation, not a speed one.' },
+  { q: 'You serve a multi-turn chat product where every request shares a 2,000-token system prompt and the previous turns. Which engine has the design most directly aimed at this traffic?', options: ['TensorRT-LLM, because it compiles the step away', 'vLLM, because it is the most widely used', 'SGLang, because its prefix cache is a radix tree the attention kernel walks directly, so the shared history is read once', 'llama.cpp, because it is most portable'], answer: 2, why: 'RadixAttention shares prefixes at the level the kernel reads them, avoiding a gather copy. The others also have prefix caching, but at block granularity with copy-on-write, which costs more per reused block.' },
+  { q: 'What happens to a TensorRT-LLM execution plan if you change the model dtype?', options: ['It recompiles automatically at the next request', 'Nothing — the plan is dtype-agnostic', 'It becomes invalid and you must rebuild, because the plan was autotuned for one exact configuration', 'It falls back to a slower generic kernel automatically'], answer: 2, why: 'The plan encodes fused kernels, shapes and chosen algorithms for one specific (model, precision, GPU, parallel layout). Changing the dtype invalidates it, and the build is a real cost that belongs in the comparison — a pipeline cost, not a one-off.' },
+  { q: 'A forward pass issues roughly 300 kernel launches at about 7 microseconds each. What is the fixed CPU cost per decode step?', numeric: true, answer: 2.1, tolerance: 0.3, unit: 'ms', why: '300 x 7 us = 2100 us = 2.1 ms. On a batch-1 step of 6.1 ms of memory traffic that is a 35% overhead; at batch 64 it is a few percent. This fixed cost is exactly what a compiled execution plan removes.' },
+] } />

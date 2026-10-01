@@ -1,0 +1,77 @@
+---
+// Scrollytelling: the stage (first child, usually a viz island) stays pinned while the <Step>s scroll.
+// The active step index is published on the container as data-index + a "scrolly:change" event,
+// which every viz picks up through useStep(). Viz controls send "scrolly:go" back.
+interface Props { tall?: boolean }
+const { tall } = Astro.props;
+---
+<section class:list={['scrolly', { tall }]} data-scrolly data-index="0">
+  <div class="stage-col"><slot name="stage" /></div>
+  <div class="steps-col"><slot /></div>
+</section>
+
+<script>
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function init(el: HTMLElement) {
+    const steps = Array.from(el.querySelectorAll<HTMLElement>(':scope > .steps-col [data-step]'));
+    steps.forEach((s, i) => (s.dataset.step = String(i)));
+    el.dataset.count = String(steps.length);
+    let index = -1;
+    let lockTo: number | null = null;
+    let lockTimer = 0;
+
+    const set = (i: number) => {
+      if (i === index) return;
+      index = i;
+      el.dataset.index = String(i);
+      steps.forEach((s, j) => { s.classList.toggle('is-active', j === i); s.classList.toggle('is-past', j < i); });
+      el.dispatchEvent(new CustomEvent('scrolly:change', { detail: i }));
+    };
+
+    const readingLine = () => (innerWidth < 900 ? innerHeight * 0.78 : innerHeight * 0.55);
+    const compute = () => {
+      if (lockTo !== null) return;
+      const line = readingLine();
+      let active = 0;
+      for (let i = 0; i < steps.length; i++) if (steps[i].getBoundingClientRect().top < line) active = i;
+      set(active);
+    };
+    let raf = 0;
+    const onScroll = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; compute(); }); };
+    addEventListener('scroll', onScroll, { passive: true });
+    addEventListener('resize', onScroll);
+
+    el.addEventListener('scrolly:go', (e) => {
+      const i = Math.max(0, Math.min(steps.length - 1, (e as CustomEvent).detail as number));
+      const target = steps[i];
+      if (!target) return;
+      lockTo = i;
+      set(i);
+      const r = target.getBoundingClientRect();
+      const y = scrollY + r.top - readingLine() + Math.min(r.height / 2, 60);
+      scrollTo({ top: y, behavior: reduce ? 'auto' : 'smooth' });
+      clearTimeout(lockTimer);
+      lockTimer = window.setTimeout(() => { lockTo = null; }, 900);
+    });
+    compute();
+  }
+  document.querySelectorAll<HTMLElement>('[data-scrolly]').forEach(init);
+</script>
+
+<style>
+  section.scrolly {
+    grid-column: wide;
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    column-gap: 3rem;
+    margin: 3rem 0 4rem;
+    position: relative;
+  }
+  .stage-col { grid-column: 2; grid-row: 1; position: sticky; top: calc(var(--bar-h) + 20px); align-self: start; }
+  .steps-col { grid-column: 1; grid-row: 1; padding: 6vh 0 30vh; }
+  @media (max-width: 900px) {
+    section.scrolly { grid-template-columns: minmax(0, 1fr); margin: 2rem 0; }
+    .stage-col { grid-column: 1; top: calc(var(--bar-h) + 4px); z-index: 5; background: var(--ground); padding-bottom: 8px; }
+    .steps-col { grid-column: 1; grid-row: 2; padding: 2vh 0 40vh; }
+  }
+</style>

@@ -1,0 +1,221 @@
+---
+title: 'Metrics & tuning one GPU'
+summary: 'Four flags decide how one GPU serves a whole product. Learn what each one actually changes, compute its consequences before you set it, and find the operating point that sits inside your latency target.'
+objectives:
+  - Read a vLLM startup log and turn its numbers into a concurrency budget
+  - Set max_model_len from your real request-length distribution, not the model card
+  - Choose gpu_memory_utilization so the KV pool is big without OOMing
+  - Find max_num_seqs from a latency target rather than from a round number
+  - Use max_num_batched_tokens to stop long prompts from stalling decode
+  - Write down an operating point you can defend in a design review
+colab: 09-tune-one-gpu.ipynb
+---
+import EngineTuner from '@/components/viz/vllm/EngineTuner.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every vLLM deployment has a config file that somebody wrote in a hurry. The good news: it is only four numbers that matter, and all four can be computed before you touch a GPU. The bad news is that they interact, and a config that is wrong in one place is usually wrong in three.
+
+This lesson is the practical one. We take **Llama-3.1-8B on one H100** — the setup you have been using since Module 02 — and derive every number from the memory budget and the workload.
+
+## The method, before the knobs
+
+Three rules, all of them from Module 06 · Measure Like a Pro:
+
+1. **Change one flag at a time.** These four interact, so a config where you moved all four and got 30% more throughput has taught you nothing.
+2. **Fix the workload first.** Tune against a *fixed* request-length distribution and a fixed output length. A benchmark that grows the prompts every run is measuring the workload, not the engine.
+3. **Write the operating point down.** Model, GPU, dtype, the four flags, the four numbers (p50/p95 TTFT, TPOT, output tok/s) and the date. Your <Term t="operating-point">operating point</Term> is that record. Module 25 · Inference Economics and Module 23 · Routing & Autoscaling both depend on you being able to look it up.
+
+<Scrolly>
+  <EngineTuner client:visible slot="stage" />
+
+  <Step title="1. Read the log first">
+    The memory bar is what the server already decided: `gpu_memory_utilization × 80 GB`, minus the weights, minus the reserve, leaving the **KV pool**. Every flag you are about to set either moves this bar or decides how it is divided. Start from what the log told you, not from a config file you found.
+  </Step>
+
+  <Step title="2. max_model_len: promise less">
+    This is the easiest win and the most often missed. `max_model_len` is not a performance setting; it is a **promise about the worst case**. 32,768 tokens of promise costs every short request a share of the budget it will never use.
+  </Step>
+
+  <Step title="3. gpu_memory_utilization: leave room">
+    This flag sizes the whole budget, so the KV pool grows and shrinks with it. Raise it and the pool gets bigger — until it walks into the CUDA context, the allocator's fragmentation and your neighbour's process, and the server dies at startup.
+  </Step>
+
+  <Step title="4. max_num_seqs: the concurrency cap">
+    The direct lever on how many sequences run in one step. It sets per-step latency and, with the pool, it sets your hard concurrency ceiling. The red line is where this workload stops fitting in memory.
+  </Step>
+
+  <Step title="5. max_num_batched_tokens: share a step">
+    One iteration processes at most this many tokens. A prompt bigger than the budget is split across iterations, so a single enormous request cannot hold the GPU hostage — the trade is longer TTFT for smoother ITL for everyone else.
+  </Step>
+
+  <Step title="6. Find the operating point">
+    Put the cap where your latency promise and your memory agree. Left of the SLO line you are wasting throughput; right of it, users wait. Both halves are computed, not guessed.
+  </Step>
+</Scrolly>
+
+## 1 · `max_model_len`: the promise, not the setting
+
+Nothing in the decode loop scales with <Term t="max-model-len">`max_model_len`</Term>. It is a **promise about the worst case**, not a speed setting: it decides how many longest-case requests can be resident in the KV pool at once.
+
+The KV cost of a request is exactly its context length times 128 KB (Llama-3.1-8B in BF16, from Module 05). So the worst case is linear and completely predictable:
+
+$$
+\text{KV per request} = \text{max\_model\_len} \times 128\ \text{KB}
+$$
+
+With a 52.7 GB pool:
+
+| `max_model_len` | Worst case per request | Fits at once |
+|---|---|---|
+| 32,768 | 4.19 GB | **12** |
+| 16,384 | 2.10 GB | **25** |
+| 8,192 | 1.05 GB | **49** |
+| 4,096 | 0.52 GB | **98** |
+
+<Callout type="mentor" title="How to choose it, in four steps">
+  Pull the real token histogram from your logs — `usage.prompt_tokens` plus `usage.completion_tokens`, at the p99, not the average. Set `max_model_len` to that, rounded up, plus a margin. Reject anything longer **at your gateway**, with a 400, rather than letting it reach the engine. Only promise 32k if you genuinely serve 32k.
+</Callout>
+
+The thing that makes this counter-intuitive: `max_model_len` does not slow a short request down **at all**. Nothing in the decode loop scales with it. It only decides how many longest-case requests can be resident together. Setting it to the model's advertised maximum is giving away concurrency for a case you will never see.
+
+## 2 · `gpu_memory_utilization`: how much of the card is yours
+
+<Term t="gpu-memory-utilization">`gpu_memory_utilization`</Term> is a fraction of the GPU's **total** memory that vLLM may plan to use. Inside that budget sit the weights, the activation reserve and the KV pool. Move it and you move the pool one-for-one.
+
+$$
+\text{pool} = \text{util} \times M - \text{weights} - \text{reserve}
+$$
+
+<Callout type="math" title="The same H100 at three settings">
+  Weights 16.06 GB, reserve ≈ 3.2 GB, so the pool is $(0.90 - 0.24) \times 80 = 52.7$ GB at `0.90`.
+
+  | util | budget | KV pool | tokens of context | 8k-token requests |
+  |---|---|---|---|---|
+| 0.60 | 48.0 GB | 28.7 GB | 219k | 26 |
+| 0.90 | 72.0 GB | 52.7 GB | 402k | 49 |
+| 0.95 | 76.0 GB | 56.7 GB | 433k | 53 |
+
+  The last row buys you 8% more concurrency and a real chance of `CUDA out of memory` during startup, because 4 GB of headroom is not enough for the CUDA context, NCCL buffers and fragmentation.
+</Callout>
+
+Rules of thumb:
+
+- **Dedicated GPU:** `0.90` is the default at the time of writing and it is a good default.
+- **GPU shared with training or another process:** drop to `0.4`–`0.6` and subtract the other tenant's live usage by hand. vLLM measures free memory at startup, but its plan is still based on the *total*.
+- **Never lower it to "save memory" on a dedicated card.** Unused memory is not a virtue on a machine nobody else is using.
+- **Watch `vllm:gpu_cache_usage_perc`.** Above ~90% you are one long request away from preemption; below ~50% you are paying for a pool you are not using.
+
+## 3 · `max_num_seqs`: where the curves meet your SLO
+
+<Term t="max-num-seqs">`max_num_seqs`</Term> is the flag people set to round numbers, and it is the one where the arithmetic is most worth doing. Take **Llama-3.1-8B on an H100 at 2,048 tokens of context per user** (a mid-length chat). Per sequence, the KV read on every decode step is **268 MB** — 2,048 tokens × 128 KB — on top of the 16.06 GB of weights.
+
+| Sequences running | Step time | Per user | Total throughput | GPU memory |
+|---|---|---|---|---|
+| 1 | 7.6 ms | 132 tok/s | 132 tok/s | 19.5 GB |
+| 8 | 8.3 ms | 121 tok/s | 965 tok/s | 21.4 GB |
+| 32 | 10.7 ms | 93 tok/s | 2,991 tok/s | 27.9 GB |
+| 64 | 13.9 ms | 72 tok/s | 4,603 tok/s | 36.4 GB |
+| 128 | 20.3 ms | 49 tok/s | 6,304 tok/s | 53.6 GB |
+| 226 | 30.1 ms | 33 tok/s | 7,502 tok/s | 79.9 GB |
+| 512 | — | — | — | **does not fit** |
+
+Every row is the same three lines of arithmetic:
+
+$$
+t = \frac{16.06\ \text{GB} + B \times 0.268\ \text{GB}}{3.35\ \text{TB/s} \times 0.8} + 1.5\ \text{ms}
+$$
+
+for the step time, $\frac{1}{t}$ for one user and $B/t$ in total. At $B = 226$: $(16.06 + 60.7)/2680 = 28.6$ ms of memory traffic, plus 1.5 ms of fixed overhead, so **30.1 ms**, and $\frac{1}{0.0301} = 33$ tokens per user. Memory runs out in the same place, because $(16.06 + 226 \times 0.268 + 3.2) = 79.9$ GB.
+
+Read the table as a sentence: **per-user speed falls slowly, total throughput rises fast, and memory ends the story at 226.**
+
+<Callout type="math" title="Pick the cap from your SLO, not your feelings">
+  Module 06 defined goodput. If the promise is "no user sees fewer than 30 tokens per second", find the row where per-user speed is still above 30: that is **226 concurrent users** on this GPU — and that is also exactly where the KV pool runs out, so on this hardware your latency promise and your memory ceiling happen to agree.
+
+  $$
+  \text{goodput}_{\max} \approx 226 \times 33 = 7{,}500\ \text{output tokens/s}
+  $$
+
+  Set `max_num_seqs` near that number and you have an operating point: the SLO holds, and the throughput is the best you can get without breaking it.
+</Callout>
+
+<Callout type="pitfall" title="Raising max_num_seqs feels free, and is not">
+  Between 32 and 226 sequences, per-user speed drops from 93 to 33 tok/s — a 2.8× slowdown for one user — while total throughput goes from 2,991 to 7,502, only 2.5×. That is a bad trade for an interactive product and a good one for batch summarization. Same GPU, same model, same flags: **the workload decides which is right.** If you cannot say which kind of product you are serving, you cannot set this flag.
+</Callout>
+
+## 4 · `max_num_batched_tokens`: the anti-footgun
+
+<Term t="max-num-batched-tokens">`max_num_batched_tokens`</Term> is the engine's per-iteration token budget: the most tokens, prompt and output together, that one forward pass may process. It decides whether a long prompt gets one iteration to itself or several with decode steps in between.
+
+One engine iteration processes at most this many tokens, counting prefill and decode together. A 4,096-token prompt at a budget of 8,192 occupies one iteration and blocks everyone else's decode for the whole of its ~130 ms. At a budget of 1,024 it is four iterations with decode steps interleaved: nobody's stream stalls, but that one user's TTFT grows by the time it waited for its turn.
+
+| budget | iterations for a 4,096-token prompt | TTFT for that prompt | Effect on everyone else |
+|---|---|---|---|
+| 8,192 | 1 | ~130 ms, uninterrupted | blocked for 130 ms |
+| 2,048 | 2 | ~135 ms + queueing | barely affected |
+| 1,024 | 4 | ~145 ms + queueing | smooth |
+| 512 | 8 | ~160 ms + queueing | smooth, slightly worse ITL |
+
+Rules of thumb: leave it at the default for uniform workloads; drop it to **1,024–2,048** if your p99 prompt is long and p95 TTFT is the thing users complain about. Defaults have moved between versions, so read them from `--help` rather than from a blog post. The mechanism behind this is **chunked prefill**, which is the whole subject of Module 10 · Prefill & Prefix Optimization.
+
+## 5 · Measure, then decide
+
+The loop, and the exact numbers to record:
+
+```text
+# before and after every change
+p50 / p95 TTFT          ms
+p50 / p95 TPOT          ms
+output tokens/s         total, at a stated concurrency
+prompt tokens/s         total
+GPU KV cache usage      %
+preemptions             vllm:num_preemptions_total
+```
+
+| Symptom | First thing to check | Likely fix |
+|---|---|---|
+| TTFT high, TPOT fine | `num_requests_waiting` | More capacity, or raise `max_num_seqs` if TPOT has headroom |
+| TPOT high | `Running` pinned at `max_num_seqs` | Raise the cap if memory allows, else accept it |
+| KV usage above 90% | `gpu_cache_usage_perc` | Lower `max_model_len`, raise util carefully, or add GPUs |
+| Preemptions climbing | pool vs traffic | Same as above; preemption is a memory symptom |
+| TTFT fine, TPOT jumps at load | prefill bursts | Lower `max_num_batched_tokens` (Module 10) |
+
+<Callout type="try" title="Sweep it yourself on a free T4">
+  The notebook for this lesson runs a small model on Colab's T4, varies `gpu_memory_utilization`, `max_model_len` and `max_num_seqs`, and prints one row per setting: measured throughput, TTFT, TPOT and KV-cache usage. It also checks your prediction of the KV pool against what vLLM prints at startup. Run it, and find where your own SLO line sits.
+  <Colab nb="09-tune-one-gpu.ipynb" />
+</Callout>
+
+## The other flags, briefly
+
+Not tuning knobs, but you will meet them in `--help` (names and defaults are version-specific; check yours at the time of reading):
+
+| Flag | Why you would use it |
+|---|---|
+| `--dtype` | `bfloat16` on Ampere and newer, `float16` on older cards such as the T4, `float8_*` on Hopper and newer. |
+| `--quantization` | `awq`, `gptq`, `fp8` and friends. This is the flag that shrinks the weights, and therefore grows the pool. Module 11. |
+| `--tensor-parallel-size` | Shard the model across GPUs when it does not fit on one. Module 18 · Multi-GPU Parallelism. |
+| `--enable-prefix-caching` | Reuse a request's prefix across requests. Module 10. |
+| `--block-size` | KV block size in tokens (16 in the V1 engine at the time of writing). Changing it changes block-table overhead. |
+| `--enforce-eager` | Skip CUDA graph capture, with <Term t="enforce-eager">`enforce_eager`</Term>. Slower per step, but it is the difference between running and not running on small or old GPUs — including the free Colab T4. |
+| `--api-key`, `--served-model-name` | Guard and rename the endpoint. Module 24 · Observability, Reliability & Security. |
+| `--disable-log-requests` | Do not log every prompt. Nobody wants a 200 KB prompt in their log aggregator. |
+
+<KeyNotes>
+  1. Four flags matter: `max_model_len`, `gpu_memory_utilization`, `max_num_seqs`, `max_num_batched_tokens`. Compute each one's consequence before setting it.
+  2. `max_model_len` is a promise, not a performance setting. Pool ÷ KV-per-request gives worst-case concurrency; on an H100 with a 52.7 GB pool, 8,192 tokens gives 49 requests where 32,768 gives 12.
+  3. `pool = util × total memory − weights − reserve`. Raise it for a bigger pool, but leave 4–8 GB of headroom or you OOM at startup.
+4. `max_num_seqs` is where per-user speed meets total throughput. Llama-3.1-8B on an H100 at 2k context: 32 concurrent → 93 tok/s each; 128 → 49 tok/s each; past ~226 it does not fit at all.
+5. Set the cap from your SLO, not a round number. With a 30 tok/s promise, about 226 concurrent users at roughly 7,500 output tok/s is the operating point.
+  6. `max_num_batched_tokens` bounds how many tokens one iteration processes. Lower it when long prompts make everyone's TTFT jittery; the cost is that the long prompt waits longer too.
+  7. Record the operating point: model, GPU, dtype, flags, p50/p95 TTFT and TPOT, throughput, KV usage, date. Everything downstream — autoscaling, cost, capacity — reads that record.
+  8. Change one flag per run. Four changed at once is four hypotheses and one data point.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B in BF16, one H100 with a 52.7 GB KV pool, max_model_len 32,768. KV bytes per token is 131,072. Roughly how many longest-case requests fit at once?', numeric: true, answer: 12, tolerance: 2, unit: 'requests', why: '32,768 × 131,072 = 4.29 GB per request. 52.7 ÷ 4.29 ≈ 12. Lowering max_model_len to 8,192 gives 49.' },
+  { q: 'On that same setup at 2,048 tokens of context per user, 200 sequences are running. What is each user getting, in tokens per second?', numeric: true, answer: 36, tolerance: 8, unit: 'tokens/s', why: 'Memory traffic per step is 16.06 GB of weights plus 200 × 268 MB = 53.7 GB of KV: about 26 ms of reads plus 1.5 ms of overhead, so 36 tokens/s each. The weights are still read once for everyone — which is why per-user speed barely moves.' },
+  { q: 'gpu_memory_utilization goes from 0.90 to 0.95 on an 80 GB GPU with 16.06 GB of weights. Roughly how much bigger does the KV pool get?', numeric: true, answer: 4, tolerance: 1, unit: 'GB', why: '0.05 × 80 = 4 GB more budget, all of it going to the pool. That is 8% more concurrency bought with the headroom you need for the CUDA context and fragmentation.' },
+  { q: 'max_num_seqs = 256 but the KV pool can only hold 226 sequences at this context length. What happens?', options: ['vLLM silently caps it at 226', 'The engine preempts: it pauses the most recent requests until memory frees up', 'Requests are rejected with a 400', 'Throughput doubles because of oversubscription'], answer: 1, why: 'The KV pool is the hard ceiling on admission. Requests beyond it cannot start, and when the pool is full the engine preempts the most recently admitted ones. vllm:num_preemptions_total is the counter to watch.' },
+  { q: 'TTFT is fine until a few long prompts arrive, then everyone’s TPOT jumps. Which single flag addresses it?', options: ['--gpu-memory-utilization', '--max-model-len', '--max-num-batched-tokens', '--tensor-parallel-size'], answer: 2, why: 'A long prompt that exceeds one iteration’s budget is chunked, so it interleaves with decode instead of occupying a whole step. That is chunked prefill — lower the budget and the stall spreads out.' },
+  { q: 'Why is it worth setting max_model_len to your p99 request length rather than the model’s maximum?', options: ['It makes decode faster', 'It has no effect on speed, but it multiplies the number of worst-case requests that fit in the KV pool', 'It reduces the size of the weights on disk', 'It enables prefix caching'], answer: 1, why: 'Nothing in the decode loop scales with max_model_len. It only sets the KV footprint you promise per request, and the pool ÷ that footprint is your concurrency ceiling.' },
+]} />

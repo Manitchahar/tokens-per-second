@@ -1,0 +1,202 @@
+---
+title: 'Project: Break and recover the service'
+summary: 'Take a real inference service and break it seven different ways — overload it, unbind its queue, invert its timeouts, storm it with retries, kill it mid-stream — measure what each fault actually does, then write the runbook that makes the next incident boring.'
+objectives:
+  - Build an inference service with a real concurrency pool, bounded waiting room, timeouts and a metrics endpoint
+  - Write a hypothesis before each fault injection, and a verdict after the measurement
+  - Measure retry amplification rather than assuming it, and bound it with a retry budget
+  - Establish time-to-detect and time-to-recover as numbers in a runbook'
+  - 'Write an incident report: findings, capacity numbers, and the five settings that decide an incident'
+colab: 24-break-recover.ipynb
+---
+
+Every mechanism in this module — admission control, timeouts, retry budgets, circuit breakers — is a paragraph of prose and a line of config. None of them has ever been *inspected* by you under load, which is why teams ship them untested and discover in production that they do not do what the docs said.
+
+This project fixes that. You will run a real inference service over real sockets, and you will break it seven ways on purpose.
+
+<Colab nb="24-break-recover.ipynb" />
+
+## What you are building
+
+A service with the parts this module taught you, and a harness that can break each of them on command:
+
+| Component | What it does | Lesson |
+|---|---|---|
+| **Concurrency pool** | A semaphore; a slot is held from prefill to the last token | *Admission control, backpressure & load shedding* |
+| **Bounded waiting room** | A second semaphore with a hard cap; past it, a fast 503 | *Load shedding* |
+| **Timeouts** | Queue timeout, generation timeout, client deadline, per-attempt timeout | *Timeouts, retries, recovery* |
+| **Retry budget** | A shared token bucket limiting retries to a ratio of requests | *Retry amplification* |
+| **Metrics endpoint** | Counters, gauges, one histogram with a bucket edge at the SLO | *Metrics & dashboards* |
+| **Fault endpoint** | Change pool size, room size, timeouts, or kill the process mid-stream | *Chaos testing* |
+
+Seven experiments, each with a **written hypothesis before you run it** and a **verdict after**. The hypothesis discipline is the point; the numbers are just the evidence.
+
+## The deliverable
+
+One artifact containing:
+
+1. **`incident_report.json`** — every configuration, every measurement, every fault and its effect. Machine-readable, reproducible.
+2. **`RUNBOOK.md`** — the settings that decide an incident, each with the measurement that justifies it.
+3. **`FINDINGS.md`** — one page: what each fault did, in numbers, and what you changed as a result.
+
+<Callout type="real" title="What makes a chaos experiment legitimate">
+  Three rules, and breaking any of them turns this into an outage of your own making:
+
+  1. **One fault at a time.** Two simultaneous faults produce an ambiguous result and a wasted afternoon.
+  2. **One blast radius.** A single replica, a single tenant, one dependency. Never the fleet.
+  3. **A written hypothesis, before.** An experiment without a prediction produces a number you cannot interpret, and you will rationalize whatever you see.
+
+  Everything else — how hard you push, how long you run — is your judgement.
+</Callout>
+
+## The experiments
+
+| # | Fault | Hypothesis to write first | What you should find |
+|---|---|---|---|
+| **A** | Baseline sweep | Load past capacity raises TTFT but does not cause timeouts, because the room is bounded | A turning point; throughput flattens while p95 keeps climbing |
+| **B** | Remove the waiting-room cap | No throughput gain; p95 grows past the SLO | Queueing math, measured: $W = \rho S/(1-\rho)$ |
+| **C** | Timeout longer than the deadline | The *client* enforces its deadline, not the server | Which component actually gave up first |
+| **D** | Dead backend + 5 retries | Amplification ≈ $(r + 1)$ with no budget, bounded with one | The measured attempts/requests ratio |
+| **E** | Kill mid-stream | Clients cannot distinguish truncation from slowness | Why a stream terminator is mandatory |
+| **F** | Fault, then clear it | Goodput returns to baseline within one long request | Time-to-detect and time-to-recover, as numbers |
+| **G** | Unbounded burst economics | Shedding is cheaper than waiting | GPU dollars and goodput per dollar, with a number |
+
+Experiment G is the one that changes minds. Run it and you will have personally watched a bounded waiting room convert a minute of panic into a metric instead of an invoice.
+
+<Callout type="math" title="The numbers you must be able to defend">
+  By the end you should be able to state, without looking anything up:
+
+  - **Capacity** of your replica in requests per second, from slots and mean service time.
+  - **The SLO threshold** and where it sits in your histogram buckets.
+  - **The retry amplification factor** you measured, and the budget that bounds it.
+  - **Time-to-detect** and **time-to-recover**, in seconds.
+  - **Goodput per dollar** during the burst versus during normal operation.
+
+  Those five numbers are the deliverable. Everything else is evidence.
+</Callout>
+
+## Step 1 · Establish the baseline before you break anything
+
+You cannot measure a regression against nothing. Run the baseline sweep first, at five or six concurrency levels, with the service in its intended configuration.
+
+Record, at each level: admitted, completed, shed, p50 and p95 TTFT from the **client's** clock, and the server's own throughput. Three things you are looking for:
+
+- the level at which the GPU token rate **flattens** (capacity),
+- the level at which p95 first exceeds the SLO (the cliff),
+- and the gap between them.
+
+<Callout type="pitfall" title="The baseline is where the real bug usually is">
+  More than one "capacity" surprise in these projects comes from the **baseline**, not the fault: a pool sized from a number nobody derived, a waiting room larger than the pool by 100×, a generation timeout longer than every client deadline, or a client with unlimited retries.
+
+  Look hard at your baseline config before you touch anything. Half the time you will find that your production configuration has Experiment B already enabled by accident.
+</Callout>
+
+## Step 2 · Inject each fault and record three things
+
+For every fault: the **hypothesis** (written first), the **measurement**, and the **verdict**. If the measurement contradicts the hypothesis, the hypothesis was wrong and that is the interesting outcome — write down which, and why.
+
+Use the fault endpoint to change configuration mid-flight rather than restarting, so you are measuring the transition and not a cold start. A cold start adds 10–30 seconds of compilation and model loading that has nothing to do with your fault.
+
+## Step 3 · Write the runbook
+
+The runbook is the part that survives you. Five sections, each a number with a justification:
+
+**1. The SLO.** Metric, percentile, threshold, window. "p95 TTFT < 1.0 s over a 5-minute rolling window."
+
+**2. Admission control.** Pool size, waiting-room size, the arithmetic behind each, and the shed response the client sees — status code, body, whether `Retry-After` is set.
+
+**3. Timeouts and retries.** Total deadline, per-hop timeout, max attempts, retry budget ratio, and which layer is allowed to retry. If your answer to "which layer retries" is "more than one", fix it before writing the runbook.
+
+**4. Recovery.** What readiness means (and that it must include warm-up), the restart procedure, and the gate that confirms recovery — goodput at baseline, not error rate at zero.
+
+**5. The blast-radius limits.** Per-tenant concurrency, per-key token rate, `max_model_len`. With the numbers.
+
+## Step 4 · Security review of the same service
+
+Before you call it done, run the four-question threat model from *Securing an inference service* against what you built:
+
+1. **If our biggest tenant disappeared, what would our burn rate be?** Compute it from Experiment G.
+2. **If someone sent 10,000 requests with a 128k-token prompt each, what stops them?** Name the control and the number. If your admission path only checks the output cap, the answer is "nothing", and that is a finding.
+3. **Could a new engineer read another tenant's prompts?** Follow the cache key and the KV block namespace.
+4. **Where does a user's prompt exist in plaintext?** List every copy, including your own logs and traces.
+
+Each answer should be one sentence with a number in it. Each vague answer is your next incident.
+
+## Extend it (pick at least two)
+
+- **Two replicas and a router.** Put the waiting-room signal into the routing decision — Module 23's queue-aware routing — and show it raises goodput where round-robin does not.
+- **A per-tenant quota.** Re-run Experiment G with one tenant capped. The difference in goodput per dollar is the availability-security argument, priced.
+- **A per-call budget that is deliberately wrong.** Replace the shared token bucket with the tempting per-request version — `retries × ratio` computed *inside* the request — and re-measure Experiment D. The ceiling vanishes and the amplification returns to $(r+1)$, which is the fastest way to understand why the bucket has to be shared state.
+- **A full trace per request** (Lesson 24.2), with the queue-wait span, so you can reconcile your measured p95 decomposition against the sum of the spans.
+- **Circuit breaker**, with a doubling cooldown, and a chaos experiment that trips it and measures the recovery curve.
+- **A load-pattern generator** replaying a real traffic trace, with a diurnal shape, so the experiments run for hours instead of seconds.
+
+## Check yourself
+
+Answer these in writing. Any "no" means the project is not finished.
+
+1. Can a reader of `FINDINGS.md` tell, for each fault, what you predicted and what you measured — with the two being different where they were different?
+2. Is your measured retry amplification from a real run, or did you quote $(r+1)$ from memory?
+3. Does your runbook's pool size have a derivation next to it, or is it a round number someone chose?
+4. Have you stated, in one sentence, what your shed response looks like from a client's point of view?
+5. Did you measure time-to-recover against **goodput back at baseline**, or did you declare victory when the error rate hit zero?
+6. Can you name one thing your service does that would leak a prompt, and have you either fixed it or written down why you accepted it?
+7. If you ran the whole experiment suite twice, would your numbers agree within your stated spread?
+
+<Callout type="mentor" title="The experiment that will change your behaviour the most">
+  Experiment E — killing the replica mid-stream.
+
+  Almost everyone runs it expecting a clean error. Almost everyone gets a stream that simply **stops**, with no terminator, and a client that cannot tell the difference between "the model finished" and "the process died". Half of production streaming infrastructure has this bug, and half of it has a retry that silently duplicates work because nobody knew the stream had been truncated.
+
+  Break it once and you will never ship a streaming endpoint again without an explicit terminator check.
+</Callout>
+
+## Acceptance criteria
+
+You have passed when all of the following hold.
+
+**Method**
+- Each fault has a hypothesis written before the run, and a verdict after it.
+- One fault at a time, one blast radius, with configuration changed mid-flight rather than by restart.
+- Baseline established before any fault, and every measurement compared against it.
+
+**Findings**
+- Retry amplification measured, not assumed, and bounded by a budget you implemented.
+- A located operating point, with the arithmetic for capacity in the report.
+- Time-to-detect and time-to-recover as numbers.
+- One experiment whose result contradicted the hypothesis, written up honestly.
+
+**Decision quality**
+- `RUNBOOK.md` with five sections, each containing a derived number.
+- A security review answering four questions with four sentences and four numbers.
+- At least one change made to the service **as a result** of a finding, with before/after measurements.
+
+**Communication**
+- `FINDINGS.md` readable by someone who has not seen the code.
+- `incident_report.json` sufficient to reproduce every measurement.
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | Every fault has a written hypothesis and a verdict, and at least one verdict contradicts its hypothesis — which is then explained. The retry budget is real code, not a comment. The runbook's numbers are all derived. A finding changed the service, with before/after evidence. The security review produces a genuine uncomfortable answer that is either fixed or explicitly accepted in writing. |
+| **Proficient** | Meets all acceptance criteria. Hypotheses are written before the runs and are mostly right. The runbook is complete and defensible. One change was made as a result of a finding. |
+| **Developing** | Faults are injected and metrics collected, but several run at once, or baselines were not established first, or the runbook numbers are round numbers without derivations. Hypotheses are reconstructed after seeing the data. |
+| **Beginning** | Breaks the service without measuring, or measures throughput without any SLO, or conflates the client clock and the server clock so the numbers do not mean anything. |
+
+<Callout type="recap" title="What this project is for">
+  Everything in this module is a paragraph and a config line. This project is the part where you find out which paragraphs are true.
+
+  The five numbers you will take away — capacity, SLO threshold, retry amplification, time-to-recover, goodput per dollar under stress — are the ones you will be asked for in a design review, in an incident, and in Module 25's cost model. **Write them down in a file, with the derivation, before you need them.**
+</Callout>
+
+<KeyNotes>
+  1. Every reliability control in this module is prose plus a config line until you have **broken the system with it switched on**.
+  2. Write the **hypothesis before the run**. A number without a prediction cannot be interpreted, and you will rationalize whatever you see.
+  3. Establish the **baseline first** — the real bug is usually in the configuration you thought was safe.
+  4. Change configuration **mid-flight** rather than restarting; a cold start adds 10–30 seconds that has nothing to do with your fault.
+  5. Measure retry **amplification** (attempts ÷ requests) rather than quoting $(r+1)$, and bound it with a budget that is code, not a comment.
+  6. Recovery means **goodput back at baseline**, not the error rate reaching zero. Those are different moments, and only one of them means users are served.
+  7. Price the incident in **goodput per dollar** during the burst, not just in error rate. That number is what makes the reliability argument to a budget holder.
+  8. Run the four-question **threat model** against your own service. Expect one uncomfortable answer, and either fix it or write down why you accepted it.
+</KeyNotes>

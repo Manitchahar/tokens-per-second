@@ -1,0 +1,20 @@
+---
+import Base from '../layouts/Base.astro';
+import AllNotes from '../components/learn/AllNotes.tsx';
+import { flatLessons } from '../data/course';
+import { url } from '../site';
+const lessons = flatLessons.map((l) => ({ key: `${l.module.slug}/${l.slug}`, code: l.code, title: l.title, href: url(l.href), module: `${l.module.num} ${l.module.title}` }));
+---
+<Base title="My notes" description="Your personal notes from every lesson, saved in this browser.">
+  <div class="page">
+    <h1>My notes</h1>
+    <p class="lead">Everything you wrote beside the lessons, in course order. Notes live only in this browser, so export them to keep a copy.</p>
+    <AllNotes client:load lessons={lessons} />
+  </div>
+</Base>
+<style>
+  .page { max-width: 860px; margin: 0 auto; padding: 3rem 24px 0; }
+  h1 { font-size: clamp(2.3rem, 5vw, 3.4rem); margin-bottom: 0.8rem; }
+  .lead { color: var(--text-2); margin-bottom: 2rem; }
+  @media (max-width: 640px) { .page { padding: 2rem 16px 0; } }
+</style>

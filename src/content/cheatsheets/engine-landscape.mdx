@@ -1,0 +1,152 @@
+---
+title: 'Module 17 · The Engine Landscape'
+module: engine-landscape
+---
+
+## The harness contract
+
+Two engines are comparable **only** when all six of these are identical. Anything not on the contract is free to vary, and will.
+
+| # | Item | What it controls for |
+|---|---|---|
+| 1 | **Workload** | prompt/output length distribution; shared-prefix fraction |
+| 2 | **Arrival pattern** | closed-loop (N in flight) vs open-loop (fixed rate) |
+| 3 | **Load point** | offered load ρ; a single value, not "as much as possible" |
+| 4 | **Quality bar** | same tokens out, not similar tokens |
+| 5 | **Tuning** | identical flags (measures your config) vs each engine's best (measures the engines) |
+| 6 | **Version + warm state** | pinned versions; cold start reported separately |
+
+<Callout type="recap" title="Comparison A vs B">
+  **A — identical naive flags** answers "what if we deploy all of these like our current one?" Usually: all roughly the same. Run this first, to see whether the choice matters at all.
+  **B — each engine at its best settings** answers "which should we run?" Costs four tuning projects and must be re-run when any engine ships. Run it only when A says the gap is worth it.
+</Callout>
+
+## Load and queueing
+
+Offered load ρ is arrival rate as a fraction of capacity.
+
+$$
+W_q \approx \frac{\rho}{1-\rho} \times \frac{S}{B}
+$$
+
+| ρ | $W_q$ | ρ | $W_q$ |
+|---|---|---|---|
+| 0.50 | 1× S/B | 0.85 | 5.7× S/B |
+| 0.70 | 2.3× S/B | 0.90 | 9× S/B |
+| 0.80 | 4× S/B | 0.95 | 19× S/B |
+
+- **Closed-loop** load generation flatters a slow engine: offered load falls as the server slows, so no queue forms. **Open-loop** fixes the arrival rate and the queue forms.
+- SLO flips between ρ = 0.82 and 0.85 for $S \approx 2.3$ s, $B = 16$ — a **3.7% move on one knob** decides pass/fail.
+- Run at **50–70%** of capacity.
+
+## Quality parity
+
+```python
+GEN = dict(temperature=0.0, top_p=1.0, seed=0, max_tokens=256, stream=True)
+```
+
+Greedy + pinned seed + pinned **commit hash** (not a branch) + fully formatted prompt from the client. Two engines on the same weights must emit the same token IDs. If they do not, one is computing in different precision, or serving a different revision.
+
+Three silent breakers: a moved `main` branch; different numerics by design (quantized vs FP16 — compare against a quality bar, not token for token); a server-applied chat template adding tokens you never typed.
+
+## Is the effect real?
+
+$$
+k \approx \left(\frac{2c}{\delta}\right)^2
+$$
+
+Repeats needed to claim effect δ against rig noise c. **Reduce c first** — interleaved A/B runs are the cheapest lever there is.
+
+| Effect δ | c = 1% | c = 5% | c = 10% |
+|---|---|---|---|
+| 20% | 1 | 1 | 1 |
+| 6% | 1 | 3 | 11 |
+| 2% | 1 | 25 | 100 |
+
+A 6% win against 5% noise is **provisional**, not a result.
+
+## Three kinds of column — never mixed in a cell
+
+| Kind | Example | Confidence |
+|---|---|---|
+| **Measured** | tok/s, p95 TTFT, goodput, cold start | high, if the contract held |
+| **Derived** | weight bytes, KV pool, step time, feasibility | exact arithmetic |
+| **Structural** | build step, CUDA required, quant format, model coverage | certain at time of writing |
+
+## The cost of a decode step
+
+$$
+t_{\text{step}} = \frac{\text{weights} + \text{KV read}}{\text{BW} \times \text{MBU}} + t_{\text{overhead}}
+$$
+
+- **Weights floor**: Llama-3.1-8B BF16 = 16.06 GB; at 78% of 3.35 TB/s = **6.1 ms**. No engine beats it.
+- **Launch cost**: ~300 kernels × 5–10 µs ≈ **2.1 ms**, constant per step.
+- That is 25% of a batch-1 step, 14% of a batch-64 step. Fixed costs matter most when the GPU work is smallest.
+
+$$
+\text{weights} = P \times b, \qquad \text{kv\_tok} = 2 \times L \times H_{kv} \times d_h \times b_{kv}
+$$
+
+## The four engines
+
+| | vLLM | SGLang | TensorRT-LLM | llama.cpp |
+|---|---|---|---|---|
+| **Core idea** | paged blocks + continuous batching, Python-scheduled | radix-tree prefix cache walked in-kernel | build once, replay an execution plan | 4-bit weights, portable, no CUDA |
+| **Fixed cost/step** | high of the GPU-native three | similar to vLLM | **lowest** | high |
+| **Prefix reuse** | block-level, CoW | **best** | block-level, CoW | limited |
+| **4-bit** | supported | supported | supported | **native** |
+| **Build step** | none | none | **per configuration** | none |
+| **Strongest at** | breadth, most models | prefix-heavy traffic | one fixed config, lowest latency | fitting a big model on small/non-NVIDIA HW |
+
+Decide in this order:
+
+1. **Does it fit?** weights + reserve vs GPU memory. Arithmetic; eliminates candidates.
+2. **Hard constraints**: model support, hardware owned, build runnable in the deploy pipeline.
+3. **Design vs traffic**: prefix-heavy → SGLang; fixed config, latency-critical → TensorRT-LLM; breadth → vLLM; non-NVIDIA or memory-starved → llama.cpp.
+4. **Only then measure.**
+
+## The selection matrix
+
+$$
+\text{score} = \sum_i w_i s_i, \qquad \sum_i w_i = 1
+$$
+
+- **Hard constraints run first** — no row that fails one can win on scores.
+- Write the **weights before the scores**; the weight is the argument.
+- **Stress the top weight ±20%.** If the winner flips, it is a judgement call — say so and name the tie-breaker.
+- Never mix a measured cell with a guess in the same column.
+
+$$
+\text{goodput per dollar} = \frac{\text{good tok/s} \times 3600}{\text{GPU \$/hour}}
+$$
+
+Worked: 1,800 tok/s × 82% good at \$2.50/h → 1,476 good tok/s → **≈ 2.1 M good tokens per dollar-hour**.
+
+## Numbers worth memorising
+
+| Quantity | Value |
+|---|---|
+| Llama-3.1-8B BF16 weights | 16.06 GB |
+| Llama-3.1-8B KV per token (BF16) | 131,072 B = 128 KB |
+| Qwen2.5-32B BF16 / INT4 weights | 65.6 GB / 16.4 GB |
+| Weight-read floor, 8B on H100 @78% | 6.1 ms |
+| Kernel launches per forward pass | ~300 → ~2.1 ms |
+| Batch-1 vs batch-64 launch share | 25% → 14% |
+| L4 KV left after 32B INT4 + 4% reserve | 6.6 GB ≈ 50K tokens |
+| T4 memory | 16 GB — 8B BF16 does **not** fit |
+| Llama-3.1-8B on A100: batch @2k / @16k ctx | 226 / 28 |
+
+## Checklist for any engine claim
+
+- [ ] Same workload, arrival pattern, load point, quality bar, tuning and versions?
+- [ ] Token-level parity verified before timing was read?
+- [ ] Rig spread stated, and does the effect exceed it?
+- [ ] Every column headed MEASURED, DERIVED or STRUCTURAL?
+- [ ] Are the derived columns doing the eliminating, before the noisy ones vote?
+- [ ] Is the build/rebuild cost of an AOT engine in the comparison?
+- [ ] Is the top weight stress-tested, and is a close result reported as a close result?
+
+## Module order
+
+- 17.1 fair-comparison → 17.2 engines-compared → 17.P project-engine-matrix
+- Next: **Module 18 Multi-GPU Parallelism** — the models your derived column could not fit on one card.

@@ -1,0 +1,136 @@
+---
+title: 'Reproducing a result'
+summary: 'Take one number from a paper and decide, honestly and in writing, whether you reproduced it. Pin the setup, measure your rig’s noise first, check the effect against it, and report a failure as cleanly as a success — because an honest negative result is a real contribution.'
+objectives:
+  - Turn a vague claim into one number with its setup attached
+  - Decide whether a setup mismatch makes the number untestable, and handle that case explicitly
+  - Measure run-to-run noise before measuring any treatment
+  - Apply the repeats-needed formula to decide whether an effect is defensible
+  - 'Distinguish reproduced, inconclusive and did-not-reproduce, and write all three honestly'
+colab: 28-reproduce-and-price.ipynb
+---
+
+import Reproduce from '@/components/viz/research-capstone/Reproduce.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson gave you a verdict sheet. This one acts on it. You picked a claim, and now you go and find out whether it is true — on your hardware, with your workload, on your day.
+
+Reproducing a result is the core skill of research, and the surprising thing is how little of it is glamorous. It is almost entirely: **decide what you are testing, control everything else, measure the noise before the signal, and then write down what you saw.** That is the whole job. Everything else is detail.
+
+Everything in this lesson has a runnable lab on a free Colab **T4**: you will measure your own rig noise, run an interleaved A/B test, apply the repeats-needed formula to your real numbers, and reproduce a mechanism rather than a headline number.
+
+<Colab nb="28-reproduce-and-price.ipynb" />
+
+<Callout type="mentor" title="What reproduction is actually for">
+  You are not trying to prove the authors right. You are trying to find out **what is true on your setup**, so that if you build on this, you know exactly what you are getting. A paper you cannot reproduce is a paper you do not understand — and building on something you do not understand is how outages happen.
+</Callout>
+
+## The five moves
+
+<Scrolly>
+  <Reproduce client:visible slot="stage" />
+
+  <Step title="1. The claim, pinned to one number">
+    "Faster" is not a claim you can test. Before you run anything, write the claim as **one number, one setup, one metric**. The paper claims, say, *"1.4× decode throughput at batch 64 on an A100, Llama-3.1-8B."*
+
+    Now you know exactly what success means: you measured 1.4× (within your noise) under that setup. Everything after this is about earning or failing to earn that number. If you cannot state the claim this precisely, you are not ready to start.
+  </Step>
+
+  <Step title="2. Pin the setup, or admit you cannot">
+    Next question: **can you hold the setup fixed?** Same GPU, same model, same batch size, same context, same engine version, same precision. If yes, this is a direct reproduction.
+
+    If no — and often the honest answer is no, because you have a T4 and they had an A100 — then you have to choose what you are actually testing. You can either aim at the **mechanism** (does this idea reduce memory traffic? does it help decode more than prefill?) or accept that you are checking **plausibility on different hardware**, not the number. Both are legitimate. Silently comparing your T4 number to their A100 number is not.
+  </Step>
+
+  <Step title="3. Measure the rig noise first">
+    Before you measure the treatment, measure **your own noise**: run the exact same thing five or six times and see how much the number moves. Call that spread $c$.
+
+    This is the step everyone skips, and it is the step that makes everything else mean something. Without $c$, a result is just a number. With $c$, a result is a claim you can defend or fail to defend. On a shared, virtualised machine like a free Colab T4, expect $c$ around **5–10%**; on a dedicated, idle GPU it can be under 1%.
+  </Step>
+
+  <Step title="4. Is the effect bigger than the noise?">
+    Now measure the treatment and compare. Two things must be true for you to claim you reproduced it: the **effect** must be real, and it must **clear the noise**.
+
+    The formula from Module 17 tells you how many repeats you need:
+
+    $$
+    k \approx \left(\frac{2c}{\delta}\right)^2
+    $$
+
+    where $\delta$ is the claimed effect size. With $c = 5\%$ and a claimed $\delta = 10\%$: $k = (2\times 5/10)^2 = 1$. One repeat. With $\delta = 4\%$: $k = (2\times 5/4)^2 \approx 6$. The claimed effect has to be compared against *your* noise, or it is not a result.
+  </Step>
+
+  <Step title="5. Close is not reproduced">
+    Here is the discipline that separates a real result from a lucky one. If your measured band **overlaps** the claim, you have reproduced it. If it does **not** overlap, you have not.
+
+    "Close" is the seductive failure. Your 1.32× against their 1.40× feels almost right, and it is tempting to write "approximately reproduced". But 1.32 and 1.40 differ by more than your noise allows, so the honest verdict is **did not reproduce** — or, if your setup differed, "could not test on this hardware", which is a different and honest statement.
+  </Step>
+
+  <Step title="6. Report it honestly either way">
+    Here is the part that actually matters, and it is the part most people skip. There are three honest outcomes, and you should be willing to write all three:
+
+    - **Reproduced.** Your band contains the claim, on the stated setup.
+    - **Did not reproduce.** Your band excludes it, on the stated setup — and you say what you think caused the gap.
+    - **Inconclusive.** Your noise was too large to tell. This is a real result, not a failure; it means *run more repeats*.
+
+    A clean negative result ("I could not reproduce X on a T4; here is my setup and here is where I think it diverges") is a genuinely useful artifact. It tells the next person not to spend a week on it, and it tells the authors something real about the limits of their claim. Never launder a failed reproduction into a vague success.
+  </Step>
+</Scrolly>
+
+## The written artifact
+
+Reproduction produces a short report, not a victory lap. It is the same five-line shape as the verdict sheet, now filled with numbers:
+
+| Line | What goes in it |
+|---|---|
+| **Claim** | the paper's number, with its setup |
+| **Setup match** | same GPU / different GPU, and what that changes |
+| **Noise $c$** | your measured spread, how you got it |
+| **Your result** | mean ± spread, and how many repeats |
+| **Verdict** | reproduced / did not reproduce / inconclusive, plus why |
+
+The value is in the last two lines. A reader who disagrees with your verdict can re-run your rig and check it, because you gave them your noise and your setup.
+
+<Callout type="pitfall" title="The four ways people fake a reproduction">
+  1. **One run, one number.** A single benchmark run reported as a result, with no noise measured. The number is real; the conclusion is not supported.
+  2. **The wrong setup, quietly.** Comparing your T4 to their A100 and calling it a match. Be explicit that the setup differs and what that costs you.
+  3. **A different workload.** They measured batch 64, short prompts; you measured batch 1, long prompts. You reproduced *a* result, not *their* result.
+  4. **"Close enough."** Calling 1.32× a reproduction of 1.40× when your noise is 5%. Close is not reproduced.
+</Callout>
+
+<Callout type="math" title="Deciding how many repeats, worked">
+  You want to test a claimed **6%** improvement. Your rig spread is $c = 8\%$. Then $k = (2\times 8/6)^2 = (2.67)^2 \approx 7$. So you run **7 repeats** of each arm, interleaved.
+
+  Now the move that actually saves your week: **reduce $c$ first.** Interleaving the arms (A, B, A, B, …) so drift affects both equally is the cheapest way to shrink noise, and shrinking noise shrinks the repeats you need quadratically. Buying a quieter machine also works, and is more expensive.
+</Callout>
+
+## Reproduce the mechanism, not just the number
+
+When you cannot match the hardware — and often you cannot — there is still a strong experiment available. Reproduce the **mechanism**.
+
+If the paper claims a method reduces KV memory traffic, you can measure memory traffic on your GPU even if it is slower or faster overall. If it claims prefill benefits but decode does not, you can reproduce *that asymmetry* on any hardware. The mechanism is the thing that generalizes; the headline number on their A100 is the thing that does not.
+
+This is the highest-value kind of reproduction, because it is the one that tells you whether the idea is sound, independent of whether you own the exact hardware the authors used.
+
+<Callout type="try" title="Your first reproduction, this week">
+  Pick one number from one paper you read this week. Write the five-line artifact for it before you run anything. If you have the hardware, run it with at least five repeats of each arm and report reproduced / did not reproduce / inconclusive with your noise stated. If you do not have the hardware, write the setup-mismatch paragraph explaining what you are testing instead — and measure the mechanism. Either way you end the week with a written result, which is more than most people ever do with a paper.
+</Callout>
+
+<KeyNotes>
+  1. Reproduction is **decide what you are testing, control everything else, measure noise before signal, and write down what you saw**. That is the whole craft.
+  2. A testable claim is **one number, one setup, one metric**. "Faster" is not a claim.
+  3. If you cannot match the setup, say so and either reproduce the **mechanism** or accept you are checking plausibility — never silently compare across hardware.
+  4. Measure your rig's **run-to-run spread $c$ before anything else**. Without it you have a number, not a result.
+  5. The repeats needed are $k \approx (2c/\delta)^2$. Reduce $c$ (interleaved runs) before you buy more runs, because it helps quadratically.
+  6. **Overlapping bands = reproduced; non-overlapping = did not reproduce; too noisy = inconclusive.** "Close" is not reproduced.
+  7. Report all three verdicts honestly, with your noise and setup written down. A clean negative result is a real contribution, and a failed reproduction dressed as a success is the only unacceptable outcome.
+  8. Reproducing the **mechanism** generalizes better than reproducing the headline number on hardware you do not own.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A paper claims a 1.4× decode speedup. You measure 1.32× with a rig spread of 5%. What is the honest verdict?', options: ['Reproduced — it is close enough', 'Did not reproduce — the gap exceeds your noise, or inconclusive if you ran too few repeats', 'Reproduced on different hardware', 'The paper must be wrong'], answer: 1, why: 'With a 5% spread, 1.32× and 1.40× differ by more than the noise, so the bands likely do not overlap: did not reproduce. If you did not run enough repeats, the honest verdict is inconclusive instead.' },
+  { q: 'Your rig spread is 8%. You want to defend a claimed 6% effect. About how many interleaved repeats of each arm do you need?', numeric: true, answer: 7, tolerance: 1.5, unit: 'repeats', why: 'k ≈ (2c/δ)² = (2×8/6)² = (2.67)² ≈ 7.1, so about 7 repeats per arm.' },
+  { q: 'Why measure the rig noise before measuring the treatment?', options: ['It is required by the paper format', 'So you know the yardstick: whether the claimed effect is bigger than the noise your rig produces', 'It makes the runs faster', 'It warms up the GPU'], answer: 1, why: 'Without a measured spread c you cannot say whether an observed effect is real or just run-to-run variation. The noise is the yardstick every effect is judged against.' },
+  { q: 'You have a T4; the paper used an A100. What is the most valuable experiment?', options: ['Compare your throughput number directly to theirs', 'Reproduce the mechanism — e.g. that the method reduces KV memory traffic — on your own hardware', 'Skip the experiment', 'Ask the authors for their T4 numbers'], answer: 1, why: 'The mechanism generalizes across hardware; the headline number on their A100 does not. Measuring memory traffic or the prefill-vs-decode asymmetry on your T4 tells you whether the idea is sound, which is what you actually need to know.' },
+  { q: 'What is the most defensible thing to do when your measured band is too wide to tell whether the claim reproduced?', options: ['Report it as reproduced, since it probably is', 'Report inconclusive, state your noise c, and note the repeats k you would need', 'Report it as did not reproduce', 'Drop the experiment'], answer: 1, why: 'Inconclusive is an honest result. Reporting your noise and the repeats you would need (k ≈ (2c/δ)²) tells the reader this is a power problem, not a contradiction of the paper.' },
+]}/>

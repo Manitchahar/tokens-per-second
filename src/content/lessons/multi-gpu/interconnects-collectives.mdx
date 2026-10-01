@@ -1,0 +1,259 @@
+---
+title: 'Interconnects & collectives'
+summary: 'The hardware that makes multi-GPU possible, and the five operations every sharding scheme is built from. You will learn to price a collective message before you run it, because the difference between a 1 µs and a 200 µs message is the difference between a speedup and a slowdown.'
+objectives:
+  - 'Rank the interconnects that matter — PCIe, NVLink, InfiniBand — by bandwidth and latency, and explain which parallelism belongs inside which'
+  - 'Compute the time a message costs as latency plus bytes divided by bandwidth times efficiency, and decide whether a message is negligible'
+  - 'Name the five collective primitives and write each as a sequence of the other two'
+  - 'Derive the ring all-reduce cost factor of 2(P-1)/P and explain why it grows with P'
+  - 'Decide the island size: the largest group of GPUs over which fine-grained sharding pays'
+---
+import InterconnectLadder from '@/components/viz/multi-gpu/InterconnectLadder.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have optimised one GPU as hard as one GPU can be optimised. PagedAttention, continuous batching, FlashAttention, quantized GEMMs, CUDA graphs, speculation — every one of those techniques makes better use of a fixed budget of FLOP/s and bytes per second.
+
+Some problems are not solvable that way. Llama-3.1-70B in BF16 is 141 GB of weights. There is no 141 GB GPU. Qwen2.5-32B with a batch of 32 requests at 8,192 tokens of context holds about 90 GB of KV cache *on top of* 66 GB of weights. You cannot fit that on one card, and no kernel in the world will make it fit.
+
+So you use more than one GPU. And the moment you do, a new, completely un-familiar cost appears: **the GPUs have to talk to each other**, and that conversation is not free.
+
+<Callout type="intuition" title="This module's whole problem in one sentence">
+  Single-GPU inference has a fixed ceiling: one GPU's memory and one GPU's bandwidth. Multi-GPU breaks that ceiling — but every byte you move to another GPU costs time you could have spent on math, and the wire is three to fifty times slower than the memory you just left. **The design of every multi-GPU system is a fight over how many bytes you can afford to move.**
+</Callout>
+
+This lesson builds the vocabulary and the arithmetic. The next three apply it.
+
+## Two GPUs on a board, two GPUs in a building
+
+"Tens of gigabytes per second" is not a specification. There is a ladder of interconnects, and where two GPUs sit on it changes everything about what you may do with them.
+
+At the bottom, a <Term t="pcie">PCIe</Term> slot. PCIe 4.0 x16 moves about 32 GB/s in one direction; PCIe 5.0 x16 about 64 GB/s. Every GPU you own is attached to the host this way, whether or not anything else is, and the host bridge is what you push data through when a GPU talks to the CPU or to another machine.
+
+Above it, <Term t="nvlink">NVLink</Term>, a chip-to-chip link that bypasses PCIe entirely. On an 8-GPU SXM node there is a full mesh: every GPU can talk to every other at 450 GB/s on H100, 900 GB/s on B200, both quoted bidirectional so half that in each direction. This is a different machine from eight PCIe-attached cards, and the difference is not incremental.
+
+Above that, <Term t="infini-band">InfiniBand</Term> and Ethernet, which leave the node. InfiniBand NDR is about 50 GB/s per port — fast, and a third of NVLink. Everything inside the box is faster than everything outside it, which is the single fact that shapes all of Module 18.
+
+<Scrolly>
+  <InterconnectLadder client:visible slot="stage" />
+
+  <Step title="1. Two GPUs talking is not one thing">
+    Same GPUs, same model, same code. On NVLink, four of them scale nearly perfectly. Across PCIe, the same four may be slower than two. **The interconnect is part of the hardware specification**, not a detail the driver handles.
+  </Step>
+
+  <Step title="2. Bandwidth first">
+    Bandwidth is bytes per second, and it is the number you will use most. A tensor-parallel all-reduce moves the whole hidden state — 8 KB at batch 1 for Llama-3.1-8B — and Llama has 32 layers with two of those per layer. Small, but 128 times per forward pass.
+  </Step>
+
+  <Step title="3. Latency is not zero">
+    Every message pays a fixed cost before a byte moves. About 1 µs inside an NVLink node, about 2–3 µs across PCIe. Drag the payload down to 1 KB and watch the time stop falling: **below a few kilobytes you are paying for the conversation, not the data.**
+  </Step>
+
+  <Step title="4. The tiers, in order">
+    Six links worth knowing, from 32 GB/s to 900 GB/s. The bottom-to-top ratio is 28x. Remember that number: it is the entire distance between a design that works and a design that does not.
+  </Step>
+
+  <Step title="5. PCIe: 50x slower than NVLink">
+    On PCIe 4.0 the ladder's bottom bar. A GPU reads its own HBM at 3,350 GB/s on an H100 — **about 50x faster than the link to its neighbour.** Anything you move off-GPU is moving against a current that runs the other way.
+  </Step>
+
+  <Step title="6. NVLink: the island">
+    Inside an 8-GPU SXM node, 450–900 GB/s to every peer, roughly a quarter of local HBM bandwidth. **This is the largest group of GPUs over which fine-grained sharding pays**, and it is the reason tensor parallelism stops at the node boundary.
+  </Step>
+
+  <Step title="7. InfiniBand: the only way out">
+    50 GB/s per port. Slow enough that you do not ship per-layer tensors across it. What you *can* ship is a whole layer's worth of state, once per micro-batch — which is exactly what pipeline parallelism does.
+  </Step>
+
+  <Step title="8. The ring is not free">
+    A ring all-reduce is two passes around a ring of $P$ GPUs, and each GPU sends $\frac{2(P-1)}{P}$ of the payload. At $P = 4$ that is 1.5x; at $P = 8$, 1.75x. Communication grows with the GPU count, so parallel efficiency falls at the tail.
+  </Step>
+</Scrolly>
+
+## Price the message, not the algorithm
+
+The rule that governs this whole module is one line long — the <Term t="collective-cost">cost of one message</Term>, with the <Term t="collective-efficiency">collective efficiency</Term> $\eta$ for how much of the wire a real collective actually uses:
+
+$$
+t_{\text{message}} = \underbrace{t_{\text{latency}}}_{\text{open the channel}} + \underbrace{\frac{S}{B \times \eta}}_{\text{move the bytes}}
+$$
+
+$S$ is the payload in bytes, $B$ is the one-directional bandwidth, and $\eta$ is the fraction of peak a real collective achieves — call it **efficiency**. Not 1.0: ring and tree algorithms do not perfectly saturate the wire, so the honest range is 0.7–0.9 for NCCL-style collectives on a good fabric, lower across PCIe.
+
+Two terms, two different regimes, and the crossover is easy to find. Set them equal:
+
+$$
+t_{\text{latency}} = \frac{S}{B\eta} \quad\Rightarrow\quad S^{*} = \frac{t_{\text{latency}} \cdot B \cdot \eta}{1}
+$$
+
+For an NVLink 4 message: $S^* = 0.9\ \mu s \times 450\ \text{GB/s} \times 0.85 \approx 344\ \text{KB}$. **Above about 300 KB, bandwidth dominates. Below it, latency does.** Tensor-parallel all-reduce payloads at realistic batch sizes are right at that boundary, which is why latency-aware kernel launches (and overlapping communication with computation, which Module 15's CUDA graphs make possible) matter so much.
+
+<Callout type="math" title="Worked: an all-reduce over NVLink 4 and over PCIe 4">
+  Llama-3.1-8B, hidden 4,096, BF16, batch 32. One all-reduce payload:
+
+  $$
+  S = 32 \times 4{,}096 \times 2 = 262{,}144\ \text{bytes} \approx 256\ \text{KB}
+  $$
+
+  Two all-reduces per layer × 32 layers = 64 messages per forward pass.
+
+  **Over NVLink 4** ($B = 450$ GB/s, $\eta = 0.85$, $t_{lat} = 0.9$ µs):
+
+  $$
+  t = 0.9\ \mu s + \frac{262{,}144}{450\times 10^{9}\times 0.85} = 0.9\ \mu s + 0.69\ \mu s = 1.59\ \mu s
+  $$
+
+  Times 64: **102 µs per forward pass.**
+
+  **Over PCIe 4.0** ($B = 32$ GB/s, $\eta = 0.8$, $t_{lat} = 2.5$ µs):
+
+  $$
+  t = 2.5\ \mu s + \frac{262{,}144}{32\times 10^{9}\times 0.8} = 2.5\ \mu s + 10.2\ \mu s = 12.7\ \mu s
+  $$
+
+  Times 64: **815 µs per forward pass — 8x worse.**
+
+  Now price it. A decode step for Llama-3.1-8B at batch 32 on an H100 is about 4.8 ms of weight reads alone (16 GB at 3.35 TB/s). So NVLink adds about **2%** and PCIe adds about **17%**. Tensor parallelism across PCIe is not forbidden, but it is clearly the wrong choice when you could use the same GPUs differently.
+</Callout>
+
+Note what that arithmetic says: the *message count* is what hurts on PCIe, not the message size. 64 separate small messages pay 64 latencies. Larger payloads amortise it. This is why a whole fused layer's output is a better thing to send than an individual MLP shard — and why the design of a sharding scheme is constrained by what granularity your wire likes.
+
+## The five collectives
+
+Every multi-GPU scheme in this module reduces to combinations of five operations. Learn these five and the rest of the module is bookkeeping.
+
+| Collective | What it does | Built from | Where you meet it |
+|---|---|---|---|
+| <Term t="broadcast">Broadcast</Term> | one GPU's value → every GPU | — | initialise a replicated tensor |
+| <Term t="reduce-scatter">Reduce-scatter</Term> | everyone reduces, each GPU keeps 1/$P$ | ring | the second half of an all-reduce |
+| <Term t="all-gather">All-gather</Term> | every GPU's shard → everyone has all of it | ring | row-parallel MLP, then all-reduce |
+| <Term t="all-reduce">All-reduce</Term> | sum across GPUs, identical result everywhere | reduce-scatter + all-gather | row-parallel linear layers |
+| <Term t="all-to-all">All-to-all</Term> | every GPU sends a slice to every other | — | MoE dispatch (Module 19), context parallelism |
+
+The structural fact is worth memorising because it lets you price anything:
+
+<Callout type="recap" title="Everything is a ring">
+  An all-reduce is a reduce-scatter followed by an all-gather. Both are rings. A ring step sends $(P-1)/P$ of the payload to one neighbour, and each of the $P$ steps moves the full pipe. So:
+
+  $$
+  \text{bytes each GPU sends} = \underbrace{2}_{\text{reduce-scatter + all-gather}} \times \underbrace{\frac{P-1}{P}}_{\text{ring fraction}} = \frac{2(P-1)}{P}
+  $$
+
+  All-gather and reduce-scatter each cost $(P-1)/P$, and **neither of those grows past 2 no matter how many GPUs you add.** The factor for all-reduce starts at 1 (P=2), is 1.5 at P=4, 1.67 at P=6 and asymptotes to 2.
+</Callout>
+
+<Callout type="real" title="What the factor does to your speedup">
+  Communication that grows with $P$, added to a term that shrinks as $\frac{1}{P}$, is exactly how parallel efficiency dies. Amdahl again, in a new costume: for Llama-3.1-8B decode at TP=8 over NVLink, the factor is 1.75, so 128 all-reduces send 1.75x the payload that a single GPU holds. The memory term falls 8x; the communication term does not fall at all. **That is why 8-way TP gives you about 5–6x, not 8x** — and why going past the NVLink island is a different kind of decision entirely.
+</Callout>
+
+## Which ring, when
+
+Two algorithms cover almost all real traffic: **ring** and **tree**.
+
+A **ring** all-reduce is $\frac{2(P-1)}{P}$ per GPU and is perfectly bandwidth-optimal — every link carries exactly its share — but its latency is 2(P-1) hops. For large messages on NVLink, ring wins.
+
+A **tree** (recursive doubling / halving) has $O(\log P)$ depth: at $P = 8$ the data is reduced in three hops. Large messages get every node, so tree is not bandwidth-optimal. **But for small messages, where latency dominates, tree's lower depth wins decisively.**
+
+This is why NCCL's tuning is not a detail. At $P = 8$ with a 2 KB payload, latency dominates completely and the algorithm choice changes the answer by an order of magnitude. At $P = 8$ with a 100 MB payload, bandwidth dominates and the algorithm barely matters.
+
+Here is all five of them, as you would actually call them. This is `torch.distributed`, the layer NCCL sits behind, and it is worth reading once so that everything later in the module is concrete:
+
+```python
+import os, torch
+import torch.distributed as dist
+
+# one process per GPU; NCCL finds the peers over NVLink or InfiniBand
+dist.init_process_group("nccl")
+rank, world = dist.get_rank(), dist.get_world_size()
+
+t = torch.randn(4096, device="cuda")
+
+dist.broadcast(t, src=0)                  # one GPU's value -> everyone
+dist.all_reduce(t, op=dist.ReduceOp.SUM)  # sum -> identical result everywhere
+dist.all_gather_into_tensor(buf, t)       # each GPU's shard -> everyone has all
+dist.reduce_scatter_tensor(out, inp)      # sum -> each keeps 1/world
+dist.all_to_all_single(out, t)            # permutation: send a slice to each peer
+
+dist.barrier()   # not a collective: just "everyone wait until you get here"
+```
+
+Three things to notice, because they explain everything:
+
+```python
+# 1. all_reduce allocates an output tensor. On a hot decode loop that allocation,
+#    not the transfer, is often the cost. Reuse the buffer:
+buf = torch.empty_like(t)
+for _ in range(100):
+    dist.all_reduce(buf)      # in-place on a preallocated buffer
+    # or: dist.all_reduce(t, async_op=True) and overlap the next kernel
+
+# 2. async_op=True is what lets Module 15's CUDA graphs overlap a collective with compute.
+#    Without it, all_reduce is a barrier: the GPU stops until the ring has drained.
+
+# 3. The group matters. TP wants one group of t ranks; PP wants another of P; a
+#    DP axis wants a third. dist.new_group([...]) builds them, and a collective only
+#    synchronises ranks inside its own group.
+```
+
+<Callout type="mentor" title="Read this code once and the rest of the module is bookkeeping">
+  The five functions map one-to-one onto the five collectives in the table above, and
+  `ReduceOp.SUM` is the only reason the all-reduce and the reduce-scatter are the same
+  primitive with different output shapes. The engineering around them — buffer reuse,
+  `async_op`, process groups — is where the real constants live, and it is exactly what the
+  arithmetic in this module is trying to predict.
+</Callout>
+
+<Callout type="pitfall" title="The three mistakes everyone makes with collectives">
+  **One: quoting bidirectional bandwidth as unidirectional.** NVLink 4 is quoted at 900 GB/s aggregate, so 450 GB/s each way. When a slide says "NVLink gives 900 GB/s" and your code moves data in both directions simultaneously, you are off by 2x.
+
+  **Two: assuming communication overlaps for free.** In Module 15 you learned to capture a decode loop in a CUDA graph. Inside a graph, NCCL collectives can overlap with compute kernels — but only if the two halves touch *different* data, and only if you told the framework they were independent. Two collectives in a row cannot overlap with each other.
+
+  **Three: counting the launch, not the wire.** A 2 KB all-reduce over PCIe is dominated by the fixed cost, and on some stacks the CUDA launch overhead of the collective itself (a few microseconds) exceeds the transfer. Small collectives are a CPU problem wearing a network costume.
+</Callout>
+
+## The island: your real unit of design
+
+Pull the ladder together into the one number you will use for the rest of the module. Call it the <Term t="island">island</Term> boundary. For an interconnect at $B$ and a GPU at $B_{mem}$, the ratio
+
+$$
+\rho = \frac{B_{mem}}{B}
+$$
+
+tells you how many times more expensive a remote byte is than a local one. On an H100 over NVLink 4: $\rho = 3350/450 \approx 7.4$. Across PCIe 4.0: $\rho \approx 105$. Over InfiniBand: $\rho \approx 67$.
+
+**A scheme is only viable when its communication is coarse enough to hide $\rho$.** Over PCIe, at $\rho \approx 105$, you want to move a whole layer's activations once — a pipeline boundary — and nothing smaller. Over NVLink, at $\rho \approx 7.4$, you can afford 128 tiny all-reduces per forward pass.
+
+<Callout type="mentor" title="The island is the answer to 'how many GPUs do I need?'">
+  Most people ask this module the wrong question. "Should I use 4 GPUs or 8?" is unanswerable without knowing the *fabric*, because 8 GPUs on one NVLink node is a different machine from 8 GPUs across 4 PCIe hosts — and often cheaper than the NVLink node.
+
+  The right question is the one from the top: **which of my GPUs can see each other at low $\rho$?** Those, and only those, form a group you may shard a single request across. Everything else gets a separate copy of the model, exactly as if you had bought two machines.
+</Callout>
+
+## Where this leaves the module
+
+Three facts to carry into the next three lessons:
+
+1. **Cost is `latency + bytes / (bandwidth x efficiency)`.** Above ~300 KB an NVLink message is a bandwidth problem; below it, a latency problem.
+2. All-reduce costs $\frac{2(P-1)}{P}$ per GPU; all-gather and reduce-scatter cost $(P-1)/P$. Neither falls as $P$ grows.
+3. **$\rho = B_{mem}/B$ sets the design.** Large $\rho$ forces coarse communication, which is why pipeline parallelism crosses the node boundary and tensor parallelism does not.
+
+The next lesson takes the smallest possible unit of sharding — one matrix — and splits it across GPUs, and then finds out exactly what the 128 all-reduces per forward pass cost in wall-clock time.
+
+<KeyNotes>
+  1. The interconnect ladder runs from PCIe 4.0 at ~32 GB/s to NVLink 5 at ~900 GB/s — a 28x range that is part of the hardware spec, not a driver detail.
+  2. Every message costs `latency + bytes / (bandwidth x efficiency)`. Real collectives hit 70–90% of peak; assuming 100% understates your cost by 10–30%.
+  3. The crossover is near 300 KB on NVLink 4. Above it you are bandwidth-bound; below it, you are paying for the conversation.
+  4. Five collectives cover everything: broadcast, reduce-scatter, all-gather, all-reduce, and all-to-all. All-reduce is reduce-scatter + all-gather.
+  5. A ring all-reduce sends `2(P-1)/P` of the payload per GPU — 1.5x at TP=4, 1.75x at TP=8. Communication grows with P, so parallel efficiency falls.
+  6. Ring is bandwidth-optimal and latency-`O(P)`; tree is bandwidth-suboptimal and latency-`O(log P)`. Small messages want tree, large messages want ring, and NCCL picks per call.
+  7. Count *messages*, not bytes: 64 small all-reduces over PCIe cost 8x what the same 64 over NVLink cost, even though the bytes are identical.
+  8. `rho = memory bandwidth / link bandwidth` is the design constraint. At rho ≈ 7 (NVLink) you can shard inside a layer; at rho ≈ 100 (PCIe) you cannot.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'An all-reduce on NVLink 4 (450 GB/s unidirectional, 0.9 µs latency, 85% efficiency) moves a 256 KB payload. How long does it take?', numeric: true, answer: 1.6, tolerance: 0.2, unit: 'µs', why: 't = 0.9 µs + 262,144 / (450e9 × 0.85) = 0.9 + 0.69 = 1.59 µs. Latency is more than half the cost — at this size you are paying for the conversation.' },
+  { q: 'A ring all-reduce across 8 GPUs: how many times the payload does each GPU send?', numeric: true, answer: 1.75, tolerance: 0.02, unit: 'x payload', why: '2(P-1)/P = 2·7/8 = 1.75. Reduce-scatter moves 7/8, then all-gather moves 7/8 more. The factor grows with P, so communication never falls as you add GPUs.' },
+  { q: 'Why does an 8-GPU NVLink node beat 8 PCIe-attached GPUs so decisively for tensor parallelism?', options: ['It has more HBM', 'The aggregate link bandwidth is roughly 28x higher, so rho = memory bandwidth / link bandwidth drops from ~105 to ~7', 'PCIe adds an extra copy of the weights', 'Tensor cores require NVLink'], answer: 1, why: 'The weights and HBM are identical. What changes is rho — the price of a remote byte relative to a local one. At rho ≈ 7, 128 small all-reduces per forward pass are affordable; at rho ≈ 105 they are ruinous.' },
+  { q: 'Which collective is NOT built out of reduce-scatter plus all-gather?', options: ['All-reduce', 'All-gather', 'Reduce-scatter', 'All-to-all'], answer: 3, why: 'All-to-all has no reduction: each GPU sends a distinct slice to each peer. It is a permutation, not a fold, which is why Module 19 (MoE dispatch) needs it and cannot get away with an all-reduce.' },
+  { q: 'Llama-3.1-8B at batch 32 sends 64 all-reduce messages per forward pass, each 256 KB. Over NVLink 4 the collective total is about 102 µs; over PCIe 4.0 it is about 815 µs. Why is PCIe 8x worse when the byte count is identical?', options: ['PCIe packets are corrupted and need retransmission', 'PCIe has 14x lower bandwidth AND higher per-message latency, and 64 small messages pay that latency 64 times', 'PCIe cannot carry floating point', 'The GPU reads weights more slowly over PCIe'], answer: 1, why: 'Cost is latency + bytes/(bandwidth x efficiency). Bandwidth differs by 14x; latency by 2.8x. With 64 separate messages, the latency term is paid 64 times instead of once, so small-message collectives are punished doubly.' },
+  { q: 'An H100 reads its own HBM at about 3,350 GB/s. What is rho = memory bandwidth / link bandwidth for a GPU attached over PCIe 4.0 at 32 GB/s?', numeric: true, answer: 105, tolerance: 5, unit: 'x', why: '3350 / 32 ≈ 105. Every byte moved to a neighbour costs as much as 105 bytes of local memory traffic. At that rho, only coarse-grained sharding — pipeline boundaries, whole layers — can hide communication.' },
+] } />

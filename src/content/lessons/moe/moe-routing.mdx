@@ -1,0 +1,256 @@
+---
+title: 'How MoE works: routing tokens to experts'
+summary: 'A transformer block spends two thirds of its parameters in one feed-forward network, and every token reads all of it. A mixture-of-experts deletes that network, replaces it with hundreds of smaller ones, and uses a tiny router to pick the handful this token actually needs. You will learn where the parameters go, where the FLOPs go, and why those two numbers are not the same.'
+objectives:
+  - Explain the structure of a mixture-of-experts block and the role of its router
+  - Derive total versus active parameters for Mixtral 8x7B and explain the sparsity ratio
+  - Explain why top-1 and top-k routing trade per-token FLOPs against quality
+  - Explain load imbalance as a consequence of expert specialisation
+  - Compute a decode step from active bytes rather than total bytes
+---
+import MoeRouter from '@/components/viz/moe/MoeRouter.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is the arithmetic that has been quietly limiting you the whole course. A transformer block spends about two thirds of its parameters in its feed-forward network — the "up" matrix, a nonlinearity, the "down" matrix. Of Llama-3.1-8B's 8.03 billion parameters, only about 0.5 billion are attention and embeddings. The rest is feed-forward, and *every token reads every one of those bytes*.
+
+That is why a 70B model on one H100 is unpleasant, and why a 7B model on the same card is pleasant. Decode is memory-bound (you built the roofline for this in Module 03, and the decode-step model in Module 05). Bytes per step is latency. If you want a better model, you normally have to buy more bytes.
+
+<Callout type="mentor" title="The problem in one line">
+  Parameter count sets **memory**; active parameter count sets **latency**. For a decade they were the same number. Mixture-of-experts makes them different.
+</Callout>
+
+## The one structural change
+
+A <Term t="mixture-of-experts">mixture-of-experts</Term> layer keeps the attention exactly as it was and replaces only the feed-forward network. Instead of one wide network, the block holds a **bank of <Term t="expert">experts</Term>** — each one the same shape as the network it replaces, but each narrower — plus a **router** that decides which few of them this token uses.
+
+For a block of width $d$ with intermediate width $4d$, the dense network is:
+
+$$
+\underbrace{W_{\text{up}} \in \mathbb{R}^{4d \times d}}_{4d^2} \qquad \underbrace{W_{\text{down}} \in \mathbb{R}^{d \times 4d}}_{4d^2} \qquad \Rightarrow \qquad 8d^2 \ \text{parameters}
+$$
+
+An MoE layer with $E$ experts of intermediate width $4d/E$ holds:
+
+$$
+E \times \Big( \tfrac{4d}{E} \cdot d + d \cdot \tfrac{4d}{E} \Big) = 8d^2 \quad \text{— identical}
+$$
+
+Same block, same size, now as $E$ separable pieces. What changes is *which* pieces a given token touches. The router is a single matrix of shape $(E+1) \times d$: one matrix-vector product that produces a score per expert, plus a bias term for each.
+
+$$
+\mathbf{g} = \mathbf{W}_{\text{router}}\, \mathbf{x} \in \mathbb{R}^{E}, \qquad \text{ExpertSet}(x) = \operatorname{topK}\big(\mathbf{g}\big)
+$$
+
+<Callout type="intuition" title="Why the router is nearly free">
+  The router costs $E \cdot d$ parameters per layer and reads them once per token. For Mixtral that is $8 \times 4096 = 32{,}768$ parameters — about 33 thousand — against the 100 million a single expert holds. The routing decision costs **three ten-thousandths** of the expert it is choosing. You can afford to be lavish here; the router is not where the cost lives.
+</Callout>
+
+## Top-1, top-2, top-k
+
+How many experts a token uses is the design's main dial, and it is a real trade, not a free lunch.
+
+**Top-1** is the Switch Transformer formulation: 2048 experts, one selected per token. The per-token expert FLOP count is exactly what a dense block of the same total size would cost. You get 2048× the parameters of one expert at the price of one.
+
+**Top-2**, used by Mixtral, doubles the expert work relative to top-1. In exchange, each token gets two experts' opinions, which is what makes the quality hold at a total parameter count that top-1 routing could not reach. At the time of writing this is the common production shape.
+
+<Scrolly>
+  <MoeRouter client:visible slot="stage" />
+
+  <Step title="1. A dense FFN is the thing to beat">
+    Every transformer block ends in one wide feed-forward network. It is two thirds of the parameters, and it reads all of them on every token. **This is the baseline any MoE has to justify itself against.**
+  </Step>
+
+  <Step title="2. Replace it with a bank of experts">
+    Delete that one network and put $E$ narrower ones in its place. They add up to exactly the same parameter count — but now they are separate, and a token does not have to use all of them.
+  </Step>
+
+  <Step title="3. The router picks k of them">
+    One matrix-vector product gives $E$ scores; softmax, take the top $k$. The router is the cheapest operation in the block, which is exactly why the design is viable at all.
+  </Step>
+
+  <Step title="4. Top-1: the simplest form">
+    Switch Transformer selects one expert of 2048. **Per-token FLOPs are unchanged** from a dense block — you have bought 2048× the parameters for the price of one.
+  </Step>
+
+  <Step title="5. Top-2 buys quality for 2× work">
+    Mixtral picks two of eight. Expert work doubles, but each token gets two experts, and quality holds at a total size top-1 could not reach.
+  </Step>
+
+  <Step title="6. Specialisation is the whole point">
+    Trained experts specialise: some take syntax, some take numbers, some take rare tokens. If experts stayed interchangeable there would be no reason to have more than one.
+  </Step>
+
+  <Step title="7. The experts are not equal">
+    And here is the bill. A router with favourites sends far more than its share of tokens to a few experts. Switch the sharpness control up and watch the imbalance number climb. **This is the tax you pay for specialisation**, and the next lesson is about paying it across GPUs.
+  </Step>
+
+  <Step title="8. Sparsity is the number that matters">
+    Total parameters divided by active parameters. Mixtral is about 3.6×; Qwen3-30B-A3B is about 9×. That ratio is what lets a 46.7B model decode like a 13B one.
+  </Step>
+
+  <Step title="9. What it costs at decode time">
+    Active bytes replace total bytes in the decode-step model, and the step time collapses. But the weights still span multiple GPUs, because **every expert has to stay resident** — a distinction the next lesson makes concrete.
+  </Step>
+</Scrolly>
+
+## Deriving Mixtral's numbers from its config
+
+Mixtral 8x7B is the cleanest case to work through, because its configuration is public and small enough to hold in your head: 32 blocks, hidden width $d = 4096$, intermediate $14336$, 8 experts per block, top-2, no shared experts, first block dense.
+
+**Attention and embeddings** (whole model):
+
+$$
+\underbrace{32 \times 2 \times 4096 \times 4096}_{\text{projections}} + \underbrace{32 \times 2 \times 4096 \times 1024}_{\text{K and V, 8 KV heads}} + \underbrace{32000 \times 4096}_{\text{embedding}}
+= 1{,}073{,}741{,}824 + 268{,}435{,}456 + 131{,}072{,}000 \approx 1.47\text{B}
+$$
+
+**One expert bank**, per MoE block: eight experts, each three matrices of $4096 \times 14336$:
+
+$$
+8 \times 3 \times 4096 \times 14336 = 1{,}409{,}286{,}336 \approx 1.41\text{B} \quad \text{per block}
+$$
+
+**Router**, per block: $(8 + 1) \times 4096 = 36{,}864$ parameters. Note how completely negligible this is against 1.41 billion.
+
+**Total** (31 MoE blocks, 1 dense block):
+
+$$
+P_{\text{total}} = 1.47\text{B} + 31 \times (1.41\text{B} + 0.000037\text{B}) + 1 \times 3 \times 4096 \times 14336
+\approx \boxed{45.3\text{B}}
+$$
+
+The published figure is 46.7B. The gap is the accounting convention: published totals are approximate and differ on tied versus untied embeddings and on whether the dense first block is counted the way this is. **Say "about 46B" and show this derivation** — it agrees to within 3%.
+
+**Active per token.** Now only two of eight experts:
+
+$$
+P_{\text{active}} = 1.47\text{B} + 31 \times \left( 2 \times 3 \times 4096 \times 14336 \right) + 0.17\text{B} \approx \boxed{12.6\text{B}}
+$$
+
+Published figure: 12.9B. Again the same few percent.
+
+**Sparsity:**
+
+$$
+\frac{45.3}{12.6} = \boxed{3.6\times}
+$$
+
+<Callout type="math" title="The dense twin is the surprising comparison">
+  A dense model with Mixtral's depth and width — 32 blocks, 4096 wide, 14336 intermediate — is $\approx 7.1$B parameters. Mixtral has **6.4× more parameters than that dense twin**, and is a substantially stronger model.
+
+  This is the part that makes MoE interesting rather than merely clever. The gain is not "same model, fewer FLOPs". It is "many more parameters than a dense model of the same shape could afford, at the FLOPs of a much smaller one".
+</Callout>
+
+Here is the same derivation for two other published configurations, so you can check that the method generalises. Both figures below come from the arithmetic above, and match the published totals to within a few percent.
+
+| | Mixtral 8x7B | DeepSeek-MoE-16B | Qwen3-30B-A3B |
+|---|---|---|---|
+| Blocks | 32 | 27 | 48 |
+| Hidden $d$ | 4096 | 2048 | 2048 |
+| Experts $E$ | 8 | 64 | 128 |
+| Top-$k$ | 2 | 6 | 8 |
+| Shared experts | 0 | 2 | 1 |
+| Expert intermediate | 14336 | 1408 | 768 |
+| Total (derived) | 45.3B | 16.0B | 30.5B |
+| Total (published, approx) | 46.7B | 16.4B | 30.5B |
+| Active per token (derived) | 12.6B | 2.95B | 3.27B |
+| Active (published, approx) | 12.9B | 2.8B | 3.3B |
+| **Sparsity** | **3.6×** | **5.4×** | **9.3×** |
+| KV cache / token | 128 KiB | 432 KiB | 96 KiB |
+
+Read the last two rows together. Higher sparsity does **not** mean slower. It means more total parameters than the compute can reach — which is a statement about the compute, not the memory.
+
+## Why experts specialise, and why that is a problem
+
+A trained expert is not a random slice of the model. Experts acquire specialities: some handle syntax, some handle numeric reasoning, some handle tokens that appear rarely. This is desirable — it is the mechanism by which capacity is allocated to the parts of the distribution that need it.
+
+But it has a direct operational consequence, and this is the thing an inference engineer must internalise: **the router develops favourites**. Load is not uniform. A few experts take a large fraction of all tokens, and the rest are nearly idle.
+
+That has two costs, and the second one is the reason the next lesson exists:
+
+1. **Memory waste.** An expert that receives almost no tokens is still resident in GPU memory, because you cannot know in advance which expert the next token will need. Sparse compute, dense memory.
+2. **Uneven work across devices.** Once experts live on different GPUs (next lesson), a hot expert means one GPU doing several times the work of its neighbours, while the slowest one sets everyone's latency.
+
+Push the **router sharpness** control in the visual up to "Very sharp" and the imbalance number roughly triples. That is not a bug in the model — it is what specialisation does.
+
+<Callout type="pitfall" title="The trap: balanced experts would be a worse model">
+  It is tempting to think load imbalance is a training defect to be ironed out. It is not. Perfectly balanced routing means experts are interchangeable, and interchangeable experts cannot specialise — which destroys the entire reason for having many of them.
+
+  Load balance is a **serving** problem, not a modelling one. You do not fix it by retraining; you fix it with capacity factors, auxiliary losses during training, and placement decisions at inference. Those are the tools the next two lessons are about.
+</Callout>
+
+## What this costs at decode time
+
+Now the payoff. Take the decode-step model from Module 05 and change one term. A dense model reads every weight byte every step. An MoE reads only the active ones:
+
+$$
+\text{bytes}_{\text{step}} = \underbrace{P_{\text{active}} \cdot \tfrac{b_w}{8}}_{\text{active weights}} + \underbrace{B\,T \cdot 2L H_{kv} D \cdot \tfrac{b_{kv}}{8}}_{\text{KV cache}}
+$$
+
+$$
+t_{\text{step}} = \max\!\Big( \tfrac{\text{bytes}_{\text{step}}}{\text{BW}\cdot\text{MBU}},\ \tfrac{2 P_{\text{active}} B}{\text{FLOP/s}\cdot\text{MFU}} \Big)
+$$
+
+Worked example: Mixtral 8x7B, BF16 weights, batch 32, 4,096 tokens of context, on an H100 (3.35 TB/s peak, taking 0.8 memory-bound utilisation → 2.68 TB/s effective).
+
+- Active weight bytes: $12.6\text{e}9 \times 2 = 25.2$ GB
+- KV cache: $32 \times 4096 \times 131{,}072 = 17.18$ GB
+- Bytes per step: $25.2 + 17.18 = 42.4$ GB
+- Time: $42.4 / 2.68 = 15.8$ ms
+- FLOPs: $2 \times 12.6\text{e}9 \times 32 = 8.1$ TFLOP; at $989 \times 0.55 = 544$ TFLOP/s that is $14.8$ ms
+
+So $\max(15.8,\ 14.8) = \boxed{15.8\text{ ms}}$, memory-bound — before any communication, which does not exist yet because we assumed one GPU could hold the thing.
+
+Now the number that makes the whole idea work:
+
+$$
+\text{fits on} = \left\lceil \tfrac{45.3\text{e}9 \times 2}{80\text{e}9} \right\rceil = \left\lceil 1.13 \right\rceil = 2 \text{ H100s}
+$$
+
+**One H100 cannot hold Mixtral in BF16. Two can.** And per step we read 25.2 GB of the 93.4 GB stored — so the second card's memory is mostly idle *between* steps while both cards' bandwidth is idle *during* them. That is exactly the tension the next lesson resolves, and it is a good place to notice how a pure arithmetic argument hands you a hardware problem.
+
+<Callout type="real" title="Why the trade is not free">
+  The KV cache is untouched by MoE. In the worked example above, 17.18 GB of the 42.4 GB moved per step is KV — 41% of the traffic — and every byte of it is compulsory. As context grows, an MoE's advantage over a dense model of similar *active* size shrinks, because the part MoE does not help keeps growing. Long context and MoE are a bad combination unless you also address the cache, which is precisely what Module 20 is for.
+</Callout>
+
+## Choosing a configuration
+
+If you are deploying one of these, the choice you actually make is $E$ and $k$.
+
+| Config | $E$ | $k$ | Sparsity (Mixtral shape) | Use when |
+|---|---|---|---|---|
+| Top-1, many experts | 64–2048 | 1 | ~16–200× | training throughput; inference quality is weaker per parameter |
+| Top-2, few experts | 8 | 2 | 3.6× | the production default for serving quality |
+| Top-8, many experts | 128 | 8 | 9.3× | small active footprint; more communication per token |
+| Fine-grained + shared | 256 | 8 | high | shared expert carries the always-needed work |
+
+More experts with the same $k$ raises total parameters and sparsity without raising per-token FLOPs — but it makes each expert smaller, and below some width the per-expert GEMM stops being efficient on the hardware. There is a floor, and it is a hardware floor, not a modelling one.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. Mixtral has 8 experts of intermediate width 14336. A dense block of width 4096 has intermediate 14336. Why do eight of the experts together equal exactly one dense block? Show the arithmetic.
+  2. Compute Mixtral's sparsity from the derived numbers. Now compute it if top-2 were changed to top-4. Which way does it move, and why?
+  3. The router for Mixtral is $9 \times 4096$ parameters. Express that as a fraction of one expert's $3 \times 4096 \times 14336$. Why does this ratio make top-2048 routing affordable?
+  4. In the decode-step model above, 41% of the bytes moved are KV cache. If the model served 32k context instead of 4k, roughly what fraction of bytes would be KV? What does that do to the argument for MoE at long context?
+  5. An MoE has perfect, perfectly balanced routing. Give one argument for why that would be a *worse* model, and one reason it would be a *faster* server.
+</Callout>
+
+<KeyNotes>
+  1. An MoE layer replaces only the block's feed-forward network with $E$ narrower experts plus a router of shape $(E+1)\times d$. Attention is untouched, and the expert bank totals exactly the parameters of the network it replaced.
+  2. The router costs $E \cdot d$ parameters — for Mixtral about 33 thousand against an expert's 100 million. Routing decisions are essentially free, which is why designs like top-1-of-2048 are viable at all.
+  3. $k$ is the main quality-versus-work dial: top-1 keeps dense FLOPs, top-2 doubles expert work and holds quality better, top-8 buys a much smaller active footprint at eight experts of communication per token.
+  4. Sparsity is total parameters divided by active parameters — about 3.6× for Mixtral 8x7B, 5.4× for DeepSeek-MoE-16B, 9.3× for Qwen3-30B-A3B. Higher sparsity means more parameters than the compute reaches, not a slower model.
+  5. Load imbalance is a consequence of expert specialisation, not a training defect. Balanced routing would mean interchangeable experts, and interchangeable experts cannot specialise.
+  6. Sparse compute means dense memory: every expert must be resident, because you cannot know which one the next token needs. Mixtral in BF16 needs two H100s to fit while reading 25 GB of the 93 GB stored.
+  7. In the decode-step model, substitute $P_{\text{active}}$ for $P$ in both the bytes term and the FLOP term. That single substitution is the entire latency story of MoE.
+  8. MoE does nothing for the KV cache. As context grows, the compulsory part of the traffic grows while the sparsity benefit is fixed, so MoE's advantage over a dense model of similar active size narrows at long context.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Mixtral 8x7B: 8 experts per block, each with intermediate width 14336, model width 4096. How many parameters is one expert bank, per block?', numeric: true, answer: 1.409, tolerance: 0.05, unit: 'B', why: 'One expert = 3 matrices of 4096 × 14336 = 3 × 58,720,256 = 176,160,768. Eight of them = 1,409,286,336 ≈ 1.41B. Compare a dense block: 3 × 4096 × 14336 = 176,160,768 — one expert is identical to the dense network it replaces, so eight experts are 8× that.' },
+  { q: 'Using the derived figures of 45.3B total and 12.6B active, what is Mixtral 8x7B’s sparsity?', numeric: true, answer: 3.6, tolerance: 0.25, unit: '×', why: '45.3 ÷ 12.6 = 3.60. This is the ratio of parameters that must be resident to parameters actually read per token. It is the number that lets a 46.7B model decode at roughly 12.6B-model speed.' },
+  { q: 'Why does a mixture-of-experts layer keep attention exactly as it was?', options: ['Attention is too small a fraction of the parameters to matter', 'The gain comes from feed-forward capacity, and attention is left alone so the change is isolated to one component', 'Attention cannot be split across GPUs', 'MoE models were trained before multi-head attention existed'], answer: 1, why: 'The FFN is about two thirds of parameters, so that is where the capacity is. Isolating the change to one component also makes the sparse/dense comparison clean: the only thing that moved is which FFN weights a token reads.' },
+  { q: 'Load imbalance in a trained MoE is best described as:', options: ['A training bug that should be driven to zero', 'An unavoidable consequence of expert specialisation, managed at serving time with capacity limits and placement', 'A sign the router is broken', 'Caused by too many experts and fixed by using fewer'], answer: 1, why: 'Perfect balance would mean interchangeable experts, and interchangeable experts cannot specialise — which removes the reason for having many. So balance is a serving constraint (capacity factor, overflow policy, placement), not a modelling goal.' },
+  { q: 'A dense block is width d = 4096 with intermediate 14336. An MoE block replaces it with 8 experts of the same intermediate width. By what factor does the block’s per-token expert FLOP count change if routing is top-2?', numeric: true, answer: 2, tolerance: 0.2, unit: '×', why: 'Top-2 activates two experts, each with identical FLOPs to the dense block, so 2× the dense per-token expert work. Top-1 would be exactly 1×. Parameter count is unchanged either way — 8 × 176M is 8× the dense block regardless of k.' },
+  { q: 'Mixtral BF16 weights on an H100 (80 GB). What fraction of the stored weight bytes does a single decode step actually read, using the derived active parameter count?', options: ['About 27%', 'About 54%', 'About 91%', '100% — every weight is read each step'], answer: 0, why: 'Total 45.3B × 2 B = 90.6 GB stored; active 12.6B × 2 B = 25.2 GB read. 25.2 / 90.6 = 0.28, so roughly a quarter to a third. This is the sparsity dividend: memory holds everything, but each step only reads the active slice.' },
+  { q: 'Why does the KV cache dilute MoE’s advantage at long context?', options: ['Because the KV cache is quantized in MoE models', 'Because KV bytes are compulsory and grow with context, while the sparsity benefit is a fixed ratio on weights only', 'Because MoE models have more layers', 'Because routers need context length'], answer: 1, why: 'Sparsity shrinks the weight term only. At 4k context on Mixtral, 41% of step traffic is KV; at 32k it would be the overwhelming majority. The compulsory part grows while the optimised part stays fixed, so the ratio of benefit to traffic falls.' },
+]} />

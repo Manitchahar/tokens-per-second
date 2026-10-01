@@ -1,0 +1,216 @@
+---
+title: 'How quantization works: scales & granularity'
+summary: 'Scale, zero-point, round, multiply back — that is the entire algorithm. You will learn why a single scale for a whole weight matrix fails on outliers, how group size trades error against metadata, and how the rounding error grows as $\sqrt{\text{layers}}$ instead of $\text{layers}$.'
+objectives:
+  - Write the quantize and dequantize equations from memory
+  - Explain what a scale and a zero-point each do
+  - Predict the worst-case error of a b-bit scheme from its grid spacing
+  - Explain why per-tensor quantization fails on outlier weights
+  - Compute the metadata overhead of a group size, and the effective bits per weight
+  - Derive the $\sqrt{L}$ error accumulation rule through a deep model
+---
+import ScalesGranularity from '@/components/viz/quantization/ScalesGranularity.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Last lesson ended with a number: BF16 weights have 7 mantissa bits of precision, and INT8 costs you almost nothing while INT4 costs you something real. This lesson is the mechanism. It is four lines of arithmetic, and every subtlety in quantization lives in the details.
+
+## The algorithm, in full
+
+You have a real-valued weight $v$ that you want to store in $b$ bits. A $b$-bit unsigned integer has $1^b$ values, so it can represent $1, 1, \dots, 2^b - 1$. Signed, add a zero-point and you get a range centred on zero.
+
+$$
+q = \operatorname{clamp}\!\left( \operatorname{round}\!\left( \frac{v - z}{s} \right) + z,\ 0,\ 2^b - 1 \right)
+\qquad
+\hat{v} = s \cdot (q - z)
+$$
+
+Read it slowly. There are exactly four operations:
+
+1. **Shift** by the zero-point $z$ — puts zero at the centre of the integer range instead of one end.
+2. **Divide** by the scale $s$ — maps the real range onto the integer grid.
+3. **Round** to the nearest integer — **this is the only step that loses information.**
+4. **Clamp** to the valid range — needed because of outliers, and the subject of a whole section below.
+
+Dequantization is the first three steps backwards, and it is **exact**: given $q$ and $s$ and $z$, $\hat{v}$ is the same number every time, on any machine, forever. The error was introduced by the round, and it is baked in at that moment.
+
+<Callout type="intuition" title="Why the zero-point exists at all">
+  Without it you would store $q = \operatorname{round}(v/s)$ clamped to $[0, 2^b-1]$. That grid runs from $1$ to $1^b-1$, all non-negative. The smallest representable magnitude is $s/2$, so the entire negative half of your distribution lands on a single value — zero. Signed integers put their resolution where the data is, which is the point.
+</Callout>
+
+## Choosing the scale: the one decision that matters
+
+$s$ and $z$ are not learned from the model and they are not magic. They are chosen so the grid covers the data. The usual choice, for a symmetric distribution, is:
+
+$$
+s = \frac{\max |v|}{2^{b-1} - 1}, \qquad z = 2^{b-1}
+$$
+
+Read that for $b = 4$: the scale is $\max|v|/7$, and the codes run from $-7$ to $+7$. Sixteen grid points, spaced $\max|v|/7$ apart, spanning the full range of the tensor.
+
+Now the error is completely determined, and you can compute it before you ever run anything:
+
+$$
+\boxed{\ |\hat{v} - v| \le \frac{s}{2} = \frac{\max|v|}{2(2^{b-1}-1)} \ }
+$$
+
+Work it for a tensor whose largest weight is 0.61 (the outlier matrix below):
+
+| Bits | $1^{b-1}-1$ | Grid step $s$ | Worst-case error | As a fraction of 0.61 |
+|---|---|---|---|---|
+| 8 | 127 | 0.0048 | 0.0024 | 0.4% |
+| 4 | 7 | 0.0871 | 0.0436 | 7.1% |
+| 3 | 3 | 0.2033 | 0.1017 | 16.7% |
+| 2 | 1 | 0.6100 | 0.3050 | 50.0% |
+
+That is a *worst case*. The expected error is smaller, because most values are not exactly halfway between grid points — but this bound is why INT8 is nearly free and 2-bit is a disaster.
+
+<Callout type="math" title="Where INT8's near-losslessness comes from, exactly">
+  BF16 keeps 7 mantissa bits, so two nearby weights that differ in their 8th significant bit are represented distinctly. A tensor with $\max|v| = 0.61$ has grid step $1.61/127 = 0.0048$ at INT8, and typical weight gaps are larger than that. So an INT8 grid is **finer than the BF16 representation over most of the range**, and rounding to it loses nothing at all for most weights.
+
+  At INT4 the grid step is 17× coarser, so weights that BF16 told apart now collapse. That is the entire difference between the two schemes — not "lower precision is worse" in the abstract, but a concrete number: 0.0048 versus 0.087.
+</Callout>
+
+## Outliers, and why one scale per tensor fails
+
+Here is the problem with the table above. Take a realistic weight row from a transformer MLP: a handful of values near 0.6, and a great many near 0.01.
+
+The scale is set by the **maximum**, because the grid must reach the largest value. So $s = 0.087$ at 4 bits. Now consider the small weights:
+
+$$
+v = 0.01 \quad\Rightarrow\quad q = \operatorname{round}(0.01/0.087) = \operatorname{round}(0.115) = 0 \quad\Rightarrow\quad \hat{v} = 0
+$$
+
+**The weight is deleted.** And it is not one weight: in a typical layer the great majority of weights are small, so a large fraction of the matrix becomes exact zeros. You have not quantized the model, you have *sparsified* it by accident, and thrown away the small values that carry real signal.
+
+The fix is almost embarrassingly simple: **do not share one scale across the whole tensor.** Split it into pieces and give each piece its own scale.
+
+<Scrolly>
+  <ScalesGranularity client:visible slot="stage" />
+
+  <Step title="1. You cannot store -0.42 as 4 bits">
+    Start with the simplest possible fact. Four bits name sixteen values. A weight of -0.42 is not one of them, so something has to decide which sixteen values the format is allowed to mean.
+  </Step>
+
+  <Step title="2. Scale and zero-point">
+    Here are the two equations. A scale $s$ maps the real range onto the integer grid, a zero-point $z$ centres it, and the round is the only lossy step. Store $q$, $s$ and $z$ and you can always get back the same $\hat{v}$.
+  </Step>
+
+  <Step title="3. Quantize, then dequantize">
+    The multiply-back is exact. The error is entirely the distance from the true value to the grid point it snapped to, and that distance is at most half the grid step.
+  </Step>
+
+  <Step title="4. One scale for the whole matrix">
+    The cheapest assignment: one scale per tensor, a single pair of numbers per layer. Elegant, tiny metadata, and almost always a bad idea. Watch the red cells.
+  </Step>
+
+  <Step title="5. The outliers ruin the grid">
+    One row holds weights near 0.61 while most sit near 0.01. The scale must reach 0.61, so the grid step is 0.087 — and a weight of 0.01 rounds to **zero**. The error is not spread evenly. It lands on the small weights, which are most of the matrix.
+  </Step>
+
+  <Step title="6. One scale per group">
+    Cut the row into groups and give each its own scale. An outlier now only ruins its own group. This is what real low-bit quantizers do, and the group size is the dial you turn.
+  </Step>
+
+  <Step title="7. One scale per channel">
+    Cut by row instead — one scale per output channel. In an LLM, different channels have genuinely different magnitudes, so this costs almost no metadata and removes most of the remaining error.
+  </Step>
+
+  <Step title="8. The metadata you pay for it">
+    Each group costs one scale and one zero-point in FP16 — four bytes. At group size 128 that is 6.25% overhead, so your 4-bit model is really 4.25 bits per weight. **This is why group size cannot simply go to 1.**
+  </Step>
+</Scrolly>
+
+## Granularity: the main dial
+
+Three choices, in increasing order of granularity, all visible in the visual above:
+
+| Scheme | Scales needed for an $[m \times n]$ matrix | Metadata | Typical error, 4-bit |
+|---|---|---|---|
+| **Per tensor** | 1 | negligible | worst — outliers kill small weights |
+| **Per channel** (row) | $m$ | $1m$ bytes | good — channels differ in scale |
+| **Per group** (contiguous run of $g$) | $\lceil n/g \rceil m$ | $1\lceil n/g \rceil m$ bytes | best per byte — adapts within a row |
+
+And the metadata bill, derived:
+
+$$
+\text{overhead} = \frac{4}{g} \cdot \frac{8}{b} = \frac{32}{g\,b}
+$$
+
+| Group size $g$ | 4-bit overhead | Effective bits/weight | 8-bit overhead |
+|---|---|---|---|
+| 32 | 25.0% | 5.00 | 12.5% |
+| 64 | 12.5% | 4.50 | 6.25% |
+| 128 | 6.25% | 4.25 | 3.13% |
+| 256 | 3.13% | 4.13 | 1.56% |
+
+<Callout type="real" title="What production tools actually choose, at the time of writing">
+  Group size 128 is the common default for weight-only INT4 in AWQ and GPTQ, and it is what most published 4-bit checkpoints use. Group size 32 shows up in aggressive INT3 work. Per-channel is the default for FP8, because FP8 floats carry their own exponent and so need no group scale at all — which is exactly why the next lesson treats FP8 as a different kind of scheme, not just a narrower INT8.
+</Callout>
+
+## Why errors add in $\sqrt{L}$, not $L$
+
+This is the part that decides whether a deep model survives 4-bit quantization, and it is worth deriving because the intuition is wrong.
+
+Take one weight perturbation of relative size $\varepsilon$ arriving at the output of a linear layer. The relative error at that layer's output is exactly $\varepsilon$ in the worst case: $\hat{W}x = (W + \Delta W)x = Wx + \Delta W x$, and $\|\Delta Wx\| / \|Wx\| \approx \|\Delta W\|/\|W\|$ when $x$ is not pathological. Averaged over a whole layer it is smaller, since errors partially cancel across the many dot products that form the output.
+
+Now the layer outputs feed the next layer. **The quantization errors of different layers are essentially independent** — each layer quantizes its own weights from scratch. When independent relative errors of size $\varepsilon$ pass through $L$ layers, the variance adds and the amplitude takes a square root:
+
+$$
+\varepsilon_{\text{out}} \approx \varepsilon \times \sqrt{L}
+$$
+
+Not $\varepsilon \times L$. Check what that means for Llama-3.1-8B, $L = 32$:
+
+| Bits | Per-weight error | After 32 layers |
+|---|---|---|
+| 8 | ~0.3% | 1.7% |
+| 4 | ~6% | 34% |
+| 3 | ~15% | 85% |
+
+<Callout type="pitfall" title="Why this rule is the whole ballgame at 4 bits">
+  34% relative error sounds fatal, and by this rule alone it would be. It is not, for two reasons that the next lesson covers properly.
+
+  **The errors are not random.** They are structured: the same few outliers get badly quantized over and over, in the same directions, and a trained model has large margins built around those directions. Real measured end-of-model error at 4-bit group-128 is several times smaller than this worst case.
+
+  **Not all weights are quantized equally.** The methods in the next-but-one lesson deliberately spend bits where they matter and round away where they do not.
+
+  But the rule still tells you the shape of the cliff: halving the bits multiplies the error by about 2, and $\sqrt{L}$ is why the same scheme that is safe for a 7-layer model fails for a 80-layer one.
+</Callout>
+
+## Round-to-nearest is not the only way
+
+One more piece of vocabulary, because you will see it in every tool's documentation:
+
+- **Round-to-nearest (RTN).** What we have derived. Simple, fast, no data needed. GPTQ and AWQ both use it as their final rounding step.
+- **Round-to-nearest-even.** Same idea, but breaks ties toward even numbers. Reduces *bias* in the accumulated sum. This is what `torch.round` does.
+- **Stochastic rounding.** Round up or down with probability proportional to the distance, so the error is zero-mean in expectation. Costs a random number per weight per step — useless for weights (quantized once, forever) but occasionally useful for activations you quantize on every step.
+
+Bias matters more than it might seem. If rounding always goes the same direction for the same sign of weight, the errors do not cancel, and the $\sqrt{L}$ rule quietly degrades into an $L$ rule.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. A tensor has $\max|v| = 0.4$. What is the grid step and the worst-case error at 4 bits? At 8 bits?
+  2. With the scale from question 1, what happens to a weight of exactly 0.02 at 4 bits? Show the arithmetic.
+  3. You use group size 64 at 4 bits. What is the overhead, and how many bits per weight does the model really use?
+  4. A model has 32 layers and per-weight relative error of 5%. Estimate the output error. If it had 128 layers, how much worse?
+  5. Why does per-channel quantization need less metadata overhead than per-group at the same effective group size? (Hint: a group of $g$ consecutive weights is $g$ scales; a channel with $n$ inputs is one scale regardless of $n$.)
+</Callout>
+
+<KeyNotes>
+  1. Quantization is `q = clamp(round((v−z)/s) + z)` and `v̂ = s·(q−z)`. The round is the only lossy step; dequantization is exact.
+  2. The scale is set by the maximum magnitude, so worst-case error is $\max|v| / (2(2^{b-1}-1))$. This one formula predicts the quality of every scheme.
+  3. One scale per tensor fails on outlier weights: the grid is stretched to reach the outlier and small weights round to zero. The damage lands on most of the matrix.
+  4. Granularity fixes it. Per-group and per-channel scales each cost 4 bytes per group and drop the error by a large factor.
+  5. Metadata overhead is $12/(gb)$: group 128 at 4 bits is 6.25%, so a "4-bit" model is really 4.25 bits per weight. Group size cannot go to 1.
+  6. Independent per-layer errors accumulate as $\sqrt{L}$, not $L$. For 32 layers, 6% per-weight becomes ~34% in the worst case — which is why structured methods exist.
+  7. Round-to-nearest-even avoids directional bias. Stochastic rounding matters for activations quantized every step, not for weights quantized once.
+  8. FP8 needs no group scale because its exponent carries the range. That is a different mechanism, not a narrower INT8 — which is the next lesson.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A weight tensor has a maximum absolute value of 0.4. At 4 bits, what is the grid step (the scale s)?', numeric: true, answer: 0.057, tolerance: 0.006, unit: '', why: 's = max|v| / (2^(b−1) − 1) = 0.4 / (2³ − 1) = 0.4/7 = 0.0571. The 16 integer codes span −0.4 to +0.4 in 14 steps. Worst-case rounding error is s/2 = 0.029.' },
+  { q: 'With that 4-bit scale, what integer code does a weight of 0.02 get stored as?', numeric: true, answer: 0, tolerance: 0, unit: '', why: 'q = round(0.02 / 0.0571) = round(0.35) = 0, so v̂ = 0. The weight is deleted. This is exactly the outlier problem: a coarse grid sized for the largest value cannot represent the small ones.' },
+  { q: 'You quantize to 4 bits with group size 64 and FP16 scales and zero-points. What fraction of the stored bytes is metadata?', numeric: true, answer: 12.5, tolerance: 2, unit: '%', why: 'Each group of 64 weights costs 4 extra bytes. Overhead = 4/64 / (4/8) = 0.0625/0.5 = 12.5%. Effective storage = 4 bits × 1.125 = 4.5 bits per weight.' },
+  { q: 'A 32-layer model is quantized and each weight gains 5% relative error. Assuming independent errors per layer, estimate the relative error at the output.', numeric: true, answer: 28, tolerance: 6, unit: '%', why: 'Errors from independent layers add in quadrature: 5% × √32 = 5% × 5.66 ≈ 28%. If the layer count were 128, it would be 5% × √128 = 57% — four times as bad for four times the layers, not sixteen times.' },
+  { q: 'Why does per-tensor INT4 quantization destroy small weights in some layers but not others?', options: ['It always destroys them; the damage is uniform', 'The scale is set by that layer’s largest weight, so layers with big outliers get a coarse grid and lose their small weights, while layers with small maxima keep a fine grid', 'Small weights are stored separately in a side table', 'The zero-point compensates exactly for the lost precision'], answer: 1, why: 'The scale is max|v| / 7, so the grid step is proportional to the layer’s largest weight. A layer with a 0.6 outlier has a step of 0.086 and rounds every 0.01 weight to zero; a layer whose maximum is 0.05 has a step of 0.007 and loses nothing. This layer-dependence is why per-group scales help so much.' },
+  { q: 'You have a choice between 4-bit weights at group size 32 and 4-bit weights at group size 128. Which statement is correct?', options: ['Group 32 is always better, because more scales means more precision', 'Group 32 has lower error but 25% metadata overhead, so it uses 5 bits per weight; group 128 has higher error but only 4.25 bits per weight', 'Group 128 is better on both axes because larger groups are more efficient', 'They use identical memory because the scales are stored in the existing weight slots'], answer: 1, why: 'This is the classic error-versus-overhead trade. Group 32: overhead 4/32 / 0.5 = 25%, effective 5.0 bits. Group 128: overhead 6.25%, effective 4.25 bits. Group 32 is genuinely more accurate; whether that accuracy is worth the extra 18% of memory is a deployment decision, not a mathematical one.' },
+]} />

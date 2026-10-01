@@ -1,0 +1,185 @@
+---
+title: 'AWQ, GPTQ & SmoothQuant'
+summary: 'Round-to-nearest is what you get for free, and it is not good enough at 4 bits. You will learn three published methods that each see the problem differently — protecting the channels that matter, repairing the error you already made, and moving the difficulty out of the activations entirely.'
+objectives:
+  - Explain why round-to-nearest quantization loses quality at 4 bits
+  - Describe what makes a weight channel "salient" and why AWQ protects it
+  - Describe GPTQ’s error-compensation loop and the role of the inverse Hessian
+  - Derive SmoothQuant’s scaling law and explain why it needs no per-group scales at low bits
+  - Compare the three methods on calibration cost, memory, and implementation complexity
+---
+import AwqGptqSmooth from '@/components/viz/quantization/AwqGptqSmooth.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Round-to-nearest — quantize each weight on its own, with one scale per group, clip to range, done — is what you get for free. At 8 bits it is genuinely fine. At 4 bits group-128, it produces models that are noticeably worse: they repeat themselves, they lose the ability to follow long instructions, and they fall apart on arithmetic.
+
+None of that is mysterious once you look at *why* RTN is weak. RTN makes two assumptions that are both false:
+
+1. **Every weight is equally important.** False. A tiny fraction of weight channels carry a large share of the output's magnitude.
+2. **The rounding errors are independent.** False. Quantizing one column changes the best choice for its neighbours, and RTN ignores that.
+
+Three methods fix this, and they are worth learning as three distinct ideas, because they generalise far beyond 4-bit.
+
+## AWQ: protect the channels that matter
+
+Activation **AWQ** (*Activation-aware Weight Quantization*) makes the first observation concrete. For one output channel $j$ of a linear layer, its contribution to the output is $W_{:,j} \cdot X_{:,j}$ — the weight column dotted with the activation column. The magnitude of what this channel contributes is roughly:
+
+$$
+\text{salience}_j = \lVert W_{:,j} \rVert \cdot \lVert X_{:,j} \rVert
+$$
+
+And empirically, in trained models this product is **extremely** skewed: 1% of channels often carry 20–50% of the total salience. Those channels are not the largest weights — they are the weights whose *input activations* are large, because that specific weight gets multiplied by a big number on every token.
+
+The key move: **you do not have to protect them with more bits.** You have to protect them with a **finer effective grid**. AWQ inserts a per-channel scale that divides out the activation magnitude before quantizing, and folds the reciprocal back into the weight after:
+
+$$
+\hat{W}_{:,j} = \left( s_j \cdot \operatorname{quant}\!\left( \frac{W_{:,j}}{ s_j },\ b \right) \right), \qquad s_j = \left( \lVert X_{:,j} \rVert^{\alpha} \right)^{\frac{1 - \alpha}{n}} \text{ (approximately)}
+$$
+
+In plain words: AWQ rescales each channel so that the channels which matter most get a **narrower quantisation range** (finer steps, more of their range used), and the channels that do not matter get a coarser one. Same bit budget, same storage, better fidelity where the output is listening.
+
+<Callout type="intuition" title="Why this works when uniform rounding does not">
+  With one scale for the whole group, the grid step is set by the largest weight in the group — you spend your precision on the biggest number, whether or not the output cares. AWQ says: no. Spend it on the number that reaches the output most strongly, and let the others round to zero. A 4-bit grid used intelligently beats a 4-bit grid used passively; the bit budget never changed.
+</Callout>
+
+AWQ needs a **calibration set** — a few hundred representative prompts — to measure the activation statistics $\lVert X_{:,j}\rVert$. That is the only data-dependent part, and it costs minutes, not hours.
+
+## GPTQ: fix the error you already made
+
+GPTQ attacks the second false assumption, and it is the most elegant of the three. Its setup: quantize the weight matrix **one column at a time**, left to right. After quantizing column $i$, you know exactly how much error you just introduced, $\delta_i = W_{:,i} - \hat{W}_{:,i}$. Instead of letting that error sit there, GPTQ **pushes it onto the columns you have not quantized yet**, weighted by how little each of those columns matters to the output.
+
+That "how little" weight is the crux, and it comes from the **inverse Hessian** of the layer's input activations, $\mathbf{H}^{-1} = (\mathbf{X}\mathbf{X}^\top)^{-1}$. This is the same object you met in LoRA-adjacent theory and in second-order optimisation: the Hessian of the loss with respect to the weights is approximated by the second moment of the inputs, $\mathbf{X}\mathbf{X}^\top$. Its inverse tells you which directions in weight space the outputs are **least** sensitive to — so you are free to dump error there.
+
+$$
+\mathbf{H}^{-1} \text{ from calibration data} \quad\Rightarrow\quad \text{round, then compensate the not-yet-quantized columns}
+$$
+
+The whole algorithm, in pseudocode (this is close to the reference implementation's structure):
+
+```python
+# one weight matrix W [out, in], calibration inputs X
+Hinv = inverse(X @ X.T + damp * I)          # damp = 1% of mean diagonal, for stability
+Wq   = zeros_like(W)
+for col in range(W.shape[1]):                 # left to right
+    w = W[:, col]
+    q = quantize_round_to_nearest(w)          # per-group scale
+    Wq[:, col] = q
+    err = (w - q) / Hinv[col, col]            # the error we just made, Hessian-scaled
+    W[:, col+1:] -= err.outer(Hinv[col, col+1:])   # push it forward, weighted
+# block the columns in practice so Hinv is never inverted one element at a time
+```
+
+The consequence worth noting: GPTQ lets the algorithm be **worse on individual weights and better on the model**, because it optimises the output, not the weights. That is the whole philosophy, and it is why its weight-space error can look worse than RTN's while its output error is better.
+
+<Callout type="pitfall" title="GPTQ and AWQ are not alternatives — most people use both ideas, and GPTQ is order-sensitive">
+  **GPTQ is greedy left-to-right**: a later column can only push error *forward*, never back. So column order matters. In practice quantizers process columns in blocks (typically 128 columns), compute the error within a block, and use that block's inverse-Hessian to settle it — which is why "act-order" (processing columns in order of decreasing Hessian diagonal) became a standard refinement.
+
+  **AWQ and GPTQ compose.** Run AWQ's channel scaling first, then GPTQ on the rescaled matrix, and you get the best of both. This is the default in most production stacks at the time of writing: AWQ-style scaling as a pre-processing step, GPTQ-style error compensation as the quantizer.
+</Callout>
+
+## SmoothQuant: move the difficulty, don't fight it
+
+The third method is the most conceptually different, and the one that changes how you think about activation quantization.
+
+The problem it solves: **activations have outliers**, and worse, the outlier channels are *consistent* — the same few channels spike on almost every token. INT8 activations with a single per-tensor scale must stretch to cover those spikes, so every ordinary value is quantized on a coarse grid.
+
+SmoothQuant's move is **mathematically equivalent migration**. For each channel, choose a scale $s_j$ and define:
+
+$$
+\hat{X}_{\cdot,j} = s_j \, X_{\cdot,j}, \qquad \hat{W}_{j,\cdot} = \frac{W_{j,\cdot}}{s_j}
+$$
+
+Because the product is unchanged — $(s_j X_{j})(W_j / s_j) = X_j W_j$ — **the output of the layer is exactly the same in exact arithmetic.** You have not approximated anything. You have chosen to represent the multiplication in a way where the awkward part (the big activations) has been shrunk and the awkward part it creates (the big weights) is handled by per-channel quantization, which weights handle gracefully.
+
+The smoothing strength $\alpha \in [0,1]$ sets how aggressively you migrate:
+
+$$
+s_j = \max\lvert X_{\cdot,j}\rvert^{\alpha} \; \big/ \; \max\lvert X_{\cdot,j}\rVert^{\alpha}_{\text{norm}}
+$$
+
+- $\alpha = 0$: no smoothing (normal W8A8; activations keep their outliers).
+- $\alpha = 1$: migrate everything (bad: weights inherit all the outliers).
+- $\alpha \approx 0.5$–$1.8$ for W8A8; the paper's sweet spot for hard quantisation (INT4/INT3) is higher, pushing *most* of the difficulty into the weights.
+
+<Callout type="math" title="Why SmoothQuant is exact where AWQ and GPTQ are approximate">
+  AWQ scales the weights and **lets the output change slightly** (it approximates — it accepts a little output error in exchange for protecting the salient channels). GPTQ scales nothing but **changes the weights** to compensate rounding (also approximate). SmoothQuant's transformation is an **exact algebraic identity** — the layer computes the identical function in infinite precision — and its only approximation is the ordinary quantization that follows.
+
+  That is why SmoothQuant is especially valuable at very low activation bits (INT4, INT3), where you need every bit of headroom, and why it composes cleanly with AWQ's channel scaling (both are per-channel rescalings; one targets weights, the other targets activations).
+</Callout>
+
+<Scrolly>
+  <AwqGptqSmooth client:visible slot="stage" />
+
+  <Step title="1. Round-to-nearest is the baseline">
+    Here is one weight row quantized the naive way: one scale for the group, round each weight, done. The red bars are weights that lost more than half their value. At 4 bits, this is the quality problem you are trying to solve.
+  </Step>
+
+  <Step title="2. It ignores what comes before">
+    The underline under each column is the activation magnitude. Notice that the two columns with by far the largest activations are **not** the largest weights — and yet they dominate the layer's output. RTN cannot see this, because it only ever looks at the weight matrix.
+  </Step>
+
+  <Step title="3. AWQ: protect the salient channels">
+    Mark the salient channels green — the ones where weight × activation is large. AWQ gives those a finer grid (the same bits, smaller steps) and lets the unimportant ones round away. The output barely moves, because you spent the precision where the output is listening.
+  </Step>
+
+  <Step title="4. GPTQ: fix the error you already made">
+    GPTQ goes left to right and, after each column, spreads the rounding error onto the columns it has not reached yet — weighted by how little each one matters, from the inverse Hessian of the calibration activations. It is worse on individual weights and better on the output.
+  </Step>
+
+  <Step title="5. SmoothQuant: move the difficulty">
+    SmoothQuant does not choose which weights to protect. It rescales activations and weights by reciprocal per-channel factors so the activation outliers shrink. The layer's output is unchanged in exact arithmetic, but both tensors are now much easier to quantize.
+  </Step>
+
+  <Step title="6. The three, side by side">
+    Weight error versus output-weighted error, for all three plus the RTN baseline. Switch methods and read both bars: the methods that look worse in weight space are often better in output space, which is the metric that actually matters. All three keep the same 4.25 bits per weight.
+  </Step>
+</Scrolly>
+
+## What it costs to actually run these
+
+These are not free algorithms, and a production choice has to weigh them. The table below is honest about the real trade-offs, at the time of writing.
+
+| | RTN | AWQ | GPTQ | SmoothQuant |
+|---|---|---|---|---|
+| Calibration data | none | ~128 sequences | ~128 sequences | ~512 sequences |
+| Calibration time | seconds | ~10–30 min | ~10–60 min | ~20–60 min |
+| Second-order work | none | none | inverse Hessian per layer | none |
+| Quality at 4 bits | poor | good | very good | good (esp. with AWQ) |
+| Composition | baseline | composes with GPTQ | composes with AWQ | composes with AWQ / GPTQ |
+| Needs custom kernel? | yes | yes | yes | yes (fused scale-fold) |
+
+The pattern: **all three need a fused kernel**, because all three fold a scale into the GEMM. None of them is a "quantize then run normally" story. And **all three need calibration data**, which is a real operational cost — you must pick a set of prompts that represent your traffic, and a set tuned for one product is wrong for another.
+
+<Callout type="mentor" title="How to choose in practice">
+  If you are shipping 4-bit weights, use **AWQ-style scaling as a preprocessing step and GPTQ as the quantizer** — that combination is the most common best-quality default and is what most published 4-bit checkpoints use. Reach for **SmoothQuant** when you need low-bit *activations* (W4A4 or W8A8 with hard prompts) or when activation outliers are visibly hurting you.
+
+  Whatever you pick: calibrate on **your own prompts**, evaluate with **your own eval** (next lesson), and always keep the BF16 model around as a fallback. Quantization is a change to the model's behaviour, and the right way to ship one is the same as any other behavioural change: canary it, and be able to roll it back.
+</Callout>
+
+<Callout type="try" title="Check yourself before continuing">
+  1. A layer has one output channel whose weight column is tiny (norm 0.05) but whose activation column is huge (norm 12), and another channel with weight norm 0.4 and activation norm 0.8. Compute both saliences. Which does RTN protect and which should AWQ protect?
+  2. Why does GPTQ's compensation make its *weight* error sometimes larger than RTN's while its *output* error is smaller? What is each error measuring?
+  3. SmoothQuant multiplies activation channel $j$ by $s_j$ and divides weight row $j$ by $s_j$. Show that the layer output is unchanged in exact arithmetic. Where does the approximation enter?
+  4. You set $\alpha = 1$ in SmoothQuant. What goes wrong?
+  5. AWQ needs 128 calibration sequences; RTN needs none. Give one operational reason a team might still choose RTN over AWQ at 8 bits.
+</Callout>
+
+<KeyNotes>
+  1. RTN fails at 4 bits because it assumes all weights are equally important and that rounding errors are independent. Both are false.
+  2. AWQ weights salience by $\lVert W_{:,j}\rVert \cdot \lVert X_{:,j}\rVert$ — often 1% of channels carry a large share of the output — and spends a finer grid there, not more bits.
+  3. GPTQ quantizes left to right and pushes each column's rounding error onto later columns, weighted by the inverse Hessian of the calibration inputs. It optimises the output, not the weights.
+  4. Because GPTQ is greedy and forward-only, column order matters; block-wise processing and act-order are the standard fixes.
+  5. AWQ and GPTQ compose — AWQ scaling as preprocessing, GPTQ as quantizer is the common best-quality default.
+  6. SmoothQuant's rescaling is an **exact algebraic identity**; only the quantization that follows is approximate. It is therefore especially strong at very low activation bits.
+  7. $\alpha$ is the smoothing dial: 0 does nothing, 1 dumps all outliers into the weights, and 0.5–0.8 is the W8A8 sweet spot.
+  8. All three need a fused scale-folding kernel and a calibration set. There is no "quantize and run normally" version of any of them.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Channel A has ‖W‖ = 0.05 and ‖X‖ = 12. Channel B has ‖W‖ = 0.4 and ‖X‖ = 0.8. By what factor does AWQ consider A more salient than B?', numeric: true, answer: 1.9, tolerance: 0.4, unit: '×', why: 'Salience A = 0.05 × 12 = 0.60. Salience B = 0.4 × 0.8 = 0.32. A is 0.60/0.32 = 1.875 ≈ 1.9× more salient. RTN, seeing only ‖W‖, would protect B — the exact failure AWQ exists to fix.' },
+  { q: 'You quantize a 4096-wide weight row to INT4 at group size 128. How many FP16 scales and zero-points must you store, and how many bytes is that?', numeric: true, answer: 128, tolerance: 8, unit: 'bytes', why: '4096/128 = 32 groups. Each needs one FP16 scale (2 bytes) and one FP16 zero-point (2 bytes) = 4 bytes. Total metadata = 32 × 4 = 128 bytes, against 4096 × 0.5 = 2048 bytes of packed data — a 6.25% overhead.' },
+  { q: 'Why can GPTQ have a larger weight-space error than round-to-nearest yet produce a better model?', options: ['It is an implementation bug that gets corrected at inference', 'It deliberately makes some weights worse so the output is better; weight error ignores what each weight does to the output, output-weighted error does not', 'It uses more calibration data, so weight error is not comparable', 'Weight error is not a meaningful metric at 4 bits'], answer: 1, why: 'GPTQ spends error in directions the output is insensitive to (low inverse-Hessian diagonal) and saves precision where it is sensitive. ‖ΔW‖ treats all directions equally, so it can look worse while the actual layer output — and hence the model — is closer to the original.' },
+  { q: 'In SmoothQuant, you multiply activation channel j by s_j and divide weight row j by s_j. The layer output is:', options: ['Changed, because the two scales are different', 'Exactly unchanged in exact arithmetic; only the subsequent quantization introduces error', 'Unchanged only if s_j = 1', 'Halved, because one tensor was divided by s_j'], answer: 1, why: '(s_j·X_j)·(W_j/s_j) = X_j·W_j term by term. It is an algebraic re-association, so in infinite precision the layer computes the identical function. The whole point is that you chose a representation where both tensors quantize more easily.' },
+  { q: 'You set SmoothQuant’s α to 1.0. What happens?', options: ['Nothing changes; α only affects speed', 'All activation outliers are pushed into the weights, so the weights now have extreme outliers and quantize badly', 'Activations become FP8 automatically', 'The calibration set is discarded'], answer: 1, why: 'α = 1 migrates the maximum possible activation magnitude into the weights. Per-channel weight quantization then has to cover a much wider range per row, wasting precision — you have moved the problem rather than solved it. α around 0.5–0.8 balances the two.' },
+  { q: 'A team ships W8A8 at 8 bits. Why might they still pick RTN over SmoothQuant?', options: ['RTN is always more accurate at 8 bits', 'RTN needs no calibration data, so there is no risk of calibrating on the wrong distribution and no calibration pipeline to build or re-run on every weight update', 'SmoothQuant is not supported by their engine', 'RTN uses less memory than SmoothQuant'], answer: 1, why: 'At 8 bits activation quantization is usually good enough that the extra quality is not worth the operational cost: a calibration set that must be chosen, stored, and refreshed whenever the model is retrained. RTN is deterministic, offline, and has no data dependency — a real reason to accept slightly worse numbers.' },
+]} />

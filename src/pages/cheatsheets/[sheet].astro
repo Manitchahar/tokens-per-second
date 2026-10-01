@@ -1,0 +1,48 @@
+---
+import { getCollection, render } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import { mdxComponents } from '../../components/mdx';
+import { modules } from '../../data/course';
+import { url } from '../../site';
+
+export async function getStaticPaths() {
+  const sheets = await getCollection('cheatsheets');
+  return sheets.map((s) => ({ params: { sheet: s.data.module }, props: { s } }));
+}
+const { s } = Astro.props;
+const { Content } = await render(s);
+const mod = modules.find((m) => m.slug === s.data.module);
+---
+<Base title={s.data.title} description={`Cheat sheet: ${s.data.title}`}>
+  <article class="sheet">
+    <header>
+      <nav class="crumbs no-print"><a href={url('cheatsheets/')}>Cheat sheets</a>{mod && <> <span>/</span> <a href={url(`learn/${mod.slug}/`)}>Module {mod.num}</a></>}</nav>
+      <h1>{s.data.title}</h1>
+      <button type="button" class="btn ghost no-print" onclick="window.print()">Print this sheet</button>
+    </header>
+    <div class="body">
+      <Content components={mdxComponents} />
+    </div>
+  </article>
+</Base>
+<style>
+  .sheet { max-width: 1160px; margin: 0 auto; padding: 2.4rem 24px 0; }
+  header { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 0.6rem 1rem; margin-bottom: 1.6rem; border-bottom: 1px solid var(--rule-2); padding-bottom: 1rem; }
+  .crumbs { grid-column: 1 / -1; font-size: 0.8rem; color: var(--text-3); display: flex; gap: 0.5rem; }
+  .crumbs a { color: var(--text-2); text-decoration: none; }
+  h1 { font-size: clamp(2rem, 4.5vw, 3rem); }
+  header .btn { font-size: 0.8rem; padding: 0.55em 0.9em; }
+  .body { columns: 2 460px; column-gap: 3rem; font-size: 0.92rem; }
+  .body :global(h2) { font-family: var(--font-sans); font-weight: 700; font-size: 0.95rem; margin: 1.6rem 0 0.6rem; break-after: avoid; border-top: 1px solid var(--rule); padding-top: 0.8rem; }
+  .body :global(h2:first-child) { margin-top: 0; }
+  .body :global(p), .body :global(ul), .body :global(table), .body :global(.katex-display), .body :global(pre) { break-inside: avoid; }
+  .body :global(ul) { padding-left: 1.1rem; margin: 0 0 0.8rem; }
+  .body :global(li) { margin-bottom: 0.25rem; color: var(--text-2); }
+  .body :global(li strong) { color: var(--text); }
+  .body :global(table) { width: 100%; border-collapse: collapse; font-size: 0.84rem; margin: 0.6rem 0 1rem; font-variant-numeric: tabular-nums; }
+  .body :global(th) { text-align: left; border-bottom: 1px solid var(--rule-2); padding: 0.35rem 0.5rem 0.35rem 0; }
+  .body :global(td) { border-bottom: 1px solid var(--rule); padding: 0.35rem 0.5rem 0.35rem 0; color: var(--text-2); }
+  .body :global(.katex-display) { margin: 0.6rem 0; text-align: left; }
+  .body :global(.katex-display > .katex) { text-align: left; font-size: 1.05em; }
+  @media print { .sheet { padding: 0; max-width: none; } .body { columns: 2; font-size: 9.5pt; } header { border-color: #999; } }
+</style>

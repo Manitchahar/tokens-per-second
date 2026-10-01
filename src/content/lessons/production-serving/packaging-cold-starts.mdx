@@ -1,0 +1,219 @@
+---
+title: 'Packaging, weights & cold starts'
+summary: 'A serving replica is not ready when its process exists — it is ready after imports, checkpoint bytes, HBM copies, graph capture, autotuning and warm-up, every one of which you pay again on every scale-up and every deploy. This lesson makes that path visible, costs it out, and shows which parts you can move off it.'
+objectives:
+  - Name every phase between "replica exists" and "replica answers requests"
+  - Cost the weight-loading phase from model size and the link it travels over
+  - Explain why the page cache makes restarts cheap and new machines expensive
+  - Move weight conversion offline so the checkpoint an engine loads is already in its final layout
+  - Design a warm-up that matches the shape your real traffic will use
+---
+import ColdStart from '@/components/viz/production-serving/ColdStart.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Everything so far assumed a server that was already running. You optimised its kernels, its scheduler, its memory layout. But in production the server you care about **does not exist yet**, and the most important number about it is the one you cannot see on a dashboard: how long between the moment the platform creates it and the moment it can answer a request.
+
+That gap is the <Term t="cold-start">cold start</Term>, and it is paid far more often than people expect. Every scale-up event creates replicas. Every autoscaler decision that says "add 4" means four cold starts. Every deploy replaces the entire fleet, so your deploy cadence is also your cold-start cadence. Get this wrong and you have built a server that is fast once it is up and unavailable exactly when you need it.
+
+The good news: this is not a mysterious problem. It is a list of phases with sizes, and you can cost each one.
+
+## The path, phase by phase
+
+A replica's life before it serves anything is six phases, in this order:
+
+1. **Process launch & imports.** Start the interpreter, then import the engine and its dependency tree.
+2. **Read the checkpoint.** Pull the weight bytes off storage into memory.
+3. **Copy into GPU memory.** Move every weight tensor into HBM.
+4. **Capture CUDA graphs.** Record one decode iteration per batch shape you will admit, so later steps launch in one call instead of hundreds.
+5. **Select kernels / autotune.** Measure candidate kernels for your shapes and keep the winners.
+6. **Warm-up.** Run synthetic requests until the replica matches its steady-state behaviour.
+
+<Scrolly>
+  <ColdStart client:visible slot="stage" />
+
+  <Step title="1. The replica exists">
+    The platform has created a pod, a container, a process. The load balancer does not yet know it exists, and it cannot answer a request. Everything from here to "ready" is the cold start, and it is drawn to scale against a **readiness budget** — the time you are willing to let a replica take before it must be serving.
+  </Step>
+
+  <Step title="2. Launch & imports">
+    Before the model does anything, Python starts and imports your engine. This is the phase that shocks people: it is roughly tens of seconds, it is **entirely independent of model size**, and it is why a 0.5 B model on a fast NVMe can still take half a minute to appear.
+  </Step>
+
+  <Step title="3. Read the checkpoint">
+    Here model size finally bites. This phase is weight bytes divided by whatever throughput your storage path actually delivers — and that is the number worth measuring on your own cluster rather than trusting a datasheet.
+  </Step>
+
+  <Step title="4. Copy weights into HBM">
+    Every weight tensor has to land in GPU memory. This moves over PCIe, which is much faster than disk but not instant, and it happens **once per process** — so a rolling deploy pays it again for every replica.
+  </Step>
+
+  <Step title="5. Capture CUDA graphs">
+    <Term t="cuda-graph-capture">CUDA graph capture</Term> is what makes decode steps cheap, and you already met it in Module 15's launch-overhead lesson: a recorded iteration replays as a single launch instead of hundreds of kernel launches. The cost is per shape, so the startup bill scales with **how many batch shapes you allow**.
+  </Step>
+
+  <Step title="6. Autotune the kernels">
+    The engine measures candidate kernels for your shapes and keeps the best. It feels wasteful to pay per replica, and it is — but it is also the measurement that makes every later request faster, so you are trading startup seconds for steady-state milliseconds.
+  </Step>
+
+  <Step title="7. Warm-up is still not enough">
+    <Term t="warmup">Warm-up</Term> is synthetic traffic run until the replica is honest: caches populated, allocator grown, no lazy paths left. The important consequence is that a replica which **skipped** warm-up looks fine on its first request and is slow on its second hundred. Warm-up is not a formality.
+  </Step>
+
+  <Step title="8. Everything against the budget">
+    Add it up and compare to the budget. This is the whole design exercise in one picture: the total is what your autoscaler's reaction time is, and anything past the budget is not a slow start — it is an outage every single time you scale.
+  </Step>
+</Scrolly>
+
+## Pricing the phase that matters most
+
+The checkpoint read is the one that scales with your model, so it is the one to get right. It is just bytes over bandwidth:
+
+$$
+t_{\text{read}} = \frac{\text{weight bytes}}{\text{storage throughput}}
+$$
+
+**Worked: Llama-3.1-8B on a cold node.**
+
+At 8.03 B parameters in BF16:
+
+$$
+\text{weights} = 8.03 \times 10^9 \times 2\ \text{bytes} = 16.1\ \text{GB}
+$$
+
+If your storage path delivers about 1.2 GB/s per node — a reasonable order of magnitude for pulling a large object over a network — then:
+
+$$
+t_{\text{read}} = \frac{16.1\ \text{GB}}{1.2\ \text{GB/s}} \approx 13\ \text{s}
+$$
+
+That is 13 seconds before a single weight is in HBM. Now the same 16.1 GB across PCIe at about 24 GB/s:
+
+$$
+t_{\text{HBM}} = \frac{16.1\ \text{GB}}{24\ \text{GB/s}} \approx 0.7\ \text{s}
+$$
+
+So the disk read dominates by nearly 20×. **Optimising your host-to-device copy when the checkpoint read is cold is tuning the wrong term.**
+
+<Callout type="math" title="The same arithmetic decides how big a model you can start at all">
+  Read the formula backwards: given a startup budget $B$ and storage throughput $S$, the largest model you can cold-start is
+
+  $$
+  P_{\max} = \frac{B \times S}{b}
+  $$
+
+  With a 120-second budget at 1.2 GB/s and BF16 weights ($b = 2$ bytes), that is $P_{\max} = 1.44\times 10^{11}$ bytes = 144 GB of weights ≈ a **72 B-parameter model**. On a faster 5 GB/s store, the same budget reaches **300 B parameters**. This is the single most useful number in this lesson: it is the hard ceiling on what you can cold-start at all, and it is a property of your storage, not of your GPUs.
+</Callout>
+
+<Callout type="pitfall" title="The startup log line that is not about your model">
+  When startup feels slow, read the log timestamps rather than blaming the engine. If `loading weights` sits there for 40 seconds, your storage path is the bottleneck and no amount of engine tuning touches it. If the gaps are between import lines, you have an import-graph problem. If the gap is after everything is loaded, you are looking at graph capture and autotune, which scale with the number of shapes you admitted. These three have completely different fixes, and the timestamps tell you which one you have in about ten seconds of reading.
+</Callout>
+
+## Why the page cache is the biggest lever you have
+
+Now the observation that makes restarts cheap and new machines expensive.
+
+<Callout type="real" title="Replicas on a machine that already has the weights">
+  A restarted process on a node whose OS has the checkpoint in the <Term t="page-cache">page cache</Term> reads those 16.1 GB out of RAM rather than off disk. RAM is effectively two orders of magnitude faster than a network-backed store, so the read phase collapses from seconds to well under a second. This is why a rolling deploy on an **already-warm node** is dramatically faster than one that spins up fresh nodes — and why autoscaling that recruits cold nodes is slower than the same scale-out on warm ones.
+</Callout>
+
+The practical consequences are concrete and worth stating plainly:
+
+- **Pull-once, run-many.** Get the weights onto a node *ahead of time* — a warm pool, a pre-pulling init container, a local NVMe cache filled by a sidecar — and treat "the checkpoint is already local" as an infrastructure guarantee you own, not a happy accident.
+- **Never restart what you did not need to.** A crash or a config change that only requires restarting the process is cheap on a warm node. The same restart on a fresh node is a full cold start. Those two are not the same operation and should not share a runbook step.
+- **Cache is not durable.** The page cache dies with the machine and can be evicted under memory pressure. It is a latency optimisation, never a correctness dependency.
+
+<Callout type="intuition" title="Why the second deployment of the day is faster than the first">
+  This is the pattern that makes cold-start debugging confusing if you do not expect it: the first deploy of the morning pulls every weight blob cold, the second pulls the identical bytes into a warm page cache, and the only difference is that the cluster has been up for a few hours. People conclude that "deploys are unreliable" when the real story is that one deploy paid storage and the other paid nothing. **Always measure cold-start time on a node you have deliberately emptied.** Anything else is a measurement of your page cache.
+</Callout>
+
+## Move the conversion offline
+
+The second half of the checkpoint phase is not bytes moving — it is **transforms**. A training checkpoint is rarely in the layout an engine wants:
+
+- It may be FP32 or BF16 while you want FP8 or INT4, so it must be **quantized** (Module 11).
+- It may be sharded across however many ranks training used, in an arbitrary layout.
+- It may need a **weight conversion** pass into the engine's exact tensor naming, dtype and quantization scheme.
+
+Doing that at startup is minutes of CPU work per replica, and you pay it again on every single replica of every single deploy. Doing it once, offline, and storing the result is minutes of total work.
+
+<Callout type="math" title="The amortisation, stated as arithmetic">
+  Offline conversion costs $C$ seconds once. Serving a converted checkpoint from a warm cache costs roughly nothing per replica. Startup conversion costs $C$ seconds **per replica**, so a rollout of $R$ replicas pays $R \times C$.
+
+  A conversion that takes 180 s and a rollout of 12 replicas: **36 minutes of CPU spent re-doing an identical transform**, versus **3 minutes once** offline. The offline artifact is not an optimization here; it is 12× less of the same work, and it is also the difference between a deploy you can complete inside a maintenance window and one you cannot.
+</Callout>
+
+<Callout type="real" title="safetensors, and why the format is a security property">
+  The checkpoint format most serving stacks prefer is <Term t="safetensors">safetensors</Term>: a JSON header describing each tensor's dtype, shape and byte offset, followed by raw tensor bytes. Two properties matter here. It is **memory-mappable**, so an engine can point at the file and let the OS page it in rather than allocating a buffer and copying into it — loading becomes nearly free in latency terms. And because it contains no executable content, loading a checkpoint **cannot run arbitrary code**, unlike the pickle-based formats it replaced.
+</Callout>
+
+That last point deserves emphasis for anyone building weights pipelines. A pickle checkpoint is executable data. If your weights arrive from anywhere you do not fully control — a partner, a community model, an upload — loading one is equivalent to running the uploader's code inside your inference process, with your credentials and your GPUs. Treat the choice of checkpoint format as part of your threat model, not as a convenience detail.
+
+## Warm-up is a design decision, not a sleep
+
+The last phase is the one most often gotten wrong, because the natural implementation is "send N requests and hope".
+
+<Callout type="pitfall" title="A fixed sleep is the wrong shape of warm-up">
+  Sleeping a fixed 30 seconds is simultaneously too slow on a fast node and too short on a slow one, and it gives you no signal about whether the replica is actually ready. The correct shape is **loop until a measured condition holds**: run warm-up traffic and only flip the readiness probe when observed TPOT reaches within some factor (say 10%) of the last measured steady-state TPOT, or when the decode step time stops improving. You are measuring the thing you promised, not counting iterations.
+</Callout>
+
+And the warm-up traffic itself must match real traffic in *shape*, because caches are shape-specialised:
+
+- **Context length.** Send a warm-up request at (or near) your longest served context so the engine has populated caches for that path. Warm-up at 512 tokens does not warm a 32k path.
+- **Batch size.** Send enough concurrency that the batch bucket you actually serve gets built. If you admit batch 1 and 64, warm both.
+- **Number of distinct prompts.** Send *varied* prompts. A warm-up that reuses one prompt populates the prefix cache, and then your replica has measured a configuration your production traffic will rarely hit — the inverse of the Module 10 trap.
+
+<Callout type="intuition" title="Why warm-up on a replica you will never send real traffic to is still worth doing">
+  Because the very first real request after startup is the one a user sees. If the engine lazily compiles a kernel, lazily grows an allocator arena, or lazily populates a cache on that request, then one unlucky user pays your startup optimisation. Warm-up is how you move a cost from a randomly chosen user's latency into a phase that is only visible in your readiness metrics. It converts an unpredictable tail into a predictable startup budget — which is the entire point of this lesson.
+</Callout>
+
+## Where the time went, and what to do about it
+
+A worked decomposition for the visual's default (Llama-3.1-8B on an H100, weights cold, a 300-second budget) looks like this — and the shape is representative, not the numbers:
+
+| Phase | Approximate cost | Scales with | Your lever |
+|---|---|---|---|
+| Process launch & imports | ~18 s | dependency tree | trim imports, pin the image |
+| Read checkpoint (cold) | ~13 s | model size ÷ storage | pre-pull, warm pool, local NVMe |
+| Copy into HBM | ~0.7 s | model size ÷ PCIe | rarely the problem |
+| Graph capture | ~3–6 s | number of batch shapes | admit fewer shapes |
+| Autotune | ~6 s | kernel candidates | cache the results in the image |
+| Warm-up | ~2–4 s | steps × decode time | warm the shapes you serve |
+
+<Callout type="mentor" title="The order to fix these in">
+  Work down the table, not across it. The order above is already roughly sorted by return on effort, and the top three account for the overwhelming majority of a real cold start.
+
+  1. **Pre-pull the weights.** Biggest win, most boring, and it is an infrastructure change rather than an engine change — which is why it is usually the one that never gets done.
+  2. **Trim the import path.** If you do not need a multimodal encoder or a speculative draft model at startup, do not import them at startup. Consider <Term t="lazy-loading">lazy loading</Term>: pay the cost on first use, not on every boot.
+  3. **Shrink the shape space.** Admitting fewer batch buckets means fewer graphs to capture and fewer kernels to select. This is a real SLO decision (it caps your concurrency ladder), so make it deliberately.
+  4. **Cache autotune results** in the image, keyed by GPU model and engine version.
+</Callout>
+
+The framework to remember: **every second in that table is a second your autoscaler cannot react in.** If your scale-up policy waits for new capacity to become ready before it counts as capacity, then a 240-second cold start means a traffic spike is 240 seconds of unhandled load. This is why cold start and autoscaling are the same conversation — and Module 23 takes it up.
+
+<Callout type="math" title="The one number to put on a dashboard">
+  Track **p50 and p99 time from replica creation to first successful request**, per model version. Not CPU seconds, not container start — the end-to-end interval, because every phase above is invisible in any single subsystem's metrics. When it rises, you immediately know whether it is storage (a phase-specific histogram tells you) or something you changed. This is the cheapest observability work you will ever do, and it is the metric that tells you whether a deploy is safe.
+</Callout>
+
+<Callout type="pitfall" title="Weight offload makes cold start a latency problem, not just a time problem">
+  If you use <Term t="weight-offload">weight offload</Term> — keeping experts in host memory and streaming them to the GPU on demand, as Module 19's mixture-of-experts naturally invites — then the startup path is no longer the whole story. The first requests trigger expert fetches over PCIe while competing with real decode work, so a replica can be **ready and still slow**. Readiness probes cannot detect this, because the replica genuinely is serving. Warm-up must therefore include traffic that touches the offloaded experts, and you should expect warm-up to be materially longer than the same model fully resident.
+</Callout>
+
+<KeyNotes>
+  1. A replica is not ready when its process exists. Readiness comes after imports, checkpoint read, HBM copy, graph capture, autotune and warm-up — and every one of those is paid again on every scale-up and every deploy.
+  2. The checkpoint read costs `weight bytes ÷ storage throughput`. For Llama-3.1-8B (16.1 GB) at 1.2 GB/s that is about 13 s, and it dominates the 0.7 s PCIe copy into HBM by nearly 20×.
+  3. Read the formula backwards for the number that matters: `P_max = budget × throughput ÷ bytes-per-weight` is the largest model you can cold-start at all, and it is a property of your storage.
+  4. A warm OS page cache collapses the read phase, so restarts on a node that already has the weights are far cheaper than genuinely new nodes. Pull ahead of time; treat local weights as an invariant you own.
+  5. Convert weights **offline**. A 180-second conversion paid per replica over a 12-replica rollout is 36 minutes of identical CPU work; done once offline it is 3 minutes, and the difference decides whether the deploy fits in a window.
+  6. Prefer `safetensors`: it is memory-mappable, so loading is near-free, and it cannot execute code — which makes the checkpoint format a security property, not a convenience.
+  7. Warm-up should loop until a measured condition holds (TPOT near steady state), send context and batch shapes matching real traffic, and use varied prompts so the prefix cache is not what you accidentally measured.
+  8. Cold start is the reaction time of your autoscaler. Track end-to-end creation-to-first-request as p50 and p99, and treat it as the constraint on Module 23.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B in BF16 (8.03 B parameters) is read from storage that sustains 1.2 GB/s on a node with a cold page cache. How long does the checkpoint read alone take?', numeric: true, answer: 13.4, tolerance: 2, unit: 's', why: 'Weights = 8.03e9 × 2 bytes = 16.06 GB. 16.06 ÷ 1.2 GB/s ≈ 13.4 s. Compare with the same bytes over PCIe at 24 GB/s ≈ 0.7 s — the storage path, not the HBM copy, is the startup bottleneck.' },
+  { q: 'You have a 120-second cold-start budget, storage that sustains 1.2 GB/s, and you serve in BF16. What is the largest parameter count you can cold-start?', numeric: true, answer: 72, tolerance: 6, unit: 'B params', why: 'P_max = budget × throughput ÷ bytes-per-weight = 120 s × 1.2 GB/s ÷ 2 bytes = 72e9 bytes = 72 B parameters. This ceiling is set by your storage, not your GPUs — on a 5 GB/s store the same budget reaches 300 B.' },
+  { q: 'A rollout converts an INT4 checkpoint online, at 180 s per replica, across 12 replicas. How much identical CPU work does that cost, and what should you have done instead?', options: ['36 minutes; convert once offline and store the converted checkpoint', '3 minutes; convert once per rollout and reuse it within the rollout', '36 minutes is unavoidable because each replica has its own GPU', '6 minutes; parallelize the conversion across the 12 replicas'], answer: 0, why: '12 × 180 s = 2,160 s = 36 minutes of the same deterministic transform run 12 times. Offline conversion is 180 s once (3 minutes), and the converted checkpoint is what every replica loads. Option D is tempting but wrong on purpose: running 12 conversions at once on one node still has to finish 180 s of work, so it buys nothing over doing it once.' },
+  { q: 'Which phase of a cold start scales with model size but is NOT usually the bottleneck, and why?', options: ['Process launch, because imports scale with parameter count', 'The host-to-device copy into HBM, because PCIe is roughly 20× faster than the storage path that feeds it', 'Warm-up, because longer contexts mean more warm-up', 'Kernel autotune, because more parameters means more candidate kernels'], answer: 1, why: 'The HBM copy is model-size dependent but runs over PCIe at ~24 GB/s — about 0.7 s for 16 GB. The same bytes off disk at 1.2 GB/s take ~13 s. Optimising the copy while the read is cold is tuning the wrong term.' },
+  { q: 'Why does a restart on a warm node finish so much faster than the same restart on a fresh node, and what is the trap in relying on it?', options: ['Fresh nodes run newer CPU microcode, which is slower', 'The OS page cache already holds the checkpoint, so bytes come from RAM instead of storage — and that cache is volatile, so you must measure cold starts on a deliberately emptied node', 'Warm nodes skip graph capture entirely', 'Nothing — they are the same operation and should take the same time'], answer: 1, why: 'The page cache turns a 16 GB disk/network read into a near-instant memory read, which is why the second deploy of the day is faster than the first. The trap is concluding that cold starts are reliable when you have only ever measured them warm. Measure on a node whose cache you have cleared, and pre-pull weights as an infrastructure invariant rather than relying on the cache being there.' },
+  { q: 'Why should checkpoint format be treated as a security decision rather than a convenience?', options: ['Because safetensors files are larger and slower to read', 'Because older pickle-based checkpoints are executable data — loading one runs the author\'s code inside your inference process, with your credentials and GPUs', 'Because only safetensors can be memory-mapped', 'Because unpickled formats are incompatible with quantization'], answer: 1, why: 'safetensors is a JSON header plus raw bytes: memory-mappable, so load latency is near zero, and with no executable content, so loading cannot run code. A pickle checkpoint is the opposite on the second point. If your weights come from a partner, a community upload or anywhere you do not fully control, that distinction is the whole threat model.' },
+]}/>

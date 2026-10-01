@@ -1,0 +1,116 @@
+---
+title: 'Module 04 · Run Your First LLM'
+module: first-llm
+---
+
+## Choosing a model
+
+$$
+\text{weights memory} = \text{parameters} \times \text{bytes per weight}
+$$
+
+| Precision | bytes/weight | 0.5B | 8B | 70B |
+|---|---|---|---|---|
+| BF16 / FP16 | 2 | 0.99 GB | 16.1 GB | 141 GB |
+| FP8 / INT8 | 1 | 0.49 GB | 8.0 GB | 70.6 GB |
+| INT4 | 0.5 | 0.25 GB | 4.0 GB | 35.3 GB |
+
+- All weights sit in GPU memory **at once**. First question is "does it fit", never "how fast".
+- Budget **10–20% headroom** for the KV cache and workspace.
+- GQA shrinks KV by `query heads / KV heads` (Llama-3.1-8B: 32 / 8 = 4×).
+- Rule: **the biggest model that fits with ~15% headroom**, then let quality break the tie.
+- Prefer an **instruct** model for products; a base model continues text instead of answering.
+
+## The generate loop
+
+```
+tokenize → prefill (whole prompt, once) → sample 1 token
+        → decode (1 token, reads KV cache) → append → repeat until stop
+```
+
+| Phase | Work per step | Limiter | Scales with |
+|---|---|---|---|
+| Prefill | all prompt tokens in parallel | compute | prompt length |
+| Decode | one token, reads all weights + KV | memory | nothing much |
+
+## Decode is bandwidth-bound
+
+Each generated token re-reads **every weight exactly once**:
+
+$$
+t_{\text{token}} \approx \frac{\text{weight bytes}}{\text{bandwidth}},\qquad
+\text{tokens/s} \approx \frac{\text{bandwidth}}{\text{weight bytes}}
+$$
+
+So **speed ∝ 1 / bytes**. Halving bytes per weight roughly doubles tokens per second.
+
+## KV cache
+
+$$
+\text{bytes per token} = 2 \times \text{layers} \times \text{KV heads} \times \text{head dim} \times \text{bytes}
+$$
+
+(the 2 is for K and V)
+
+| Model | KV/token (BF16) | KV at 2,048 tokens |
+|---|---|---|
+| Qwen2.5-0.5B (24 layers, 2 KV heads, dim 64) | 12.0 KB | 25 MB |
+| Llama-3.1-8B (32 layers, 8 KV heads, dim 128) | 128 KB | 262 MB |
+| Llama-3.1-70B (80 layers, 8 KV heads, dim 128) | 320 KB | 671 MB |
+
+$$
+n_{\max} \approx \frac{\text{free memory}}{\text{bytes per token} \times T}
+$$
+
+Memory **climbs one step per generated token** and is freed only when the request ends.
+
+## Measuring
+
+- **TTFT** — time to first token. Prefill + queueing + network.
+- **TPOT** — time per output token. Decode + network. Its reciprocal is per-user tokens/s.
+- **Warm up first.** The first call on a fresh process is 2–10× slower.
+- Use **CUDA events**, never bare `time.perf_counter()` (CUDA is asynchronous).
+- GPU-Util is "was any kernel running", **not** efficiency. Pair it with tokens/s and memory.
+
+Efficiency against the floor:
+
+$$
+\text{efficiency} = \frac{\text{weight bytes}/\text{bandwidth}}{t_{\text{measured}}}
+$$
+
+Anything well below 100% is host-side overhead: launches, Python, sampling.
+
+## Serving
+
+- **Load once.** Loading takes seconds, generating milliseconds. That is why a server exists.
+- Streaming = **server-sent events**: one response, `text/event-stream`, one `data:` line per token, flushed immediately.
+- Never buffer tokens server-side — it restores the delay streaming removed.
+- Never run `generate` on the async event loop; it blocks every other request. Use a thread + queue.
+- Always `join()` the worker in a `finally`; always clamp `max_tokens` server-side.
+- `/health` must never touch the GPU, or it fails exactly when overloaded.
+
+## Latency vs throughput
+
+- Concurrency shares the weight reads → **aggregate throughput rises**.
+- Concurrency adds KV caches → **per-user TPOT worsens**, and memory is the ceiling.
+- Every serving config is a point on that curve. Never optimise one side alone.
+
+## Reference hardware
+
+| GPU | Memory | Bandwidth | Peak (BF16) |
+|---|---|---|---|
+| T4 (free Colab) | 16 GB | 320 GB/s | 65 TFLOP/s |
+| A100 80GB | 80 GB | 2.0 TB/s | 312 TFLOP/s |
+| H100 SXM | 80 GB | 3.35 TB/s | 989 TFLOP/s |
+
+The T4 has FP16 tensor cores but **no native BF16 and no FP8** — use FP16 there.
+
+## The generation parameters
+
+| Argument | Effect | Getting it wrong |
+|---|---|---|
+| `max_new_tokens` | hard cap on length | unbounded run, unbounded cost |
+| `do_sample=False` | greedy (argmax) | can loop forever |
+| `temperature` | divides logits before softmax | `→ 0` collapses to greedy |
+| `eos_token_id` | when to stop | runs to the cap every time |
+| chat template | the conversation format | model behaves like a base model |

@@ -1,0 +1,174 @@
+---
+title: 'Percentiles: why averages lie'
+summary: 'Averages hide the users who are suffering. Learn what p50/p95/p99 actually mean, why latency distributions are always skewed, and how to write a latency target that means something.'
+objectives:
+  - Define a percentile precisely and compute p50, p95 and p99 from a sample
+  - Explain why latency distributions are right-skewed and what that does to the mean
+  - Say when to use the median, the mean, and a high percentile
+  - Choose a percentile for an SLO and justify the choice
+  - 'Recognize the traps: tiny samples, averaged percentiles, and percentiles of averages'
+---
+
+import TailLatency from '@/components/viz/benchmarking/TailLatency.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A support ticket arrives: "your service is slow." You pull the dashboard and it says your average TTFT is 380 ms. That looks fine. It is also, for about one user in twenty, a lie.
+
+Nobody experiences an average. A user gets *their* request, once, and it either felt fast or it didn't. Averaging is a way of summarizing a population, and for latency the population is so lopsided that the summary describes almost nobody.
+
+## What a percentile is
+
+Sort $N$ measurements from fastest to slowest. The **p99** is the value that 99% of them beat — the slowest 1% are worse than it.
+
+$$
+\text{p99} = \text{the value below which 99\% of measurements fall}
+$$
+
+Equivalently, p99 is the value that only 1 in 100 requests exceeds. p50 is the median. p95 means 19 in 100 requests were worse.
+
+<Callout type="math" title="Computing one by hand">
+  Thirty TTFT samples in milliseconds, sorted:
+
+  ```
+  180 190 195 200 205 210 220 225 230 240 240 250 260 265 275 285
+  290 310 340 355 380 410 470 520 610 740 980 1250 1840 3200
+  ```
+
+  - **p50**: halfway is between the 15th and 16th value → $(275 + 285)/2 = 280$ ms
+  - **p90**: 90% of 30 is the 27.1th value → between the 27th (980) and 28th (1250) → about **1,007** ms
+  - **p99**: 99% of 30 is the 29.7th value → between the 29th (1840) and 30th (3200) → about **2,806** ms
+  - **mean**: sum ÷ 30 → **512** ms
+
+  Four summaries of one dataset. They span a factor of ten.
+</Callout>
+
+<Scrolly>
+  <TailLatency client:visible slot="stage" />
+
+  <Step title="1. Every service has this shape">
+    Thirty requests, one dot each. Most land in a tight cluster between 180 and 400 ms. A handful sit far to the right, out at a second, two seconds, three seconds.
+
+    This asymmetry has a name: the distribution is **right-skewed**, or long-tailed. It is not a quirk of this made-up dataset; it is the normal shape of any system with variable work and variable queuing.
+  </Step>
+
+  <Step title="2. The mean is the wrong summary">
+    The amber marker is the **mean**: add everything, divide by the count. Here it lands at 512 ms.
+
+    But there is no request in the dataset that took 512 ms. You are reporting a number that describes no user, and you have described the slow tail slightly too optimistically — it is 1.8× the median.
+  </Step>
+
+  <Step title="3. The median is the typical user">
+    The green marker is **p50**, at 280 ms. Half your requests are faster, half slower, and this is where a normal user actually sits.
+
+    When you want to say "how fast is your service for a typical person", p50 is the honest answer. Most dashboards call it the median or the "p50".
+  </Step>
+
+  <Step title="4. The tail is where users notice">
+    The dotted markers are p90 and p99. p90 is about a second; p99 is nearly three seconds, **10× the median**.
+
+    Now count the users. If you serve a million requests a day, p99 is 10,000 people. If you serve ten thousand, it is a hundred. Percentiles describe a *population*, so you must know your traffic to know how many humans are in the tail.
+  </Step>
+
+  <Step title="5. Same data, four answers">
+    The four bars are the four summaries of the identical dataset, on a log scale so you can see all of them at once.
+
+    They are not competing claims; each answers a different question. The mistake is choosing the flattering one and calling it "the latency".
+  </Step>
+
+  <Step title="6. The tail sets your bill">
+    To promise "p99 under 2 seconds", you must size the system so that 99% of requests finish inside two seconds. You are provisioning for the slow case, and slow cases are expensive: more GPUs, more headroom, more queue depth.
+
+    This is why cutting the tail is usually worth more than cutting the median. It is worth far more, per millisecond.
+  </Step>
+
+  <Step title="7. Which percentile to promise">
+    For interactive chat, **p95 or p99 on TTFT** is the right target, with p50 reported alongside so you can see the spread.
+
+    The rule of thumb: promise the percentile that describes the users you would actually lose. And always publish the median next to it — a service with p50 of 200 ms and p99 of 900 ms is a different service from one with p50 of 400 ms and p99 of 450 ms, and only the pair tells you which.
+  </Step>
+</Scrolly>
+
+## Why latency is always skewed
+
+Three mechanisms, all of which you have already met in this course, conspire to make the tail long:
+
+1. **Queuing is nonlinear.** From the M/M/1 result: at 90% utilization the mean wait is 9× the service time, and it grows without bound as you approach 100%. A small burst of arrivals creates a large latency spike.
+2. **Work is variable.** Prompt and output lengths vary. A 200-token prefill takes several times longer than a 20-token one, so the slowest requests in a batch finish last and set the tail.
+3. **Occasional slow paths.** Preemption and recompute, prefix-cache eviction, a garbage-collection pause in the allocator, another tenant appearing on the GPU. These produce rare, large excursions.
+
+<Callout type="intuition" title="The queueing amplification">
+  Here is why tail latency is a scheduling problem, not a kernel problem.
+
+  Suppose per-request service time is 50 ms. At 60% utilization, a request waits about $\frac{0.6}{0.4} = 1.5$ service times and finishes in about 125 ms. At 95%, it waits $\frac{0.95}{0.05} = 19$ service times and finishes in about 1 second — **8× worse for exactly the same amount of work.**
+
+  Nothing about the GPU got slower. You simply ran closer to the edge. This is why autoscaling on p95 latency rather than on utilization is the standard practice, and it is the subject of *Break one GPU*.
+</Callout>
+
+## The traps
+
+<Callout type="pitfall" title="Four ways percentile reporting goes wrong">
+  **Averaging percentiles.** If you have 10 replicas and each reports a p99 of 300 ms, you do *not* have a p99 of 300 ms. You have 10 separate distributions. The true p99 across all traffic is found by pooling every request — the combined p99 will be worse than the average of the per-replica p99s, and in a load-balanced fleet it is often noticeably worse.
+
+  **Percentiles of small samples.** A p99 from 30 samples is the largest of about 0.3 samples, i.e. noise. You need at least hundreds, and realistically thousands, of requests per reported percentile. Below about 1,000 samples, report p95 at best.
+
+  **Percentiles of per-batch averages.** If you compute a mean per batch and then take a p99 of those means, you have measured the tail of the *batching*, not the tail of the requests. Latency is per request.
+
+  **Choosing the percentile after seeing the data.** Writing "p90 under 500 ms" because p90 happens to be 480 ms is not an SLO. Pick the percentile from which users you are willing to lose, before you look.
+</Callout>
+
+## Writing a latency SLO
+
+A good latency objective names a **percentile**, a **threshold**, and a **time window**, and it is written per metric:
+
+> p95 TTFT under 600 ms, and p95 TPOT under 40 ms, measured over any rolling 5-minute window, at the 99th percentile of traffic days.
+
+Compare that to the versions you will actually see:
+
+| Bad | Why |
+|---|---|
+| "TTFT under 1 second" | No percentile — could mean p50 or p99 |
+| "Average TTFT under 1 second" | Describes nobody; hides the tail |
+| "TTFT under 1 second, always" | No window; one bad day and you have failed |
+| "Fast response times" | Not a number |
+
+The window matters because it defines how much slack you get. A p99 measured over 5 minutes responds to a brief spike; one measured over a month does not.
+
+<Callout type="real" title="Why p99 and not p99.9 for chat">
+  Interactive products usually stop at p95 or p99. At 10,000 requests per second, p99.9 is 10,000 requests per second that miss the target — a tenth of your traffic, which is a user-visible outage, not an edge case.
+
+  The right percentile is a business decision about how many unhappy users you accept. State it, measure it, and hold it. This is exactly the argument the next lesson makes precise with goodput.
+</Callout>
+
+## Reporting percentiles well
+
+A number in isolation is not a result. A useful latency report is:
+
+> **p50 / p95 / p99 TTFT**, **p50 / p95 / p99 TPOT**, **throughput**, over N requests at concurrency C, on GPU X, for workload W, median of R runs.
+
+The three-number shape (p50/p95/p99) is the minimum. If you can only afford two, report p50 and p99 — the median and the tail — and never a bare mean.
+
+<Callout type="math" title="Why the mean of an exponential is the wrong tool">
+  Latency tails are approximately **exponential**: once you are in the tail, each additional unit of time has roughly the same chance of arriving as the last. For an exponential distribution the mean *is* $\frac{1}{\lambda}$ and the median is $\ln 2/\lambda \approx 0.69/\lambda$ — which is why in the visual the mean exceeds the median by about 1.4× even before the extra structure of a real service.
+
+  Worse, the standard deviation of an exponential equals its mean, so a small change in load changes the mean sharply. Any summary statistic based on averaging will move when the tail moves. Percentiles are local: p50 barely notices the tail, p99 is all tail. Reporting several is the only way to see the whole shape.
+</Callout>
+
+<KeyNotes>
+  1. **p99 is the value 99% of requests beat** — the slowest 1%. Percentiles describe a population, so a p99 at 10,000 req/s means 100 unhappy users per second.
+  2. Latency distributions are **right-skewed**: most requests cluster, a few are very slow. The mean of such a distribution describes no actual request.
+  3. The median (p50) is the typical user; a high percentile is the tail. They answer different questions and can differ by 10× or more.
+  4. In an exponential tail, the mean exceeds the median by about 1.4× and the standard deviation equals the mean, so averages are unstable under load changes.
+  5. Three mechanisms lengthen the tail: **nonlinear queueing near saturation**, variable prompt and output lengths, and rare slow paths like preemption and cache eviction.
+  6. Cutting p99 is usually worth more than cutting p50, because you must size capacity for the case you promise.
+  7. Never average percentiles across replicas; pool the raw samples first. A p99 from under ~1,000 samples is noise.
+  8. A latency SLO names a percentile, a threshold, and a rolling window — "p95 TTFT under 600 ms over 5 minutes" — never a bare average.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'TTFT samples (ms), sorted: 200, 220, 240, 260, 280, 300, 320, 340, 360, 400, 900, 1500. What is the p90 (the value 90% of samples fall below)?', numeric: true, answer: 900, tolerance: 30, unit: 'ms', why: '90% of 12 is the 10.8th value, between the 10th (400) and 11th (900), so ≈ 860–900 ms depending on the interpolation convention. Using nearest-rank, the 11th value: 900 ms.' },
+  { q: 'A service has p50 TTFT of 250 ms and p99 TTFT of 3,000 ms. About how many times slower is the tail than the typical request?', numeric: true, answer: 12, tolerance: 1.2, unit: '×', why: '3,000 ÷ 250 = 12. The mean would sit nearer the p99 than the p50 in a distribution this skewed, which is exactly why means mislead.' },
+  { q: 'Each of 10 replicas reports p99 TTFT of 300 ms. You report "fleet p99 = 300 ms". What is wrong?', options: ['Nothing, it is correct', 'You averaged percentiles; the true fleet p99 must be computed from pooled raw samples and is usually worse', 'You should report the mean instead', 'Ten replicas is too few to measure p99'], answer: 1, why: 'Percentiles are not additive. Pool every request across all replicas, then take the percentile of the combined distribution. Averaging per-replica p99s understates the tail.' },
+  { q: 'Why does latency get dramatically worse as utilization approaches 100%, even though the GPU is doing the same work per token?', options: ['The GPU overheats', 'Queuing time grows as ρ/(1−ρ); at 95% utilization the mean wait is ~19× the service time', 'Memory bandwidth drops', 'Batch size automatically shrinks'], answer: 1, why: 'Queueing delay diverges as utilisation → 1. The work per request is identical; the time spent waiting for it is what explodes. That is why autoscaling keys on latency, not utilization.' },
+  { q: 'A latency SLO says "average TTFT under 500 ms". Why is this a bad objective?', options: ['Averages are too expensive to compute', 'It has no percentile, so a service with a great median and a terrible tail would pass', 'Averages cannot be measured', 'It is too strict'], answer: 1, why: 'Without a percentile the objective is ambiguous, and in practice people read it as the median. A service with p50 of 200 ms and p99 of 5,000 ms could satisfy it while a hundredth of users suffer badly.' },
+  { q: 'You want to detect a p99 regression. Roughly how many requests do you need per measurement window before the p99 is meaningful?', numeric: true, answer: 1000, tolerance: 400, unit: 'requests', why: 'The top 1% is only a handful of samples at small n — at n=30 the “p99” is essentially the maximum, pure noise. You want hundreds to thousands so the tail contains enough samples to be stable.' },
+]} />

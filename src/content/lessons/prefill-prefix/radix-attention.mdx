@@ -1,0 +1,137 @@
+---
+title: 'RadixAttention, eviction & cache-friendly apps'
+summary: 'A flat prefix cache only matches whole conversations. A radix tree matches every shared prefix, all the way down — and its eviction policy becomes the hard part. You will build both, then reshape an application around them.'
+objectives:
+  - Explain why a flat cache wastes multi-turn conversations
+  - Describe a radix tree of KV blocks and how a lookup walks it
+  - State the eviction rule that keeps shared prefixes safe
+  - Reason about what eviction costs the next request
+  - Design an application whose prompts share a long stable prefix
+---
+import RadixTree from '@/components/viz/prefill-prefix/RadixTree.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Lesson 10.2 gave you a prefix cache. Here is the awkward part of it.
+
+You are serving a chat product. A user has sent nine messages in one conversation. Your cache stores the KV blocks of that conversation, keyed by the hash of the whole prompt. Now they send message ten. It shares **nine entire messages** with what you have cached — and the cache returns nothing, because it only knows how to match complete entries. It is a cache for *conversations*, not for *prefixes*.
+
+Throw in a second user whose conversation branched off after message three, a third sharing the same system prompt, and an unrelated request from another product. You now have a dozen conversations that overlap in complicated ways, and no structure to exploit any of it.
+
+<Callout type="intuition" title="The name tells you the idea">
+  A **radix tree** is a compressed trie: a tree where every path from the root is a string, and long single-child runs are squeezed into one node. RadixAttention (from SGLang, at the time of writing) uses exactly that structure for the KV cache: **a radix tree over token blocks, shared by every request on the GPU.** Every shared prefix is stored once, and every request walks down to find its own history.
+</Callout>
+
+## From a flat list to a tree
+
+The change from "a list of conversations" to "a tree of prefixes" is small in code and large in effect.
+
+**Flat cache.** Key = hash of the whole prompt. Lookup = try a few hashes, stop at the first block-level mismatch. Sharing happens only between *identical* prompts.
+
+**Radix tree.** Key = hash of each block *in context*, chained: `hash(block_i ‖ parent_hash)`. Lookup = start at the root, walk down while child hashes match, stop at the first mismatch, and prefill the rest. Sharing happens at **every depth**.
+
+That chained hash is what makes it correct. A block of token IDs means different things at different prefixes — tokens `[50, 51]` after "the answer is" are not the cached KV of `[50, 51]` at the start of a document. Including the parent's hash in the child's key makes the identity of a block *depend on its whole history*, so a match implies an identical prefix.
+
+<Scrolly>
+  <RadixTree client:visible slot="stage" />
+
+  <Step title="1. A flat cache">
+    A flat cache stores whole conversations and matches a new prompt against complete entries. The conversation you are typing shares most of its tokens with the one you just sent, and gets nothing back.
+  </Step>
+
+  <Step title="2. A radix tree">
+    Instead, one tree per model per GPU, holding every request's blocks, keyed on every shared prefix. A prompt finds its own history wherever it was created — same GPU, different request, same node.
+  </Step>
+
+  <Step title="3. Sharing is free">
+    Several conversations branch off one shared system prompt, stored once. Two turns of the same conversation share nodes all the way down. This is Module 08's copy-on-write, made automatic by the structure.
+  </Step>
+
+  <Step title="4. It is a trie of token blocks">
+    Each edge is one KV block, hashed together with its parent. The same token IDs at the same position on the same path give the same hash — so a hit is exact, and reuse costs one walk down the tree.
+  </Step>
+
+  <Step title="5. Evicting a leaf">
+    Memory runs short, so something must go. The safe candidate is a leaf: a node with no children, no live request. Drop it and nothing else can tell.
+  </Step>
+
+  <Step title="6. Evicting a shared ancestor">
+    An internal node with living children is not a candidate. Dropping it would strand every request beneath it, so the policy only removes nodes whose whole subtree is cold — oldest first.
+  </Step>
+
+  <Step title="7. Design the application">
+    Because the cache follows the tree, your prompt structure decides the hit rate. Stable prefix first, variable part last, one shared system prompt at the root.
+  </Step>
+</Scrolly>
+
+## Eviction, which is the actual hard part
+
+Hit rate gets you the easy wins. **Eviction decides whether the feature survives contact with production.** Cache all the prefixes, and you run out of memory — and because you share prefixes, every extra entry is not one conversation's copy but a node that many conversations hang from.
+
+The naive policy, LRU over whole conversations, is wrong here for a specific reason: **it evicts by recency of the whole entry, ignoring structure.** The oldest entry in the tree may be a shared root that a hundred active requests depend on. Evicting it either corrupts them or forces a recompute cascade.
+
+The safe rule, and the one RadixAttention uses, is a *structural* one:
+
+<Callout type="math" title="The eviction rule">
+  A node is a candidate for eviction only if **its entire subtree is cold** — no running request points anywhere below it, and no child survives.
+
+  Evict candidates in least-recently-used order. When you drop a node, its children are already gone, so nothing is stranded and nothing must be recomputed. A shared ancestor with living descendants is simply never on the list.
+
+  The consequence to internalize: **you can only evict leaves.** Memory pressure therefore propagates *upward* from the tips, and a prefix stays cached precisely as long as something is still branching below it.
+</Callout>
+
+That rule has a consequence worth designing around. Shared prefixes are the *last* things to go, because something is always branching below them. So a workload with a genuinely shared prefix (a system prompt, a hot document set) keeps its cache across memory pressure, while a workload of unrelated one-shot queries has no structure to protect and degrades to plain LRU. Structure is the defence.
+
+## What eviction costs, and how to measure it
+
+Evicting a node is free for the requests still running — they hold references to live blocks, and a node is only a candidate when nothing live points below it. The cost lands on the **next** request that wanted that prefix:
+
+1. it misses, and prefills those tokens again;
+2. that prefill is charged to its TTFT;
+3. if the prefix was long, that is a visible latency spike.
+
+Two metrics tell you whether the policy is healthy:
+
+- **Hit rate**, ideally broken into *prefix hit rate* (tokens reused) and *full-hit rate* (requests served entirely from cache).
+- **Eviction pressure** — the share of a step in which the cache had to evict, or equivalently how close you run to the memory limit.
+
+<Callout type="pitfall" title="Running the cache at 100% is a mistake">
+  An engine that lets the prefix cache consume all GPU memory leaves nothing for activations, sampling, or a request whose context is growing — and you will OOM in production, not in a test. Budget the KV pool the way Module 08 taught you to budget concurrency: reserve a fraction for workspace, cap the sequence count, and give the prefix tree its own limit rather than letting it grow until something crashes. The hit rate you lose by capping at, say, 80% of the pool is far cheaper than the OOM you avoid.
+</Callout>
+
+## Designing the application around the tree
+
+The tree rewards a very specific prompt shape: **long, byte-identical, stable prefix; short, variable tail.** Getting there is mostly an application-design decision, not an engine one.
+
+**Multi-turn chat — already ideal.** Send the conversation as the prefix, newest turn at the end. Every turn hits the whole history. Keep the *template* bytes identical too: a different date string in the system prompt throws the cache away for every request.
+
+**RAG — sort the context.** Two questions about the same document produce the same retrieved chunks, but only if order is deterministic. Sort by document ID. Remove per-request timestamps, request IDs and user IDs from the *front* of the prompt — put them at the *end*, after the shared context. Then re-retrieved context re-hits.
+
+**Agents — keep the history intact.** An agent loop that re-sends its whole transcript every step gets a hit rate of nearly 100% for free. An agent that summarizes or reorders its history between steps destroys the prefix every turn.
+
+**Few-shot and tool schemas — trivial wins.** A stable example block and a stable tool list are exactly the shared prefix this feature is for. Keep them byte-identical across deployments, or the cache empties on every release.
+
+<Callout type="recap" title="The three rules, together">
+  1. **Stable first, variable last.** The prefix is the part every request shares; put anything unique at the end.
+  2. **Byte-identical or nothing.** One changed byte — a timestamp, a UUID, a different sort — restarts the walk at the first mismatching block.
+  3. **Reuse beats recompute, structurally.** Group requests so they branch from the same root, and the tree keeps that root alive under memory pressure all by itself.
+</Callout>
+
+<KeyNotes>
+  1. A flat cache keys whole conversations, so a tenth turn shares nine messages with the cache and still gets nothing. A radix tree keys **every** shared prefix.
+  2. Blocks are hashed with their parent hash (`hash(block ‖ parent)`), so a block's identity includes its whole history — which is what makes reuse exact.
+  3. One tree per model per GPU. A request walks down while hashes match, stops at the first mismatch, and prefills only the remainder.
+  4. Eviction is the hard part. The safe rule: **evict only leaves whose subtree is cold**, oldest first. You can only evict from the tips upward.
+  5. Shared prefixes are the last thing evicted, because something is always branching below them. Structure is the defence under memory pressure.
+  6. Eviction costs the *next* request that wanted the prefix: a miss, a recompute, and a TTFT spike. Watch prefix hit rate and eviction pressure together.
+  7. Budget the prefix pool below 100% of GPU memory. A cache that grows until OOM is a cache you will debug in production.
+  8. Design the prompt shape: stable prefix first, variable tail last, byte-identical every time. Sort RAG context by document ID and move timestamps and IDs to the end.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A cache is full and the least-recently-used entry is a system-prompt node with 40 live conversations branching below it. What should a correct radix eviction policy do?', options: ['Evict it, since it is least recently used', 'Evict it and force all 40 conversations to recompute their prefix', 'Skip it: it has surviving children, so it is not a leaf and not a candidate', 'Evict all 40 conversations, which frees more memory anyway'], answer: 2, why: 'The rule is structural: only nodes whose entire subtree is cold are candidates. Dropping an internal node would strand every request beneath it, so the policy walks upward from the leaves instead.' },
+  { q: 'A block of tokens `[50, 51]` appears in two prompts, once at the start and once after other tokens. Why must the cache key include the parent hash?', options: ['To compress the key so it fits in an integer', 'Because identical tokens at different positions produce different keys and values, so identity depends on the whole prefix', 'Because block hashes collide without it', 'To let the cache evict leaves'], answer: 1, why: 'A token’s hidden state depends on everything before it, so `[50, 51]` after "the answer is" is not the same KV as `[50, 51]` at a document’s start. Chaining the parent hash makes identity prefix-dependent, which is what makes a hit exact.' },
+  { q: 'What is the main reason to cap the prefix cache below 100% of GPU memory?', options: ['Capping it always increases the hit rate', 'To leave room for activations, sampling and growing sequences, avoiding OOM in production', 'Because a full cache cannot store new nodes', 'To leave room for the model weights'], answer: 1, why: 'Weights are a fixed reservation; what a runaway prefix cache competes with is the transient memory each step needs and the KV space growing sequences require. Budget the pool below full, the way Module 08 budgets concurrency.' },
+  { q: 'Your RAG prompt is built as: a timestamp, then retrieved documents in score order, then the question. Hit rate is near zero. What is the single most effective fix?', options: ['Reduce the KV block size to 16 tokens', 'Increase the prefix cache budget', 'Sort retrieved documents by document ID and move the timestamp after them', 'Switch to a larger model'], answer: 2, why: 'The prefix must be byte-identical to hit. An unstable sort and a leading timestamp change the token sequence on every request, so the walk stops at block zero. Reordering makes the shared head stable for free.' },
+  { q: 'Which application gets the highest prefix hit rate with no extra engineering?', options: ['A batch of unrelated one-shot queries', 'Multi-turn chat, where each turn re-sends the whole conversation', 'Random user-uploaded documents as prompts', 'Requests with a unique request ID at the front of the prompt'], answer: 1, why: 'In multi-turn chat the shared prefix is the conversation itself, so nearly every token of every turn after the first is reused. The others have nothing shared but the chat template.' },
+  { q: 'An agent rewrites and reorders its transcript history between steps. What does that do to prefix caching?', options: ['Nothing, the KV blocks are re-used by hash regardless of order', 'It improves the hit rate by keeping blocks warm', 'It destroys the prefix every turn, because the shared token sequence changes and the walk stops early', 'It halves the KV memory per request'], answer: 2, why: 'A hit requires the same tokens at the same positions on the same path. Rewriting history changes the sequence, so the cache can only share the leading system prompt and nothing of the transcript.' },
+]} />

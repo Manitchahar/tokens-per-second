@@ -1,0 +1,229 @@
+---
+title: 'Goodput per dollar & choosing GPUs'
+summary: 'The fastest GPU is not the cheapest GPU, and the cheapest GPU is not the best value. This lesson derives the two price-per-unit numbers that rank hardware, shows why they disagree, and gives you the break-even test that settles a purchase in your head.'
+objectives:
+  - 'Define goodput per dollar and explain why it is the only metric that compares two systems honestly'
+  - 'Compute dollars per unit of bandwidth and dollars per unit of FLOP/s for a set of cards'
+  - 'Explain why those two rankings disagree and which one your traffic selects'
+  - 'Apply the break-even test — a cheaper card wins if it is proportionally slower than it is cheaper'
+  - 'Show that for a model that does not fit, memory usually decides before speed does'
+---
+
+import GoodputPerDollar from '@/components/viz/economics/GoodputPerDollar.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You can now price a token. The obvious next question is hardware: **which GPU should we buy?**
+
+This is where most teams go wrong, and they go wrong in a specific, predictable way. They compare the biggest number on the spec sheet — throughput — and they pick the newest card. Then they discover the bill.
+
+Here is the thing nobody puts on a spec sheet: the newest card is also the most expensive card, and for serving workloads the two effects very nearly cancel. The right comparison is not speed and it is not price. It is **value**.
+
+<Callout type="mentor" title="This is a real job skill">
+  Choosing hardware for an inference service is a routine part of the role, and it is done by someone who has actually done the arithmetic. A candidate who can sit down with a spreadsheet, take a workload, and say which card is cheapest *for that workload* — and by what factor — is demonstrating the thing this module is for.
+</Callout>
+
+## The metric that decides it
+
+From Module 06, goodput is throughput multiplied by the fraction of requests that met their SLO. The natural extension is to divide by what you paid:
+
+$$
+\text{goodput per dollar} = \frac{\text{goodput (tokens/s)} \times 3600}{\text{dollars per hour}}
+$$
+
+Units: **good output tokens delivered per dollar spent**. It is the only column that compares two configurations honestly, because it is the only one that prices *the promise you made* rather than the speed you achieved.
+
+<Callout type="math" title="Worked: why the two rankings of two cards differ so much">
+  Two cards. One card delivers 4,603 tokens/s at \$2.50/hour; the other delivers 2,873 tokens/s at \$1.60/hour.
+
+  - Throughput: the first is **1.60× faster**.
+  - Cost per million output tokens: \$0.197 versus \$0.241 — a **1.22×** difference.
+
+  The faster card is only 1.22× cheaper per token. It is not the 1.60× the throughput chart suggests, because you are paying for the *seconds*, and a faster card retires the work in fewer of them.
+
+  But look at the second number: 2,873 tokens/s for \$1.60/hour is **1,796 tokens per dollar-hour**, against 1,841 for the fast card. **The cheap card is 2.5% better value while being 38% slower.** That is the entire argument, and it takes one division.
+</Callout>
+
+## Two numbers per card, and they disagree
+
+Strip the model out of it and each card has exactly two prices that matter for serving.
+
+**Dollars per unit of bandwidth.** Decode is memory-bound (Module 05): the step reads weights and KV and waits for bytes. So a card that makes output tokens cheap is a card whose *price* is low relative to its *bandwidth*. This is the <Term t="price-per-bandwidth">dollars per (TB/s)</Term> column.
+
+**Dollars per unit of FLOP/s.** Prefill is compute-bound: the prompt goes through the model in one parallel pass. So for a prompt-heavy product, a card that makes prompt tokens cheap is low price relative to arithmetic. This is the <Term t="price-per-flops">dollars per (PFLOP/s)</Term> column.
+
+| Card | \$/hour | Bandwidth | \$ per (TB/s) | \$ per (PFLOP/s) |
+|---|---|---|---|---|
+| T4 | 0.35 | 0.32 TB/s | 1.09 | 5.38 |
+| L4 | 0.80 | 0.30 TB/s | 2.67 | 6.61 |
+| A100 80GB | 1.60 | 2.00 TB/s | 0.80 | 5.13 |
+| H100 SXM | 2.50 | 3.35 TB/s | 0.75 | 2.53 |
+| H200 | 3.50 | 4.80 TB/s | 0.73 | 3.54 |
+| B200 | 5.50 | 8.00 TB/s | 0.69 | 2.44 |
+
+*(Public spec-sheet numbers and illustrative on-demand rates; both move over time, so re-check before you buy.)*
+
+<Callout type="intuition" title="Two things to notice in that table">
+  **First: the bandwidth column barely moves.** From the A100 to the B200, dollars per TB/s falls only about 14% — while raw bandwidth rises fourfold. Memory bandwidth got dramatically better and got dramatically *more expensive*, and the net effect on cost per token is a modest improvement.
+
+  **Second: the FLOP column moves a lot.** The same comparison shows roughly a halving. Arithmetic improved faster than its price.
+
+  The consequence is a genuinely useful asymmetry: **if your product is decode-bound, a new generation of GPU is not going to save you much money. If it is prefill-bound, it might halve your bill.** Which one you are is a question about your traffic, not your hardware.
+</Callout>
+
+<Scrolly>
+  <GoodputPerDollar client:visible slot="stage" />
+
+  <Step title="1. The wrong question">
+    Each row is one card, each bar one fixed job: Llama-3.1-8B, a 512-token prompt, a 256-token answer, 64 concurrent streams. Same model, same code, same tokens.
+
+    The amber bar is speed. It is the number on the spec sheet, and it is also the number that is least informative about cost.
+  </Step>
+
+  <Step title="2. Two cards, one job">
+    Now the second bar: dollars per million output tokens, counting every card you are billed for. If a card cannot hold the weights, it is drawn hatched and its cost is not a price at all.
+
+    The fastest card and the cheapest card are already visibly different rows, and neither of them is obviously right.
+  </Step>
+
+  <Step title="3. Divide by the price">
+    The readout divides throughput by dollars per hour. That is goodput per dollar, and it is the first column in this lesson that is a decision rather than a description.
+
+    Notice how much closer together these values are than the throughput values. Hardware generations differ a lot in speed and surprisingly little in value.
+  </Step>
+
+  <Step title="4. Rank by price per bandwidth">
+    Decode is memory-bound, so this is the column that ranks a decode-heavy product: sort by dollars per TB/s, cheapest first.
+
+    The T4 and L4 look terrible here, and that is correct for a datacentre decode workload — they have almost no bandwidth per dollar. But they are cheap for other reasons, which is step 7.
+  </Step>
+
+  <Step title="5. Rank by price per FLOP/s">
+    Now the prefill column. The ordering changes: the newer cards separate hard from the older ones.
+
+    **The two rankings disagree, and that disagreement is the whole lesson.** No card is simply "the best". There is a card that is best for long answers and a different card that is best for long prompts.
+  </Step>
+
+  <Step title="6. Your traffic picks the column">
+    Move the prompt and output sliders. A long prompt with a short answer is prefill-priced and the FLOP ranking applies. A one-line prompt with a long answer is decode-priced and the bandwidth ranking applies.
+
+    Real traffic is a mixture, so the honest answer is a weighted blend — and the weights are your traffic distribution, which you should go and measure.
+  </Step>
+
+  <Step title="7. The break-even test">
+    Here is the rule that settles most comparisons in your head: **a cheaper card wins if it is proportionally slower than it is cheaper.**
+
+    Each row compares a card against the H100 on per-user tokens per second (not per batch — batching makes every card look similar and hides the difference). If the slowdown factor is smaller than the price factor, the cheaper card wins on every token.
+  </Step>
+
+  <Step title="8. Read the set, not the winner">
+    Plot every candidate on cost against speed and keep the ones nothing else beats both of. You get a <Term t="pareto-frontier">Pareto set</Term>, not a name.
+
+    Then apply the constraints you already know — does it fit, does it meet the tail, is the minimum batch high enough to be worth it — and those pick from the set. This is the same <Term t="selection-matrix">selection matrix</Term> discipline from Module 17, with cost as the metric.
+  </Step>
+</Scrolly>
+
+## The break-even test
+
+Here is the rule that settles most comparisons in your head: **a cheaper card wins if it is proportionally slower than it is cheaper.** That is the <Term t="break-even-test">break-even test</Term>, and it is worth being able to do in your head during a purchase conversation.
+
+Let us apply it to a real set of cards. The workload: **Llama-3.1-8B, 512 prompt tokens, 256 output tokens, 2,048 tokens of context, 64 concurrent streams, BF16, interactive latency SLO.**
+
+| Card | tok/s | per-user tok/s | Max streams that fit | \$/hr | \$/M output | Goodput per \$-hr |
+|---|---|---|---|---|---|---|
+| A100 80GB | 2,873 | 45 | 226 | 1.60 | 0.241 | 1,796 |
+| **H100 SXM** | **4,603** | **72** | 226 | 2.50 | **0.197** | **1,841** |
+| H200 | 6,302 | 98 | 444 | 3.50 | 0.219 | 1,800 |
+| B200 | 9,561 | 149 | 583 | 5.50 | 0.211 | 1,738 |
+
+<Callout type="math" title="What this table actually says">
+  Ranked by throughput the order is B200, H200, H100, A100 — and the newest card wins by **3.3×**.
+
+  Ranked by dollars per million output tokens the order is **H100, B200, H200, A100**. The fastest card is *second*, and by 12%.
+
+  Ranked by goodput per dollar the order is **H100, A100, H200, B200** — and the spread across all four is under 8%. **Four cards, a 3.3× range in speed, and a 1.06× range in value.**
+
+  That is the finding, and it is robust across workloads: for memory-bound decode, hardware generations buy you speed much faster than they buy you value. If your decision is "which card", the honest answer is usually "the one that is easiest to get, fits the model, and has the fewest operational surprises" — with the cost difference a rounding error next to the risk of a bad purchase.
+</Callout>
+
+<Callout type="real" title="So why do people buy the newest card anyway?">
+  Three legitimate reasons, none of them cost:
+
+  1. **Fewer cards for the same capacity.** If you have a fixed rack, a fixed power budget or a fixed number of slots, then throughput per card *is* the constraint, and the newest card genuinely lets you deploy fewer machines. Value per dollar stops being the only thing that matters when the denominator is slots rather than dollars.
+  2. **Per-user latency.** At the same batch, the H200 gives 98 tokens/s per user against the H100's 72. If your SLO is on per-user speed and you refuse to raise concurrency, speed is what you need.
+  3. **Fewer cards to operate.** A smaller fleet is a smaller on-call surface. At \$2.50/hour the difference over a year is roughly \$22,000 per card, so this is a real trade — but it is a decision about operational risk, and it should be argued as one.
+
+  Make the argument you are actually making. "It is faster" and "it is better value" are different claims, and only one of them is supported by the table.
+</Callout>
+
+<Callout type="pitfall" title="When the value spread is not small">
+  The finding above is about **decode-bound** traffic at a moderate context. It does not hold everywhere, and saying it as though it does is its own error.
+
+  - **Prefill-bound traffic** (long prompts, short answers) ranks by dollars per FLOP/s, where the newer cards separate by ~50%. There, the newest card genuinely is better value.
+  - **Long context** shifts cost back toward bandwidth and toward memory capacity, and the H200's 141 GB can be worth several times its price premium if it removes tensor parallelism.
+  - **A model that does not fit** is decided by card count, not by speed at all.
+
+  Compute the spread for your workload before you generalise. The method is the thing; the conclusion is per-workload.
+</Callout>
+
+## When memory decides instead
+
+For small models on modern cards, value is nearly flat and speed decides. That stops being true the moment the weights no longer fit.
+
+Take **Llama-3.1-70B**. In BF16 it needs 141 GB. An 80 GB card cannot hold it. So the question stops being "how fast is this card" and becomes "how many cards must I buy, and what does the communication between them cost?"
+
+| Configuration | Cards billed | Weights | Fits one card? | Streams that fit | \$/M output |
+|---|---|---|---|---|---|
+| 70B BF16 on H100 | 2 | 141 GB | no — sharded | 0 | 6.65 |
+| 70B BF16 on 1 × B200 | 1 | 141 GB | yes | 47 | 2.77 |
+| 70B INT8 on H100 | 2 | 71 GB | no — 2 cards | 9 | 4.22 |
+| **70B INT4 on 1 × H100** | **1** | **35 GB** | **yes** | **61** | **1.35** |
+| 70B INT4 on 1 × A100 | 1 | 35 GB | yes | 61 | 1.76 |
+
+<Callout type="math" title="Read the last two rows together">
+  The A100 is a **1.56× cheaper card** than the H100. On this job it is about **1.63× slower per user**. So it is *slightly* too slow for the saving, and it loses — but only just, and only on this configuration.
+
+  Now move up one row: **INT8 weights are 71 GB, which needs two H100s.** The price roughly triples to \$4.22 while the A100 is still running one card comfortably. **The cheaper card now wins outright**, because it is the only card that can hold the model at all.
+
+  The lesson is that these two decisions are not independent. Precision determines how many cards you need; the card count determines the bill. This is <Term t="precision-first">precision first, then card</Term> — because precision can move the card count, and the card count is a multiplier on everything.
+</Callout>
+
+<Callout type="pitfall" title="Three arguments to distrust in a hardware decision">
+  1. **"It is twice as fast."** Speed per card is not value. Check the price per million tokens, and check the price *including every card you are billed for*.
+  2. **"The benchmark said so."** A benchmark measured at batch 1, or with a short context, or on a workload you do not have, ranks cards by a property your traffic does not share. Use your harness from Module 06, on your workload.
+  3. **"It has more memory."** More memory is a *feasibility* property, not a cost property. It lets the model load; it does not by itself make tokens cheaper. But it can, by letting you avoid tensor parallelism — which is a 2× multiplier on the bill, so check it properly.
+</Callout>
+
+<Callout type="try" title="Do this before your next hardware conversation">
+  Write down, in this order: the model, the precision, the prompt and output length distribution, the concurrency you intend to run at, and the SLO. Then compute dollars per million tokens for each candidate card — including the card count — and rank them.
+
+  If the top two are within about 10%, the cost argument has run out and you should choose on fit, availability and operational familiarity. Say so explicitly in the write-up, because "they were within 8%" is a *finding*, and "the new card was faster" is not.
+</Callout>
+
+<Callout type="recap" title="The three-sentence version">
+  **Goodput per dollar** is the only column that compares two cards honestly, because it prices the work that met your SLO against what you paid for it.
+
+  Two numbers per card decide it: **dollars per TB/s** ranks decode workloads, **dollars per PFLOP/s** ranks prefill workloads, and they disagree — so your traffic mix picks between them.
+
+  And when the weights do not fit, memory decides before speed ever gets a vote.
+</Callout>
+
+<KeyNotes>
+  1. **Goodput per dollar** = good tokens delivered per dollar spent. It is the only metric that compares two systems, because it prices the SLO you promised rather than the speed you achieved.
+  2. Each card has two prices that matter: **dollars per unit of bandwidth** (ranks decode) and **dollars per unit of FLOP/s** (ranks prefill).
+  3. Those two rankings **disagree**. There is no best card; there is a best card *for your traffic mix*, and you have to measure the mix.
+  4. From an A100 to a B200, dollars per TB/s falls only ~14% while dollars per PFLOP/s roughly halves. **Newer hardware helps prefill workloads far more than decode workloads.**
+  5. In the worked comparison, four cards span a **3.3× range in throughput and a 1.06× range in goodput per dollar**. When the spread is that small, choose on fit and operational risk, and say so.
+  6. Legitimate reasons still exist to buy the newest card — slots and power are fixed, per-user latency is the SLO, fewer cards means less to operate. Just make that argument explicitly rather than smuggling it in as "value".
+  7. **Precision first, then card.** How many cards you need is decided by how many bits the weights take, and the card count is a multiplier on the whole bill. An INT4 70B on one H100 beats BF16 on two by a factor of about five.
+  8. A cost comparison that ignores the memory edge, or that prices a tensor-parallel deployment as one card, is not a cost comparison. It is arithmetic about a machine that does not exist.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Card A delivers 4,603 tokens/s at \$2.50/hour. Card B delivers 2,873 tokens/s at \$1.60/hour. How many tokens per dollar-hour does the cheaper card deliver, compared with the expensive one?', numeric: true, answer: 1796, tolerance: 40, unit: 'tokens', why: 'Tokens per dollar-hour is just throughput ÷ price. B: 2,873 ÷ 1.60 = 1,796. A: 4,603 ÷ 2.50 = 1,841. Card A is 2.5% better value while being 60% faster — the spread in value is tiny compared with the spread in speed.' },
+  { q: 'A card costs \$1.60/hour and is 1.6× slower per user than a \$2.50/hour card. Does the cheaper card win?', options: ['Yes — it is cheaper', 'No — it is 1.6× slower but only 1.56× cheaper, so it is very slightly too slow for the saving', 'Yes — cost per token is what matters, not speed', 'It depends on the batch size'], answer: 1, why: '1.60 / 2.50 = 0.64, so it is 1.56× cheaper. It is 1.6× slower. Break-even requires slower-by less than cheaper-by, and 1.6 > 1.56 — so it loses, but only by 2.5%. At INT8 weights, where the cheap card can hold the model on one card and the expensive one needs two, the same arithmetic reverses completely.' },
+  { q: 'An H100 at \$2.50/hour delivers 4,603 output tokens/s. Roughly how many output tokens does one hour of that card produce, in millions?', numeric: true, answer: 16.6, tolerance: 0.4, unit: 'M tokens', why: '4,603 tokens/s × 3,600 seconds = 16.6M tokens per hour. That is the numerator of goodput per dollar: divide by the \$2.50 hourly price and you get 6,626 thousand good tokens per dollar-hour, before any SLO filter is applied.' },
+  { q: 'From an A100 to a B200, roughly how much does dollars per (TB/s) fall, and how much does dollars per (PFLOP/s) fall?', options: ['About 14% and about 53%', 'About 53% and about 14%', 'Both about 50%', 'Neither moves meaningfully'], answer: 0, why: 'A100 is \$0.80 per TB/s and \$5.13 per PFLOP/s. B200 is \$0.69 and \$2.44. That is a 14% fall in the bandwidth price and a 53% fall in the FLOP price. Memory bandwidth improved far more slowly relative to its price than arithmetic did — so new hardware helps prefill-heavy products much more than decode-heavy ones.' },
+  { q: 'Llama-3.1-70B in BF16 needs 141 GB and an 80 GB card holds 80 GB. What is the first question when costing this deployment?', options: ['How fast is the card', 'How many cards must be bought, because the bill is multiplied by that number and each step is slowed by communication', 'What is the price per million tokens on one card', 'Whether the GPU supports BF16'], answer: 1, why: 'The model does not fit, so the decision is about card count before it is about card quality. Two cards is a 2× multiplier on the bill plus the collective cost, while 4-bit weights fit on one card and eliminate both. That is why precision is chosen before hardware.' },
+  { q: 'Four cards span 3.3× in throughput and only 1.06× in goodput per dollar, on a decode-bound workload. What is the defensible conclusion?', options: ['Buy the fastest, since more speed is never wasted', 'The cost argument is exhausted — choose on fit, availability and operational familiarity, stating that the spread was under 10%', 'The cheapest is always correct', 'Average the two rankings'], answer: 1, why: 'When the value spread is under about 10%, cost cannot distinguish the candidates and any of them is defensible. Choosing on fit and operational risk is then the right call — but it has to be written down as a deliberate choice, because "it was faster" would be an unsupported claim. Note the qualification: on prefill-bound traffic the spread is far larger and the newest card does win on value.' },
+  { q: 'Two cards are otherwise identical, but one has 2× the memory at the same price. When does that make it cheaper per token?', options: ['Never — memory does not affect cost', 'Always — more memory means more speed', 'When the extra memory lets you avoid tensor parallelism, avoiding a 2× multiplier on the bill', 'Only if you use more batch size'], answer: 2, why: 'Memory is a feasibility property, so on its own it does not change cost per token. But if it lets a model that would need 2 cards fit on 1, you remove a 2× multiplier on the bill — that is a large, real saving, and it is why 4-bit weights beat a bigger card.' },
+]} />

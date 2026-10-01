@@ -1,0 +1,239 @@
+---
+title: 'Tiered KV: CPU, SSD & remote caches'
+summary: 'The KV cache does not have to live beside the GPU. You will price each tier by the only number that matters — bandwidth against the cost of recomputing — find the crossover where fetching stops paying, and learn why the engineering is not the storage but the overlap.'
+objectives:
+  - Price a KV read from each tier against the cost of recomputing the same tokens
+  - Compute the bandwidth at which fetching and recomputation break even
+  - Explain why recompute is nearly free during a memory-bound decode step
+  - Size the resident prefix so that streaming hides inside one step
+  - Name the correctness and concurrency hazards that offload creates
+---
+import TierLadder from '@/components/viz/long-context/TierLadder.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Your service needs to serve a 200,000-token context. There is no model with a 200K window you want to buy, no card with the memory for the cache, and no amount of clever scheduling that will conjure 200 GB.
+
+And yet this is not an unusual requirement. Long documents, long agent histories, multi-session memory, video and audio transcripts, codebases — these all want far more context than any card can hold. The interesting fact is that **this is a storage problem, and storage problems have been solved before.**
+
+The insight, and it is the whole lesson: the KV cache is *derived data*. Every byte of it can be recomputed from the prompt, because that is literally what prefill does. It is the one piece of a transformer that is not irreplaceable. So it does not have to be stored where the model runs. It can live on a cheaper tier and be fetched when needed — and at some point, fetching stops being worth it and you recompute instead.
+
+## The ladder
+
+Four places, three wires. Approximate public spec-sheet numbers, and the numbers that matter are bandwidth and capacity, not price.
+
+| Tier | Sustained bandwidth | Capacity per machine | Reaches the GPU how |
+|---|---|---|---|
+| GPU HBM (H100 SXM) | **3.35 TB/s** | 80–141 GB | on-package |
+| Host DRAM, PCIe 5.0 ×16 | **55 GB/s** | 256 GB–2 TB | PCIe, ~128 GB/s peak |
+| Local NVMe, PCIe 4.0 ×4 | **7 GB/s** | 2–30 TB | PCIe, same controller |
+| Remote node, 10 GbE | **1.25 GB/s** | node-sized | the network |
+
+That is **2,700×** from the top to the bottom. It is also roughly 8×, 8× and 5× between neighbours — each step down is a real cost, not a rounding error, and this is why "just put it on the CPU" is a valid engineering answer for one workload and a disaster for another.
+
+<Scrolly>
+  <TierLadder client:visible slot="stage" />
+
+  <Step title="1. Four places to put a cache">
+    The KV cache of a running request does not have to be in GPU memory. Host memory, a local SSD, and another machine are all reachable, with very different numbers. Laddering them is the design space for the rest of this lesson.
+  </Step>
+
+  <Step title="2. Bandwidth is the whole story">
+    The bars are on a **log scale**. HBM is about 60× faster than host DRAM, which is about 8× faster than NVMe, which is about 5× faster than a remote node. Eight orders of magnitude separate the ends, which is why "tiered" is a real engineering discipline and not just "put it somewhere slower."
+  </Step>
+
+  <Step title="3. The cost of one token">
+    One token of KV for Llama-3.1-8B is 131,072 bytes. From HBM, 39 **nanoseconds**. Over PCIe, 2.4 **microseconds**. From NVMe, 19. From another machine, 105 — a tenth of a millisecond to read 128 KB, across a network.
+  </Step>
+
+  <Step title="4. The other option: recompute">
+    But you do not have to fetch those keys and values — you can **recompute** them. Push the tokens through the model again, which costs $P \cdot 2$ FLOPs, about **29.5 microseconds** on an H100 at 55% MFU. And here is the twist that makes this interesting: a decode step is memory-bound, so **its tensor cores are already sitting idle.**
+  </Step>
+
+  <Step title="5. The crossover">
+    Line the two up and the decision becomes arithmetic. PCIe wins by an order of magnitude. NVMe is almost exactly even. A remote node on 10 GbE **loses to recompute by 3.5×** — so streaming across a slow network is the wrong answer, and the crossover is a bandwidth you can compute.
+  </Step>
+
+  <Step title="6. What it means per step">
+    Multiply by context and batch and this becomes a per-decode-step decision. At 32,768 tokens and a batch of 8, streaming from NVMe costs 4.9 seconds per step while recomputing the context costs 0.97 seconds of FLOPs you were not otherwise using.
+  </Step>
+
+  <Step title="7. The rule">
+    Keep the cache where **fetching beats recomputing** — roughly anything above 4.4 GB/s for this model — and never stream more than you can hide inside a single step. Everything else in this lesson is the machinery for doing exactly that.
+  </Step>
+</Scrolly>
+
+## Why recompute is nearly free
+
+The crossover above is the most counter-intuitive number in this module, so let me justify it properly.
+
+Recomputing one token of KV means running it through the model, which costs $P \cdot 2$ FLOPs because a token-forward costs twice the parameter count (Module 05's <Term t="token-forward">token-forward</Term>). For Llama-3.1-8B on an H100 at 55% MFU:
+
+$$
+t_{\text{recompute}} = \frac{2 \times 8.03\times 10^9}{989\times 10^{12} \times 0.55} \approx 29.5\ \mu\text{s}
+$$
+
+Now the part that matters. A decode step for a batch of 32 at 8K context takes about **18.8 ms** and is **memory-bound** — it is waiting on bytes, and its arithmetic units are close to idle. The projection FLOPs in that step are roughly those of a token-forward times the batch size, which at the same MFU is about **0.94 ms**. So the math units are busy about **5%** of the step.
+
+That is Module 05's <Term t="waste-currency">waste only costs what it is made of</Term>, and it is why tiered KV works at all:
+
+<Callout type="intuition" title="Recompute is cheap because it uses the resource that is idle">
+  A decode step has three resources: HBM bandwidth (saturated), tensor cores (idle), and network (unused). Recomputing a token spends tensor cores, which are free at that moment, to avoid spending bandwidth, which is not.
+
+  So the correct question is never "is recompute expensive?" in absolute terms. It is **"is my arithmetic unit busy?"** — and during decode it is not. If you were recomputing during prefill, at 55% MFU on a compute-bound step, the same arithmetic would be real cost, and then fetching always wins.
+</Callout>
+
+Set the two equal to get the crossover bandwidth:
+
+$$
+BW_{\text{crossover}} = \frac{b_{kv}}{t_{\text{recompute}}} = \frac{131{,}072}{29.5\times 10^{-6}} \approx 4.4\ \text{GB/s}
+$$
+
+<Callout type="math" title="The crossovers for the models you know">
+  | Model | KV per token | Recompute on H100 | Crossover bandwidth |
+  |---|---|---|---|
+  | Qwen2.5-0.5B | 12,288 B | 1.8 µs | **6.9 GB/s** |
+  | Llama-3.1-8B | 131,072 B | 29.5 µs | **4.4 GB/s** |
+  | Qwen2.5-32B | 262,144 B | 118 µs | **2.2 GB/s** |
+  | Llama-3.1-70B | 327,680 B | 258 µs | **1.3 GB/s** |
+
+  Read down the last column: **bigger models tolerate slower storage**, because they have more arithmetic to spare and more bytes per token to amortise the fetch over. A 0.5B model is the opposite — its arithmetic is so cheap that even a modest SSD is a coin flip.
+</Callout>
+
+Read that table against the ladder and the design space collapses to something short. **Host DRAM over PCIe is always worth it. NVMe is worth it for models above a few billion parameters. A remote node over 10 GbE is not worth it for anything** — and if you are reaching across a network anyway, use 25 or 100 GbE, where the numbers change again.
+
+## Hiding the fetch: the resident-prefix split
+
+Knowing the crossover tells you *which* tiers to use. It does not tell you *how much* to move, and that is the real engineering.
+
+Here is the constraint that decides everything. In a decode step, time is the maximum of the weight read and the cache read — Module 05's `max` again. If you stream the entire cache every step, the cache read dominates and your token rate collapses. So:
+
+$$
+\text{streamed bytes per step} \leq \text{BW}_{\text{tier}} \times t_{\text{weights}}
+$$
+
+That is the budget. For Llama-3.1-8B on an H100, the weight read is 6.0 ms, so from host DRAM you can stream 55 GB/s × 6 ms = **330 MB per step** without losing a single millisecond of speed. Everything beyond that must either be recomputed or waited for.
+
+<Callout type="pitfall" title="The mistake that makes tiered KV look bad">
+  Streaming the *whole* cache every step is the obvious implementation and it is catastrophic. A 32,768-token cache at batch 8 is 34 GB; from NVMe that is 4.9 seconds per token, and no amount of engine tuning recovers it.
+
+  The fix is the one that makes it work: **keep a resident prefix in GPU memory and stream only the tail.** Two warm tokens — the most recent few thousand — cover almost all of the attention mass in practice, so the streamed remainder is a fraction of the total.
+</Callout>
+
+The split that works is a **resident window** plus a **sliding streamed window**:
+
+- **Resident**: the last $R$ tokens of the conversation, held in GPU memory permanently. Attention needs them every step and they are what the model actually uses most.
+- **Streamed**: everything between the shared prefix and the resident window, fetched fresh each step.
+- **Recomputed**: the prefix if it is long, if it is not pinned, or if the tier is too slow to fetch it.
+
+At 32,768 tokens with $R = 4{,}096$: 4.29 GB resident, 28.6 GB streamed across a batch of 8. Over PCIe that is 0.52 seconds — still far too slow, and the honest conclusion is that this configuration does not work on one card. Halve the context to 8K and it becomes 1.07 GB resident and 7.2 GB streamed, 130 ms, which fits inside an acceptable step.
+
+<Callout type="recap" title="What the ladder buys you, honestly">
+  Tiered KV does **not** make a 32K context on a batch of 32 free. The arithmetic above says the bytes still have to arrive, and at 8× less bandwidth they arrive 8× slower.
+
+  What it buys is the ability to **keep a much larger total context across far more conversations than HBM can hold**, by accepting that the cold parts are slow. That is a real and large win — it turns "three simultaneous 128K conversations" into "sixty 128K conversations" — but it is a win in *capacity*, bought with *latency*, and it is only free if the latency lands somewhere the model does not care much about.
+</Callout>
+
+## The four mechanisms, and why each is hard
+
+<Callout type="real" title="What the engines do at the time of writing">
+  **vLLM** exposes CPU offloading through its `kv_transfer_config` and the `cpu_offload_gb` option: a configurable slice of the KV cache lives in pinned host memory and is gathered to the GPU on demand. **SGLang** has `hicache` — a hierarchical cache with separate GPU, CPU and optional third-tier backing stores, plus an LFU-with-awareness eviction policy that protects actively-used layers. **TensorRT-LLM** has context-only offload targets, using an on-device or host allocator with the paged KV format already in place.
+
+  The names and defaults move. The structure is stable: a paged KV pool (Module 08) plus a transfer path between it and a slower allocator, with the block table as the addressing scheme.
+</Callout>
+
+Every implementation is some combination of four mechanisms, and each has a trap.
+
+**1. Prefetch and overlap.** Fetch the blocks a step will need *while the current step runs*. This is the single highest-value mechanism, because it is what converts "fetch time" into "waste bandwidth." The trap: a prefetch that misses becomes a stall, so you need to prefetch one step further than you think.
+
+**2. Overlap compute with transfer.** On a multi-GPU node with NVLink (Module 18), shards of the same step can read different parts of the cache while other shards compute — a pipeline rather than a barrier. The trap: the last shard to finish sets the latency, so the split has to be uneven, with the slowest transfer given the least work.
+
+**3. Chunked attention over the cache.** Instead of one attention call over the whole cache, split the cache into chunks and run attention over each, combining partial results — exactly the online-softmax structure from Module 09. The trap: the combination must rescale by each chunk's running maximum, or the answer is wrong. This is a <Term t="numerical-stability">numerical stability</Term> problem, not a performance one.
+
+**4. Recompute as a fallback.** When a tier is too slow, compute instead. The trap: it must be scheduled *deliberately*, because a step that fetches when it should have recomputed costs both — you wait for bytes you did not need.
+
+<Callout type="pitfall" title="Four correctness hazards, all of them silent">
+  - **Transfer and compute racing.** If a block is overwritten by the next step's write while the current step is still reading it, you get numbers from two different contexts. Symptoms: garbage output, no crash. Fix: double-buffering, or a per-step fence on every buffer.
+  - **Position metadata must travel with the cache.** A cached key carries its RoPE rotation from Module 04. Reconstruct it without the position and attention silently reads the wrong keys. The position table is part of the payload, not metadata about it.
+  - **Quantization scales.** An FP8 KV block carries a scale factor per block or per group (Module 11). Move the bytes without the scales and the values are nonsense.
+  - **Page cache coherence on CPU offload.** Host memory is cached; the GPU is not. A naive `cudaHostGetDevicePointer` on a page that was recently written by a different thread can give stale data. Fix: pinned memory, explicit fences, and a cache-flush discipline.
+</Callout>
+
+<Callout type="pitfall" title="Backpressure: your fastest tier has to absorb the slowest one">
+  A remote cache with three seconds of latency is fine for *throughput* and catastrophic for *memory*. Every resident request you cannot serve pins its GPU blocks for the whole round trip, so a service that suddenly attracts long-context traffic will hold far more GPU blocks than its nominal capacity.
+
+  This is Module 08's admission control resurfacing at a new layer: **bound the number of concurrent remote-touched sequences explicitly**, and make it a separate, smaller number than the resident budget. A tiered cache that cannot be back-pressured is an outage waiting for a traffic spike.
+</Callout>
+
+## Measuring a tier honestly
+
+Never quote a spec sheet as a tier's bandwidth. The number you need is the one your code achieves, and it is usually well below the sheet.
+
+```python
+# The only three numbers you need from a tier, measured rather than assumed.
+def measure_tier(move_bytes, n_rounds=20, pin=True):
+    """Returns (GB/s, first-byte latency ms). Run this against each tier you ship."""
+    import time, torch
+    n = int(move_bytes / 2)                       # float16 elements
+    src = torch.empty(n, dtype=torch.float16)
+    dst = torch.empty_like(src)
+    if pin and src.is_cuda:
+        src_pin = src.pin_memory(); dst_pin = dst.pin_memory()
+    else:
+        src_pin, dst_pin = src, dst
+
+    for _ in range(3):                           # warm up: first touch is always slow
+        if src.is_cuda: dst_pin.copy_(src, non_blocking=True); torch.cuda.synchronize()
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()                     # steady-state bandwidth
+    for _ in range(n_rounds):
+        if src.is_cuda: dst_pin.copy_(src, non_blocking=True)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    bw = move_bytes * n_rounds / (t1 - t0)
+
+    # first-byte latency: one small transfer, timed on the host
+    small = min(n, 1024)
+    t2 = time.perf_counter()
+    for _ in range(50):
+        if src.is_cuda: dst[:small].copy_(src[:small], non_blocking=True)
+    torch.cuda.synchronize()
+    lat_ms = (time.perf_counter() - t2) / 50 * 1e3
+    return bw / 1e9, lat_ms
+
+GB, LAT = measure_tier(2 * 1024**3)               # move 2 GB
+print(f"{GB:.1f} GB/s, {LAT:.2f} ms first byte")
+print(f"break-even vs 29.5 us recompute: {GB/1000 * 1e9 / 131072:.1f} GB/s needed")
+```
+
+Two things will surprise you. **Unpinned memory is dramatically slower** than pinned, and the page-locked copy path is the only one that can saturate PCIe — this single flag is often the difference between a tier working and not. And **first-byte latency on a remote tier is milliseconds**, which is why batching and prefetch depth matter more than raw bandwidth for remote caches.
+
+<Callout type="mentor" title="How to choose, in order">
+  1. **Compute the crossover** for your model: $b_{kv} / t_{\text{recompute}}$. Below that, stop.
+  2. **Start at host DRAM** and treat it as free. If PCIe beats recompute — and it always does — there is no reason to go slower.
+  3. **Then add NVMe** for the cold tail only, with a resident window in front of it. Measure the resident window: if it covers most of the attention mass, you may never stream at all.
+  4. **Then remote**, only if you have 25 GbE or better, only with explicit backpressure, and only for prefixes that genuinely have reuse across requests — otherwise it is just a slow copy.
+  5. **Measure** the achieved bandwidth of each tier in your own process, and put the crossover number in a comment next to the threshold you set.
+</Callout>
+
+<KeyNotes>
+  1. The KV cache is **derived data** — every byte can be recomputed from the prompt. That is what makes it the one thing in a transformer that can live on a cheap tier.
+  2. Four tiers, ~2,700× apart: HBM 3.35 TB/s, host DRAM over PCIe 55 GB/s, NVMe 7 GB/s, a remote node on 10 GbE 1.25 GB/s.
+  3. One token of KV is 131,072 bytes for 8B: 39 ns from HBM, 2.4 µs over PCIe, 19 µs from NVMe, 105 µs across 10 GbE.
+  4. Recomputing it costs 2P FLOPs, about **29.5 µs** on an H100 — and decode is memory-bound, so the tensor cores are ~95% idle while that happens. Recompute is cheap because it spends the idle resource.
+  5. The break-even bandwidth is $b_{kv} / t_{\text{recompute}} \approx$ **4.4 GB/s** for 8B, and it *falls* as the model grows — bigger models tolerate slower storage.
+  6. PCIe always wins, NVMe wins above a few billion parameters, and **10 GbE loses to recompute**. Use 25–100 GbE or do not bother.
+  7. The per-step budget is `streamed bytes ≤ tier bandwidth × weight-read time`: 330 MB per step over PCIe on an H100, if you want zero added latency.
+  8. Keep a **resident window** of the most recent tokens in GPU memory and stream only the tail. Streaming the whole cache every step is the failure mode that makes tiered KV look impossible.
+  9. Tiered KV buys **capacity, not speed** — and it is free only where the latency lands somewhere attention does not care about.
+  10. The silent hazards: transfer/compute races, RoPE positions not travelling with the cache, quantization scales left behind, and unpinned host memory. Plus backpressure, or a traffic spike becomes an outage.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B in BF16 stores 131,072 bytes of KV per token, and recomputing one token’s KV costs about 29.5 µs on an H100. What is the break-even storage bandwidth?', numeric: true, answer: 4.4, tolerance: 0.4, unit: 'GB/s', why: 'BW = b_kv / t_recompute = 131,072 ÷ 29.5e-6 = 4.44e9 bytes/s ≈ 4.4 GB/s. Above that, fetching beats recomputing. Note this is a bandwidth crossover, not a latency one: 10 GbE (1.25 GB/s) loses to recompute by 3.5×.' },
+  { q: 'One H100 decode step reads 16.1 GB of weights in 6.0 ms. Streaming a KV cache over PCIe 5.0 at 55 GB/s without adding a single millisecond to the step can move at most how many bytes?', numeric: true, answer: 330, tolerance: 20, unit: 'MB', why: '55 GB/s × 6 ms = 0.33 GB = 330 MB. That is the streaming budget for zero added latency. A 32,768-token cache at batch 8 is 34 GB, so this configuration simply does not fit the budget — which is why a resident window and recompute-as-fallback are not optional.' },
+  { q: 'Why is recomputing KV cache often cheaper than fetching it, during decode?', options: ['Recomputation produces exactly the same numbers more reliably than a copy', 'A decode step is memory-bound, so its tensor cores are largely idle and the extra FLOPs cost almost nothing', 'The GPU can recompute faster than any network or SSD can deliver bytes', 'Recompute avoids the PCIe round trip, so it has lower latency'], answer: 1, why: 'Decode is bandwidth-bound with the math units ~5% busy. Recompute spends the idle resource to avoid the scarce one. This is Module 05’s “waste only costs what it is made of” — and it reverses during prefill, where the tensor cores are the bottleneck.' },
+  { q: 'Llama-3.1-70B has 327,680 bytes of KV per token and costs about 258 µs to recompute on one H100. Its break-even bandwidth is roughly how much?', numeric: true, answer: 1.3, tolerance: 0.2, unit: 'GB/s', why: '327,680 ÷ 258e-6 = 1.27 GB/s. Compare 4.4 GB/s for 8B: bigger models tolerate slower storage, because they have both more bytes per token to amortise and more idle arithmetic to spend. Small models like Qwen2.5-0.5B sit at the opposite extreme, around 6.9 GB/s.' },
+  { q: 'Which failure is the most dangerous when offloading KV cache to host memory, and why?', options: ['Slow first-byte latency, because it shows up as extra TTFT', 'A transfer/compute race, because a block overwritten mid-read silently corrupts the answer with no error', 'Higher memory usage on the host, because it exhausts the machine’s RAM', 'The loss of the prefix-cache hit rate, because it wastes compute on prefill'], answer: 1, why: 'Latency and host memory are visible and bounded. A race between a block being written for the next step and being read for the current one produces plausible-looking garbage — no crash, no log line, wrong answer. Fix it with double buffering or a per-step fence on every buffer.' },
+  { q: 'What does tiered KV actually buy you?', options: ['Faster decode for long contexts, because the cache is bigger', 'Capacity: far more total context and more conversations than HBM could hold, bought with latency', 'Lower prefill cost, because cold blocks can be fetched in parallel', 'Better quality, because more context is always used well'], answer: 1, why: 'The bytes still have to arrive, and at 8× less bandwidth they arrive 8× slower. What changes is how many conversations you can hold — three 128K conversations becomes dozens — and the gain is free only where the latency lands where attention does not care. Recall lost-in-the-middle: more context is not automatically better quality.' },
+]} />

@@ -1,0 +1,259 @@
+---
+title: 'Project: Productionize your server'
+summary: 'Take a tuned server and turn it into something a team can run, trust and update: a one-command harness, a measured cold-start budget, correct probes and drain, a canary with a pre-committed threshold, a timed rollback, and an error budget with an owner. The deliverable is the runbook and the evidence, not the server.'
+objectives:
+  - Assemble a one-command harness that starts the server and reproduces every number in your report
+  - Measure and decompose cold start into its six phases on real hardware
+  - Implement three separate probes and a drain, and verify neither is hiding a failure
+  - Write a canary with a named metric, a threshold and a detection-power calculation
+  - Produce a runbook, a rollback record and a readiness verdict with named owners
+colab: 22-cold-start.ipynb
+---
+import ProductionGate from '@/components/viz/production-serving/ProductionGate.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have built a fast server. You measured it, tuned it, and know exactly why it runs at the speed it does. What you do not have is the thing that makes it a **production service**: everything around the server that lets someone else — or you, at 3am, six months from now — start it, trust it, update it and roll it back.
+
+This project is that work. It is deliberately shaped like the document you would actually hand a team before they let you deploy to production.
+
+## The deliverable
+
+One repository, four artefacts. The first is the one that matters most and the one everyone skips.
+
+| Artefact | What it is |
+|---|---|
+| **`harness/`** | One command that builds the image, starts the server, runs the checks and prints every number in your report |
+| **`checklist.md`** | The nine readiness gates, each with its number, its owner and its evidence link |
+| **`runbook.md`** | What to do when the SLO burns, including the rollback procedure with measured timings |
+| **`evidence/`** | The raw outputs the checklist cites: cold-start traces, probe logs, canary comparisons, the timed rollback |
+
+The harness is not a convenience. A checklist whose numbers nobody can regenerate is a checklist of opinions, and the first time the model is retrained or the engine is upgraded, every number in it becomes unverifiable and the whole document loses authority.
+
+<Callout type="mentor" title="The single sentence that separates this from homework">
+  A working server is a demonstration; a **productionized** server is one that someone else can operate without you. Every task below exists to remove a piece of knowledge that currently lives only in your head. If a task does not move knowledge into the repository, it does not belong in this project.
+</Callout>
+
+## The nine gates
+
+<Scrolly>
+  <ProductionGate client:visible slot="stage" />
+
+  <Step title="1. The deliverable is not a server">
+    A server you can start is a demo. A server that can be started by a documented command, on a documented machine, by someone who has never met it — that is the target. The first three lessons were about getting the server fast; this project is about making it operable.
+  </Step>
+
+  <Step title="2. Four artefacts, not one">
+    A harness, a checklist, a runbook and the evidence behind them. Note that three of the four are written documents: that ratio is deliberate and reflects what production work actually is.
+  </Step>
+
+  <Step title="3. Gates 1–3: the runnable part">
+    **Version pinning** (reproducibility), **cold-start budget** (how fast you can react to load) and **memory headroom** (whether it survives peak). These are gates because they have numbers: a pinned digest, a measured startup, a measured pool fraction.
+  </Step>
+
+  <Step title="4. Gates 4–6: the lifecycle part">
+    **Measured warm-up**, **three separate probes** and a **drain that outlasts the longest request**. These are the gates people skip, and every one of them fails silently — a warm-up that is a sleep, a liveness probe that flaps, a drain that truncates long generations.
+  </Step>
+
+  <Step title="5. Gates 7–9: the release part">
+    **A canary with a threshold**, a **rollback you have timed**, and an **error budget with a named owner**. These are the gates that only make sense with a team around them, which is why they come last.
+  </Step>
+
+  <Step title="6. Enter your own numbers">
+    Describe your deployment: model, GPU, cold start, drain timeout, output length, canary slice. Every gate recomputes against your numbers, so you can see immediately which ones your configuration actually violates.
+  </Step>
+
+  <Step title="7. What fails first">
+    Gates are not equally urgent. With a slow cold start and a short drain, the lifecycle gates fail long before the release ones matter — which tells you which week of work to do first.
+  </Step>
+
+  <Step title="8. The verdict">
+    Every gate green means defensible. One red gate is a runbook item with a date. Three red gates means the server is not production-ready — and the important thing is that you now know **which** three, with numbers.
+  </Step>
+</Scrolly>
+
+<Colab nb="22-cold-start.ipynb" />
+
+## Part 1 · Build the harness
+
+One command, no arguments beyond configuration, that anyone can run:
+
+```bash
+# harness/run.sh — starts the server, waits for readiness, runs every check
+./harness/run.sh --model Qwen2.5-7B-Instruct --gpu h100 --profile prod
+```
+
+It must do all of the following, in order, and fail loudly at the first problem:
+
+1. **Pull the pinned image by digest.** Not by tag — a tag is a promise, a digest is a fact.
+2. **Start the server and timestamp every startup phase.** This is how you get the cold-start decomposition for free on every run.
+3. **Poll the readiness endpoint until it passes, and record how long that took.** This number goes straight into the checklist.
+4. **Verify the probes are actually distinct** by asserting that readiness fails while liveness passes during a synthetic fault.
+5. **Run a warm-up traffic burst** and record the first-request TTFT versus steady-state TPOT. The gap is the warm-up quality metric.
+6. **Run a drain test**: start a long generation, send SIGTERM, and assert the generation completed. Assert the process exited within the timeout.
+7. **Print a table** of every number the checklist cites, with the commit SHA of the code that produced it.
+
+<Callout type="pitfall" title="The harness must be able to fail">
+  A harness that only prints results and never exits non-zero is a report generator, not a gate. If the drain test truncates, the harness should exit 1. If the cold start exceeds your budget, the harness should exit 1. This is what lets you put the harness in a CI job and in a pre-deploy check — and it is the difference between a checklist that catches regressions and one that records them after the fact.
+</Callout>
+
+**On the free Colab T4**, the numbers will not match your production hardware and you should not pretend they will. What transfers is the *shape*: the phase decomposition, the ratio between phases, the order in which problems appear. Run the notebook in this module, record the decomposition it produces, and state clearly in your report which figures are T4-derived and which are from your target machine.
+
+## Part 2 · Decompose your cold start
+
+Use the notebook, or your harness, to produce a real phase decomposition on your hardware. Report:
+
+| Phase | Measured | Scales with | Where you cut it |
+|---|---|---|---|
+| Process launch & imports | — s | dependency tree | |
+| Checkpoint read | — s | model ÷ storage | |
+| Copy into HBM | — s | model ÷ PCIe | |
+| Graph capture | — s | number of batch shapes | |
+| Autotune | — s | kernel candidates | |
+| Warm-up | — s | steps × decode time | |
+
+Then answer three questions in writing:
+
+1. **Which phase dominates for your model on your storage?** (For most deployments the checkpoint read, but measure it — it is not always true, and a surprise here is a finding.)
+2. **What is your total, and does it fit a scale-up budget?** If a traffic spike needs new capacity in 60 seconds and your cold start is 240, you have an SLO you cannot meet during scale events. Say so explicitly.
+3. **What did you change, and what did it buy?** Every optimisation needs a measured before and after.
+
+<Callout type="math" title="The three numbers your cold-start section must contain">
+  - `t_startup` total, p50 and p99 across restarts (p99 matters because a slow node is a slow deploy).
+  - `P_max = budget × storage_throughput ÷ bytes_per_weight` — the largest model you could cold-start at your current budget. If you deploy a model bigger than this, your deploys are already failing silently under good conditions.
+  - The phase that dominates, with its share of total. If it is under 50%, you have more than one thing worth fixing.
+</Callout>
+
+## Part 3 · Get the lifecycle honest
+
+Three deliverables here, each with a test attached.
+
+**Warm-up.** Implement warm-up that flips readiness on a measured condition (decode step time stable within 10% of its best recent value), not a sleep. Then *verify* it: send a request immediately after readiness flips and record its TTFT. If it is materially worse than steady-state TPOT, your warm-up condition is wrong — loosen it and re-measure.
+
+**Probes.** Three endpoints, three meanings, and a test for each:
+
+- Readiness fails during startup and warm-up; passes after. **Test:** assert readiness is failing while liveness is passing at t=10s into startup.
+- Liveness does not depend on latency. **Test:** inject a 5-second artificial latency spike and assert liveness still passes. If it fails, your probe will restart replicas during ordinary latency spikes.
+- Startup probe has a generous budget. **Test:** assert that a replica whose cold start is 4 minutes is not restarted during those 4 minutes.
+
+**Drain.** Set the drain timeout from your measured longest generation, not from a default. **Test:** start a generation at your p99 output length, send SIGTERM mid-generation, and assert it completes. Then run the same test with a drain timeout deliberately set too short, and record what the client observes — you want a screenshot of the truncated answer in your evidence directory, because that is what convinces people the gate matters.
+
+<Callout type="math" title="Your drain timeout, computed from your own metrics">
+  Using your measured TTFT and TPOT and your longest supported output:
+
+  $$
+  t_{\text{drain}} = t_{\text{TTFT}} + t_{\text{TPOT}} \times \text{max\_output}
+  $$
+
+  Then add 50% margin for the slow-request tail. Record this number in the checklist as the drain timeout, and record **why** it is that number. When someone later proposes raising `max_output` to 8000 tokens, the checklist already contains the consequence: the drain timeout must rise too, or every deploy will truncate those generations.
+</Callout>
+
+## Part 4 · Design the release
+
+**Version pinning.** Define one version string covering weights, code, tokenizer/chat template, and sampling defaults. Publish it in `/v1/models`, log it per request, and make it a required field in your canary reports.
+
+**Canary.** Write, before you deploy anything:
+
+- The slice (a percentage of requests, randomised per request).
+- The metrics compared against the live baseline, contemporaneously.
+- The thresholds and the time window: "p95 TTFT worse than 10% for 15 minutes" or "refusal rate doubles".
+- The detection-power calculation from the previous lesson: `n ≥ ln(0.05)/ln(1−r)` for the regression size `r` you are trying to catch.
+
+Then actually run a canary — ideally on a real deployment, and ideally one you have deliberately broken — and record what it caught and how long it took to notice.
+
+**Rollback.** Do not just write the procedure. Perform it: deploy a version you know is broken, revert, and time it. Record `t_rollback` in the runbook with the measurement. If it exceeds your incident tolerance, that measured gap is the argument for changing your rollout strategy — and now you have the numbers to make it with.
+
+<Callout type="recap" title="What Part 4 actually produces">
+  A release section in your runbook with three numbers in it: `t_rollout`, `t_rollback`, and the canary's detection time for a regression of size `r`. Those three numbers, measured rather than estimated, are what let someone else decide whether your release process is safe — and they are the numbers you will be asked for the first time something goes wrong.
+</Callout>
+
+## Part 5 · Write the SLO and the error budget
+
+Your service needs a stated promise, measured against something real.
+
+**The SLI and SLO.** Pick one primary and one secondary:
+
+- Primary: p95 TTFT under your target, at your target concurrency.
+- Secondary: goodput (requests per second meeting the full SLO), or p99 TPOT.
+
+State the measurement window (a rolling 7 days is typical), the exclusion rules (planned maintenance? canary traffic?), and the client population.
+
+**The error budget.** From the SLO:
+
+$$
+\text{budget} = 1 - \text{SLO target}
+$$
+
+For a 99.9% SLO, you may violate 0.1% of requests — 43 minutes in a month. Then say what your team does with it, and this is the part that makes the document real:
+
+- If the budget is healthy, you may ship a riskier release.
+- If it is exhausted, you freeze features and fix stability.
+
+An error budget with no stated consequence is a dashboard, not a policy.
+
+## Part 6 · The runbook
+
+The runbook is the artefact that gets used at 3am, so it must be short and correct rather than comprehensive. Required sections:
+
+1. **How to tell it is broken**, with the exact dashboard query and the exact threshold.
+2. **The first three actions**, numbered, each with the command to run.
+3. **Rollback**, with the measured `t_rollback` and the commands.
+4. **Escalation**: who to wake, and when.
+5. **What not to do** — the tempting wrong moves, like restarting all replicas when one is unhealthy.
+
+<Callout type="mentor" title="Write section 5">
+  Most runbooks omit it and it is the one that prevents the worst outcomes. Every incident has a moment where someone restarts everything, or raises a limit "to see if that helps", or deploys a fix to production to stop the bleeding. Those actions are usually worse than the incident. Write them down, explicitly, so that someone under pressure reads the line that says not to do that.
+</Callout>
+
+## Acceptance criteria
+
+Your project is done when **all** of the following hold. Each is checkable by someone who did not write it.
+
+1. `./harness/run.sh` runs to completion on a clean machine, with no arguments beyond configuration, and exits non-zero if any gate fails.
+2. The cold-start decomposition is measured on your target hardware, or explicitly marked as T4-derived with the shape-only caveat.
+3. All three probes exist, are distinct in meaning, and have a passing test for each behaviour described above.
+4. A generation at your p99 output length survives a SIGTERM during production-style load.
+5. A canary has been run at least once against a real deployment, with its detection time recorded for a stated regression size.
+6. `t_rollback` is measured by performing a rollback, not estimated.
+7. An SLO with a named owner, an SLI with a stated window, and an error budget with a stated consequence.
+8. A runbook with all five sections, including what not to do.
+9. Every number in the checklist links to evidence in the repository that a reader can re-verify.
+
+## Rubric
+
+| Criterion | Weight | What earns full marks |
+|---|---|---|
+| **Harness quality** | 20% | One command, runs on a clean machine, exits non-zero on failure, regenerates every cited number |
+| **Lifecycle correctness** | 25% | Three probes verified distinct, warm-up condition-based, drain tested with a truncated case captured as evidence |
+| **Release design** | 25% | Canary with pre-committed threshold and detection-power calculation; rollback timed by actually performing it |
+| **Cold-start analysis** | 15% | Real phase decomposition, dominant phase identified and addressed, before/after measured |
+| **Communication** | 15% | Runbook is usable at 3am, error budget has a consequence, every claim is backed by a citable number |
+
+The weighting puts **25% on lifecycle correctness** because that is where silent failures live. Nothing in the lifecycle breaks loudly: a liveness probe that flaps looks like intermittent latency, a short drain looks like a client bug, a sleep-based warm-up looks like a healthy server. Detecting that class of problem is the actual skill being assessed.
+
+<Callout type="mentor" title="The strongest projects contain a surprise">
+  Real examples from work like this:
+  - "Our warm-up passed readiness at 90% of steady-state speed, so the first 20 requests per replica were slow. We only found it because the harness measured first-request TTFT, not just the probe state."
+  - "Our liveness probe used a latency threshold. During one 5-second GPU stall it restarted the whole fleet, and the restart storm caused the outage we were responding to."
+  - "Our drain timeout was 30 seconds and our p99 output was 900 tokens. Every deploy was silently truncating 2% of generations; users had been complaining for months and we blamed the client."
+
+  If your readiness report is all green and uneventful, you may have written the tests too generously. Go and break something deliberately, then check that your harness catches it.
+</Callout>
+
+<KeyNotes>
+  1. The deliverable is a harness, a checklist, a runbook and evidence — not the server. Three of the four artefacts are documents, and that ratio reflects what production work is.
+  2. The harness must exit non-zero when a gate fails. A harness that only prints is a report generator, and a checklist whose numbers cannot be regenerated is a list of opinions.
+  3. Cold-start decomposition must be measured on real hardware and must state which figures are T4-derived and shape-only. What transfers from a T4 is the ordering and ratios, not the milliseconds.
+  4. Three probes, three meanings, three tests. The test that matters most: inject a latency spike and assert liveness still passes, because a latency-sensitive liveness probe causes restart storms.
+  5. Drain timeout = `t_TTFT + t_TPOT × max_output` plus 50% margin, and capturing a deliberate truncation as evidence is what convinces a team the gate matters.
+  6. A canary needs a pre-committed metric, threshold and time window, plus a detection-power calculation for the regression size you are trying to catch — and it must have been run for real.
+  7. `t_rollback` is measured by performing a rollback, never estimated. It is the first number anyone asks for during an incident.
+  8. An error budget is only real if it states its consequence — freeze features when it is exhausted. And write section 5 of the runbook: what not to do.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Your harness runs the drain test and a generation is truncated mid-stream. What should the harness do, and why does this matter more than printing the result?', numeric: false, options: ['Print a warning and exit 0, since the run was informative', 'Exit non-zero, so the check can gate a CI job or a pre-deploy step', 'Retry the generation and exit 0 if the retry succeeds', 'Store the truncated output and exit 0, escalating only after three occurrences'], answer: 1, why: 'A harness that never fails is a report generator, not a gate. Exiting non-zero is what lets the same command serve as a CI job and a pre-deploy check, which is the only way a regression is caught before users see it rather than recorded afterwards. Option C is tempting but wrong on purpose — a retry hides exactly the signal you built the test to detect.' },
+  { q: 'Your measured TTFT is 400 ms, TPOT is 25 ms, and your longest supported output is 2000 tokens. With the recommended 50% margin, what drain timeout should the checklist record?', numeric: true, answer: 76, tolerance: 3, unit: 's', why: 'Base = 0.4 s + 0.025 s/token × 2000 tokens = 0.4 + 50 = 50.4 s. With 50% margin that is 75.6 s, so record ~76 s. The margin matters more than it looks: without it you are exactly at the boundary, where the slow-request tail starts losing generations.' },
+  { q: 'Why is the rubric weighted 25% toward lifecycle correctness rather than toward the harness or the cold-start analysis?', numeric: false, options: ['Because lifecycle work takes the longest to implement', 'Because nothing in the lifecycle fails loudly — a flapping liveness probe looks like latency, a short drain looks like a client bug, a sleep-based warm-up looks like a healthy server', 'Because the cold-start analysis is easy and needs no evidence', 'Because lifecycle gates are the only ones a customer ever notices'], answer: 1, why: 'Every lifecycle failure is silent. A liveness probe with a latency threshold restarts replicas during ordinary stalls and the resulting cold-start storm causes the outage you were trying to fix. A drain shorter than your longest request produces clean TCP closes, so users see half an answer and blame the client. A warm-up that sleeps too little has a server that passes its probe and is still slow. Detecting that entire class of silent failure is the skill being assessed.' },
+  { q: 'Your canary must detect a 4% regression with 95% confidence (n ≥ ln(0.05)/ln(1−r)). About how many canary requests does that require, and what does it tell you about canary design?', numeric: true, answer: 74, tolerance: 10, unit: 'requests', why: 'n ≥ ln(0.05) / ln(0.96) = 2.996 / 0.0408 ≈ 73 requests. The design consequence: at 4% you need roughly 74 requests, at 5% about 58, at 1% about 298. Small regressions need disproportionately more traffic, so a canary sized for the obvious failures silently passes the subtle ones — which is why the regression size you intend to catch has to be written into the canary plan before you deploy.' },
+  { q: 'Your canary has passed six consecutive releases. A colleague suggests raising the threshold since it has never been useful. What is the correct response?', numeric: false, options: ['Agree — an always-green canary is wasted capacity and should be removed', 'Investigate first: an always-green canary usually means the threshold is too loose, the slice is too small for the regression you care about, or the proxy metric does not track the property you care about', 'Lower the canary slice to save money and rely on the automated tests', 'Keep it as is and add a second canary metric without changing the threshold'], answer: 1, why: 'A canary that never fails has not demonstrated it works; it has failed to tell you anything. The usual causes are exactly the three listed, and all three are invisible without evidence. Keep a record of past releases with their measured deltas — that record is how you calibrate sensitivity, and it is the difference between a team that ships daily and one that deploys hopefully.' },
+]}/>

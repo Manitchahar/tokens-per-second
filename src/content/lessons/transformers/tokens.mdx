@@ -1,0 +1,223 @@
+---
+title: 'Tokens & tokenizers'
+summary: 'A model reads integers, not words. This lesson builds a tokenizer from scratch: characters, merges, IDs, and the vocabulary arithmetic that decides how many tokens your prompt actually costs you.'
+objectives:
+  - Explain why a model cannot read characters and what a token really is
+  - Describe byte-pair encoding as greedy merging of frequent pairs
+  - Compute characters per token, and check a tokenizer against a real vocabulary size
+  - Explain why real vocabulary sizes are multiples of 256
+  - Convert a prompt from characters to tokens and from tokens to KV cache bytes
+---
+import TokenizerViz from '@/components/viz/transformers/TokenizerViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Type a prompt into a chatbot and something happens before the GPU ever sees it: the text is chopped into **tokens**, and each token is replaced by an integer. "Hello world" might arrive as `[15339, 1917]`. Everything downstream — the embedding lookup, the attention matrix, the <Term t="kv-cache">KV cache</Term>, your bill — is counted in those integers. Get the count wrong and every number in the rest of this course is wrong.
+
+An inference engineer needs three things from tokenizers: how to read one, how to count with one, and what a bad one costs.
+
+## Why not just feed characters?
+
+The earliest language models did use characters, and it works — but character by character, "unbelievable" is 12 items and "tokenization" is 12. Every item costs a full pass through a 4,096-wide hidden state, an attention row, and a slot in the KV cache. You would be spending your whole memory budget on spelling.
+
+Words would be better, but English has hundreds of thousands of them, plus every language, every proper noun, every number, every typo. The vocabulary would be enormous and most entries would be used once.
+
+The answer most people landed on: **learn the most common pieces of text from a huge corpus, and add a guaranteed fallback so nothing is ever impossible.**
+
+## Byte-pair encoding, from scratch
+
+**Byte-pair encoding (BPE)** works in four steps.
+
+**1. Start with characters.** Every character becomes its own token. Your 28-character sentence `the transformer reads tokens` is 28 tokens. Useless, but total.
+
+**2. Count adjacent pairs.** In English text the pair `t`+`h` occurs constantly. So do `he`, `in`, `er`, ` th`.
+
+**3. Merge the most frequent pair.** Replace every occurrence of that pair with a new single token. `t`+`h` becomes `th`, a new token with a new ID. Recount.
+
+**4. Repeat until you hit your budget.** Every merge halves the average length of the text. Stop at 32,000 merges and you have GPT-2's vocabulary; at 128,000 and you have Llama-3.1's.
+
+The result, in the visual, for our toy sentence:
+
+| | pieces | chars per token |
+|---|---|---|
+| Characters only | 28 | 1.00 |
+| After a few merges | `the` · ` ` · `trans` · `form` · `er` · ` ` · `read` · `s` · ` ` · `tok` · `ens` = 11 | 2.55 |
+| After all merges | `the` · ` ` · `transformer` · ` ` · `reads` · ` ` · `tokens` = 7 | **4.00** |
+
+<Callout type="math" title="Characters per token is the number to memorise">
+  English prose runs at roughly **4 characters per token**, or 0.75 tokens per word. Keep the reciprocal too: **1 token ≈ 0.75 English words**. Every "tokens per second" figure, every context-length claim and every price depends on this ratio.
+</Callout>
+
+## Each piece is just an integer
+
+A tokenizer is two dictionaries and a merge list:
+
+- **encode(text) → list of IDs**: greedily apply merges, then look each piece up in the vocabulary
+- **decode(ids) → text**: look each ID up, concatenate the pieces
+- **the vocabulary**: a list mapping piece → ID, in a fixed order
+
+That ID is the *only* representation of your text inside the model. `15339` does not mean "Hello" in any way the model can inspect — it is an index, and the meaning arrives one step later when that index selects a row of a table.
+
+<Scrolly>
+  <TokenizerViz client:visible slot="stage" />
+
+  <Step title="1. Characters, not words">
+    `the transformer reads tokens` is **28 characters**. A character-level model would need 28 units of attention and 28 KV cache entries for one sentence — and would still have to learn spelling from scratch.
+  </Step>
+
+  <Step title="2. Merge them into pieces">
+    Merge frequent adjacent pairs and you get word-like pieces: `the`, `transformer`, `tokens`. The sentence is now **7 items**. Nothing was thrown away — concatenate the pieces and you get the original string back, character for character.
+  </Step>
+
+  <Step title="3. Every piece is an integer">
+    Each piece maps to an ID, which is its row number in the vocabulary. The table below is a toy vocabulary of 23 entries; Llama-3.1's real one has **128,256**. The highlighted rows are the 7 this sentence uses.
+  </Step>
+
+  <Step title="4. How aggressive the merges are">
+    Drag the slider. Merging harder gives fewer, longer tokens — cheaper to process, but coarser. Real designs sit between the extremes: Qwen2.5's 151,936 entries, Llama-2's 32,000, GPT-2's 50,257.
+  </Step>
+
+  <Step title="5. Nothing is ever lost">
+    The base of every vocabulary is **all 256 byte values**, one token each. Anything on earth can therefore be spelled out, so no tokenizer ever needs an "unknown" symbol. Llama-3.1's 128,256 is exactly **256 × 501**: 256 byte tokens plus 501 rounds of learned merges.
+  </Step>
+
+  <Step title="6. A token is not free">
+    Every token costs an embedding row (8 KB read), a row in every attention score matrix, and a KV cache entry in every layer that stays alive for the whole request. That is why a tokenizer that emits 10% more tokens makes a prompt measurably slower and more expensive.
+  </Step>
+</Scrolly>
+
+## The real vocabularies
+
+| Model | Vocabulary | ÷ 256 | Character ratio | Special tokens? |
+|---|---|---|---|---|
+| GPT-2 | 50,257 | — | ≈ 4.0 | |
+| Llama-2 | 32,000 | 125 | ≈ 3.6 | `<unk>`, `<s>`, `</s>` |
+| Llama-3.1 | 128,256 | **501** | ≈ 4.0 | none (byte-level) |
+| Qwen2.5 | 151,936 | 593 + 288 | ≈ 3.6 | 288 chat/system markers |
+| GPT-4 | ~100,000 | — | ≈ 4.0 | |
+
+Two things worth noticing. Llama-3 dropped the `<unk>` token entirely — with 256 byte tokens as a floor there is nothing to be unknown about. And Qwen2.5's extra 288 entries are **special tokens**: strings like `<|im_start|>` that the chat template injects to mark conversation roles. Those are real tokens that consume real context.
+
+<Callout type="pitfall" title="Non-English text and code are much denser">
+  The 4-characters-per-token figure is *English prose*. Two cases that will bite you:
+
+  - **Code and numbers.** `tokenizer.encode("def f(x): return x**2")` produces far more tokens per character than prose, because source code is full of rare short pieces and no natural word structure. Assume 2.5–3 characters per token.
+  - **CJK and other non-Latin scripts.** Chinese, Japanese and Korean usually cost around **one token per character or more**, because a single Han character carries more meaning than an English letter but the vocabulary needs one entry per common character. A prompt in Chinese can be 2–3× more tokens than the same meaning in English.
+
+  If your product is multilingual, the tokenizer's vocabulary is not a detail — it is a per-language pricing decision.
+</Callout>
+
+## Tokens in a real request
+
+You will never send bare text to an instruct model. The **chat template** wraps your messages in special tokens that mark who is speaking and where turns begin and end. Qwen2.5's template, for a two-turn conversation, looks like this — and every marker is a token:
+
+```
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Explain the KV cache.<|im_end|>
+<|im_start|>assistant
+```
+
+Count those markers and you will see the overhead that surprises people: **a three-message conversation with 12 words of actual content is about 40 tokens.** Roughly 8–10 tokens of pure framing, plus 3–4 per additional message. If you are budgeting a context window for an agent that makes twenty tool calls in a row, the framing is a real line item — 20 × 10 = 200 tokens of nothing but scaffolding.
+
+Three practical consequences:
+
+- **The number an API reports is the number that matters.** `usage.prompt_tokens` from the provider counts the *templated* string, markers included. Your own client-side estimate will be slightly low if you forget the template.
+- **Prefixes are made of tokens too**, which is what makes prefix caching (Module 10) work: if many requests share a system prompt, that shared prefix is a contiguous span of tokens that can be reused rather than recomputed.
+- **Never concatenate two token IDs and expect one token back.** Encoding is not additive across a boundary; `"token" + "ization"` is two pieces that *might* merge into one, and only if the merge exists in the vocabulary.
+
+<Callout type="math" title="The budget you are actually managing">
+  For a request with a 2,000-token system prompt, a 3,000-token user message and a 500-token answer:
+
+  | | tokens | KV cache (Llama-3.1-8B) |
+  |---|---|---|
+  | Template markers | ~25 | 3 MiB |
+  | System prompt | 2,000 | 250 MiB |
+  | User message | 3,000 | 375 MiB |
+  | Answer being generated | 500 | 62 MiB |
+  | **Total at the end** | **5,525** | **691 MiB** |
+
+  The markers are 0.5% of the tokens and 0.4% of the memory. Nobody optimises them. Nobody should.
+</Callout>
+
+## Tokens are the unit of everything
+
+Once you can count tokens, every other number in this course becomes computable. For Llama-3.1-8B, which Module 02's cheat sheet derived:
+
+$$
+\text{KV cache bytes} = T \times 2 \times 32 \times 8 \times 128 \times 2 = T \times 131{,}072 \text{ bytes}
+$$
+
+so a 4,000-token prompt holds 4,000 × 131,072 = **512 MiB** of KV cache. And 4,000 tokens of English prose is about 16,000 characters: roughly four paragraphs.
+
+| Prompt | Characters | Tokens | KV cache (Llama-3.1-8B) |
+|---|---|---|---|
+| A one-line question | 60 | 15 | 1.9 MiB |
+| A code review request | 2,400 | 960 | 123 MiB |
+| A long document | 16,000 | 4,000 | 512 MiB |
+| The same document in Chinese | 4,000 chars | ~5,500 | 704 MiB |
+
+**The multiply you will do in production.** $T = 8{,}192$ tokens × 131,072 bytes = **1.07 GB** of KV cache for one user. On an 80 GB H100 with 16.1 GB of Llama-3.1-8B weights, that is 1.07 GB per concurrent sequence — about 58 sequences before the card is full. Module 05 is entirely about that arithmetic, and it is the arithmetic that decides how many users one GPU can serve.
+
+## In code
+
+Everything a tokenizer is, in twenty lines:
+
+```python
+import regex as re                      # the split pattern is part of the tokenizer
+
+class TinyBPE:
+    def __init__(self, merges):          # merges: [("t","h"), ("th","e"), ...] in learned order
+        self.ranks = {p: i for i, p in enumerate(merges)}
+        self.vocab = {bytes([b]): b for b in range(256)}   # 256 byte tokens: the floor
+
+    def encode(self, text: str) -> list[int]:
+        # 1. bytes: every character is 1-4 bytes, every byte has an ID
+        parts = [bytes([b]) for b in text.encode("utf-8")]
+        while True:
+            # 2. find the adjacent pair with the best (lowest) merge rank
+            best, at = None, -1
+            for i in range(len(parts) - 1):
+                r = self.ranks.get((parts[i], parts[i + 1]))
+                if r is not None and (best is None or r < best):
+                    best, at = r, i
+            if at < 0: break
+            # 3. merge that one pair everywhere
+            parts[at:at + 2] = [parts[at] + parts[at + 1]]
+        return [self.vocab.setdefault(p, len(self.vocab)) for p in parts]
+
+tok = TinyBPE([(b"t", b"h"), (b"th", b"e"), (b"r", b"e"), (b"a", b"d"), (b" ", b"t")])
+ids = tok.encode("the transformer reads tokens")
+print(ids, len(ids))                     # 7-ish ids for a 28-character sentence
+print(b"".join(tok.vocab[i] for i in ids))  # -> b'the transformer reads tokens'
+```
+
+Real tokenizers add one thing: they never let a merge cross a category boundary. GPT-style tokenizers split on a regex first — words, numbers and punctuation each merge separately, and the leading space of a word is part of the piece (`Ġthe`, `Ġtok`) rather than a separate token. Llama-3's `Ġ` is just a visible marker standing in for a real space byte.
+
+<Callout type="try" title="Count real tokens in three minutes">
+  In the Colab notebook for this module, load a tokenizer and print, for the same sentence: `len(tokenizer(text).input_ids)`, the decoded pieces, and `characters / tokens`. Then repeat with code, with a number-heavy string, and with a line of Chinese. Write the four ratios in **My notes**. Every prompt-length estimate you make later should use a ratio you measured, not one you assumed.
+</Callout>
+
+<Callout type="real" title="What this means when you serve a model">
+  The tokenizer is part of the model. It ships with the weights, its vocabulary size is baked into the embedding matrix, and a server must run it on every request — in the request path, before the GPU. It also means your context window is a *token* budget, so a "128K context" model accepts fewer characters of code than of prose. At the time of writing, most production engines run the tokenizer in Rust on the CPU, batched with continuous batching, because it is pure overhead you cannot avoid.
+</Callout>
+
+<KeyNotes>
+  1. A model reads **integers, not text**. A token is a piece of text plus an integer ID, and the ID is a row number, not a meaning.
+  2. **Byte-pair encoding** starts from bytes, repeatedly merges the most frequent adjacent pair, and stops at a fixed vocabulary size. Every merge is one learned rule.
+  3. English runs at about **4 characters per token** (0.75 tokens per word). Code is denser (≈ 2.5–3); CJK is much denser still (≈ 1 token per character).
+  4. Every vocabulary starts with **all 256 byte values**, one token each. Llama-3.1's 128,256 = 256 × 501 exactly. This is why no tokenizer needs an "unknown" token.
+  5. Vocabulary sizes: GPT-2 50,257 · Llama-2 32,000 · Llama-3.1 128,256 · Qwen2.5 151,936 (256 × 593 + 288 special chat tokens).
+  6. **Tokens are the billing unit.** Everything else — KV cache, context limit, prefill cost, tokens per second — is denominated in tokens.
+  7. KV cache for Llama-3.1-8B = $T \times 131{,}072$ bytes. 8,192 tokens = **1.07 GB** for a single sequence.
+  8. Word-start spaces are part of the token (`Ġthe`), and merges never cross a word/number/punctuation boundary.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'How many characters are in the string "the transformer reads tokens"?', numeric: true, answer: 28, tolerance: 0, why: '"the" is 3, a space 1, "transformer" is 11, a space 1, "reads" is 5, a space 1, "tokens" is 6: 3+1+11+1+5+1+6 = 28.' },
+  { q: 'If that sentence tokenizes to 7 tokens, what is the characters-per-token ratio?', numeric: true, answer: 4, tolerance: 0.05, why: '28 ÷ 7 = 4.00 characters per token, which is exactly the English average.' },
+  { q: 'Llama-3.1’s vocabulary holds 128,256 entries. Why is that number exactly divisible by 256?', options: ['It is a power of two, like every vocabulary', 'The base of every BPE vocabulary is one token per possible byte value, and the learned merges come in multiples of that', 'Because 256 is the largest vocabulary that fits in a 16-bit ID', 'Because 256 is the number of characters in the Latin alphabet'], answer: 1, why: 'BPE starts from the 256 possible byte values, then adds learned merges. 128,256 = 256 × 501. It guarantees that any input can be spelled, so no "unknown" token is needed — Llama-2 had one, Llama-3 does not.' },
+  { q: 'A prompt is 4,000 tokens on Llama-3.1-8B. How much KV cache does it hold, in MiB?', numeric: true, answer: 512, tolerance: 8, unit: 'MiB', why: '4,000 × 131,072 bytes = 524,288,000 bytes = 500 MiB, conventionally 512 MiB using the exact per-token figure of 128 KiB.' },
+  { q: 'Why does code usually produce more tokens per character than English prose?', options: ['Code is always longer', 'Code is full of rare symbols and short pieces with no natural word structure, so the vocabulary covers it less efficiently', 'Tokenizers skip whitespace in code', 'Because code contains more uppercase letters'], answer: 1, why: 'The 4 characters-per-token figure is measured on English prose. Source code mixes rare identifiers, operators and digits, so the merge table covers it less well — typically 2.5–3 characters per token.' },
+  { q: 'A Chinese prompt and an English prompt express the same information. The Chinese one uses 2,500 tokens, the English one 1,000. Why?', options: ['Chinese models are lower quality', 'Han characters usually cost about one token each, so the same meaning needs more tokens', 'The tokenizer was trained only on English', 'Chinese text has more punctuation'], answer: 1, why: 'One Han character carries roughly the meaning of an English *word*, so the same information needs ~2.5× the characters, and Han characters are not well covered by merge patterns. Budget per-language, not per-character.' },
+] } />

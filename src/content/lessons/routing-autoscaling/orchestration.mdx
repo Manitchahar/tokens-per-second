@@ -1,0 +1,168 @@
+---
+title: 'Kubernetes, KServe, Ray Serve & llm-d'
+summary: 'Every layer above the GPU is a choice. You will learn what each orchestration technology actually owns, why a GPU replica does not fit the ordinary web-server model, and how to choose a layer by how much control you want to keep.'
+objectives:
+  - Map the five layers between your application and a GPU, and say who owns each
+  - Explain why a GPU inference replica breaks the assumptions of a web-server pod
+  - Compare KServe, Ray Serve and llm-d on control, code owned and scheduling intelligence
+  - Recognise which parts of Kubernetes to keep versus build yourself
+  - Justify an orchestration choice for a specific product shape
+---
+import Orchestrator from '@/components/viz/routing-autoscaling/Orchestrator.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Everything in the last three lessons assumed a fleet that somebody had built: replicas that start, a router that knows about them, an autoscaler that adds more. This lesson is about the part that actually builds it — the stack of software between your HTTP handler and the GPU.
+
+The trap is that this stack was designed for web servers, and an inference replica is not one.
+
+## The five layers
+
+Whatever the technology, every LLM deployment is the same five layers:
+
+1. **Your application** — clients, streaming, authentication, your business logic.
+2. **Routing** — which replica gets this request (Lesson 23.1).
+3. **Scaling** — how many replicas exist (Lesson 23.3).
+4. **Replicas** — the engine process holding the weights and the KV cache.
+5. **The GPU** — where the work happens.
+
+Layers 2 and 3 are what you learned today. Layers 4 and 5 are Modules 05 through 22. Layer 1 is your product. The interesting question is: **which technology sits where, and who has to maintain it?**
+
+<Scrolly>
+  <Orchestrator client:visible slot="stage" />
+
+  <Step title="1. The five layers">
+    Every deployment, from a laptop to a thousand-GPU cluster, is this stack. The bottom three layers are shared infrastructure that works the same for any container. The top two are where LLM inference genuinely differs from serving an ordinary API.
+  </Step>
+
+  <Step title="2. Kubernetes is the substrate">
+    Nodes, pods, Deployments, Services, Ingress. Kubernetes schedules pods, restarts the ones that die, discovers them through a Service, and gives them DNS names. It is a genuinely excellent substrate — and it has never heard of a token, a KV cache or a GPU.
+  </Step>
+
+  <Step title="3. A pod is not a replica">
+    A web pod is cheap, interchangeable and disposable. An inference replica holds 16 GB of loaded weights, a populated KV cache, and the in-flight state of real users' conversations. It wants a whole node, pinned devices, large shared memory, and minutes to drain on shutdown.
+  </Step>
+
+  <Step title="4. KServe: inference as a resource">
+    KServe's premise: a model should be a Kubernetes resource, not a program you write. You declare an `InferenceService` — model, runtime, autoscaler — and a controller reconciles it into a deployment, a Service, an HPA and an ingress. Minimum code, minimum control.
+  </Step>
+
+  <Step title="5. Ray Serve: requests as objects">
+    Ray's premise: the *request* is the primitive. You write a `@app.deployment` class and Ray handles placement, continuous batching across replicas, request routing and scale-to-zero. More power, and all of it is code you now maintain.
+  </Step>
+
+  <Step title="6. llm-d: scheduling as its own layer">
+    llm-d's premise: inference has a scheduling problem that generic Kubernetes scheduling cannot express — cache locality, prefix affinity, prefill/decode balance. So it adds a scheduler-aware control plane that treats placement as a first-class decision.
+  </Step>
+
+  <Step title="7. Choosing a layer">
+    Choose by how much you want to own. KServe if you want Kubernetes to own it, Ray Serve if you want to program the serving logic yourself, llm-d if the scheduling itself is where you think the advantage is. Everything above the line is code someone has to page at 3am.
+  </Step>
+</Scrolly>
+
+## Why GPU replicas break the web-server pod model
+
+A pod is defined by four assumptions that hold for a web server and fail for an <Term t="inference-replica">inference replica</Term>:
+
+**Small state.** A web pod holds a few megabytes. An inference replica holds the model's weights — 16 GB for Llama-8B in BF16 — plus a KV cache that grows to tens of gigabytes. You cannot casually run ten of these on one node and expect them to behave.
+
+**Fast start.** A web pod is serving requests within a second. An inference replica must load weights from disk or network, allocate its KV pool, and warm up (Module 22) — tens of seconds to several minutes. This is why scaling has to be anticipatory.
+
+**Cheap to replace.** Kubernetes kills and recreates pods freely. Killing a pod that holds live KV cache kills real users' in-flight conversations, so you need <Term t="draining">draining</Term>, preStop hooks and a generous `terminationGracePeriodSeconds`.
+
+**One GPU, one process.** Multi-GPU inference needs collective communication (Module 18), which means the GPUs must be on the same node with a topology-aware placement, shared memory configured, and often `hostIPC` and huge pages enabled.
+
+In practice the manifest grows accordingly. Note the <Term t="termination-grace">termination grace period</Term>, which is minutes rather than seconds:
+
+```yaml
+# A rough shape of what an inference pod actually needs. Illustrative.
+spec:
+  terminationGracePeriodSeconds: 600   # drain, do not kill
+  containers:
+    - name: engine
+      command: ["vllm", "serve", "meta-llama/Llama-3.1-8B"]
+      env:
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: spawn
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          sharedmemory: 16Gi      # paged KV + NCCL need it
+      startupProbe:                # "ready" only after weights load
+        httpGet: { path: /health, port: 8000 }
+        failureThreshold: 60
+        periodSeconds: 5
+      lifecycle:
+        preStop: { exec: { command: ["sh","-c","sleep 15"] } }
+```
+
+Notice the `startupProbe` rather than a readiness probe: the pod is *alive* long before it is *able to serve*, and a liveness probe that fires during weight loading will restart the pod in a loop forever. That distinction is the single most common failure when putting vLLM behind Kubernetes, and it is why the <Term t="startup-probe">startup probe</Term> exists as a separate primitive.
+
+<Callout type="pitfall" title="The liveness-probe restart loop, and why it costs you your KV cache">
+  Point a liveness probe at an endpoint that does not answer until the model is loaded, and Kubernetes concludes the container is hung. It kills it and starts a new one, which loads the weights again, which does not answer the probe. The result is a pod that restarts every thirty seconds, burns the image pull quota, and never serves a request. Use a <Term t="startup-probe">`startupProbe`</Term> with a generous threshold, then a liveness probe that only checks the process is alive.
+</Callout>
+
+## The three tools, honestly compared
+
+| | KServe | Ray Serve | llm-d |
+|---|---|---|---|
+| **Abstraction** | `InferenceService` CRD | `@app.deployment` class | Gateway + placement layer on k8s |
+| **You write** | YAML | Python | YAML + optional components |
+| **Owns** | reconciliation, ingress, HPA wiring | placement, batching, routing, scale-to-zero | routing, topology-aware placement |
+| **Scheduling awareness** | basic (HPA on queue/GPU) | good (programmable) | the point of the project |
+| **Scale to zero** | yes | yes, built-in | depends on setup |
+| **Learning curve** | Kubernetes | Ray | both |
+| **Best when** | you already run k8s and want it to just work | serving logic is genuinely custom | placement/locality is your differentiator |
+
+**KServe** (<Term t="kserve">KServe</Term>) is the pragmatic default. It wins because everything you already know about Kubernetes — RBAC, network policies, secrets, canaries from Module 22, Prometheus metrics — keeps working, and because a controller doing reconciliation is far less code for you to maintain at 3am.
+
+**Ray Serve** (<Term t="ray-serve">Ray Serve</Term>) wins when your serving logic is genuinely custom: you need per-request Python, complex batching policies, model multiplexing with a shared queue, or you want the same framework for training and serving. Its real advantage is that continuous batching across replicas is a first-class concept rather than something you bolted onto HTTP.
+
+**llm-d** (<Term t="llm-d">llm-d</Term>) is the interesting bet, and at the time of writing it is young. Its thesis is the correct one — the placement problem is genuinely different for inference, and prefill/decode balance and cache locality belong in the scheduler. If it delivers, it is a real advantage; if you adopt it early, you are adopting a moving target.
+
+<Callout type="real" title="A fourth option worth knowing">
+  vLLM ships with a production stack of its own: an API server, a router that can be cache-aware, and workers managed directly, without Kubernetes at all. For a fleet of ten to fifty replicas on a fixed set of machines, this is often the *lowest* operational burden, because there is no cluster to operate. Reach for a cluster when you need to scale across machines you do not own or when the org already runs one.
+</Callout>
+
+## Choosing, concretely
+
+Decide by asking three questions in order:
+
+1. **Do you already run Kubernetes?** If yes, KServe costs you the least. If no, and your fleet is under ~50 replicas on machines you control, vLLM's own stack or a plain process manager may be less work than adopting a cluster.
+2. **Is the serving logic unusual?** Multi-model routing with model-specific batching, custom tokenization, or application-level logic in the request path all argue for Ray Serve.
+3. **Is placement your differentiator?** If you are betting that cache-aware routing and prefill/decode balance are where the performance comes from, that argues for a layer that treats them as first-class — which is llm-d's reason to exist.
+
+<Callout type="mentor" title="What to say in a design review">
+  "We run on Kubernetes because the org already operates it, so the marginal cost of KServe is a CRD rather than a cluster. We keep the router in front of the engines rather than relying on a Service, because routing on KV load is worth more than the operational simplicity we would buy. We revisit llm-d when placement becomes our bottleneck, not before."
+</Callout>
+
+## The rolling deploy, end to end
+
+Module 22 taught canaries and rollbacks for one server. On a fleet the same release is a multi-step dance, and the ordering matters more than it did with one pod.
+
+The safe sequence is: bring up the new replica, let it pass its health checks and take its first real request, then move a small share of traffic, then ramp. At each stage the question is whether the *new* replica's percentiles match the old fleet's. Because you route on KV load and a fresh replica has an empty cache, the newcomer looks like the least loaded thing in the fleet and will take a disproportionate share of traffic immediately — which is useful, because it exercises it, and risky, because a cold replica is slower for exactly the requests that need its prefix.
+
+Two practices make this survivable. First, **warm the replica before it counts**: send it a synthetic prompt of representative length so its KV pool is allocated and its weights are resident, and only then add it to the router's candidate set. Second, **hold one replica of headroom** so the new version has somewhere to land traffic without the fleet shrinking. Both are the same lesson as scaling, applied to releases instead of demand.
+
+<Callout type="pitfall" title="A cold replica will take more traffic than you intended">
+  Every routing policy in this module prefers the least-loaded replica, and a replica that has just started is the least loaded thing that exists. So your canary does not receive 5% of traffic — it receives whatever the router thinks is fair, which on a cold cache is often far more. Warm it first, or cap its share explicitly, or your 5% canary is really a 60% canary that you believed was 5%.
+</Callout>
+
+<KeyNotes>
+  1. Every LLM deployment is five layers: app, routing, scaling, replicas, GPU. The technologies differ in which layers they own.
+  2. A GPU inference replica breaks four pod assumptions: small state, fast start, cheap replacement, one process per GPU.
+  3. Always use a `startupProbe` with a generous threshold, not a liveness probe that fires during weight loading — otherwise you get a restart loop that never serves.
+  4. KServe wins on operational cost for anyone already running Kubernetes, because reconciliation beats hand-written code.
+  5. Ray Serve wins when serving logic is genuinely custom, because continuous batching across replicas is first-class rather than bolted on.
+  6. llm-d's thesis is right — placement is a different problem for inference — but at the time of writing it is young.
+  7. Under ~50 replicas on machines you own, vLLM's own production stack is often less work than adopting a cluster.
+  8. Route in front of the engines with something KV-aware; a plain Service cannot see the thing that matters.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'You deploy vLLM on Kubernetes with a liveness probe hitting the health endpoint every 5 seconds, and the pod restarts forever. What is happening and what fixes it?', options: ['The GPU is overheating; add a node selector', 'The pod takes minutes to load weights, so liveness kills it before it can serve, forever', 'The health endpoint returns 200 too often', 'vLLM does not support Kubernetes'], answer: 1, why: 'Liveness asks "is this process wedged?" and a model still loading weights looks exactly like a hang. Use a startupProbe with a failureThreshold large enough to cover weight loading, and keep liveness for genuine process death only.' },
+  { q: 'An inference pod holds 16 GB of weights plus a growing KV cache. Which four pod assumptions does it break?', options: ['Immutability, idempotency, statelessness, replication', 'Small state, fast start, cheap to replace, and independent scheduling', 'Multi-tenancy, encryption, audit, compliance', 'Horizontal scaling, load balancing, health checking, DNS'], answer: 1, why: 'Big state means a slow start (weight load), a careful shutdown (drain KV rather than kill), and node-level placement with pinned GPUs. These are exactly the four you must configure for in the manifest.' },
+  { q: 'Why is a plain Kubernetes Service an inadequate front door for an inference fleet?', options: ['It cannot load balance at all', 'It load balances on connections and cannot see KV cache occupancy or prefix affinity, which are the signals that determine whether a request is cheap or expensive', 'It does not support HTTP/2', 'It cannot route to pods in different namespaces'], answer: 1, why: 'A Service counts connections. Request cost varies by orders of magnitude with prompt length and cache state, so connection count is the wrong unit — the argument from Lesson 23.1. You need a router that can score replicas on KV load and prefix match.' },
+  { q: 'A serving pod needs to be able to serve its prefill and decode without them interfering. Which scheduling concern does a generic scheduler not express?', options: ['How many CPUs to give it', 'Placing prefill-heavy and decode-heavy workloads on appropriately specialised GPUs, and keeping prefix-affine work near the cache holding it', 'Which node has the most RAM', 'Whether to use HTTPS'], answer: 1, why: 'This is the Module 21 disaggregation and Lesson 23.2 cache-locality problem. A generic scheduler balances CPU, memory and GPU count; it has no concept that this workload has phases and cache state worth co-locating. That gap is exactly what llm-d exists to fill.' },
+  { q: 'Llama-3.1-8B weights in BF16 take about 16 GB. An 80 GB H100 leaves roughly 56 GB of KV pool after weights, CUDA context and workspace. At 131,072 bytes of KV per token, how many KV tokens does that pool hold?', numeric: true, answer: 402, tolerance: 15, unit: 'thousand tokens', why: '56 GB = 56 × 10⁹ bytes. Dividing by 131,072 bytes per token gives 427,000 — and after reserving for fragmentation the usable pool is about 402,000 tokens. That is 392 users at a 1,024-token context, or 49 at 8,250. The pool size is the first half of every capacity calculation in this module.' },
+  { q: 'You deploy 4 replicas and roll a new model version. The new replica starts and your least-loaded router immediately sends it a large share of traffic. An H100 holds about 402,374 KV tokens; the new replica currently holds 0. By what factor does it look less loaded than a replica holding 100,000 tokens?', numeric: true, answer: 100, tolerance: 5, unit: '×', why: 'Load is measured as a fraction of the pool: the new replica reads 0.00 and the warm one reads 100,000 / 402,374 ≈ 0.25. A zero-load replica wins every comparison, so it absorbs far more than its intended canary share. Warm it before adding it to the router candidate set, or cap its share explicitly.' },
+] } />

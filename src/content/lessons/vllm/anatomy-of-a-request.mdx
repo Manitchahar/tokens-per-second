@@ -1,0 +1,184 @@
+---
+title: 'Anatomy of a request inside vLLM'
+summary: 'Follow one POST all the way to a streamed token: the API server, the tokenizer, the scheduler, the model runner, the sampler and the detokenizer — and the three clocks that decide whether your users are happy.'
+objectives:
+  - Name the six stages a request passes through, and say which one owns the GPU
+  - Decompose time to first token into queueing, prefill and one decode step
+  - Explain why the scheduler is the component that decides who waits
+  - Trace how KV blocks are allocated, grown and freed for one request
+  - Recognise the four reasons a request gets slower, and which knob fixes each
+colab: 09-anatomy.ipynb
+---
+import RequestInsideEngine from '@/components/viz/vllm/RequestInsideEngine.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You can start the engine and you can call it. What you cannot yet do is explain a slow request. "TTFT was 1.4 seconds" is a number; "the queue was 900 ms deep because we were running 256 sequences and the harness opened them all at once" is an explanation, and only one of those two lets you fix anything.
+
+So this lesson opens the hood and follows one request from the JSON body to the last `data:` line. Almost everything here is Module 07 and Module 08 with real names attached.
+
+## The one structural fact
+
+vLLM is split in two, and the split explains most of its behaviour:
+
+- The **API server** owns the HTTP port. It validates requests, runs the <Term t="tokenizer">tokenizer</Term>, keeps the streams open, and pushes finished text to the client. It touches **no GPU at all**.
+- The <Term t="engine-core">engine core</Term> owns the GPU. It holds the <Term t="model-runner">model runner</Term>, the scheduler and the KV cache manager. It never parses HTTP.
+
+In vLLM's V1 engine, at the time of writing, these can be separate processes talking over a socket rather than two threads in one process. That is a deployment detail; the reason for the split is not. Anything that can be moved off the critical GPU path should be, because the GPU path is the scarce resource and Python is slow.
+
+<Callout type="real" title="Why the split is worth caring about">
+  The scheduler has to run between GPU steps. If a Python-heavy activity — JSON parsing, detokenizing a 200-request batch, opening a socket — happened on the same thread that decides the next batch, it would land directly in your inter-token latency. Keeping the HTTP world outside the engine means that only genuinely GPU-bound work is on the critical path. Module 15 · Compilation & CUDA Graphs is the same idea one level down: the GPU should never wait on Python.
+</Callout>
+
+## The six stages
+
+<Scrolly>
+  <RequestInsideEngine client:visible slot="stage" />
+
+  <Step title="1. A POST arrives">
+    The API server checks the body against the model's schema, builds a <Term t="sampling-params">SamplingParams</Term> object, stamps an arrival time, and puts the request in the **waiting queue**. Nothing has touched the GPU yet, but the stopwatch has started: this is where <Term t="ttft">TTFT</Term> is won or lost.
+  </Step>
+
+  <Step title="2. Tokenize">
+    The chat template is applied — system prompt, role markers, your text — and the whole string becomes token IDs. The engine never sees a word again. Note the trap: the template's own special tokens count against your context and are billed as prompt tokens.
+  </Step>
+
+  <Step title="3. The scheduler admits it">
+    The scheduler asks three questions: are there free KV blocks, is the batch below `--max-num-seqs`, and does this step still have token budget? Yes to all three and it moves into the **running** list. This is the loop you built by hand in Module 07.
+  </Step>
+
+  <Step title="4. Prefill">
+    Every unfinished sequence's tokens go through the model in **one** forward pass. A 512-token prompt is one big matrix multiply, it runs at peak FLOP/s, and it writes one KV block per 16 tokens.
+  </Step>
+
+  <Step title="5. The first token">
+    The final hidden state goes through the LM head into logits, then the sampler picks a token. That single token is the *first* token, so everything before it was TTFT. It costs exactly one decode step.
+  </Step>
+
+  <Step title="6. Decode, step after step">
+    Each subsequent step is identical: read the weights once, read every running sequence's KV cache, produce one token each, append, sample. Memory-bound, same cost no matter how many sequences are running.
+  </Step>
+
+  <Step title="7. Finish, free, refill">
+    When a sequence emits its stop string its blocks are freed — **and the freed blocks go straight to a waiting sequence in the very next step**. That is continuous batching, and it is why vLLM does not waste a GPU waiting for the longest request in the batch.
+  </Step>
+</Scrolly>
+
+### Stage by stage, with the details that bite
+
+**The API server.** Validation is strict on purpose. A prompt longer than `--max-model-len` comes back as a `400` with the exact token count in the message — that error is a feature, and it is far kinder than an out-of-memory crash twenty seconds later. It also assigns a request id, which is what you put in a log line when you are chasing one unlucky user (Module 24 · Observability, Reliability & Security).
+
+**The tokenizer.** Two details matter. First, the chat template: for an instruct model the template inserts role markers such as `<|im_start|>` and `<|im_end|>`, and those are real tokens that occupy real KV blocks. A "1,000-token chat" with a chat template can be 1,060 tokens of context. Second, counting happens on *tokens*, not characters — the same sentence can be 15% longer in another language, which is why a context limit expressed in characters is a bug.
+
+**The scheduler.** It is the heart, and it is deliberately boring: each iteration it re-forms the running batch from whoever is still alive, runs them together, then looks at what came back.
+
+```python
+# pseudocode for one engine iteration, not the real source
+while True:
+    running, waiting = scheduler.schedule()   # who runs this step
+    output = model_runner.execute(running)    # one forward pass for all of them
+    tokens  = sampler.sample(output.logits)   # one kernel for all of them
+    scheduler.update(running, tokens)         # free finished blocks, admit waiters
+```
+
+Three rules decide who is in `running`, and each one is a knob you will meet in the next lesson:
+
+1. **KV blocks available.** If there are none, nothing is admitted. In vLLM V1, when the engine is completely full it preempts: it pauses (and in the V1 design, recomputes later rather than swapping pages to host memory) the most recently admitted, longest request. You will see `vllm:num_preemptions_total` climb, and that is a signal, not a curiosity.
+2. **`--max-num-seqs`.** A hard cap on how many sequences run at once. It bounds per-step latency directly, which is why you raise it for throughput and lower it for tail latency.
+3. **`--max-num-batched-tokens`.** How many tokens one iteration may process. This is what stops a 30,000-token prompt from blocking everybody else's decode for a second and a half — the exact problem Module 10 · Prefill & Prefix Optimization is about.
+
+**The model runner.** This is where the GPU work happens, and it is a lot less code than you might fear, because PyTorch and the attention kernels do the heavy lifting: gather each sequence's blocks into one batch tensor, run the transformer once, run the attention backend over the paged KV cache (Module 14 · Attention Optimization), write the new keys and values back into their blocks. On modern setups the decode step is wrapped in a **CUDA graph**, so the whole step is one graph replay rather than hundreds of kernel launches (Module 15).
+
+**The sampler.** Every sequence's logits are filtered and sampled in **one kernel**, for the whole batch. `temperature` and `top_p` from Module 03 are applied here, and they cost the same whether they change the answer or not. This is worth internalising: a request asking for `n: 4` does not cost 4 steps, it costs one step and four times the KV cache.
+
+**The detokenizer.** The unglamorous stage that makes streaming work. A token is not a character: it can be half of a multi-byte UTF-8 sequence, or the first half of a word like `Ġatten`. The <Term t="detokenizer">detokenizer</Term> buffers partial tokens and only emits complete text, and it has to be incremental, because the alternative is to wait for the whole answer — which is exactly the latency you were trying to avoid.
+
+## The three clocks, and the arithmetic
+
+<Callout type="math" title="Where TTFT comes from">
+  $$
+  \text{TTFT} = \underbrace{t_{\text{queue}}}_{\text{scheduling}} + \underbrace{t_{\text{prefill}}}_{\text{compute-bound}} + \underbrace{t_{\text{step}}}_{\text{one decode step}}
+  $$
+
+  and after that, every token costs one more $t_{\text{step}}$:
+
+  $$
+  \text{ITL} = t_{\text{step}} = \max\left(\frac{\text{weights} + \text{KV}}{\text{bandwidth}},\ \frac{2 \cdot \text{params} \cdot B}{\text{FLOP/s}}\right) + t_{\text{overhead}}
+  $$
+</Callout>
+
+Work it for **Llama-3.1-8B on one H100** with a 512-token prompt and 64 output tokens, one user alone on the GPU.
+
+**Prefill.** Two FLOPs per parameter per token, so a 512-token prompt costs
+
+$$
+2 \cdot 512 \cdot 8.03\times 10^{9} = 8.2\ \text{TFLOP}
+$$
+
+At 55% of the H100's 989 TFLOP/s peak — 544 TFLOP/s effective — that is about **15 ms**. The weight read (16.06 GB at 2.7 TB/s effective) is 6 ms and overlaps it, so prefill is compute-bound:
+
+$$
+t_{\text{prefill}} \approx 15.1\ \text{ms} + 2\ \text{ms} \approx 17\ \text{ms}
+$$
+
+**One decode step.** Weights 16.06 GB plus KV for 512 tokens (512 × 128 KB = 64 MB), read at 2.7 TB/s:
+
+$$
+t_{\text{step}} \approx \frac{16.12\ \text{GB}}{2.7\ \text{TB/s}} = 6.0\ \text{ms} \quad+\quad 1.5\ \text{ms overhead} \approx 7.5\ \text{ms}
+$$
+
+**TTFT with an empty queue** is therefore 0 + 17 + 7.5 = **24.5 ms**, and the whole 64-token answer takes 17 + 64 × 7.5 = **497 ms**.
+
+**TTFT with a queue.** Now open 200 requests at once. The engine retires roughly one token per user per 7.5 ms, so the last one admitted waits on the order of seconds. **The GPU work barely changed; the queue did all of it.** This is the single most important habit in performance engineering: before optimizing prefill, check whether you are actually prefill-bound. Most "the model is slow" complaints are queueing.
+
+<Callout type="pitfall" title="The trap: batching for throughput and wondering about latency">
+  Turning `max_num_seqs` from 32 to 256 barely slows each individual decode step — the weights are read once either way — so throughput doubles and your per-user speed looks fine. What happens is that the *queue* becomes long, so TTFT grows, and users feel the answer "hang" before it starts. This is the latency–throughput trade-off from Module 00 wearing a different hat. Report p95 TTFT next to throughput, always.
+</Callout>
+
+## KV blocks, for one request, counted
+
+Blocks are handed out in units of <Term t="kv-block">16 tokens</Term>. A request that ends up with 576 tokens of context holds
+
+$$
+\left\lceil \frac{576}{16} \right\rceil = 36\ \text{blocks}
+$$
+
+and every block is 16 tokens × 32 layers × 8 KV heads × 128 head dim × 2 (K and V) × 2 bytes = **128 KB**. So $(36 \times 128)$ KB = **4.7 MB**, and it is freed the instant the request finishes.
+
+Two consequences worth carrying forward:
+
+- **Blocks are the unit of admission.** A request that needs 12,288 tokens of context needs 768 blocks *before it starts*. It cannot be admitted by growing into them, so a single monster prompt can refuse every small request behind it. Module 10 fixes this with chunked prefill and prefix caching.
+- **A new block arrives every 16 generated tokens.** During a long answer the request's footprint creeps upward, so a server at 95% KV usage can be preempted by a request that was fine a minute ago. Watch `vllm:gpu_cache_usage_perc`.
+
+<Callout type="mentor" title="A 30-second triage for a slow request">
+  1. **Is the queue deep?** `Waiting` in the stdout summary, or `vllm:num_requests_waiting`. If yes, you are capacity-bound: raise `max_num_seqs` if ITL has room, otherwise add replicas.
+  2. **Is prefill huge?** Compare `prompt_tokens` in `usage` against your expectation. A 20k-token prompt is 200 ms of compute before a single token exists.
+  3. **Is the answer running long?** `max_tokens` set too high means a slot is held by a request that stopped caring ten tokens ago.
+  4. **Is it preempted?** `vllm:num_preemptions_total` rising means the KV pool is too small for the traffic, full stop.
+</Callout>
+
+Now you can see the whole path. The next lesson is the practical one: what to actually type, in what order, and how to know whether each change helped.
+
+<Callout type="try" title="Time the three clocks yourself">
+  The notebook for this lesson streams a single request and timestamps every chunk, which splits <Term t="ttft">TTFT</Term> from <Term t="itl">ITL</Term>; then it fires N requests at once to watch the queue grow; then it reads `vllm:gpu_cache_usage_perc` while long and short prompts are in flight, so you can see a request's KV footprint with the engine's own numbers. Run it on a free T4.
+  <Colab nb="09-anatomy.ipynb" />
+</Callout>
+
+<KeyNotes>
+  1. vLLM splits into an **API server** (HTTP, tokenizer, streams, no GPU) and an **engine core** (scheduler, KV cache, model runner, sampler). Keeping Python off the GPU path is a deliberate design choice.
+  2. A request passes through six stages: HTTP API → tokenizer → scheduler → model runner → sampler → detokenizer. Only the model runner and the sampler touch the GPU.
+  3. The scheduler admits a request only if there are free KV blocks, room under `max_num_seqs`, and token budget left in the step. It re-forms the batch every iteration.
+  4. `TTFT = queue + prefill + one decode step`. For Llama-3.1-8B on an H100 that is about `0 + 17 ms + 7.5 ms`, but under real load **the queue dominates**.
+  5. `ITL` is one memory-bound decode step: weights plus that sequence's KV cache, divided by effective bandwidth, plus fixed overhead. Sampling parameters do not change it.
+  6. KV blocks are allocated in units of 16 tokens and are **all reserved before the request starts**. `ceil(context / 16)` blocks, 128 KB each for Llama-3.1-8B in BF16.
+  7. When a request finishes, its blocks go straight to a waiting request in the next step. That is the entire point of continuous batching.
+  8. When the pool is exhausted the engine preempts. A rising `vllm:num_preemptions_total` means the KV pool is too small for your traffic — not that a flag is mistyped.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B in BF16, 32 layers, 8 KV heads, head dim 128. How many bytes of KV cache does one token of context need?', numeric: true, answer: 131072, tolerance: 4000, unit: 'bytes', why: '2 (K and V) × 32 layers × 8 heads × 128 dim × 2 bytes = 131,072 bytes = 128 KB per token. This is the number that sets how many requests fit.' },
+  { q: 'A request finishes with 576 tokens of context. How many 16-token KV blocks does vLLM hold for it?', numeric: true, answer: 36, tolerance: 1, unit: 'blocks', why: 'ceil(576 / 16) = 36 blocks, reserved up front. At 128 KB per block that is 4.7 MB, freed the moment the request ends.' },
+  { q: 'On an H100, one decode step for Llama-3.1-8B takes about 6 ms of memory reads plus 1.5 ms of overhead. What is that, per user, in tokens per second?', numeric: true, answer: 133, tolerance: 15, unit: 'tokens/s', why: '1 ÷ 0.0075 s = 133 tokens/s. Note this barely changes with batch size: the weights are read once for everyone.' },
+  { q: 'TTFT is 24 ms when the queue is empty. It becomes 1.4 s under load. What changed?', options: ['Prefill got slower', 'The GPU is doing more math per request', 'The request waited in the queue to be admitted', 'The tokenizer got slower'], answer: 2, why: 'Prefill and the first decode step are the same 24 ms of work; the extra 1.38 s is queueing. Admission, not arithmetic, is what latency is made of under load.' },
+  { q: 'Why does the engine core refuse to admit a request that needs 12,288 tokens of context while it has room for several small ones?', options: ['Prefill for 12,288 tokens would exceed the token budget', 'All its KV blocks must be reserved before it starts, and one big request can hold them all', 'n would have to be set to 1', 'The chat template forbids long prompts'], answer: 1, why: 'Blocks are allocated up front, not grown on demand: 12,288 tokens is 768 blocks committed before the first token. A long request can therefore starve small ones behind it.' },
+  { q: 'Which component is responsible for keeping Python work off the GPU critical path?', options: ['The tokenizer', 'The detokenizer', 'The API server and engine core running separately', 'The sampler'], answer: 2, why: 'HTTP, tokenization and detokenization all live outside the engine, so scheduling and GPU execution are not interrupted. Tokenizer and detokenizer cost microseconds; the structure is what matters.' },
+]} />

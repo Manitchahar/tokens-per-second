@@ -1,0 +1,262 @@
+---
+title: 'Step 1: Model runner & KV cache'
+summary: 'Write the component that actually touches the GPU. You will build a runner that holds the weights and the KV cache, takes a batch of one-token-per-sequence, and returns one token per sequence — and you will measure exactly which bytes make that step slow.'
+objectives:
+  - Write a model runner with the interface [batch] ids in, [batch] ids out
+  - Append new keys and values to a per-sequence cache without recomputing old ones
+  - Compute KV cache bytes per token from a model config and predict the pool size
+  - Explain why step time is flat in batch size but linear in context length
+  - Assert your memory budget holds at every shape, including full-length prefill
+---
+import RunnerAndKV from '@/components/viz/mini-engine/RunnerAndKV.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You now know the shape of an engine. This lesson writes the box at its bottom: the <Term t="model-runner">model runner</Term>, the only component that ever touches the weights.
+
+It is the least interesting component and the fastest one to get right, which makes it the right place to start. By the end you will have code that takes 96 sequences and gives back 96 tokens in a single forward pass, with a KV cache that is provably the right size.
+
+## The interface, in one sentence
+
+A decode step takes a **list of sequences, one token each**, and returns **one token per sequence**. That is the entire contract between the scheduler and the runner. The scheduler decides who is in the batch; the runner does not know or care why.
+
+```python
+class ModelRunner:
+    def __init__(self, model, kv_manager, block_size=16):
+        self.model = model          # the nn.Module, on the GPU
+        self.kv = kv_manager        # holds the KV tensors
+        self.block_size = block_size
+
+    def execute(self, sequences) -> list[int]:
+        """One decode step: one token per sequence, one token back each."""
+        input_ids = torch.tensor([s.last_token_id for s in sequences], device="cuda")
+        positions = torch.tensor([s.num_tokens - 1 for s in sequences], device="cuda")
+        return self.model.generate(input_ids, past_key_values=self.kv.cache, ...)
+```
+
+Everything above is the easy part. The two things that are not obvious are **appending to the KV cache** and **being sure it fits**.
+
+<Scrolly>
+  <RunnerAndKV client:visible slot="stage" />
+
+  <Step title="1. Inputs: one token each">
+    A decode step begins with `B` token IDs — one per running sequence — and their positions. Nothing else comes in. The prompt was already processed during <Term t="prefill">prefill</Term>; from here on every sequence contributes exactly one row.
+  </Step>
+
+  <Step title="2. Write K and V">
+    Each token becomes a query, a key and a value. Query and key go to attention; the **key and value are appended to that sequence's cache** and stay there. This append is the only write of the step, and it is what makes generation cheap.
+  </Step>
+
+  <Step title="3. Attention reads the whole cache">
+    The query attends over every key this sequence has ever stored, not just the new one. So the KV read is proportional to `B × context`. This is the only term in the step that grows with conversation length.
+  </Step>
+
+  <Step title="4. The MLP is most of the weights">
+    About two thirds of a transformer's parameters live in its feed-forward blocks. Reading them once per step, for all sequences together, is the floor on decode latency — and it does not care how many sequences there are.
+  </Step>
+
+  <Step title="5. LM head and sample">
+    The last hidden state goes through one matrix multiply against the vocabulary — 128,256 columns for Llama-3.1 — giving logits. The <Term t="sampler">sampler</Term> turns logits into a token: temperature, top-p, and a seeded RNG so your benchmark is reproducible.
+  </Step>
+
+  <Step title="6. One step, N tokens out">
+    Run that once and you have advanced all `N` sequences by one token. The step's memory traffic barely changed as `N` grew, so total throughput scaled almost perfectly. **That is batching, in one picture.**
+  </Step>
+
+  <Step title="7. The only thing that matters">
+    Slide the batch size and the context. Step time is flat in batch and linear in context. Batching is close to free; long context is not. Every scheduling decision in the next lesson is about who gets to occupy this step.
+  </Step>
+</Scrolly>
+
+## The KV cache, written by hand
+
+The cache is a tensor per layer, per K and V, shaped `[num_blocks, block_size, num_kv_heads, head_dim]`. The `num_blocks` axis is the whole point — it is why the cache does not have to be contiguous, which is Module 08's entire idea. In Step 3 you will exploit it for prefix sharing.
+
+Writing a new token's K and V is a single scatter:
+
+```python
+def append_kv(layer_idx, seq, new_k, new_v):
+    """new_k/new_v: [B, num_kv_heads, head_dim] — this step's keys and values."""
+    blocks = self.kv.blocks_for(seq)          # which physical blocks hold this sequence
+    slot  = seq.num_tokens % self.block_size  # where inside the last block it lands
+    self.kv.k[layer_idx][blocks[-1], slot] = new_k
+    self.kv.v[layer_idx][blocks[-1], slot] = new_v
+    seq.num_tokens += 1
+```
+
+Three things to notice, all of them load-bearing:
+
+- `blocks_for(seq)` is a **gather through the block table**, not a slice. Sequence tokens are physically scattered; attention reconstructs them through this index.
+- The write is into `blocks[-1]`, the sequence's most recently allocated block. Allocating a new block every 16 tokens is the allocator's job, not the runner's.
+- `slot` is `num_tokens % 16`. The runner never needs to know the physical layout — only the position within a block.
+
+<Callout type="pitfall" title="The bug everybody writes once">
+  Writing the new K and V **after** attention instead of before. It works for prefill, where all tokens are processed at once, and produces a subtly wrong result at decode: the newest token would never attend to itself, so its own key would be missing from its own softmax. The visible symptom is output that is *almost* right and degrades with context length. Write first, then attend.
+</Callout>
+
+## Sizing the pool, before you allocate
+
+The runner must not start if the pool cannot hold what the scheduler might ask for. This is the Module 09 startup budget, and it belongs in your constructor:
+
+$$
+\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_{head} \times \text{bytes}
+$$
+
+```python
+kv_bytes_per_token = 2 * model.config.num_hidden_layers * \
+                     model.config.num_key_value_heads * \
+                     model.config.head_dim * dtype_bytes
+
+pool_bytes = util * total_mem - weights_bytes - reserve
+pool_blocks = pool_bytes // (block_size * kv_bytes_per_token)
+```
+
+For **Llama-3.1-8B in BF16**: `2 × 32 × 8 × 128 × 2 = 131,072` bytes = **128 KB per token**. One token of context costs more than a token of weights in a small model, and 8,192 tokens of context is **1.07 GB per user**.
+
+| Model | KV/token (BF16) | 8k context, per user | Concurrency at a 40 GB pool |
+|---|---|---|---|
+| Qwen2.5-0.5B | 12 KB | 98 MB | ~400 |
+| Llama-3.2-3B | 112 KB | 917 MB | ~43 |
+| Llama-3.1-8B | 128 KB | 1.07 GB | ~37 |
+| Llama-3.1-70B | 320 KB | 2.68 GB | ~14 |
+
+That last column is the number that decides your `max_model_len`. A 70B model at full 128k context cannot hold more than a handful of users on one 80 GB card, whatever the scheduler does.
+
+<Callout type="math" title="What the reserve is for">
+  `reserve ≈ 0.04 × M` covers the CUDA context, the activation workspace for a full-length prefill, and the peak of any sampling or logging pass. It is not a fudge factor: a 128k-token prefill materialises activations far larger than a decode step does, and an engine that sized its pool with no reserve will start fine and then OOM on its first long prompt.
+</Callout>
+
+## The flat-in-batch result, computed
+
+Take Llama-3.1-8B on an H100 at 3.35 TB/s, context 4,096 tokens, BF16.
+
+Weights: `16.06 GB`. KV per sequence: `4096 × 131,072 = 537 MB`.
+
+$$
+t_{\text{weights}} = \frac{16.06}{3350} = 4.79\ \text{ms} \qquad
+t_{\text{KV per seq}} = \frac{0.537}{3350} = 0.16\ \text{ms}
+$$
+
+| Batch | Weight read | KV read | Total bytes | Step time | Throughput |
+|---|---|---|---|---|---|
+| 1 | 16.06 GB | 0.54 GB | 16.6 GB | 4.95 ms | 202 tok/s |
+| 16 | 16.06 GB | 8.6 GB | 24.7 GB | 7.37 ms | 2,170 tok/s |
+| 32 | 16.06 GB | 17.2 GB | 33.3 GB | 9.93 ms | 3,220 tok/s |
+| 64 | 16.06 GB | 34.4 GB | 50.4 GB | 15.0 ms | 4,260 tok/s |
+
+From 1 to 16 users, throughput goes up **10.7×** while the step takes 1.5× longer. Users 2 through 16 are nearly free. Past about 30 sequences the KV read starts to dominate and each new user costs real time — that knee is the subject of the next lesson.
+
+<Callout type="intuition" title="Why this is the whole game">
+  The weight read is a **fixed** cost per step. The KV read is **variable**. So an engine is really doing two things: amortise the fixed cost over as many sequences as memory allows, and keep the variable cost small by not letting contexts grow. Scheduling is the art of trading one against the other, and the trade is entirely in this table.
+</Callout>
+
+## Prefill is the same code, with more rows
+
+Decode is one token per sequence. Prefill is hundreds of tokens for one sequence. The runner handles both with the same call, because that is the point of treating a step as a flat batch of rows:
+
+```python
+def step(self, sequences, chunk=None):
+    """chunk=None -> decode (one row per sequence).
+       chunk=list of (req, start, n) -> prefill those n tokens for those requests."""
+    input_ids, positions, slot_map = [], [], []
+    for i, req in enumerate(sequences):
+        if chunk and chunk[i] is not None:
+            start, n = chunk[i]
+            toks = req.ids[start:start + n]
+            positions.extend(range(start, start + n))
+            input_ids.extend(toks)
+            slot_map.extend(self.slot_of(req, p) for p in range(start, start + n))
+        else:
+            input_ids.append(req.last_token_id)
+            positions.append(req.num_tokens - 1)
+            slot_map.append(self.slot_of(req, req.num_tokens - 1))
+    ...
+```
+
+This is why continuous batching is easy to implement: a prefill chunk and a decode row are the *same kind of thing* — a token, its position, and the cache slot it writes. A chunked-prefill engine interleaves the two in one batch and does not need two code paths.
+
+<Callout type="pitfall" title="Positions come from the sequence, never from the row">
+  The most damaging batching bug is computing the position from the row index: `positions = torch.arange(len(rows))`. At batch 1 it is correct, which is why it survives testing. At batch 8 every sequence gets RoPE offsets from its neighbours, position embeddings point at the wrong tokens, and the output is fluent nonsense rather than an error.
+  
+  Write the parity test at batch 8 **before** you write anything else, because this bug is invisible at batch 1 and it is the difference between an engine and a random token generator.
+</Callout>
+
+## Sampling, and why you seed it
+
+The last thing the runner does is turn one row of logits into one token id. It is the smallest piece of code in the engine and it carries a surprising amount of responsibility.
+
+```python
+def sample(logits, temperature=1.0, top_p=1.0, top_k=-1, seed=0):
+    """logits: [B, vocab] -> [B] token ids."""
+    if temperature <= 0:
+        return logits.argmax(-1)                     # greedy: deterministic
+    logits = logits / temperature
+    if top_k > 0:
+        kth = logits.topk(top_k, dim=-1).values[:, -1:]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p < 1.0:
+        srt, idx = logits.sort(-1, descending=True)
+        cum = srt.softmax(-1).cumsum(-1)
+        drop = cum - srt.softmax(-1) > top_p
+        srt[drop] = float("-inf")
+        logits = torch.full_like(logits, float("-inf")).scatter_(1, idx, srt)
+    g = torch.Generator(device=logits.device); g.manual_seed(seed)
+    return torch.multinomial(logits.softmax(-1), 1, generator=g).squeeze(-1)
+```
+
+Three things to take from it:
+
+- **Greedy at temperature 0** makes the engine deterministic, which is what lets you diff it against `transformers`. Do your parity testing here.
+- **Top-p truncation happens before softmax**, on the sorted cumulative probabilities, so you keep the smallest set of tokens summing to `p`.
+- **The seed lives in the sampler, not the engine.** An unseeded engine cannot be compared with itself, and none of the numbers in this module mean anything without it. This is the one-line habit that separates an experiment from a measurement.
+
+## Assert your memory budget before the GPU does
+
+The engine will tell you when you are out of memory, but it will tell you deep inside a kernel with no request identity attached. Assert it yourself, in the place where you still know which request failed:
+
+```python
+def step(self, sequences):
+    used = self.kv.blocks_used()
+    assert used <= self.kv.num_blocks, (
+        f"KV pool exhausted: {used}/{self.kv.num_blocks} blocks, "
+        f"{len(sequences)} sequences in batch"
+    )
+    ...
+```
+
+<Callout type="math" title="The floor no scheduling trick goes below">
+  A single forward pass needs the weights resident: $\text{working set} \ge \text{params} \times \text{bytes}$. For Llama-3.1-8B in BF16 that is 16.06 GB, so it will not fit on a 16 GB card at all with any KV cache. This <Term t="working-set">working set</Term> is the memory floor of your whole design: every byte above it is a byte available for KV, and therefore for concurrency.
+</Callout>
+
+## Check yourself before continuing
+
+```python
+# the assertions your runner should make, every step
+assert kv_manager.blocks_used() <= kv_manager.total_blocks
+assert logits.shape == (len(sequences), model.config.vocab_size)
+assert all(r.num_tokens % block_size != 0 or r.blocks_allocated
+           for r in sequences)      # a full block must have been extended
+```
+
+The first one is not optional. A runner that does not assert its own budget will pass every test with one request and OOM in production at 4 a.m.
+
+<KeyNotes>
+  1. The runner's contract is **[B] token IDs in, [B] token IDs out**. It never decides who is in the batch; that is the scheduler's entire job.
+  2. Appending K and V to the cache is a scatter through the block table, into `blocks[-1]` at slot `num_tokens % 16`. Write **before** attention, or the newest token misses itself in its own softmax.
+  3. KV bytes per token is `2 × layers × kv_heads × head_dim × bytes`. For Llama-3.1-8B in BF16 that is **128 KB**, so 8k of context is **1.07 GB per user**.
+  4. The pool is `util × memory − weights − reserve`, and the reserve covers a full-length prefill's activations, not a decode step's.
+  5. Step time is **flat in batch** and **linear in context**. Users 2–16 are nearly free; past ~30 sequences at 4k context, every added user costs real time.
+  6. Compute batch size before allocating: `max_concurrency ≈ pool_bytes / (max_context × kv_bytes_per_token)`. It is usually smaller than you expect.
+  7. Seed the sampler's RNG, and use temperature 0 for parity testing. An unseeded engine cannot be benchmarked against itself.
+  8. Prefill and decode are the same call with a different row shape: a token, its position, and the cache slot it writes.
+  9. Positions come from each **sequence's** token count, never from the batch row index. This bug is invisible at batch 1 and catastrophic at batch 8.
+  10. Assert the memory budget on **every** step. An engine that cannot check its own invariants will not fail in testing; it will fail in production.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B has 32 layers, 8 KV heads, head dim 128, in BF16. How many bytes does one token of KV cache cost?', numeric: true, answer: 131072, tolerance: 2000, unit: 'bytes', why: '2 × 32 × 8 × 128 × 2 = 131,072 bytes, or 128 KB. The leading 2 is for K and V separately.' },
+  { q: 'That model serves 8,192-token contexts from a 40 GB KV pool. Roughly how many users fit at once?', numeric: true, answer: 37, tolerance: 4, unit: 'users', why: 'Per user: 8192 × 131,072 = 1.07 GB. 40 / 1.07 ≈ 37 users. This is why max_model_len is the concurrency knob.' },
+  { q: 'Why must the runner write the new K and V to the cache before computing attention?', options: ['To keep the tensor contiguous in memory', 'Because the new token must be able to attend to itself; writing afterwards drops its own key from its own softmax', 'To avoid a second kernel launch', 'Because softmax needs the full cache before it can start'], answer: 1, why: 'A token attends to itself as well as to everything before it. Write after attention and the newest key is missing from its own softmax — output that looks nearly right but degrades as context grows.' },
+  { q: 'Llama-3.1-8B on an H100 at 4,096 tokens of context. The weights take 4.79 ms to read and each sequence’s KV takes 0.16 ms. At batch size 32, what dominates the step?', options: ['The weight read, because 16 GB is more than 17 GB by enough to matter', 'The KV read, because 32 × 0.16 ms now exceeds the 4.79 ms weight read', 'Neither; it is compute-bound at this batch size', 'Exactly equal, so it does not matter'], answer: 1, why: '32 × 0.16 = 5.1 ms of KV against 4.79 ms of weights. Past roughly 30 sequences at this context the KV read overtakes the weights — that crossover is the knee.' },
+  { q: 'You double the context length of every request and change nothing else. What happens to the per-token step time?', options: ['It halves, because attention over more tokens is better amortised', 'It is unchanged, since the weight read dominates', 'It roughly doubles, because the KV read is proportional to context', 'It grows by the square of the factor, because attention is quadratic'], answer: 2, why: 'Decode attention is linear in context for the memory read; only the FLOPs are quadratic. The KV read is what dominates, so the step time scales linearly.' },
+  { q: 'Your runner asserts nothing about memory and passes every test with one request. What is the most likely production failure?', options: ['It will run fine, since a single request fits', 'It will OOM under concurrency or on a long prompt, because nothing checks the budget at the shapes production uses', 'It will produce wrong tokens after about 4,000 tokens', 'It will be slower than vLLM'], answer: 1, why: 'One request exercises almost none of the memory logic. The failure modes that matter — full pool at peak concurrency, full-length prefill activations — are exactly the ones a single-request test never reaches.' },
+]} />

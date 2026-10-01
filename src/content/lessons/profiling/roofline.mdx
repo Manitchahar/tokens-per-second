@@ -1,0 +1,214 @@
+---
+title: 'The roofline model, in depth'
+summary: 'Module 02 introduced the roofline as a picture. Here it becomes a tool: how to compute the intensity of a real kernel including its wasted bytes, how to read MFU and MBU without fooling yourself, how much headroom is left, and which of the three possible fixes is actually available to you.'
+objectives:
+  - Compute arithmetic intensity for a kernel as actually executed, including wasted sectors
+  - Find the ridge point for any GPU and classify a kernel against it
+  - Distinguish MFU from MBU and quote the one that matches the bound
+  - Compute the headroom between a measured kernel and the roof
+  - Choose between raising intensity, lowering bytes, and improving efficiency
+---
+import RooflineLab from '@/components/viz/profiling/RooflineLab.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Module 02 drew a roofline and said "FLOPs per byte decides which limit you hit". That was enough to understand *why* decode is memory-bound and prefill is compute-bound. It is not enough to sit down in front of a slow kernel and work out what to do about it.
+
+This lesson is the working version. Four numbers, one graph, and a decision procedure you can run on any kernel in about five minutes.
+
+## The model in its full form
+
+A kernel does $F$ floating-point operations while moving $B$ bytes. Two hard floors:
+
+$$
+t \ge \max\left(\frac{F}{\text{peak FLOP/s}},\ \frac{B}{\text{bandwidth}}\right)
+$$
+
+Divide the first by the second and the machine's own numbers combine into one:
+
+$$
+I = \frac{F}{B} \quad\text{(arithmetic intensity)}, \qquad
+I_{\text{ridge}} = \frac{\text{peak FLOP/s}}{\text{bandwidth}}
+$$
+
+The **ridge point** <Term t="ridge-point">$I_{\text{ridge}}$</Term> is the intensity at which the two floors are equal. Below it you are memory-bound; above it you are compute-bound. Plotting achievable performance against intensity gives the roofline: a slope of bandwidth on the left, a flat ceiling of peak FLOP/s on the right.
+
+<Callout type="math" title="Ridge points, all of them">
+  | GPU | Peak (BF16 dense) | Bandwidth | Ridge point |
+  |---|---|---|---|
+  | T4 (free Colab) | 65 TFLOP/s | 0.32 TB/s | ~203 FLOP/byte |
+  | L4 | 121 TFLOP/s | 0.30 TB/s | ~403 FLOP/byte |
+  | A100 80GB | 312 TFLOP/s | 2.0 TB/s | ~156 FLOP/byte |
+  | H100 SXM | 989 TFLOP/s | 3.35 TB/s | ~295 FLOP/byte |
+  | H200 | 989 TFLOP/s | 4.8 TB/s | ~206 FLOP/byte |
+  | B200 | ~2,250 TFLOP/s | 8.0 TB/s | ~281 FLOP/byte |
+
+  Spec-sheet figures are approximate and vary by SKU and clock. The ridge point is the ratio, so it is more stable than either number alone — but it still moves between cards.
+</Callout>
+
+Notice what the table says about buying hardware. The L4 has a *higher* ridge point than an H100, which means it takes **more** arithmetic intensity to become compute-bound — it is relatively more bandwidth-rich per FLOP. For a decode workload, which lives at intensity ≈ 1, that is irrelevant: everything here is on the flat slope, and only the slope's value (0.30 vs 3.35 TB/s) matters.
+
+<Scrolly>
+  <RooflineLab client:visible slot="stage" />
+
+  <Step title="1. One graph, two roofs per machine">
+    Switch GPUs with the segmented control. The slope is the bandwidth and the flat top is the compute ceiling, so the same workload sits in a different place on a different card. Compute intensity is a property of the *kernel*; the roofs are a property of the *machine*.
+  </Step>
+
+  <Step title="2. The ridge point splits the plot">
+    The intersection of slope and ceiling. Left of it the memory system is the wall; right of it the math units are. No amount of clever code moves a kernel across the ridge — only changing its intensity does.
+  </Step>
+
+  <Step title="3. Two efficiencies, and they trade off">
+    <Term t="mfu">MFU</Term> is achieved FLOP/s over peak FLOP/s. <Term t="mbu">MBU</Term> is achieved bytes/s over peak bandwidth. A memory-bound kernel has a low MFU **by construction**, and calling that a failure is the most common misreading of a profile.
+  </Step>
+
+  <Step title="4. Put your kernel on the plot">
+    Drag the row count. As $m$ grows, intensity grows almost linearly, because the weight matrix dominates the bytes and does not change while the FLOPs grow with $m$. Decode sits at $m=1$ and prefill at $m$ in the hundreds — that is the whole prefill/decode split in one slider.
+  </Step>
+
+  <Step title="5. Measure the gap">
+    The red arrow is your **headroom**: the speed-up a perfect kernel would give you on identical hardware. Under 1.15× there is nothing to win here and you should stop. At 1.5× or more, this kernel is worth an engineer's week.
+  </Step>
+
+  <Step title="6. Three fixes, and only three">
+    **Raise intensity** (batch more rows, tile for reuse), **lower bytes** (quantize, fuse, keep data in cache), or **improve efficiency** (coalescing, occupancy, fewer launches). Only the first two can move a kernel across the ridge; the third only closes the vertical gap.
+  </Step>
+
+  <Step title="7. Quote the number that matches the bound">
+    On a memory-bound kernel, quote MBU. On a compute-bound one, quote MFU. A prefill GEMM at 60% MFU is doing well; the same kernel at 60% MBU would be alarming.
+  </Step>
+
+  <Step title="8. The decision procedure">
+    Compute intensity → find the ridge → classify → measure headroom → pick a fix. Every optimization proposal you will ever write should be answerable to those five steps, and any that cannot should be dropped.
+  </Step>
+</Scrolly>
+
+## The measurement definition, done properly
+
+Most arguments about MFU are arguments about the denominator. Here is the definition Nsight Compute uses, and it is worth writing down because the shortcut version is wrong in a way that flatters bad kernels.
+
+$$
+\text{MFU} = \frac{\text{FLOPs actually executed}}{\text{peak FLOP/s} \times \text{elapsed}}, \qquad
+\text{MBU} = \frac{\text{bytes actually transferred (L2 to HBM)}}{\text{bandwidth} \times \text{elapsed}}
+$$
+
+Two details matter enormously in an inference context:
+
+**Flops "actually executed" counts padding.** A tiled GEMM with a 128×128 tile computes a 4,096×4,096 matrix in 1,024 tiles; the edge tiles compute rows and columns that do not exist in a ragged batch and the hardware still does the arithmetic. Nsight reports the padded number. For a well-shaped prefill this is a few percent. For a **decode** GEMM — $m=1$ or 32 against $K=N=4096$ — the padding *dominates*: you report ~137 GFLOP for what is mathematically 33.5 MFLOP, and your "MFU" becomes a fiction.
+
+**The honest decode metric is MBU.** Which is exactly why production inference teams quote achieved bandwidth for decode and MFU for prefill, rather than one number for both.
+
+<Callout type="pitfall" title="The MFU number that will mislead you in review">
+  Llama-3.1-8B decode, batch 1, one row against a 4096×4096 weight:
+
+  $$
+  F_{\text{padded}} \approx 2 \cdot 128 \cdot 4096 \cdot 4096 = 4.3\ \text{GFLOP}
+  \qquad F_{\text{real}} = 2 \cdot 1 \cdot 4096 \cdot 4096 = 33.5\ \text{MFLOP}
+  $$
+
+  A 128× faster discrepancy. Any MFU quoted for small-batch decode is really measuring tile padding, not work. Quote MBU. If someone shows you an MFU chart for decode, they have measured the padding.
+</Callout>
+
+## Headroom: the number that tells you whether to bother
+
+For a kernel with measured duration $t_{\text{meas}}$, the <Term t="headroom">headroom</Term> is:
+
+$$
+\text{headroom} = \frac{t_{\text{meas}}}{\max\left(F/\text{peak},\ B/\text{bw}\right)}
+$$
+
+So a kernel measured at 20 ms with a memory floor of 15.1 ms has headroom of 20 ÷ 15.1 = 1.32×. That is a real but modest win, and it explains why well-optimized engines sit where they do: you cannot beat the floor, and you can only approach it.
+
+<Callout type="math" title="Realistic ceilings, so you know when to stop">
+  | Kernel class | Good result | Excellent result | Notes |
+  |---|---|---|---|
+  | Large BF16 GEMM (prefill) | 55–65% MFU | 75%+ | cuBLAS, K and N in the thousands |
+  | Decode GEMV (m=1..32) | 75–90% MBU | 92% MBU | pure streaming, little reuse |
+  | Fused RMSNorm + RoPE | 80–90% MBU | 93% MBU | ideal: read once, write once |
+  | Fused softmax (Module 13) | 60–80% MBU | 85% MBU | needs the online trick |
+  | Elementwise (SiLU, add) | 85–95% MBU | 97% MBU | nothing but streaming |
+  | Attention kernel | 40–70% MBU | varies | depends heavily on context |
+  | Whole decode step | 70–80% MBU | 85% MBU | the number to hold yourself to |
+
+  **If you are already at 85% MBU on a streaming kernel, there is no kernel work left.** The remaining time is launch overhead, gaps between kernels, and the arithmetic you cannot avoid. That is the moment to stop optimizing and go to Module 15, *Compilation & CUDA Graphs*.
+</Callout>
+
+## Where each phase sits, with numbers
+
+Prefill for Llama-3.1-8B at $m = 512$, BF16, on an H100:
+
+$$
+F = 2 \cdot 512 \cdot 4096 \cdot 4096 = 17.2\ \text{GFLOP}, \quad
+B = (512\cdot4096 + 4096^2 + 512\cdot4096)\cdot 2 = 42\ \text{MB}
+$$
+
+$$
+I = \frac{17.2\times 10^9}{42\times 10^6} \approx 410\ \text{FLOP/byte} \quad > \quad 295
+$$
+
+Compute-bound, sitting on the flat top. That single GEMM takes 17.2 ÷ (989 × 0.6) = 0.029 ms at 60% MFU — a rounding error, because one matrix is a small part of a model.
+
+Scale it to the **whole model**: Llama-3.1-8B has 8.03B parameters, so a 512-token chunk is \$2 \cdot 512 \cdot 8.03\times 10^9 = 8.2$ TFLOP, which at 60% MFU is 13.8 ms of pure GEMM. That is the number Module 10's chunk-size formula was built from, and Lesson 12.5 adds attention and the elementwise passes to land near 21 ms.
+
+<Callout type="pitfall" title="The unit mistake everyone makes once">
+  A single `[512 × 4096] · [4096 × 4096]` multiply is **17.2 GFLOP**. The whole model's prefill at the same $m$ is **8.2 TFLOP** — 480× more, because there are 32 layers and several matrices in each. Carrying the GFLOP number into a whole-model timing calculation makes you out by three orders of magnitude, and the result looks plausible enough to ship.
+
+  **Always state whether a FLOP count is one kernel or the whole forward pass.** The intensity is per-kernel and is fine either way; the time is not.
+</Callout>
+
+Decode, same model, batch 32 at 8k context:
+
+$$
+F \approx 2 \cdot 8.03\times 10^9 \cdot 32 = 514\ \text{GFLOP}, \quad
+B = 16.1 + 34.4 = 50.5\ \text{GB}
+$$
+
+$$
+I = \frac{514\times 10^9}{50.5\times 10^9} \approx 10\ \text{FLOP/byte} \quad < \quad 295
+$$
+
+Memory-bound by a factor of 29 in intensity. At 76% MBU: 50.5 ÷ (3.35 × 0.76) = 19.8 ms. **The compute term would take 514 ÷ (989 × 0.65) = 0.8 ms.** Ninety-six percent of the math units are idle, and that is not a defect — that is what a memory-bound workload *is*.
+
+## Choosing the fix
+
+Three moves, and the roofline tells you which is available:
+
+<Callout type="recap" title="The decision table">
+  | Symptom | Diagnosis | Available fix | Which module |
+  |---|---|---|---|
+  | Intensity far left of ridge, MBU already over 85% | At the memory floor | Raise intensity: batch more | 07 · Batching & Scheduling |
+  | Intensity left of ridge, MBU under 60% | Bad memory access or occupancy | Fix coalescing, raise occupancy | 12.1, 12.2 |
+  | Bytes dominated by weights | Memory-bound on parameters | Quantize | 11 · Quantization |
+  | Bytes dominated by KV | Memory-bound on the cache | Quantize KV, compress context | 11.5, 20 · Long Context |
+  | Bytes dominated by intermediate activations | Fusing would remove a round trip | Fuse the kernels | 13 · Triton, 14 · FlashAttention |
+  | Right of ridge, MFU under 50% | Bad tiling or a small GEMM | Better tiling, a library call, or batch | 13 · Triton |
+  | Either bound, headroom under 1.15× | At the floor | **Stop. Move on.** | — |
+
+  The last row is the one people skip and the one that saves the most time.
+</Callout>
+
+<Callout type="mentor" title="How to use this in a design review">
+  When someone proposes an optimization, ask for three numbers in this order: **what is the intensity, which limit does that put you against, and what is the measured headroom**. A proposal with intensity and headroom is engineering. A proposal with neither is folklore, and it is usually someone's memory of a benchmark they ran on different hardware.
+
+  If the answer is "headroom 1.05×", the honest response is that the work is not worth doing — and saying so is a real contribution.
+</Callout>
+
+<KeyNotes>
+  1. The roofline is $t \ge \max(F/\text{peak}, B/\text{bw})$, and the ridge point is peak ÷ bandwidth: ~295 FLOP/byte on H100, ~156 on A100, ~203 on T4.
+  2. Count **FLOPs as executed** (including tile padding) and **bytes as transferred including wasted sectors**. Both shortcut definitions flatter bad kernels.
+  3. MFU is meaningless for small-batch decode: a 128×128 tile on an $m=1$ GEMV reports 128× the real FLOPs. **Quote MBU for decode, MFU for prefill.**
+  4. Headroom = measured time ÷ the floor. Below ~1.15× there is nothing left to win, and the right move is to stop.
+  5. Good results look like: GEMM 55–65% MFU, decode 75–90% MBU, streaming elementwise 85–95% MBU. At 85% MBU a streaming kernel has no kernel work left.
+  6. Only three fixes exist: raise intensity, lower bytes, improve efficiency. Only the first two can move a kernel across the ridge.
+  7. Prefill at $m=512$ runs at ~410 FLOP/byte (compute-bound); decode at batch 32 and 8k context runs at ~10 (memory-bound by 29×).
+  8. In any design review, ask for intensity, bound and headroom in that order. No headroom means no work.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'An H100 has 989 TFLOP/s of BF16 compute and 3.35 TB/s of bandwidth. What is its ridge point?', numeric: true, answer: 295, tolerance: 15, unit: 'FLOP/byte', why: 'Ridge = peak FLOP/s ÷ bandwidth = 989/3.35 ≈ 295 FLOP per byte. Below that intensity a kernel is memory-bound.' },
+  { q: 'A kernel has a memory floor of 15.1 ms and you measure it at 24 ms. What is the headroom — the speed-up a perfect kernel would give?', numeric: true, answer: 1.59, tolerance: 0.12, unit: '×', why: 'headroom = 24 / 15.1 ≈ 1.59×. Above ~1.3× the kernel is worth an engineer’s time; below ~1.15× it is not.' },
+  { q: 'Why is quoting MFU for a batch-1 decode step misleading?', options: ['Because decode does no arithmetic at all', 'Because a 128×128 tile computes padding that counts as executed FLOPs, inflating MFU by up to 128×', 'Because MFU only works for prefill', 'Because MFU ignores the KV cache'], answer: 1, why: 'The tile is fully computed whether or not the rows exist, and Nsight counts it. An m=1 GEMV reports ~4.3 GFLOP for 33.5 MFLOP of real work. Quote MBU for decode.' },
+  { q: 'Your prefill GEMM achieves 60% MFU and your decode step achieves 20% MFU. Which is concerning?', options: ['Both — 60% MFU is low', 'The decode step — but check its MBU first, since decode is memory-bound and low MFU is expected', 'Neither, MFU is meaningless', 'The prefill GEMM, which should reach 95% MFU'], answer: 1, why: 'MFU is only a defect when the kernel is compute-bound. Decode is memory-bound by construction, so its MFU is naturally tiny. Measure MBU there: if MBU is above 85%, the step is at its floor and nothing is wrong.' },
+  { q: 'A kernel is memory-bound and its MBU is only 35%. Which fix applies?', options: ['Quantize the weights', 'Improve efficiency: fix coalescing or occupancy, since intensity is already low', 'Buy a GPU with more FLOP/s', 'Use a larger batch — the intensity is fine'], answer: 1, why: 'Batching raises intensity and is a workload change; quantizing lowers bytes. But when you are memory-bound and only reaching 35% of bandwidth, the bytes are being moved badly — the launch-level fix is coalescing and occupancy.' },
+  { q: 'A kernel sits right of the ridge and achieves 40% MFU. What is the headline number?', numeric: true, answer: 40, tolerance: 6, unit: '% MFU', why: 'Right of the ridge means compute-bound, so MFU is the metric that matters. 40% on a large prefill GEMM means a better tiling or a library call is worth ~1.5×.' },
+]} />

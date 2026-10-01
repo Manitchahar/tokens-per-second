@@ -1,0 +1,248 @@
+---
+title: 'Eager mode & launch overhead'
+summary: 'A decode step is not one operation but hundreds of tiny ones, and each one costs the CPU a few microseconds before the GPU hears about it. Learn to measure the two pipelines of a step separately, and to tell when Python — not the GPU — is what you are paying for.'
+objectives:
+  - 'Explain what PyTorch eager mode does with one operator and name the four things a launch costs'
+  - 'Separate a decode step into its CPU time and its GPU time, and state that the step is the max of the two'
+  - 'Compute the CPU toll of a decode step from a kernel count and a per-launch cost'
+  - 'Derive the batch size at which the GPU overtakes the CPU, and use it to reason about a configuration'
+  - 'Recognise launch-bound workloads by eye, from a profiler trace or a layer count'
+---
+import LaunchOverhead from '@/components/viz/compilation/LaunchOverhead.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is a sentence that sounds wrong until you measure it: a 32-layer model producing **one token** is, in PyTorch, several hundred separate pieces of work, and someone has to write down all several hundred before the GPU can start.
+
+The GPU is not the problem. On an H100, reading Llama-3.1-8B's 16 GB of weights takes about **6 milliseconds** of solid, well-utilised work. The problem is that the CPU needs about **3 milliseconds just to say what to do**, before any of that starts — and the moment the CPU is the slower of the two, the most expensive machine in the building sits idle waiting for Python.
+
+This is the first time in the course that the **CPU** is the interesting computer. Everything so far — the roofline in Module 02, the KV cache in Module 05, the batching in Module 07 — was about how to make the GPU's work smaller. This lesson is about the other half of the step: the part that never touches the GPU at all.
+
+## Eager mode, precisely
+
+<Term t="eager-mode">**Eager mode**</Term> is PyTorch's default execution model. Every operation you write — every `torch.matmul`, every `+`, every `view` — is dispatched immediately, one at a time, in the order you wrote it. The name is the opposite of <Term t="lazy-mode">**lazy mode**</Term> (what `torch.compile` and JAX give you by default), where operations are recorded into a tape and only turned into work later, in bigger pieces.
+
+Here is one decoder layer of Llama-3.1-8B, written the way the model code is written:
+
+```python
+# One decoder layer, PyTorch eager mode. Read every line as "one kernel launch".
+h = x
+r = rmsnorm(h) * g                       # launch 1: read 8 KiB, write 8 KiB
+q = r @ Wq; k = r @ Wk; v = r @ Wv        # launches 2-4: three GEMMs
+q, k = apply_rope(q, pos), apply_rope(k, pos)   # launches 5-6
+a = attention(q, k, v)                   # launch 7 (+ 1-2 inside the attention call)
+h = h + (a @ Wo)                         # launches 8-9
+r2 = rmsnorm(h) * g                      # launch 10
+h = h + (down(silu(gate(r2)) * up(r2)))  # launches 11-15
+```
+
+Seven matrix multiplies, and about **nine small elementwise kernels** around them. Multiply by 32 layers, add the final norm, the LM projection and the sampling chain, and one token costs on the order of **500 to 600 kernel launches**.
+
+<Callout type="intuition" title="A small kernel is still a kernel">
+  Those nine elementwise kernels each move a few kilobytes. Individually they are free. But a kernel is not free to *start* — and `silu(gate) * up` is two kernels when it could be one, and the reason it is two is that nobody has told PyTorch they belong together.
+</Callout>
+
+## The bill for one launch
+
+<Term t="kernel-launch">**A kernel launch**</Term> is the act of telling the GPU "run this function over these pointers". <Term t="launch-overhead">**Launch overhead**</Term> is the CPU work that happens *before* the GPU starts: roughly four things, in order.
+
+1. **Python.** Interpret the line of Python, look up the method, build the argument tuple. Microseconds, and it is the biggest single term.
+2. **The dispatcher.** Decide which C++ kernel implements this op for this dtype, then walk the autograd graph (if grad is enabled, which it is by default even in inference, unless you wrap the step in `torch.inference_mode()`).
+3. **The caching allocator.** Find or reserve device memory for the output tensor. Almost always a cache hit — but it is a lock, a hash lookup and a free-list pop.
+4. **`cudaLaunchKernel`.** One call into the driver, which writes a command into the stream's queue.
+
+The standard figure for that whole chain on a server core is **about 6 microseconds per launch**; you will measure your own in the lab, and it varies roughly from 3 µs on a fast bare-metal box to 20 µs on a busy laptop or a shared machine.
+
+$$
+t_{\text{cpu}} = N_{\text{kernels}} \times c_{\text{launch}}
+$$
+
+$$
+556 \times 6\ \mu\text{s} = 3{,}336\ \mu\text{s} = \textbf{3.3 ms}
+$$
+
+<Callout type="math" title="Where 556 comes from, so you can redo it yourself">
+  Llama-3.1-8B has 32 layers, and a layer is 7 GEMMs + 1 attention call + 9 elementwise kernels = 17 launches. The head and the sampling chain add about 12 more.
+
+  $$
+  32 \times 17 + 12 = 556 \text{ launches}
+  $$
+
+  Use 2 bytes per weight, 8.03B parameters, 8 KV heads of 128, 32 layers for the GPU number, and 3.35 TB/s at about 80% of peak:
+
+  $$
+  t_{\text{gpu}} = \frac{8.03\times 10^9 \times 2}{3.35\times 10^{12} \times 0.8} = \textbf{5.99 ms}
+  $$
+</Callout>
+
+So on an H100 at batch 1, a Llama-3.1-8B decode step is 3.3 ms of Python and 6.0 ms of GPU. **The CPU is 55% as expensive as the GPU.** That is not yet a disaster. It is one extra process on the machine away from being one.
+
+## Two pipelines, and the step is the max
+
+The single most useful sentence in this module: **the CPU and the GPU do not take turns.**
+
+While the GPU is busy with kernel 40, the CPU is already writing down kernel 41. The GPU works from a *queue*, and as long as the queue is never empty, the CPU is free to be slow. So the step is not a sum:
+
+$$
+t_{\text{step}} = \max\left(t_{\text{cpu}},\ t_{\text{gpu}}\right) + t_{\text{sync}}
+$$
+
+The `t_sync` term is the one time per step when the two are *not* overlapped: the host has to read the sampled token ids back off the device to decide what to do next. That is about 0.2 ms, and no amount of graph magic removes it — until Module 22's lesson on keeping sequence state on the device.
+
+When $t_{\text{cpu}} > t_{\text{gpu}}$ the queue drains. The GPU finishes its last kernel, finds nothing waiting, and idles until the CPU catches up. The machine is doing **nothing**, and it does this once per generated token, forever.
+
+<Scrolly>
+  <LaunchOverhead client:visible slot="stage" />
+
+  <Step title="1. One step, hundreds of operators">
+    Eager mode turns one decoder layer into about seventeen separate launches. Times 32 layers, plus the head: roughly **556 launches** to produce a single token. Nothing is wrong here — it is just how the code is written.
+  </Step>
+
+  <Step title="2. Each launch is a few microseconds of Python">
+    Zoom into the first launch: a Python call, the dispatcher, the allocator, then the driver call. Times 556 that is **3.3 ms** before the GPU has done any work at all. This is the part that does not appear in a kernel profile.
+  </Step>
+
+  <Step title="3. The GPU side is a completely different bill">
+    The GPU's cost is bytes over bandwidth, and at batch 1 that bill is almost entirely **weights**: 16 GB, and a KV cache of only 134 MB. This is the roofline floor from Module 02, unchanged.
+  </Step>
+
+  <Step title="4. They overlap, so you add nothing">
+    The GPU runs kernel 40 while the CPU writes kernel 41. The two costs run concurrently, which is why the step is the **max** of them and not the sum.
+  </Step>
+
+  <Step title="5. Unless the CPU falls behind">
+    Here the CPU is the longer pipeline, so the queue empties and the GPU waits. That hatched gap is **waste**, and it is paid on every single token, not on the tail.
+  </Step>
+
+  <Step title="6. The step is the longer side">
+    3.9 ms of step, of which 3.3 ms is the CPU. There are exactly two ways to shorten a step: **fewer, cheaper launches**, or **fewer bytes**. The rest of this module is those two levers.
+  </Step>
+
+  <Step title="7. Add users and watch them cross">
+    The CPU line is flat — it does not care how many users are decoding. The GPU line grows with the KV cache. They cross once, and the batch at which they cross tells you which regime you are in.
+  </Step>
+
+  <Step title="8. Depth, not size">
+    Kernel count follows the **layer count**; bytes follow the **parameter count**. So a 0.5B model with 24 layers is launch-bound by nearly 7×, while a 70B model with 80 layers never is. Small and deep is the dangerous shape.
+  </Step>
+</Scrolly>
+
+<Callout type="math" title="The crossover batch, derived once">
+  Set the two pipelines equal, with $W$ = weight bytes and $k$ = KV bytes per token per sequence:
+
+  $$
+  N \cdot c_{\text{launch}} = \frac{W + B \cdot T \cdot k}{\text{BW} \cdot \text{MBU}}
+  \quad\Longrightarrow\quad
+  \boxed{B^{*} = \frac{N \cdot c_{\text{launch}} \cdot \text{BW} \cdot \text{MBU} - W}{T \cdot k}}
+  $$
+
+  For **Qwen2.5-0.5B on an H100**, 24 layers (420 launches), $c = 6$ µs, $T = 1{,}024$, $k = 12{,}288$ bytes, $W = 0.98$ GB, and $\text{BW}\cdot\text{MBU} = 2.68$ TB/s:
+
+  $$
+  t_{\text{cpu}} = 420 \times 6\ \mu\text{s} = 2.52\ \text{ms}, \qquad
+  t_{\text{cpu}} \times 2.68\ \text{TB/s} = 6.75\ \text{GB}
+  $$
+
+  $$
+  B^{*} = \frac{6.75 - 0.98}{1{,}024 \times 12{,}288 \times 10^{-9}} \approx \textbf{459 users}
+  $$
+
+  Below 459 concurrent users, **Qwen2.5-0.5B on an H100 is limited by Python, not by the GPU.** You can double the number of users and double the throughput, because each extra user costs the CPU nothing at all.
+</Callout>
+
+## The table worth memorising
+
+Same H100, same 6 µs launch, BF16, batch 1, 1,024 tokens of context, 80% of peak bandwidth:
+
+| Model | Layers | Launches | CPU time | GPU time | Verdict |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 420 | **2.5 ms** | 0.37 ms | launch-bound, **6.9×** |
+| Llama-3.2-3B | 28 | 488 | **2.9 ms** | 2.4 ms | launch-bound, 1.2× |
+| Llama-3.1-8B | 32 | 556 | 3.3 ms | **6.0 ms** | GPU-bound, 1.8× |
+| Qwen2.5-32B | 64 | 1,100 | 6.6 ms | **24.4 ms** | GPU-bound, 3.7× |
+| Llama-3.1-70B | 80 | 1,372 | 8.2 ms | **52.7 ms** | GPU-bound, 6.4× |
+
+Two columns that move for different reasons. The left one is **depth**: how many times you went through a block. The right one is **size**: how many bytes you have to read. A launch-bound configuration is not "a small model" — it is a model whose depth is large relative to its weight bytes, and that set includes plenty of real serving traffic: small chat models, rerankers, embedding models, and the draft model in Module 16's speculative decoding.
+
+<Callout type="real" title="What this looks like in a real engine">
+  At the time of writing, vLLM captures CUDA graphs for the decode step by default on supported models and has done so for several releases, and TensorRT-LLM builds an engine graph ahead of time. Both exist for exactly the reason in this lesson. SGLang attacks the same tax by generating fused kernels, and llama.cpp by writing a small number of large operations by hand. You will meet all four engines in Module 17.
+</Callout>
+
+<Callout type="pitfall" title="Four ways to fool yourself with these numbers">
+  **1. Profiling only the GPU.** Nsight Systems shows you kernel durations and a gap. If you never look at the CPU track, a launch-bound configuration looks like "the GPU is slow" and you will optimise the wrong thing forever.
+
+  **2. Timing a loop without synchronising.** `for _ in range(10): model(x)` with the result never read is a *no-op* to the CUDA driver in some builds, and a real forward pass in others. Time it with CUDA events around a `torch.cuda.synchronize()`, and confirm the output is used.
+
+  **3. Comparing against a model with fewer layers.** The CPU term is not a constant. Switching from a 32-layer to a 24-layer model changes your CPU bill by 25% and your GPU bill by much more — or, for a small model, by *less*.
+
+  **4. Believing a launch cost measured on an idle laptop.** A desktop CPU with a fast single-core clock and a bare-metal driver can be 3× cheaper per launch than a shared cloud vCPU. Measure on the machine you deploy on.
+</Callout>
+
+<Callout type="mentor" title="The habit this lesson is really teaching">
+  From here on, every performance question about a serving engine has two columns, and you should be able to fill in both before you touch a knob: **how much data moves, and how much code runs**. Module 12's profiler is how you fill them in. A number with one column filled in is a guess.
+</Callout>
+
+## Measuring it yourself
+
+This is the whole measurement, and it fits in six lines. It is Part 1 of the lab, but you can run it right now against any model you have loaded:
+
+```python
+import torch, time
+from torch.profiler import profile, ProfilerActivity
+
+def count_kernels(fn):
+    fn()                                   # warm up: autotuning, allocator, cuBLAS handles
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
+        fn()
+        torch.cuda.synchronize()
+    evts = [e for e in p.key_averages() if e.device_type == torch.autograd.DeviceType.CUDA]
+    launches = sum(e.count for e in evts if e.self_device_time_total > 0)
+    gpu_us = sum(e.self_device_time_total for e in evts)
+    return launches, gpu_us
+
+# and the CPU side, with the GPU deliberately not waited on
+torch.cuda.synchronize(); t0 = time.perf_counter()
+for _ in range(50):
+    with torch.inference_mode():
+        model(input_ids, past_key_values=cache, use_cache=True)
+t_issue = (time.perf_counter() - t0) / 50      # how long the CPU took to *say* it
+torch.cuda.synchronize()
+```
+
+`launches` is your `N`. `t_issue` is your `t_cpu` — and notice it does not include a single `cuda.synchronize()`, so it is measuring the CPU's opinion of the work, not the work. If `t_issue` is within 10% of the total step time, you are launch-bound, and no kernel you write will fix it.
+
+<Callout type="try" title="Three things to try before the lab">
+  1. Wrap the step in `torch.inference_mode()`. It removes autograd bookkeeping from the dispatcher. Measure `launches` and `t_issue` before and after — this alone often cuts the CPU term by a fifth.
+  2. Set the batch size to 1 and to 32 and compare `t_issue`. It should barely move. If it moves a lot, something in your step is scaling with the batch on the CPU — a Python loop over requests, most likely.
+  3. Count the launches per layer by commenting out one block at a time. If the number is much higher than 17 per layer, find the extra kernels: usually an unnecessary `.contiguous()`, a `torch.cat`, or a mask built with broadcasting.
+</Callout>
+
+## What is actually on the table
+
+Now that the tax is visible, here is the whole menu for the rest of the module.
+
+- **Write fewer kernels.** Every elementwise chain you collapse is a launch you never pay for and a round trip through HBM you never make. That is <Term t="operator-fusion">**operator fusion**</Term>, and it is the first half of next lesson.
+- **Make each launch cheaper.** Get the Python interpreter out of the loop. Same GPU work, same kernels, but the CPU spends 2 µs instead of 6 µs per launch. Also <Term t="torch-compile">`torch.compile`</Term>.
+- **Make one launch do everything.** Record the step once and replay the recording, so the CPU's entire contribution becomes a single call. That is a <Term t="cuda-graph">CUDA graph</Term>, and it is the lesson after next.
+
+None of these change the mathematics. The model computes the same thing, the GPU does the same arithmetic, the logits are bit-for-bit the same in the first two cases. What changes is how much Python is standing between you and the answer.
+
+<KeyNotes>
+  1. Eager mode runs one operator at a time. A 32-layer Llama-3.1-8B decode step is roughly **556 kernel launches**: 17 per layer, plus the head and sampling chain.
+  2. A launch costs the CPU about **6 µs** before the GPU starts: Python, dispatcher, caching allocator, `cudaLaunchKernel`. So $t_{cpu} = N \times c$ — for 556 launches, **3.3 ms**.
+  3. The GPU's cost is a different bill entirely: bytes ÷ bandwidth. For 8B on an H100 that is 16 GB ÷ 2.68 TB/s = **6.0 ms**.
+  4. The two pipelines overlap, so $t_{step} = \max(t_{cpu}, t_{gpu}) + t_{sync}$, **not** the sum. Add a 0.2 ms host sync for reading the sampled tokens back.
+  5. When $t_{cpu} > t_{gpu}$ the queue drains and the GPU idles once per token. That is a constant tax, not a tail-latency problem.
+  6. The crossover batch is $B^{*} = (t_{cpu} \cdot \text{BW} \cdot \text{MBU} - W) / (T \cdot k)$. For Qwen2.5-0.5B on an H100 it is about **459 users** at 1,024 tokens of context.
+  7. Kernel count follows **layer count**; bytes follow **parameter count**. So small-and-deep models are launch-bound and large ones are not.
+  8. Measure the CPU term with the GPU deliberately not synchronised (`t_issue`), and count kernels with the PyTorch profiler. A number with one column filled in is a guess.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A decode step issues 556 kernel launches and each launch costs the CPU 6 µs. How much CPU time does one decode step take?', numeric: true, answer: 3.34, tolerance: 0.1, unit: 'ms', why: 't_cpu = N × c = 556 × 6 µs = 3,336 µs = 3.34 ms. The model size does not appear anywhere in this number.' },
+  { q: 'Llama-3.1-8B in BF16 is 8.03B parameters, so 16.06 GB of weights. An H100 delivers about 2.68 TB/s (80% of 3.35 TB/s peak). How long does reading just the weights take?', numeric: true, answer: 6.0, tolerance: 0.3, unit: 'ms', why: '16.06e9 / 2.68e12 = 5.99 ms. Divide by bandwidth, not by FLOP/s: decode is memory-bound, so this is the floor.' },
+  { q: 'You add 256 concurrent users to a Qwen2.5-0.5B decode loop on an H100. The CPU term is 2.5 ms at batch 1 and still 2.5 ms at 256, and the step time does not move. What does that tell you?', options: ['The GPU got faster', 'The step is launch-bound: the CPU bill does not depend on the batch, so users are nearly free', 'The KV cache is not being read', 'The measurements are wrong'], answer: 1, why: 't_cpu = N × c depends only on the kernel count, so it is flat in batch. If the step time is unchanged while the batch grows, the CPU is the longer pipeline and each new user costs almost nothing — until the KV read finally overtakes it, at about 459 users here.' },
+  { q: 'Your decode step is max(CPU 3.3 ms, GPU 6.0 ms) + 0.2 ms sync. Making the CPU side infinitely fast would make the step…', options: ['0.2 ms', '3.3 ms', '6.2 ms', '9.7 ms'], answer: 2, why: 'The step is the max, not the sum. Removing the CPU term entirely leaves the GPU term plus the sync: 6.0 + 0.2 = 6.2 ms. Launch optimisation alone cannot save the 3.3 ms you are not currently losing.' },
+  { q: 'Llama-3.1-8B, 32 layers. A layer is 7 GEMMs, 1 attention call and 9 elementwise kernels, and the head adds 12. How many kernel launches is one decode step?', numeric: true, answer: 556, tolerance: 12, unit: 'launches', why: '32 × (7 + 1 + 9) + 12 = 32 × 17 + 12 = 556.' },
+  { q: 'Why is a small model like Qwen2.5-0.5B more exposed to launch overhead than Llama-3.1-70B?', options: ['Small models use more layers per parameter', 'Kernel count follows layer count and bytes follow parameter count, so a small model pays a similar Python bill for far less GPU work', '70B uses fewer, larger kernels so its CPU cost is also high', 'GPUs are slower at small matrix multiplies'], answer: 1, why: 'Qwen2.5-0.5B has 24 layers, so about 420 launches (2.5 ms of CPU), but only 0.98 GB of weights (0.37 ms of GPU). Llama-3.1-70B has 80 layers (8.2 ms CPU) but 141 GB of weights (52.7 ms GPU). Depth sets the CPU bill; size sets the GPU bill.' },
+]}/>

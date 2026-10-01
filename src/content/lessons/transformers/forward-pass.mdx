@@ -1,0 +1,223 @@
+---
+title: 'The whole forward pass: one token’s journey'
+summary: 'Every box on the page, in order, with the bytes and the FLOPs for each. Then the single most important number in inference: the same 512 tokens cost 14 milliseconds to prefill and 3 seconds to generate.'
+objectives:
+  - List the five stages of a forward pass and the shape of the tensor at each
+  - Compute the bytes read and FLOPs performed for one decode step and for a prefill
+  - Show why a decode step is memory-bound and a prefill is compute-bound
+  - Derive the prefill-versus-generate cost ratio and explain why it is ~200×'
+  - Count the kernel launches and the residual-stream traffic in a forward pass
+---
+import ForwardPass from '@/components/viz/transformers/ForwardPass.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Five boxes. Everything you have learned in this module goes into them, and everything the rest of this course is about comes *out* of them. After this page you will be able to look at any LLM's config and say, without running it, how many bytes a token costs and how many FLOPs it takes.
+
+## The five stages
+
+$$
+\text{IDs} \;\rightarrow\; \mathrm{Embed} \;\rightarrow\; \underbrace{\big[\,\text{block} \times L\,\big]}_{\text{03.4–03.6}} \;\rightarrow\; \mathrm{RMSNorm} \;\rightarrow\; W_{\text{head}} \;\rightarrow\; \mathrm{sample} \;\rightarrow\; \text{ID}
+$$
+
+For Llama-3.1-8B, with $L = 32$:
+
+| # | Stage | Shape | Parameters touched | Bytes read per token | FLOPs per token |
+|---|---|---|---|---|---|
+| 1 | Embedding lookup | `[T, 4096]` | 1 row of 525.3 M | **8 KB** | 0 |
+| 2 | 32 × block | `[T, 4096]` | 6.979 B | **13.96 GB** | 13.96 G |
+| 3 | Final RMSNorm | `[T, 4096]` | 135 K gains | **0.26 MB** | 0.00026 M |
+| 4 | Output head | `[T, 128256]` | 525.3 M | **1.05 GB** | 1.05 G |
+| 5 | Sampling | `[128256]` | none | 1.03 MB | 0.5 M |
+| | **Total** | | **8.03 B** | **15.55 GB** | **15.01 G** |
+
+Two rules generate almost every row in that table:
+
+## The shape sheet
+
+Shapes are how you debug, so keep this in your head. For a batch of $B$ sequences and $T$ tokens in Llama-3.1-8B, here is every tensor between the input IDs and the output token, in order:
+
+| Where | Shape | Notes |
+|---|---|---|
+| input IDs | `[B, T]` | integers, 1 per token |
+| embedding lookup | `[B, T, 4096]` | a gather, not a matmul |
+| RMSNorm ×1 | `[B, T, 4096]` | elementwise, no shape change |
+| q_proj | `[B, T, 4096]` | → 32 heads × 128 |
+| k_proj, v_proj | `[B, T, 1024]` | → 8 KV heads × 128 |
+| after RoPE (q, k) | `[B, 32/8, T, 128]` | rotation only |
+| after GQA repeat | `[B, 32, T, 128]` | k and v only |
+| scores | `[B, 32, T, T]` | **the one tensor that grows quadratically** |
+| softmax shares | `[B, 32, T, T]` | same shape, sums to 1 |
+| mixed values | `[B, T, 4096]` | back to one vector per token |
+| o_proj | `[B, T, 4096]` | |
+| residual add | `[B, T, 4096]` | shape never changes |
+| MLP gate, up | `[B, T, 14336]` | **3.5× wider** |
+| SiLU ⊙ | `[B, T, 14336]` | elementwise |
+| MLP down | `[B, T, 4096]` | back to 4,096 |
+| final RMSNorm | `[B, T, 4096]` | |
+| logits | `[B, T, 128256]` | **the other big tensor** |
+
+Three observations that matter for serving:
+
+1. **Everything is `[B, T, 4096]` except two things.** The score matrix (quadratic in $T$) and the logits (linear in the vocabulary). Everything else is a fixed-width slab, which is exactly why the hardware is good at it.
+2. **The hidden size never changes.** A block is 4,096 in, 4,096 out. Only the MLP's interior is wider, and only transiently. This is what makes the residual stream possible.
+3. **The vocabulary is usually bigger than the hidden size.** 128,256 vs 4,096 — a 31× fan-out at the very last layer, and the widest tensor in the whole pass. In batched prefill with 8,000 tokens that is `[8, 8000, 128256]`, which is why engines compute logits for only the final position during generation.
+
+<Callout type="math" title="The two rules">
+  **Bytes = parameters × bytes-per-parameter.** Every weight is read once per forward pass per token row. In BF16, a model of $P$ parameters costs $P \times b = 2P$ bytes to traverse, once.
+
+  **FLOPs = 2 × parameters touched.** One multiply plus one add per weight, and you use every weight exactly once. (That factor of two was derived in Module 01.)
+
+  Hence: **a forward pass always runs at roughly 1 FLOP per byte**, no matter how big the model is. Arithmetic intensity is a property of *reusing* weights, not of the model.
+</Callout>
+
+<Callout type="math" title="Why 1 FLOP/byte means memory-bound, every time">
+  On an H100 the ridge point is 295 FLOP/byte (Module 02). A forward pass with no weight reuse sits at about **1 FLOP/byte**, three hundred times to the left of the ridge.
+
+  Decode at $T = 4{,}096$ context, Llama-3.1-8B:
+
+  $$
+  t_{\text{mem}} = \frac{15.55\times 10^9}{3.35\times 10^{12} \times 0.8} = 5.80\ \text{ms} \qquad
+  t_{\text{math}} = \frac{15.01\times 10^9}{989\times 10^{12} \times 0.55} = 27.6\ \mu\text{s}
+  $$
+
+  **5.80 ms of memory against 27.6 microseconds of math.** A 210× gap. Every optimisation in the rest of this course either reduces those bytes or finds a way to make the bytes serve more than one token.
+</Callout>
+
+<Scrolly>
+  <ForwardPass client:visible slot="stage" />
+
+  <Step title="1. One token, one vector">
+    An integer goes in; one row of the embedding table comes out — 4,096 numbers, 8 KB read. Nothing else about the token survives as an integer. Everything downstream sees only this vector.
+  </Step>
+
+  <Step title="2. Through one block">
+    RMSNorm, attention, add, RMSNorm, SwiGLU, add. **218.1 M parameters, 436.2 MB of weights, 436.2 MFLOPs.** The MLP is 80.8% of both the bytes and the math — attention is the minority of a block.
+  </Step>
+
+  <Step title="3. Through thirty-two">
+    Thirty-two identical blocks: **6.98 B parameters, 13.96 GB of weights**, 13.96 GFLOPs. Add the embedding table and the output head and you have the 16.06 GB from 03.1. All of it is re-read for every generated token.
+  </Step>
+
+  <Step title="4. The output head">
+    One final RMSNorm, then a `[4,096 × 128,256]` multiply: 525.34 M parameters, **1.05 GB**, 1.05 GFLOPs. The output is one score for all 128,256 vocabulary tokens — 6.8% of the step.
+  </Step>
+
+  <Step title="5. And then sampling">
+    Temperature, top-k, top-p, and a draw. No weights, no GEMMs, about 0.5 MFLOP of pure arithmetic. A couple of microseconds on a GPU, hidden behind the next layer. Module 03.8 does it properly.
+  </Step>
+
+  <Step title="6. Decode: read 15 GB, do 15 GFLOP">
+    The blue bar is where the 15.55 GB goes. **90% is the same 32 blocks of weights**, every step, for every user. 5.80 ms of memory against 27.6 µs of math: memory-bound by 210×.
+  </Step>
+
+  <Step title="7. Prefill: the same stack, many rows">
+    Identical graph, $m$ rows at once. Weight bytes are read once and reused $m$ times, so arithmetic intensity grows roughly linearly in $m$. Switch to 32,768 tokens and watch attention take over the amber bar.
+  </Step>
+
+  <Step title="8. Why prefill is ~200× cheaper">
+    512 tokens by prefill: about **14 ms**. The same 512 tokens generated one at a time: 512 × 5.80 ms = **3.0 seconds**. Same weights, same arithmetic — the only difference is how many rows reuse each byte. That gap is the subject of Module 05.
+  </Step>
+</Scrolly>
+
+## Where the 15.55 GB goes
+
+Read the numbers as a budget, because that is how you will think about them for the rest of your career:
+
+| Item | Bytes | Share |
+|---|---|---|
+| 32 blocks × MLP matrices | 11.28 GB | 72.5% |
+| 32 blocks × attention matrices | 2.68 GB | 17.3% |
+| Output head `lm_head` | 1.05 GB | 6.8% |
+| KV cache at 4,096 tokens | 0.54 GB | 3.4% |
+| All 33 RMSNorm gains + the embedding row | 0.26 MB | ~0% |
+
+Two consequences an inference engineer should take away immediately.
+
+**The MLP is the budget.** Three matrices per block, 72.5% of every decode step's bytes. If you are going to make decode faster, `gate_proj` / `up_proj` / `down_proj` are the place to look — whether by quantizing them, fusing them, or batching them.
+
+**The KV cache is small here and large later.** At 4,096 tokens it is 3.4% of the step. At 32,768 it is 4.0 GB, or 21% of the step. At 131,072 it is 16.1 GB — as much as the weights themselves. Long context is a KV cache problem before it is an attention problem.
+
+<Callout type="pitfall" title="The embedding table is read once per token, and only one row">
+  It is tempting to add 1.05 GB of "embedding cost" to a decode step. **Do not.** The embedding table is 525 M parameters but a decode step reads exactly **one row: 8,192 bytes**. The `lm_head` is the same size and *that one is fully read*, because it is a real matrix multiply. 1.05 GB of embedding reads against 8 KB, a 131,000× difference, for matrices of identical shape.
+</Callout>
+
+## Kernel launches
+
+The FLOPs and bytes are the same for every implementation. What differs between frameworks is **how many kernels it takes to do them**, because each launch costs 5–10 µs of CPU time (Module 02).
+
+| Implementation | Kernels per block | Per 32-layer forward pass |
+|---|---|---|
+| Eager PyTorch (no fusion) | ~14 | **~450** |
+| Fused RMSNorm + residual | ~11 | ~350 |
+| Fused SwiGLU + norm + add | ~9 | ~290 |
+| Compiled with CUDA graphs | same kernels, **one launch** | 1 replay + ~290 launches |
+
+**What that costs in wall-clock time.** 450 kernels × 7 µs of launch overhead is **about 3.2 ms of CPU time per forward pass**, against 5.80 ms of GPU memory time. The CPU cannot keep up: the GPU would idle roughly a third of the time waiting to be told what to do next. That is the single biggest reason engines do not run plain PyTorch, and it is why CUDA graphs and `torch.compile` exist (Module 15). Note that the fix is not fewer FLOPs — it is **more work per launch**, by putting more tokens into each step.
+
+## Residual stream traffic
+
+The other thing worth counting is how much the *glue* moves. Per block, per token:
+
+| | Read | Write |
+|---|---|---|
+| RMSNorm × 2 | 16 KB (stream) + 16 KB (gains) | 16 KB |
+| Residual adds × 2 | 32 KB | 16 KB |
+
+That is about **96 KB per block**, 3.07 MB per token for the whole 32-layer model. Against 15.55 GB of weights it is 0.02%.
+
+Yet it is the first thing an engine optimises, because:
+- it is pure elementwise work with arithmetic intensity near 0.3, so it is memory-bound and slow per byte
+- each of those operations is a separate kernel launch, and launches are the bottleneck above
+
+Fusing the norm, the activation and the residual add into the neighbouring GEMM's epilogue removes both problems at once. Module 13 is that work; Module 15 is about the launches.
+
+## Prefill and decode, side by side
+
+$$
+\begin{aligned}
+\text{decode FLOPs/token} &= 2 P \approx 15.0\ \text{GFLOP} \\
+\text{prefill FLOPs for } m \text{ tokens} &= 2 m P + 2 m^2 d L \approx 15.0 m\ \text{GFLOP} \\
+\text{decode bytes/token} &= 2 P + T \cdot 2 L n_{kv} d_h \cdot 2 \\
+\text{prefill bytes} &= 2 P + 2 m d \cdot 2 \approx 16.1\ \text{GB} \quad \text{(independent of } m\text{)}
+\end{aligned}
+$$
+
+Divide and you get the two regimes from Module 02, exactly as predicted:
+
+| | Bytes | FLOPs | Intensity | Bound |
+|---|---|---|---|---|
+| Decode, 1 token, 4K ctx | 15.55 GB | 15.0 GFLOP | **0.97** | memory |
+| Prefill, 512 tokens | 16.1 GB | 7.75 TFLOP | **481** | compute |
+| Prefill, 32,768 tokens | 16.1 GB | 773 TFLOP | **48,000** | compute |
+
+Prefill is not "decode but faster". It is a different workload on the same hardware, and an engine that runs both well has to handle both limits.
+
+<Callout type="real" title="What this predicts, and it is what you will see">
+  - A prefill-heavy workload (long prompts, short answers) saturates the **tensor cores**; a decode-heavy workload (chat, one token at a time) saturates **bandwidth**. Module 10 is about mixing them badly.
+  - At $m = 512$ prefill is already compute-bound by a factor of 1.6 on an H100. That is why TTFT for a long prompt grows with prompt length even on an idle GPU.
+  - `nvidia-smi` will show ~100% tensor-core utilisation during prefill and much lower memory utilisation, and the opposite pattern during decode. If you cannot tell which phase you are in from a trace, you cannot tune either.
+</Callout>
+
+<Callout type="try" title="Measure the ratio on your own GPU">
+  In the module notebook, run one 512-token prefill and then generate 512 tokens one at a time on the same model, timing both with CUDA events. Compute the ratio. Then repeat with a batch of 8 sequences and watch the *per-user* time rise while the *aggregate* throughput rises much faster — that is Module 07's whole subject, and you will have measured it.
+</Callout>
+
+<KeyNotes>
+  1. Five stages: **embed → 32 × block → final norm → output head → sample**. Nothing is added to that graph after this module.
+  2. **Bytes = parameters × bytes-per-parameter** (read once per row), and **FLOPs = 2 × parameters touched**. So a forward pass runs at about **1 FLOP/byte** for any model size.
+  3. Llama-3.1-8B, one decode step at 4K context: **15.55 GB read, 15.01 GFLOP**. On an H100 that is 5.80 ms of memory against 27.6 µs of math — memory-bound by 210×.
+  4. Of those 15.55 GB: MLP matrices 72.5%, attention matrices 17.3%, output head 6.8%, KV cache 3.4%, norms ~0%.
+  5. The embedding table is 525 M parameters but a decode reads **one row, 8 KB**. The output head is the same shape and is **fully read**, because it is a GEMM. 131,000× difference, identical shapes.
+  6. Prefill bytes are ~constant (16.1 GB) while FLOPs grow linearly in $m$, so intensity goes 481 FLOP/byte at $m=512$ — past the H100 ridge of 295, hence compute-bound.
+  7. 512 tokens by prefill ≈ **14 ms**; the same 512 generated one at a time ≈ **3.0 s**. **208×.** Same weights, same arithmetic — the difference is rows per byte.
+  8. Eager PyTorch launches ~450 kernels per forward pass ≈ 3.2 ms of CPU time, against 5.80 ms of GPU time. The GPU is idle a third of the time waiting for launches.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B: how many bytes does one decode step read from the weights, in GB, at 4K context? (Weights = 8.03e9 params in BF16; KV = 4096 × 131,072 bytes.)', numeric: true, answer: 15.55, tolerance: 0.3, unit: 'GB', why: '8.03e9 × 2 = 16.06 GB of weights, but the embedding table contributes only one 8 KB row, so 15.55 GB is actually read, plus 0.54 GB of KV cache = 16.09 GB of traffic.' },
+  { q: 'Llama-3.1-8B, one decode token: how many GFLOPs of math does it do?', numeric: true, answer: 15.01, tolerance: 0.5, unit: 'GFLOP', why: '2 × 7.504e9 parameters actually multiplied = 15.01 GFLOP. The embedding lookup does no arithmetic, so it is 8.03e9 × 2 minus the 1.05 GFLOP that never happens.' },
+  { q: 'On an H100 at 3.35 TB/s and 80% achievable bandwidth, how many milliseconds does reading 15.55 GB take?', numeric: true, answer: 5.8, tolerance: 0.4, unit: 'ms', why: '15.55e9 ÷ (3.35e12 × 0.8) = 5.80 ms. That is 172 tokens/second as a hard floor for one user, before any overhead.' },
+  { q: 'Prefilling 512 tokens on an H100 at 55% of peak takes about 14 ms. Generating those 512 tokens one at a time at 5.8 ms each takes about 3.0 s. Roughly how many times more expensive is generating?', numeric: true, answer: 208, tolerance: 25, why: '3.0 s ÷ 0.014 s ≈ 214. The arithmetic is identical; the only difference is that prefill reuses each weight byte 512 times instead of once.' },
+  { q: 'Of a Llama-3.1-8B decode step’s 15.55 GB, what share comes from the MLP matrices?', options: ['About 17%', 'About 35%', 'About 72%', 'About 95%'], answer: 2, why: '176.16 M × 2 bytes × 32 layers = 11.28 GB of 15.55 GB = 72.5%. Attention matrices add 17.3%. The MLP is where a quantizer or a kernel author should look first.' },
+  { q: 'Prefill of 4,096 tokens on Llama-3.1-8B in BF16: roughly how many bytes does it read from HBM, in GB?', numeric: true, answer: 16.1, tolerance: 0.8, unit: 'GB', why: 'The weight bytes (16.06 GB) are read once regardless of how many rows go through; activations add only 4096 × 4096 × 2 ≈ 32 MB. So prefill bytes are essentially constant in the prompt length — that is exactly why its arithmetic intensity grows with m.' },
+] } />

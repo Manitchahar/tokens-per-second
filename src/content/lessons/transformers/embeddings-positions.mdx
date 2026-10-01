@@ -1,0 +1,210 @@
+---
+title: 'Embeddings & positions'
+summary: 'A token ID is a row number. This lesson reads a row out of the embedding table, shows what it costs, and then derives RoPE — the rotation trick that lets a model know word order and still extend to 128K tokens.'
+objectives:
+  - Explain what an embedding row is and how many bytes it costs to read
+  - Show why embeddings alone destroy word order, using a concrete example
+  - Describe learned absolute, sinusoidal and rotary position encodings
+  - Derive the RoPE property that q·k depends only on the distance m − n
+  - Compute a RoPE frequency and explain why Llama-3.1 raised its base from 10,000 to 500,000
+---
+import EmbeddingPos from '@/components/viz/transformers/EmbeddingPos.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In 03.2 your sentence became integers. Now it becomes vectors: one row of one enormous table, per token. Then — and this is the part that trips up most people — we have to give those vectors a sense of **place**, because a bag of vectors does not know which word came first.
+
+That second half is where the elegant mathematics is. It is also where an inference engineer has to look carefully, because the position scheme a model uses has a hard reach limit built into it.
+
+## The embedding table
+
+An <Term t="embedding">embedding</Term> is a lookup table with one row per token. Nothing more:
+
+$$
+\mathbf{e}_{\text{token}} = \text{Embed}[\text{id}] \quad\in\quad \mathbb{R}^{d}
+$$
+
+For Llama-3.1-8B, $d = 4096$ — the <Term t="hidden-size">hidden size</Term> — and the table is $V \times d = 128{,}256 \times 4096$.
+
+| | Llama-3.1-8B | Qwen2.5-0.5B |
+|---|---|---|
+| Vocabulary | 128,256 | 151,936 |
+| Hidden size | 4,096 | 896 |
+| Embedding rows | 128256 × 4096 | 151936 × 896 |
+| Parameters | 525.3 M | 136.1 M |
+| Bytes in BF16 | **1.05 GB** | 272 MB |
+
+The lookup itself is almost free. You read **one row**: $d \times b = 4{,}096 \times 2 = 8{,}192$ bytes. That is 0.05% of the 16.1 GB of weights. Two thousand tokens cost 16 MB of embedding reads, against 16 GB of weights.
+
+<Callout type="pitfall" title="The table itself is not small, even though the lookup is">
+  Do not confuse two different numbers. Reading a row is 8 KB and irrelevant. *Storing* the table is 1.05 GB of the model's 16.1 GB, and the **output head** — the same shape, used at the very end to turn the final vector into 128,256 logits — is another 1.05 GB. Together they are 13.1% of the model, and they are the two matrices you are most likely to quantize when you need memory.
+</Callout>
+
+What *is* in a row? Nothing human-readable. Each of the 4,096 numbers is a learned direction; the row for "the" is a point in 4,096-dimensional space, and two tokens are similar exactly when their rows point the same way. The training process chose those directions, and nothing in the architecture interprets them.
+
+<Scrolly>
+  <EmbeddingPos client:visible slot="stage" />
+
+  <Step title="1. An ID means nothing by itself">
+    Five tokens from 03.2 arrive as five integers: 15339, 1917, 4734, 11203, 128009. Nothing in the number 15339 says "the". The model has no table of meanings it can consult — it has one table of vectors, and it must index into it.
+  </Step>
+
+  <Step title="2. An embedding table turns an ID into a vector">
+    Row 15339 of a 128,256 × 4,096 table. The lookup is a **gather**: read 4,096 numbers at a computed offset and copy them. Eight kilobytes. The table is the first of the model's parameters, and it is 525 million of them.
+  </Step>
+
+  <Step title="3. From here on, the token is that vector">
+    The integer is discarded. Everything downstream — attention, the MLP, the residual stream, the logits — sees only 4,096 numbers. If two tokens have similar rows the model will tend to treat them similarly, and nothing else about them matters.
+  </Step>
+
+  <Step title="4. But the vector does not know its position">
+    Token 15339 at position 0 and token 15339 at position 9,999 both produce **the identical vector**, read from the identical row. So "dog bites man" and "man bites dog" are literally the same input to the model. Word order has been thrown away, and it has to be put back.
+  </Step>
+
+  <Step title="5. Three ways to add position">
+    **Learned absolute** (GPT-2): a second table of position vectors, added to the embedding. Simple, but the table fixes a maximum context forever — you cannot serve a longer prompt than the table has rows. **Sinusoidal** (the original 2017 Transformer): fixed sine and cosine waves of the position, no table, but the reach is limited. **Rotary** (RoPE, used by Llama and Qwen2): encode position in the rotations of the query and key vectors instead.
+  </Step>
+
+  <Step title="6. RoPE: rotate the query and key">
+    In every attention head, take the query and key vectors and split them into pairs: $(q_0, q_1), (q_2, q_3), \dots$, 64 pairs for a 128-wide head. Rotate pair $i$ by the angle $m \cdot \theta_i$, where
+  </Step>
+
+  <Step title="7. Only the difference survives">
+    Rotations compose: rotating by $m\theta$ and then $n\theta$ is the same as rotating by $(m+n)\theta$. So a rotated query at position $m$ dotted with a rotated key at position $n$ depends only on the **difference** $m - n$. Drag both sliders together and watch the score stay put: the model measures distance, not absolute position. That is the whole trick, and it is why RoPE extends to long context without a table.
+  </Step>
+</Scrolly>
+
+## The RoPE formula, derived
+
+Pair $i$ of a head of width $d_{\text{head}}$ gets a frequency that depends on $i$:
+
+$$
+\theta_i = \text{base}^{-2i/d_{\text{head}}}, \qquad
+\theta_{i+m} \text{ applied to } (q_{2i}, q_{2i+1})
+$$
+
+Written as a rotation matrix $R(\phi)$, RoPE transforms:
+
+$$
+\mathbf{q}' = R(m\theta)\mathbf{q}, \qquad \mathbf{k}' = R(n\theta)\mathbf{k}
+$$
+
+Now the score that attention computes:
+
+$$
+\mathbf{q}' \cdot \mathbf{k}' = \mathbf{q}^\top R(m\theta)^\top R(n\theta)\mathbf{k} = \mathbf{q}^\top R\!\left((n - m)\theta\right)\mathbf{k}
+$$
+
+The two positions collapse into one number: the difference. Nothing in the score knows whether the query is at position 10 or position 50,000.
+
+<Callout type="math" title="Why d_head pairs, and why they all rotate at different speeds">
+  $d_{\text{head}} = 128$ gives 64 pairs. Pair 0 has $\theta_0 = 1$: it turns a full circle every token, so it encodes exact position but only over tiny distances. Pair 63 has $\theta_{63} = \text{base}^{-63/64}$: it barely turns at all, so it carries "these two are about this far apart" over millions of tokens.
+
+  The set of 64 frequencies is a fixed basis, like the 64 octaves of a piano. Each pair encodes one distance scale. Nothing is learned here — only the base is a design choice.
+</Callout>
+
+## The base is the reach limit
+
+Compute the slowest pair's wavelength for each published base:
+
+$$
+\text{wavelength}_i = \frac{2\pi}{\theta_i} = 2\pi \cdot \text{base}^{2i/d_{\text{head}}}
+$$
+
+For the slowest pair ($i = 63$, $d_{\text{head}} = 128$):
+
+| Base | Model | $\theta_{63}$ | Wavelength |
+|---|---|---|---|
+| 10,000 | Llama-2 (4K context) | 1.16 × 10⁻⁴ | **54,400 positions** |
+| 500,000 | Llama-3.1 (128K context) | 2.51 × 10⁻⁶ | **2,510,000 positions** |
+| 1,000,000 | Qwen2.5 | 1.76 × 10⁻⁶ | 3,570,000 positions |
+
+And here is the cost of a small base, using the mid-speed pair $i = 8$ of 64:
+
+| | θ (rad/token) | Δ=1 | Δ=4 | Δ=8 | Δ=16 |
+|---|---|---|---|---|---|
+| base 10,000 | 0.316 | 0.95 | 0.30 | **−0.82** | **+0.35** |
+| base 500,000 | 0.194 | 0.98 | 0.71 | 0.02 | −1.00 |
+
+Read the base-10,000 row. At a distance of 8 tokens the pair's score is −0.82; at 16 tokens it is +0.35. **A token 16 away looks more similar than one 8 away.** That is aliasing, and it is why Llama-2's effective context was much shorter than its nominal 4,096. Raise the base and the same row becomes monotone: 0.98, 0.71, 0.02, −1.00.
+
+<Callout type="real" title="This is the single most useful fact about long context">
+  If you extend a model's context by scaling RoPE frequencies (NTK-aware scaling, YaRN, position interpolation — Module 20), you are trading quality at short distances for reach at long ones. That is why extended-context fine-tuning exists and why "we support 128K" claims deserve a benchmark, not a config value.
+</Callout>
+
+## What it costs at inference
+
+Everything about positions is free at inference in a way that is worth being precise about:
+
+| | Cost |
+|---|---|
+| Learned absolute position table | extra memory (GPT-2: 1,024 × 768 = 786 K params, tiny) |
+| RoPE | **zero extra parameters.** It is a rotation applied to Q and K after they are computed |
+| Where it runs | one elementwise kernel over Q and K per layer, or fused into the QKV projection |
+
+So RoPE is not a place where inference engineers lose money. It is a place where a bad hyperparameter quietly destroys quality. The kernel is negligible; the arithmetic above is not.
+
+## What is actually in an embedding row
+
+Nothing human-readable, and it is worth saying clearly what that means for the work you will do.
+
+An embedding row is a point in 4,096-dimensional space, and the only thing training did was move rows around until the geometry became useful. Three consequences follow:
+
+**Rows are comparable, and that comparison is the whole mechanism.** Two tokens whose rows point the same way are treated similarly by every downstream matrix. Cosine similarity between the rows for `dog` and `puppy` is meaningfully higher than between `dog` and `banana` — not because anyone designed it, but because training pushed them there. If you have ever asked a model "what is this token's nearest neighbour?", this is what you are computing.
+
+**The table is bigger than the vocabulary suggests.** 128,256 rows for Llama-3.1, but only the tokens that actually appear get meaningful rows. Rare byte-fallback entries sit in a part of the space the model barely uses — which is fine, because they cost 4,096 numbers each whether or not anyone ever types them. That is 525 million parameters, many of them for characters nobody will send you.
+
+**Tying the two tables is a real choice.** Some models use the same matrix for the input embedding and the output head, so the row for `dog` is also the *output* vector that makes `dog` likely. Llama-3.1-8B does not tie, and spends another 525 million parameters on it. Tying halves that cost and is a slight quality constraint; not tying lets the two roles drift apart. Qwen2.5-0.5B and Llama-3.2-3B tie, because they are small.
+
+<Callout type="try" title="See the rotations for yourself">
+  In the module notebook, take a real 1.1B model, pull out its RoPE embedding module, and print $\theta_i$ for $i = 0, 8, 32, 63$. Then plot $\cos(\Delta\theta_i)$ against $\Delta$ for $\Delta = 0 \dots 32$ on a log axis. You will see 64 curves: the fast ones oscillating, the slow ones flat. That plot is the reason position encodings are designed the way they are.
+</Callout>
+
+## In code
+
+RoPE, in the ten lines it actually takes:
+
+```python
+import torch, math
+
+def rope(x, pos, base=500000.0):
+    """x: [T, heads, d_head]  pos: [T] -> same shape."""
+    d = x.shape[-1]
+    inv = 1.0 / (base ** (torch.arange(0, d, 2, device=x.device).float() / d))   # θ_i, 64 values
+    ang = pos[:, None].float() * inv[None, :]                                     # m · θ_i
+    cos, sin = ang.cos(), ang.sin()
+    # interleave to (x0, x1, x2, x3, ...) so pairs are adjacent
+    x = x.reshape(*x.shape[:-1], -1, 2)
+    x0, x1 = x[..., 0], x[..., 1]
+    return torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).flatten(-2)
+
+# the property that makes RoPE work: rotate q by m, k by n, and only (m-n) matters
+m, n, d = 7, 3, 128
+q = torch.randn(1, d); k = torch.randn(1, d)
+a = (rope(q.reshape(1,1,d), torch.tensor([m])) * rope(k.reshape(1,1,d), torch.tensor([n]))).sum()
+b = (rope(q.reshape(1,1,d), torch.tensor([m + 1000])) * rope(k.reshape(1,1,d), torch.tensor([n + 1000]))).sum()
+print(a.item(), b.item())   # identical to ~6 decimal places
+```
+
+<Callout type="real" title="Qwen2 adds one more normalisation">
+  Qwen2 models apply a small RMSNorm to each query head and each key head *before* RoPE. It costs 2 × 128 numbers per head and it is one more elementwise kernel. It exists because without it, some attention heads produce values large enough to destabilise the softmax at long context. Llama does not do this. When you read a model's config you will see it, and it is not a bug.
+</Callout>
+
+<KeyNotes>
+  1. An **embedding** is one row of a `vocab × hidden` table. Llama-3.1-8B: 128,256 × 4,096 = 525 M parameters, 1.05 GB in BF16, 6.5% of the model.
+  2. The lookup reads **one row**: 8,192 bytes per token. Cheap. *Storing* the table plus the output head is 2.1 GB and is not cheap.
+  3. The ID is discarded after the lookup. From then on the token is 4,096 numbers and nothing else.
+  4. Embeddings alone carry no position: the same token at position 0 and position 9,999 produces an identical vector. "Dog bites man" would be indistinguishable from "man bites dog".
+  5. Three position schemes: learned absolute (needs a table, fixes the context length), sinusoidal (no table, shorter reach), and **RoPE** (no table, long reach).
+  6. **RoPE rotates Q and K by $m\theta_i$**, where $\theta_i = \text{base}^{-2i/d_{\text{head}}}$. 64 pairs for a 128-wide head, from one turn per token to almost none.
+  7. Rotations compose, so $\mathbf{q}'\cdot\mathbf{k}'$ depends only on $m - n$. Move both tokens forward together and the score does not change.
+  8. The base sets the reach: Llama-2's 10,000 gives the slowest pair a 54,400-token wavelength; Llama-3.1's 500,000 gives 2.51M. Small bases alias — at base 10,000, Δ=16 can score *higher* than Δ=8.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B’s embedding table has 128,256 rows of 4,096 numbers. How many bytes is that in BF16?', numeric: true, answer: 1.05, tolerance: 0.05, unit: 'GB', why: '128,256 × 4,096 × 2 bytes = 1,050,600,192 bytes ≈ 1.05 GB. That is 6.5% of the model’s 16.1 GB.' },
+  { q: 'One token’s embedding lookup on Llama-3.1-8B reads how many bytes?', numeric: true, answer: 8192, tolerance: 10, unit: 'bytes', why: 'One row = 4,096 numbers × 2 bytes = 8,192 bytes = 8 KB. Tiny: a 2,000-token prompt costs 16 MB of embedding reads against 16 GB of weights.' },
+  { q: 'RoPE rotates the query and key by an angle that grows with position. What does q·k end up depending on?', options: ['The absolute position m only', 'The absolute position n only', 'The difference m − n', 'The sum m + n'], answer: 2, why: 'Rotations compose: R(mθ)ᵀR(nθ) = R((n−m)θ). Both absolute positions cancel and only the gap survives. This is why RoPE has no maximum-context table.' },
+  { q: 'Llama-2 uses a RoPE base of 10,000 and Llama-3.1 uses 500,000. The slowest of the 64 pairs is pair 63 of a 128-wide head. About what is its wavelength in tokens for base 10,000?', numeric: true, answer: 54400, tolerance: 3000, unit: 'tokens', why: 'wavelength = 2π · base^(2·63/128) = 2π · 10,000^0.984 ≈ 2π × 8,662 ≈ 54,400 tokens. With base 500,000 it becomes about 2.51M tokens, which is what lets Llama-3.1 reach 128K.' },
+  { q: 'Why can’t you just use a learned position embedding table, as GPT-2 does?', options: ['Learned positions are less accurate than RoPE', 'The table has one row per position, so the maximum context length is fixed the moment you train', 'Learned positions need more than 2 bytes per number', 'Learned positions cannot be batched'], answer: 1, why: 'GPT-2 has 1,024 rows = a 1,024-token ceiling. Extending it means training new rows (interpolation, PI, NTK-aware scaling), whereas RoPE extends by raising the base. Position vectors are still stored, but they are tiny.' },
+  { q: 'Adding RoPE to a model costs how many extra parameters?', numeric: true, answer: 0, tolerance: 0, why: 'None. RoPE is a rotation applied to Q and K after the projection — a pure function of position, with no stored table. It costs one elementwise kernel per layer, which is negligible.' },
+] } />

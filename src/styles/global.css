@@ -1,0 +1,171 @@
+/* ───────────────────────── Tokens per Second · design tokens
+   World: a GPU profiler trace on a calm dark slate.
+   Prose stays achromatic. Color is spent only on data, and always means the same thing:
+   compute = amber, memory = blue, tokens = green, communication = violet, error = red, idle = hatched grey. */
+
+:root {
+  color-scheme: dark;
+
+  --ground: #0e1116;
+  --ground-2: #12161d;      /* recessed wells: code, stage */
+  --ground-3: #181d26;      /* hover / raised */
+  --rule: #232935;          /* hairlines */
+  --rule-2: #333b4a;        /* stronger hairlines, axes */
+  --text: #e8e6e1;
+  --text-2: #a9afba;
+  --text-3: #7c8391;        /* ticks, meta: large or non-essential only */
+
+  --compute: #f2b544;
+  --memory: #58c4dd;
+  --token: #83c167;
+  --comm: #a78bfa;
+  --error: #fc6255;
+  --idle: #4a5262;
+
+  --compute-dim: rgb(242 181 68 / 0.16);
+  --memory-dim: rgb(88 196 221 / 0.16);
+  --token-dim: rgb(131 193 103 / 0.16);
+  --comm-dim: rgb(167 139 250 / 0.16);
+  --error-dim: rgb(252 98 85 / 0.16);
+
+  --font-display: 'KaTeX_Main', 'Latin Modern Roman', 'CMU Serif', Georgia, serif;
+  --font-sans: 'Atkinson Hyperlegible Next', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Atkinson Hyperlegible Mono', ui-monospace, 'Cascadia Mono', Consolas, monospace;
+
+  --measure: 68ch;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --radius: 2px;
+  --bar-h: 56px;
+
+  /* shiki css-variables theme */
+  --astro-code-foreground: #d8d6d0;
+  --astro-code-background: var(--ground-2);
+  --astro-code-token-constant: #58c4dd;
+  --astro-code-token-string: #83c167;
+  --astro-code-token-comment: #6f7684;
+  --astro-code-token-keyword: #f2b544;
+  --astro-code-token-parameter: #e8e6e1;
+  --astro-code-token-function: #a78bfa;
+  --astro-code-token-string-expression: #83c167;
+  --astro-code-token-punctuation: #8b92a0;
+  --astro-code-token-link: #58c4dd;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html {
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 17px;
+  line-height: 1.65;
+  -webkit-text-size-adjust: 100%;
+  text-rendering: optimizeLegibility;
+  scroll-padding-top: calc(var(--bar-h) + 16px);
+  scrollbar-color: var(--rule-2) var(--ground);
+}
+
+body { margin: 0; min-height: 100vh; background: var(--ground); overflow-x: hidden; }
+
+::selection { background: var(--compute); color: #111; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--ground); }
+::-webkit-scrollbar-thumb { background: var(--rule-2); border-radius: 10px; border: 2px solid var(--ground); }
+
+:focus-visible { outline: 2px solid var(--memory); outline-offset: 3px; border-radius: 2px; }
+
+a { color: var(--text); text-decoration-color: var(--rule-2); text-underline-offset: 0.22em; text-decoration-thickness: 1px; transition: text-decoration-color 0.2s; }
+a:hover { text-decoration-color: var(--text); }
+
+img, svg { max-width: 100%; }
+
+h1, h2, h3, h4 { font-weight: 400; line-height: 1.15; text-wrap: balance; margin: 0; }
+h1, h2 { font-family: var(--font-display); letter-spacing: -0.01em; }
+h3, h4 { font-family: var(--font-sans); font-weight: 700; letter-spacing: 0; }
+
+p { margin: 0 0 1em; text-wrap: pretty; }
+
+code, kbd, samp, pre { font-family: var(--font-mono); font-size: 0.86em; }
+:not(pre) > code {
+  background: var(--ground-2);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 0.08em 0.36em;
+  color: #dcdad4;
+  white-space: nowrap;
+}
+
+kbd { border: 1px solid var(--rule-2); border-bottom-width: 2px; border-radius: 3px; padding: 0 0.35em; font-size: 0.8em; }
+
+hr { border: 0; border-top: 1px solid var(--rule); margin: 3rem 0; }
+
+.num, .tabular { font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
+
+.visually-hidden { position: absolute !important; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ───────── data colour utilities (fills for SVG, text for inline) */
+.k-compute { --k: var(--compute); --k-dim: var(--compute-dim); }
+.k-memory { --k: var(--memory); --k-dim: var(--memory-dim); }
+.k-token { --k: var(--token); --k-dim: var(--token-dim); }
+.k-comm { --k: var(--comm); --k-dim: var(--comm-dim); }
+.k-error { --k: var(--error); --k-dim: var(--error-dim); }
+.k-idle { --k: var(--idle); --k-dim: rgb(74 82 98 / 0.25); }
+.k-text { --k: var(--text); --k-dim: rgb(232 230 225 / 0.08); }
+
+/* inline colour key used in prose: <span class="ink k-compute">compute</span> */
+.ink { color: var(--k); font-weight: 700; }
+
+/* ───────── buttons */
+.btn {
+  --k: var(--text);
+  display: inline-flex; align-items: center; gap: 0.5em;
+  font: 700 0.9rem/1 var(--font-sans);
+  color: var(--ground);
+  background: var(--k);
+  border: 1px solid var(--k);
+  border-radius: var(--radius);
+  padding: 0.8em 1.15em;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 0.25s var(--ease-out), background 0.2s, color 0.2s;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+.btn.ghost { background: transparent; color: var(--text); border-color: var(--rule-2); }
+.btn.ghost:hover { border-color: var(--text-2); }
+.btn[disabled] { opacity: 0.4; cursor: not-allowed; transform: none; }
+.btn svg { width: 1em; height: 1em; }
+
+/* ───────── code blocks */
+pre.astro-code {
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 1rem 1.15rem;
+  overflow-x: auto;
+  line-height: 1.55;
+  font-size: 0.8rem;
+  margin: 1.4rem 0;
+  tab-size: 4;
+}
+pre.astro-code code { font-size: inherit; }
+
+/* ───────── KaTeX */
+.katex { font-size: 1.08em; color: var(--text); }
+.katex-display { margin: 1.5rem 0; overflow-x: auto; overflow-y: hidden; padding: 0.25rem 0; }
+.katex-display > .katex { font-size: 1.2em; }
+
+/* ───────── motion safety */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
+}
+
+/* ───────── print (cheat sheets) */
+@media print {
+  :root { --ground: #fff; --ground-2: #f5f5f5; --text: #111; --text-2: #333; --text-3: #555; --rule: #ccc; --rule-2: #999; }
+  html, body { background: #fff; color: #111; font-size: 11pt; }
+  .no-print, .topbar, .site-foot, .notes-fab { display: none !important; }
+  a { text-decoration: none; }
+  .katex { color: #111; }
+}

@@ -1,0 +1,232 @@
+---
+title: 'Project: Build an engine selection matrix'
+summary: 'Turn everything in this module into one decision document: a matrix that narrows four engines to one on your hardware and your traffic, where every column is labelled measured, derived or structural — and the cheap certain columns are allowed to decide before the expensive noisy one ever runs.'
+objectives:
+  - Build the derived column of the matrix from weight and KV arithmetic, before touching a GPU
+  - Write hard constraints that eliminate candidates without a benchmark, and apply them first
+  - Measure at least two engines under a harness contract and state your run-to-run spread
+  - Enforce quality parity so the measured column compares equal work
+  - Combine the survivors with weighted criteria whose weights are stated before the scores
+  - Write a recommendation with a sensitivity check and an honest tie-breaker'
+colab: 17-engine-matrix.ipynb
+---
+
+You now have the two halves of this module. The first lesson gave you the rule: a comparison is only valid if six things were held identical. The second gave you the subjects: four engines, each built around a different idea, each with a different strength and a different condition attached.
+
+This project joins them into the artifact an inference engineer actually delivers. Not a benchmark, and not a ranking. **A decision you can defend**, in a form that survives someone asking "where did this number come from?"
+
+<Colab nb="17-engine-matrix.ipynb" />
+
+## The deliverable
+
+One repository containing:
+
+1. **`matrix.py`** — computes the derived columns (weight bytes, KV pool, max batch, feasibility verdict) for every (model, precision, GPU) triple you care about. No GPU required. This is the notebook's first half.
+2. **`harness.py`** — one measurement collector, reused unchanged across every engine you benchmark. This is the notebook's middle.
+3. **`MATRIX.md`** — the table. Rows are candidate engines; every column is headed `MEASURED`, `DERIVED` or `STRUCTURAL`.
+4. **`DECISION.md`** — your hard constraints, your weights, the weighted result, a sensitivity check, and the recommendation in one sentence.
+5. **`findings.md`** — what you could not measure, what you inferred instead, and the structural facts you took from documentation at the time of writing.
+
+<Callout type="real" title="Why the column headings are the whole point">
+  A matrix whose columns are unlabelled is not a decision document, it is a vibe with numbers in it. The reader cannot tell a measurement from an inference, and six weeks later neither can you.
+
+  The three kinds have different confidence and different failure modes. **Derived** numbers are exact and cannot be wrong — you either did the arithmetic or you did not. **Measured** numbers are only as good as the contract that produced them. **Structural** numbers are certain right up until someone ships a release. Putting them in separate columns, with headers, is what makes the table auditable.
+</Callout>
+
+## Step 1 · The derived column (no GPU, and it eliminates the most)
+
+Start here, and resist every temptation to benchmark first. For any model, precision and GPU, you can compute exactly:
+
+$$
+\begin{aligned}
+\text{weights} &= P \times b \\
+\text{reserve} &\approx 0.04 \times \text{mem} \\
+\text{kv\_bytes\_tok} &= 2 \times L \times H_{kv} \times d_h \times 2 \\
+\text{pool} &= \text{mem} - \text{weights} - \text{reserve} \\
+\text{pool\_tokens} &= \frac{\text{pool}}{\text{kv\_bytes\_tok}} \\
+\text{max\_batch} &= \frac{\text{pool\_tokens}}{\text{ctx}}
+\end{aligned}
+$$
+
+Worked, from the notebook: **Llama-3.1-8B, BF16, on a T4.**
+
+- weights = $8.03\times 10^9 \times 2 = 16.06$ GB
+- reserve = $0.04 \times 16 = 0.64$ GB
+- kv per token = $2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes
+- pool = $16 - 16.06 - 0.64 = -0.70$ GB → **negative**
+
+It does not fit. Not "it will be slow" — it will not load. And a T4 is 16 GB, so this is a hard constraint that eliminates the candidate before any benchmark exists.
+
+Now **the same model on an A100 (80 GB)**: pool = $80 - 16.06 - 3.2 = 60.7$ GB, so $\frac{60.7\times 10^9}{131{,}072} \approx 463{,}000$ tokens of context. At 2,048 tokens per request that is **226 concurrent streams**; at 16,384 it is 28.
+
+<Callout type="math" title="Context is a matrix column, not a footnote">
+  The same model on the same GPU supports an 8× range of batch capacity depending only on how long the context is. A matrix with a single "max batch" number and no context stated is not describing a system — it is describing one point in a 2-D space, and the point it chose may be the one where your engine loses.
+
+  This is the single most common omission in real capacity matrices, and it is free to fix: add a context column, or state the context your number assumes.
+</Callout>
+
+## Step 2 · Hard constraints (the eliminations)
+
+A <Term t="hard-constraint">hard constraint</Term> is a criterion a candidate either satisfies or does not, with no trading off. Run these before any scoring, because a row that fails one can never be the answer no matter how well it scores elsewhere.
+
+Your matrix should have a pass/fail block that looks like this:
+
+| Constraint | vLLM | SGLang | TensorRT-LLM | llama.cpp |
+|---|---|---|---|---|
+| Weights fit our GPU at our precision | | | | |
+| We have a CUDA build in our pipeline | | | | |
+| Our model has a supported kernel path | | | | |
+| No ahead-of-time build step in deploy | | | | |
+| Runs without NVIDIA hardware | | | | |
+
+Fill every cell from **documentation at the time of writing**, cite the version, and date the file. These are structural facts and they are the cheapest thing in the matrix to get right.
+
+<Callout type="pitfall" title="Three eliminations people forget to apply">
+  1. **The deployment pipeline is a constraint, not a preference.** If TensorRT-LLM needs a 20-minute build per configuration and your deploys are every six hours with a config change each time, that is a real cost — quantify it in minutes, and put it in the structural column.
+  2. **"We might need a non-NVIDIA path later" is not a hard constraint** unless there is a date and a plan attached to it. Otherwise it is a preference in disguise, and it will quietly eliminate the only engine that fits on your hardware today.
+  3. **Model support is a moving target.** A model with no kernel path today may have one next quarter. That makes it a risk, not a constraint. Put it in `findings.md` with a monitoring plan, not in the pass/fail block.
+</Callout>
+
+## Step 3 · The measured column (only now, and only what the contract allows)
+
+This is where the notebook's middle section earns its keep. Two rules govern everything in this step.
+
+**One harness, reused unchanged.** If you find yourself writing a second collector, you have broken the contract from the first lesson. The engine is the only variable that changes between arms.
+
+**Parity before timing.** At temperature 0 with a pinned seed and a pinned revision, two engines serving the same weights must emit the same token sequence. Check it. If they do not match, you are not comparing engines — you are comparing two different computations, and the timing is meaningless.
+
+```python
+# the contract, in code — one file, one function, every engine
+GEN = dict(temperature=0.0, top_p=1.0, seed=0, max_tokens=128, stream=True)
+
+def parity_check(url, prompt, n=64):
+    """Run before you trust any timing. Returns the token IDs."""
+    ...
+```
+
+Then report, for each engine: p50 and p95 <Term t="ttft">TTFT</Term>, p50 <Term t="tpot">TPOT</Term>, total tokens/s, and the **run-to-run spread** you measured by repeating one arm.
+
+<Callout type="math" title="Say what your rig's noise is before you say what your effect is">
+  On a free Colab T4, expect a run-to-run spread $c$ of roughly 5–10%: it is a shared, virtualised machine. Against $c = 8\%$, a claimed 4% advantage needs $k \approx (2\times 8/4)^2 = 16$ repeats to be defensible. A claimed 30% advantage needs 1.
+
+  So write the sentence honestly: *"vLLM measured 28% higher throughput than llama.cpp at INT4 on Qwen2.5-0.5B, 4 repeats interleaved, rig spread 7%. The effect is large relative to the noise. The llama.cpp figure is for a quantized model and is therefore not a like-for-like comparison of the engines' kernels — see §3."*
+</Callout>
+
+## Step 4 · Weighted criteria, and a sensitivity check
+
+Only the survivors of steps 1–3 reach this step. Combine them with <Term t="weighted-criteria">weighted criteria</Term>:
+
+$$
+\text{score} = \sum_{i} w_i \times s_i, \qquad \text{with } \sum_i w_i = 1
+$$
+
+The weights are the argument, and they must be written **before** the scores. If you set them after looking, you have fitted them to a conclusion you already had.
+
+A defensible set for an interactive product, with the reasoning:
+
+| Criterion | Weight | Why that weight |
+|---|---|---|
+| p95 TTFT headroom against our SLO | 0.35 | it is the promise to the user, and the only one they feel |
+| goodput per dollar | 0.30 | throughput is worthless if it misses the SLO |
+| fit at our context length | 0.20 | a capacity column that decides how many replicas you buy |
+| build and deploy complexity | 0.10 | real cost, but paid by you and not by the user |
+| operational familiarity | 0.05 | matters, and small, and it is the honest place to admit it |
+
+Then do the thing nobody does: **change the most important weight by 20% and re-score.** If the winner flips, your decision is not determined by the data — it is determined by a weight you guessed, and you must say so and name the tie-breaker.
+
+<Callout type="intuition" title="A close result is information, not a failure">
+  If your top two are within a few percent, the correct output is not a foregone conclusion. It is: *"On our weights, vLLM and SGLang are within 4%, which is inside our 7% rig spread. We choose SGLang because our traffic is 80% prefix-sharing, which is a design-alignment argument rather than a measured one, and because our team already operates it."*
+
+  That is a stronger document than a table with a bold winner. It tells the reader exactly what you know, what you inferred, and which part of the decision is a judgement.
+</Callout>
+
+## Step 5 · Goodput per dollar, the tie-breaker
+
+When two survivors both work, the <Term t="goodput-per-dollar">goodput per dollar</Term> usually decides, because it is the only column that prices the latency you promised:
+
+$$
+\text{goodput per dollar} = \frac{\text{tok/s meeting SLO} \times 3600}{\text{GPU \$ per hour}}
+$$
+
+Worked: a GPU at \$2.50/hour delivering 1,800 tok/s of which 82% meets the SLO gives 1,476 good tok/s, so $\frac{1476 \times 3600}{2.50} \approx 2.13$ M good tokens per dollar-hour. A cheaper GPU at \$0.80/hour needs to beat that to justify itself, and at a lower <Term t="goodput">goodput</Term> fraction it often does not — which is the whole argument for running your SLO as a constraint rather than a target.
+
+<Callout type="recap" title="What a good matrix looks like">
+  It is not the table with the most numbers. It is the table where **a reader can tell, for every cell, whether it is arithmetic, measurement or documentation** — and where the cheap certain columns visibly did most of the elimination before the expensive noisy column was allowed to vote.
+</Callout>
+
+## Extend it (pick at least two)
+
+- **A shadow deployment.** Run the runner-up engine alongside the incumbent on 5% of traffic, with the same harness and the same SLO, and report the goodput difference. This is the only way to get a real measurement of your own traffic instead of a synthetic workload.
+- **A context sweep in the derived column.** Make the matrix 3-D: model × precision × context, with feasibility verdicts in words. Show where each combination crosses from "fits" to "OOM".
+- **A rebuild-cost column for TensorRT-LLM.** Measure how long a build actually takes for your model and config, and convert it into a deploy-cost figure by multiplying by your deploy frequency. Put it beside the per-step saving so the trade is visible in both directions.
+- **A version-bump re-run.** Pin versions, then bump one engine by a release and re-measure. Did the ranking hold? This is what tells you how much maintenance your matrix actually costs.
+- **A negative result.** Find a column where the engines are within noise, and write it up as a finding: *this criterion does not discriminate between these candidates; stop using it.* Removing a useless column is a real contribution.
+
+## Check yourself
+
+Before you call it done, answer these. Any "no" means the matrix is not finished.
+
+1. Does every column have a `MEASURED`, `DERIVED` or `STRUCTURAL` header, and does every cell agree with its header?
+2. Could you eliminate at least one candidate using arithmetic alone, with no benchmark cited?
+3. Did you verify token-level parity between the engines you measured, before reading any timing?
+4. Have you stated your rig's run-to-run spread, and does every claimed effect exceed it?
+5. Were your weights written down before you collected the scores?
+6. If you changed your most important weight by 20% and the winner flipped, does your document say so and name a tie-breaker?
+7. Could a colleague who has never seen your code read `DECISION.md` and reach the same decision you did?
+
+## Acceptance criteria
+
+You have passed the project when all of the following hold.
+
+**Rigor**
+- Every derived number is reproducible from the formulas, with inputs shown.
+- Every measured number comes from one harness, under a stated contract, with parity verified.
+- Structural claims are cited to a version and dated.
+- The three column kinds are never mixed in a single cell.
+
+**Decision quality**
+- At least one candidate eliminated by hard constraint, with arithmetic shown.
+- Weights stated before scores, and normalised.
+- A sensitivity check on the top weight.
+- A recommendation in one sentence, with its weakest link named.
+
+**Communication**
+- `DECISION.md` is readable by someone who has not seen the benchmark.
+- `findings.md` records what you could not measure and what you did instead.
+- The matrix would survive an audit in which every measured cell was challenged.
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | Arithmetic eliminates candidates before any measurement, columns are cleanly separated by kind, parity was verified before timing, rig spread is stated and every effect clears it, weights are pre-registered and stress-tested, and the recommendation names its own weakest link. A reader could re-derive every number and re-run the decision. |
+| **Proficient** | Meets all acceptance criteria. Two engines measured under a real contract, derived column correct, hard constraints applied, weights justified and summed to one. The decision is defensible even if the sensitivity check was shallow. |
+| **Developing** | The matrix has the right shape but the columns blur: a measured number sits beside an inference, or a structural claim has no version. One engine measured, or parity never checked. Weights chosen after the scores. |
+| **Beginning** | A ranking with no contract behind it. Different workloads per row, no parity check, no spread, no sensitivity analysis. The table looks confident and would not survive one question from an engineer who knows the field. |
+
+<Callout type="mentor" title="The sentence that ends the interview">
+  At the end of this you should be able to say, without notes:
+
+  > *"We run vLLM in BF16 on A100s. It was not a close call: the derived column eliminated the alternatives on memory and context, SGLang's prefix advantage is worth 3% on our traffic and we have 80% prefix sharing, and TensorRT-LLM's build step costs us more in deploy time than it returns in latency. Our goodput per dollar is X, our SLO headroom is Y, and here is the measurement that would change our mind."*
+
+  That sentence — with the numbers attached and the falsifier named — is the deliverable. The table is how you earned it.
+</Callout>
+
+## Where this goes next
+
+- **Module 18 (Multi-GPU Parallelism)** — your derived column already told you which models exceed one card. Now you find out what it costs to split them, and the interconnect will be the constraint that decides.
+- **Module 19 (Mixture-of-Experts Inference)** — for an MoE model, "weights in bytes" stops being the whole memory story, and your derived column needs a routing-aware term.
+- **Module 20+ (production serving)** — the operating point you chose here becomes the input to autoscaling, admission control and capacity planning.
+
+Keep the matrix. Every engine release, every new model and every hardware refresh means re-running it, and the version that tells you whether anything changed is the one you kept.
+
+<KeyNotes>
+  1. Build the **derived** column first. It is exact, it needs no GPU, and it eliminates the most candidates — most "which engine" questions die there.
+  2. Context length moves max batch by more than an order of magnitude, so **a matrix with no context column is not describing a system**.
+  3. Hard constraints run before scoring and cannot be traded off. Include the deployment pipeline, not just the hardware.
+  4. Measure with **one harness reused unchanged** across every engine, and verify **token-level parity** before you read a single timing.
+  5. State your rig's run-to-run spread first, then check every claimed effect against it. On a shared free T4, expect 5–10%.
+  6. Write your weights **before** you collect the scores, and stress the most important one by ±20%. A winner that flips under that test is a judgement call, and you should say so.
+  7. Separate the three column kinds in the headings — `MEASURED`, `DERIVED`, `STRUCTURAL` — and never mix them in a cell. A reader who cannot tell an arithmetic result from a guess cannot use the table.
+  8. A close result is information. When the top two are inside the noise, the honest deliverable names the tie-breaker and says which part of the decision is judgement rather than measurement.
+</KeyNotes>

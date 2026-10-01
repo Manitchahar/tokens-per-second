@@ -1,0 +1,317 @@
+---
+title: 'Tensor parallelism'
+summary: 'Splitting the matrices inside one transformer layer across GPUs. You will learn why the Megatron block needs exactly one all-gather and one all-reduce per layer, what it costs in wall-clock time, and why the memory win is larger than the speedup.'
+objectives:
+  - 'Derive the Megatron block: column-parallel then row-parallel, one all-gather in and one all-reduce out'
+  - 'Compute TP communication bytes per forward pass and price them against the memory time they replace'
+  - 'Explain why TP memory falls as 1/t but TP time does not, and derive the sublinear speedup'
+  - 'Determine the largest legal TP degree for a model, and explain what GQA does to that limit'
+  - 'Decide between TP and pipeline parallelism for a given model, fabric and workload'
+---
+import TensorParallelBlock from '@/components/viz/multi-gpu/TensorParallelBlock.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The previous lesson gave you the vocabulary: interconnects, collectives, and the number $\rho$ that says how expensive a remote byte is. Now we use them on the smallest possible unit of work — **one layer of one token's forward pass**.
+
+<Term t="tensor-parallelism">Tensor parallelism</Term> (TP) is the idea that one token's computation can be split across GPUs, each doing a piece of every matrix multiply. Every request still passes through all $t$ GPUs; they just cooperate to produce one answer.
+
+It is the most powerful parallelism and the most expensive in communication. It is also the one you reach for first.
+
+## Splitting a matrix: two ways, and only two
+
+Every weight in a transformer is a matrix. To split one across GPUs you have exactly two options, and the whole design is the choice between them.
+
+**Split by output columns.** Take $W_1$ of shape $[h_{out}, h_{in}]$ and cut $h_{out}$ into $t$ pieces:
+
+$$
+W_1 = [W_1^{(1)} \ W_1^{(2)} \ \dots \ W_1^{(t)}], \qquad XW_1 = [XW_1^{(1)} \ XW_1^{(2)} \ \dots \ XW_1^{(t)}]
+$$
+
+Each GPU does a mat-vec (or matmul) against its own columns and produces a **slice of the output**. Nothing has to be combined: the shards already are the answer. This is a <Term t="column-parallel">column-parallel linear</Term>.
+
+**Split by input rows.** Take $W_2$ of shape $[h_{in}, h_{out}]$ and cut $h_{in}$:
+
+$$
+W_2 = \begin{bmatrix} W_2^{(1)} \\ W_2^{(2)} \\ \vdots \\ W_2^{(t)} \end{bmatrix}, \qquad
+W_2 X = \sum_{i=1}^{t} W_2^{(i)} X^{(i)}
+$$
+
+Each GPU computes a **partial sum** of the full output. The partials must be added — one <Term t="all-reduce">all-reduce</Term>. This is a <Term t="row-parallel">row-parallel linear</Term>.
+
+<Callout type="intuition" title="Why two shapes and not more">
+  A matrix has two dimensions. Splitting along the first dimension makes each GPU produce part of the output (no combine). Splitting along the second makes each GPU produce part of the *sum* (needs a combine). Every tensor-parallel layer you will ever read is some arrangement of these two facts — usually one of each, back to back.
+</Callout>
+
+## The Megatron block
+
+Now put them together and you get the pattern from the 2021 Megatron-LM paper, which is what every framework still implements. The MLP (Module 03) is three matrices: $W_1$ expands hidden → intermediate, $W_2$ projects intermediate → hidden, $W_3$ projects hidden → intermediate again, and the middle one is combined.
+
+The block, with $t = 4$:
+
+```
+        X  [full, on every GPU]
+        |
+   [ all-gather ]        <- only if X was split
+        |
+  +-----+-----+-----+-----+
+  | W1^1| W1^2| W1^3| W1^4|   column-parallel: no communication
+  +-----+-----+-----+-----+
+        |
+  X1    X2    X3    X4    (shards, each GPU has its own)
+        |
+  +-----+-----+-----+-----+
+  | W2^1| W2^2| W2^3| W2^4|   row-parallel: each a partial sum
+  +-----+-----+-----+-----+
+        |
+   [ all-reduce ]        <- sums the partials
+        |
+        Y  [full, on every GPU]
+```
+
+**One all-gather going in, one all-reduce coming out.** That is the entire cost of tensor parallelism, and it repeats once per layer. For Llama-3.1-8B, 32 layers, that is 64 collective calls per forward pass.
+
+And here it is, in about fifteen lines. The two slicing patterns are the whole scheme:
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class ColumnParallel(nn.Module):
+    """Split the first MLP matrix by OUTPUT columns. Each rank computes a slice
+    of the result; the shards ARE the answer, so nothing is communicated."""
+    def __init__(self, h, f, t, rank):
+        super().__init__()
+        self.fs = f // t                       # this rank's slice of the output
+        self.weight = nn.Parameter(torch.empty(h, self.fs))
+        self.rank, self.t = rank, t
+
+    def forward(self, x):                     # x: [B, h] — full, on every rank
+        y = x @ self.weight                   # [B, fs] — our slice only
+        return F.silu(y)
+
+
+class RowParallel(nn.Module):
+    """Split the second MLP matrix by INPUT rows. Each rank computes a PARTIAL
+    SUM of the same output, so one all-reduce finishes the job."""
+    def __init__(self, f, h, t, rank):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(f // t, h))   # only our rows
+        self.rank, self.t = rank, t
+
+    def forward(self, act):                   # act: [B, fs] — our slice only
+        return act @ self.weight              # [B, h] — a partial sum
+
+
+# the block, with the two collectives
+def megatron_mlp(x, col, row, group):
+    act = col(x)                       # column-parallel: no communication
+    y = row(act)                       # row-parallel: a partial sum on this rank
+    dist.all_reduce(y, op=dist.ReduceOp.SUM, group=group)   # <-- the whole cost
+    return y
+```
+
+Two lines carry the entire lesson. `ColumnParallel` never calls a collective, because a slice of an output needs no reconciliation. `RowParallel` calls exactly one, because a partial sum is not an answer until it is added up.
+
+<Scrolly>
+  <TensorParallelBlock client:visible slot="stage" />
+
+  <Step title="1. One layer, four GPUs">
+    Each card holds a quarter of every weight matrix in the layer. It reads a quarter of the weights, does a quarter of the FLOPs — and then talks to its neighbours twice.
+  </Step>
+
+  <Step title="2. Column-parallel needs no communication">
+    Splitting $W_1$ by output columns means each GPU produces a slice of the expanded activations. Those slices *are* the result. **This half is free.**
+  </Step>
+
+  <Step title="3. Row-parallel produces partial sums">
+    Splitting $W_2$ by input rows means each GPU computes a partial sum of the same hidden-state vector. Correct, and not yet complete.
+  </Step>
+
+  <Step title="4. Gather in, reduce out">
+    One all-gather rebuilds the full input; one all-reduce sums the partial outputs. The pair is the Megatron block, and it is the only communication in the layer.
+  </Step>
+
+  <Step title="5. Now price it">
+    At $t = 4$ the all-reduce moves 1.5x the hidden state per layer. Times two collectives times 32 layers. Switch the interconnect to PCIe and watch what happens.
+  </Step>
+
+  <Step title="6. Attention splits identically">
+    Q, K and V are column-parallel — each GPU gets whole heads. The output projection is row-parallel. One difference from the MLP: **the KV cache also divides by $t$.**
+  </Step>
+
+  <Step title="7. Memory divides by t">
+    Weights fall to $\frac{1}{t}$ and the KV cache falls to $\frac{1}{t}$. For Llama-3.1-70B on an 80 GB card, $t = 4$ is the difference between fitting and not fitting at all.
+  </Step>
+
+  <Step title="8. Time does not">
+    Memory time falls as $\frac{1}{t}$, compute time falls as $\frac{1}{t}$, and the collectives do not fall at all. Switch to InfiniBand and the bars reorder: **you are no longer spending your time on memory.**
+  </Step>
+</Scrolly>
+
+## The cost, in bytes
+
+The all-reduce's payload is the hidden state: $[B, T, h]$ in BF16, so $S = B \cdot T \cdot h \cdot 2$ bytes. Per layer, per direction, in a ring:
+
+$$
+\text{bytes sent} = \frac{2(P-1)}{P} \cdot B \cdot T \cdot h \cdot 2
+$$
+
+Two collectives per layer, $L$ layers. Total per forward pass:
+
+$$
+\text{TP bytes} = 2 L \cdot \frac{2(t-1)}{t} \cdot B \cdot T \cdot h \cdot 2
+$$
+
+<Callout type="math" title="Worked: Llama-3.1-70B, TP=4, batch 1, decode, over NVLink 4">
+  $L = 80$ layers, $h = 8{,}192$, $B = 1$, $T = 1$.
+
+  Payload: $S = 1 \times 1 \times 8{,}192 \times 2 = 16{,}384$ bytes $= 16$ KB.
+
+  Per pass per layer: $\frac{2 \cdot 3}{4} = 1.5 \times 16\ \text{KB} = 24.6$ KB.
+  Per forward pass: $\text{per pass} = 2 \times 80 \times 24.6\ \text{KB} = 3.93$ MB.
+
+  Time on NVLink 4 (450 GB/s, $\eta = 0.85$, $t_{lat} = 0.9$ µs):
+
+  $$
+  t = 0.9\ \mu s + \frac{3.93\times 10^6}{450\times 10^9 \times 0.85} = 0.9\ \mu s + 10.3\ \mu s \approx 11.2\ \mu s
+  $$
+
+  Memory time it replaces: each GPU now holds 141/4 = 35.3 GB, read at 3.35 TB/s × 0.8 = **13.2 ms**.
+
+  **Collectives are 0.085% of the step.** TP=4 over NVLink is essentially free, and you should use it.
+
+  Now the same thing over PCIe 4.0 (32 GB/s, $\eta = 0.8$, $t_{lat} = 2.5$ µs):
+
+  $$
+  t = 2.5\ \mu s + \frac{3.93\times 10^6}{32\times 10^9 \times 0.8} = 2.5\ \mu s + 153.5\ \mu s = 156\ \mu s
+  $$
+
+  That is 1.2% of the step — still small, but 14x worse. **And that is with 160 messages.** At batch 32 the payload is 512 KB, the latency term vanishes into the bandwidth term, and PCIe costs about 6.4% against NVLink's 0.5%. The lesson: PCIe works for TP at small batch and hurts at large batch.
+</Callout>
+
+<Callout type="intuition" title="Why 80 layers of tiny messages is cheaper than 2 layers of big ones">
+  Notice what the arithmetic rewards: the *payload* grows linearly with batch and context, but the *message count* is fixed at 2L regardless. Every extra layer adds a fixed latency you cannot avoid, and every extra batch row adds only bandwidth cost.
+
+  This is why TP is so much kinder to **prefill** than to **large-batch decode**. In prefill the payload is $T$ tokens wide, so a single collective at $T = 4{,}096$ is 8 MB and the latency term is 0.001% of it. TP is nearly free in prefill and needs care in decode.
+</Callout>
+
+## The sublinear speedup
+
+Here is the honest picture. With $P = t$ GPUs:
+
+$$
+t_{\text{step}} = \max\!\left( \frac{W/P}{B_{mem}\eta_{mem}},\ \frac{2P_{params}B}{P \cdot F_{peak}\eta_{flops}} \right) + t_{comm} + P \cdot t_{overhead}
+$$
+
+Three observations:
+
+1. **The memory and compute terms both fall as $\frac{1}{P}$.** Good.
+2. **$t_{comm}$ falls to a floor, not to zero.** It is proportional to the payload, and the payload does not shrink. This is the Amdahl term from Module 12 wearing a network costume. Call the result the <Term t="communication-overhead">communication overhead fraction</Term>.
+3. **$t_{overhead}$ grows as $P$.** Every rank launches its own kernels and its own collectives. Per-rank launch overhead is a few microseconds; at $P = 8$ and $L = 80$ layers that is not nothing.
+
+<Callout type="math" title="The three regimes of TP speedup">
+  **Communication negligible** (NVLink, large batch): $t_{comm} \ll t_{mem}/P$, so speedup $\to P$. Efficiency near 100%. This is the good case.
+
+  **Communication comparable** (NVLink, small batch, many layers): $t_{comm} \approx t_{mem}/P$, so speedup $\approx P/2$ at moderate $P$. At $P = 8$ and batch 1 on a 80-layer model, expect 5–6x, not 8x.
+
+  **Communication dominant** (PCIe or InfiniBand): $t_{comm} \gtrsim t_{mem}$, so speedup **approaches 1 from above** — adding GPUs makes the step *slower*. This is the failure mode to recognise, and it is why you must measure rather than assume.
+</Callout>
+
+## What t can legally be
+
+The <Term t="tp-degree">TP degree</Term> $t$ must divide three things:
+
+| Constraint | Why | Llama-3.1-70B | Qwen2.5-1.5B |
+|---|---|---|---|
+| number of query heads | heads split whole | 64 | 12 |
+| number of KV heads | KV heads split whole | **8** | **2** |
+| MLP intermediate size | `inter` split whole | 28,672 | 8,960 |
+
+**The KV head count is usually the binding constraint**, and it is easy to forget because the weights are 64 heads wide while the cache is only 8. For Llama-3.1-70B the legal powers of two are $t \in \{1, 2, 4, 8\}$. For Qwen2.5-1.5B with 2 KV heads, $t \in \{1, 2\}$.
+
+<Callout type="pitfall" title="GQA quietly caps your TP degree">
+  Llama-3.1-8B has 32 query heads, so the weights would happily split 32 ways. But it has only **8** KV heads, so $t > 8$ would force you to split a KV head across GPUs — which means the attention output needs an extra reduction, and the KV cache layout stops being a clean 1/$t$. Real frameworks refuse $t > n_{kv}$ without falling back to duplicating or uneven splits.
+
+  The generalisation to remember: **every dimension you split must be divisible by $t$, and in a GQA model the smallest of those dimensions is the KV head count.**
+</Callout>
+
+## Attention under TP, precisely
+
+Attention splits exactly like the MLP, with one structural addition:
+
+- $W_Q$, $W_K$, $W_V$: **column-parallel**. GPU $i$ gets heads $\{i \cdot n_q/t, \dots\}$, and its $K$ and $V$ projections produce its own heads' keys and values. **No communication** for the projections.
+- Attention itself: each GPU attends with its own heads over the *full* sequence. No communication.
+- $W_O$: **row-parallel**. The per-head outputs are concatenated (already a full $h$-vector) and $W_O$ is split by input rows. One all-reduce.
+
+Because each GPU holds **whole KV heads**, its KV cache slice is exactly $\frac{1}{t}$ of the total:
+
+$$
+\text{KV per GPU} = \frac{1}{t} \times 2 L n_{kv} d \times 2\ \text{bytes per token}
+$$
+
+This is the second reason TP saves memory beyond just dividing the weights, and it is often the larger effect at long context and high batch.
+
+## Tensor vs pipeline: the decision
+
+The two parallelism strategies in this module differ on every axis, and the choice is easier once you see them side by side.
+
+| | Tensor parallelism | Pipeline parallelism |
+|---|---|---|
+| Splits | matrices inside a layer | layers across GPUs |
+| Collectives per layer | 2 (all-gather + all-reduce) | 1 per boundary, so $P-1$ total |
+| Communication volume | $\propto B \cdot T \cdot h$ per layer | $\propto B \cdot T \cdot h$ per boundary |
+| **Total volume** | 2L x (2(t-1)/t) x BTh | (P-1) x BTh |
+| Splits KV cache | yes, 1/t | no |
+| Best interconnect | NVLink ($\rho \approx 7$) | InfiniBand ($\rho \approx 67$) |
+| Max degree | head count, usually ≤ 8 | layer count, unbounded |
+| Big weakness | communication overhead | the bubble, and no intra-layer compute |
+
+For Llama-3.1-70B at $B{=}32$, $T{=}1$, on a node with NVLink:
+
+- **TP=8:** 2 x 80 x 1.75 x 524,288 = 147 MB per forward pass
+- **PP=8:** 7 x 524,288 = 3.7 MB per forward pass — **40x less**
+
+But PP=8 on 80 layers means 10 layers each, and it pays a bubble. That comparison — 40x less communication against a bubble that may cost 20–40% — is the entire decision, and it has no answer without numbers from your workload.
+
+<Callout type="mentor" title="The rule you should actually remember">
+  **Tensor parallelism inside the fast island. Pipeline parallelism across the slow parts.**
+
+  It falls out of the totals above. TP's communication grows with layer count $L$; PP's grows with stage count $P$. When $L$ is large (every modern LLM) and $P$ is small (one node), TP's volume is far bigger — and NVLink can absorb it. When you must go beyond one node, only PP's coarse communication survives InfiniBand.
+
+  The 3D parallelism layout every large deployment uses is exactly this rule applied twice: tensor inside a node, pipeline between nodes, data across the rest.
+</Callout>
+
+<Callout type="real" title="What the frameworks call it">
+  At the time of writing, vLLM takes `--tensor-parallel-size` and `--pipeline-parallel-size`; SGLang has `--tp` and `--pp`; TensorRT-LLM calls them tensor and pipeline parallelism with a parallel-config object. Megatron-LM, which invented this design, uses `tensor_model_parallel_size` and `pipeline_model_parallel_size`.
+
+  What has changed since 2021 is not the scheme but the plumbing: custom all-reduce kernels, communication/computation overlap, and fused collectives inside CUDA graphs (Module 15) all attack the exact term derived above. **The scheme is stable; the constant factors are what a vendor competes on.**
+</Callout>
+
+## Where this leaves the module
+
+- TP splits matrices: column-parallel is free, row-parallel costs one all-reduce. **Two per layer, every layer.**
+- TP communication is 2L x (2(t-1)/t) x BTh bytes per forward pass, and that volume is why it stays inside the NVLink island.
+- Memory falls as $\frac{1}{t}$ (weights *and* KV cache); speedup does not, because collectives do not shrink.
+- $t$ must divide heads, KV heads and MLP width — and GQA's KV head count is usually the limit.
+- Pipeline parallelism moves 40x less data for Llama-3.1-70B at $t = P = 8$, and pays for it with a bubble instead of collectives.
+
+The next lesson takes that bubble apart: what a forward-only pipeline actually looks like on a clock, why it gets worse as you add stages, and the one knob — micro-batches — that fixes it.
+
+<KeyNotes>
+  1. A matrix splits two ways: by output columns (each GPU gets a slice of the result, free) or by input rows (each GPU gets a partial sum, needs an all-reduce).
+  2. The Megatron block is column-parallel then row-parallel: **one all-gather in, one all-reduce out**, repeated for every layer. Llama-8B pays 64 collectives per forward pass.
+  3. TP communication per forward pass is `2 * layers * 2(t-1)/t * B * T * hidden * 2` bytes. For Llama-70B at t=4, batch 1, that is 3.93 MB — about 0.085% of the step over NVLink.
+  4. The same 3.93 MB over PCIe costs 1.2% of the step, and at batch 32 it is 6.4%. Small-batch TP is more forgiving than large-batch TP.
+  5. TP memory falls as 1/t for both weights and KV cache (each rank holds whole KV heads). TP *time* does not, because the collective payload is independent of t — speedup is sublinear.
+  6. Legal TP degrees must divide query heads, KV heads and MLP intermediate size. GQA's small KV head count is usually the binding constraint, not the weight shapes.
+  7. Attention under TP is column-parallel Q/K/V plus a row-parallel output projection, so it costs the same one all-reduce per layer as the MLP.
+  8. For Llama-70B at t = P = 8, pipeline moves 40x less data than tensor parallelism. Tensor goes inside the NVLink island; pipeline crosses it.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why does a column-parallel linear need no communication while a row-parallel one needs an all-reduce?', options: ['Column-parallel layers are smaller', 'Column-parallel shards partition the output, so each GPU already holds a correct piece; row-parallel shards each produce a partial sum of the same output, which must be added', 'Row-parallel is always quantized', 'All-reduce is free on NVLink'], answer: 1, why: 'Splitting by output columns gives every GPU a distinct, correct slice of the result — concatenation is the answer. Splitting by input rows gives every GPU a partial sum of the SAME output, so the partials must be reduced. This is the whole reason one is free and the other is not.' },
+  { q: 'Llama-3.1-70B (80 layers, hidden 8,192), TP = 8, batch 1, decode. How many bytes of collectives does one forward pass move? Use bytes = 2 · layers · [2(t-1)/t] · B · T · hidden · 2 bytes.', numeric: true, answer: 4587520, tolerance: 200000, unit: 'bytes', why: 'Ring factor 2(t-1)/t = 1.75. Payload = B·T·hidden·2 = 1·1·8192·2 = 16,384 B. Total = 2 collectives × 80 layers × 1.75 × 16,384 = 4,587,520 B ≈ 4.6 MB. Pipeline at P=8 would move 7 × 16,384 = 115 KB — 40x less.' },
+  { q: 'Llama-3.1-70B has 64 query heads and 8 KV heads. What is the largest legal power-of-two TP degree?', numeric: true, answer: 8, tolerance: 0, unit: 't', why: 't must divide heads, KV heads and the MLP intermediate width (28,672). The KV head count — 8 — is the binding constraint, not the 64 query heads. GQA quietly caps tensor parallelism.' },
+  { q: 'Why does TP speedup fall off as t grows even when communication is negligible?', options: ['Weights get smaller', 'Collectives cost 2·2(t-1)/t·BTh per forward pass, and that payload does not shrink with t, while the memory and compute terms do — plus per-rank launch overhead grows linearly in t', 'More GPUs are slower per GPU', 'The KV cache becomes less accurate'], answer: 1, why: 'Even a "free" collective is a fixed cost added to a term that is falling as 1/t. Amdahl again. At t=8 on a 80-layer model with batch 1, expect 5–6x, not 8x.' },
+  { q: 'Tensor parallelism splits the KV cache by t. Why?', options: ['It does not — only pipeline parallelism splits it', 'Each rank owns whole query heads and therefore whole KV heads, so its slice of the cache is exactly 1/t of the total', 'The cache is stored in FP8', 'Only the last stage holds the cache'], answer: 1, why: 'K and V projections are column-parallel, so rank i computes the keys and values for its own head subset. No head is split, so no communication is needed, and the cache divides cleanly by t. This is often a bigger memory win than the weight split.' },
+  { q: 'Which statement about the TP communication volume is true?', options: ['It is proportional to the number of layers L', 'It grows with layer count L, which is why TP stays inside the fast island; pipeline’s volume grows with stage count P and can cross the slower link', 'It is independent of batch size', 'It depends only on the GPU count'], answer: 1, why: 'TP moves 2L·[2(t-1)/t]·BTh bytes; the L factor is what makes it large for modern LLMs. Pipeline moves only (P-1)·BTh. Hence: tensor inside NVLink, pipeline between nodes.' },
+] } />

@@ -1,0 +1,188 @@
+---
+title: 'How a GPU runs your code: threads, warps & blocks'
+summary: 'The machinery between your Python call and the arithmetic units. Threads, warps, blocks, grids, occupancy and the wave tail — the vocabulary every profiler trace is written in, and the reason a kernel can be slow while every individual instruction is optimal.'
+objectives:
+  - Explain the thread → warp → block → grid hierarchy and which of those the hardware actually schedules
+  - Compute the block count and wave count for a launch, and spot a grid that straddles a wave boundary
+  - Derive occupancy from registers and shared memory, and say what occupancy is and is not for
+  - Explain warp divergence and estimate its cost
+  - Predict the wave-quantization loss for a given grid on a given GPU
+---
+import WarpGrid from '@/components/viz/profiling/WarpGrid.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A profiler trace is a stack of colored bars, and each bar is one **kernel launch**: a rectangle that says "on this GPU, this function ran from here to here". Once you know that a kernel is a grid of blocks of warps of threads, the rectangle stops being a mystery and starts being a machine you can reason about.
+
+This lesson is that vocabulary. Module 02 gave you the two speed limits and the die. Now we look at *how work is actually placed onto the arithmetic units*, because that is what decides whether your kernel reaches the bandwidth its hardware advertises.
+
+## One launch, four layers
+
+When you write `y = torch.relu(x)` in PyTorch, a CUDA kernel is launched with three numbers: how many blocks, how many threads per block, and how much memory each thread gets. The GPU then does the following, in order, and always in this order:
+
+1. **Threads.** The finest unit. Each thread has its own program counter and its own registers. Your code's `for` loop index, your `if`, your local variable — all per-thread.
+2. **Warps.** The hardware does not schedule threads, it schedules <Term t="warp">warps</Term>. On every current NVIDIA GPU a warp is exactly **32 threads** that issue the same instruction together. All 32 lanes are computing, or none are: there is no partial warp.
+3. **Blocks.** Warps are bundled into <Term t="thread-block">thread blocks</Term> of 32, 64, 128, 256, 512 or 1024 threads. A block runs on **one** SM. It cannot straddle two, and that is what makes shared memory possible at all: every thread in a block can address the same on-chip scratchpad.
+4. **Grid.** The whole launch. Potentially hundreds of thousands of blocks — a <Term t="grid">grid</Term>, all independent, with no ordering guarantee between them.
+
+<Callout type="intuition" title="The one sentence that makes the rest of this lesson make sense">
+  The GPU schedules **blocks**, and it can only run as many blocks at once as it has free slots on its SMs. Everything about occupancy and about the "tail" of a kernel follows from that one fact.
+</Callout>
+
+<Scrolly>
+  <WarpGrid client:visible slot="stage" />
+
+  <Step title="1. You pick the number of threads">
+    A typical elementwise kernel launches **one thread per element**. For a `[32, 512, 4096]` activation that is 67 million threads. You are not naming SMs; you are naming a *quantity of work*, and the hardware decides how to spread it.
+  </Step>
+
+  <Step title="2. Threads are bundled into warps of 32">
+    The scheduler hands out **warps**, not threads. A warp is 32 lanes of the arithmetic unit moving in lockstep on one instruction. This is why a branch that some threads take and others skip costs *both* branches — the warp cannot split.
+  </Step>
+
+  <Step title="3. Warps are bundled into blocks">
+    A block of 256 threads is 8 warps. It is scheduled onto **one** SM and stays there until it finishes. Two blocks cannot share an SM's shared memory, which is exactly why shared-memory tiling works inside a block and nowhere else.
+  </Step>
+
+  <Step title="4. Blocks are the unit the grid scheduler sees">
+    With 256 threads per block and 67 million elements, the grid is about 262,000 blocks. The GPU's grid scheduler drops blocks onto SMs as slots free. The blocks are independent — that is the entire parallelism model.
+  </Step>
+
+  <Step title="5. Only some blocks are resident at once">
+    Each SM can host only a limited number of blocks, set by how many **registers** and how much **shared memory** each block wants. On an H100 with 256-thread blocks you can usually fit around 8 at once, so 132 SMs hold roughly 1,056 blocks concurrently and the rest queue.
+  </Step>
+
+  <Step title="6. Occupancy is how full the machine is">
+    **Occupancy** is resident warps divided by the SM's maximum. It exists for one reason: an SM stays busy only when at least one of its warps is not stalled on memory. More resident warps means more chances to overlap a wait with arithmetic.
+  </Step>
+
+  <Step title="7. The wave tail">
+    One full round of blocks is a **wave**. If your grid needs 1.05 waves, the first wave runs on the whole GPU, then 5% of it runs for another full block-duration while 95% idles. That is **wave quantization** and it is a real, measurable loss.
+  </Step>
+
+  <Step title="8. The practical rules">
+    Prefer 128–512 threads per block. Keep registers under 64 per thread or occupancy collapses. And check the wave count: a grid just over a multiple of the resident capacity is the classic hidden 2× loss.
+  </Step>
+</Scrolly>
+
+## Compute the grid and the waves yourself
+
+The arithmetic is not deep, but it is the arithmetic you will do while reading a trace. For a one-thread-per-element kernel over $n$ elements with $T$ threads per block:
+
+$$
+\text{blocks} = \left\lceil \frac{n}{T} \right\rceil, \qquad \text{waves} = \frac{\text{blocks}}{\text{blocks resident per SM} \times \text{number of SMs}}
+$$
+
+Take an H100 (132 SMs) with 256-thread blocks that fit 8 blocks per SM, so 1,056 blocks are resident. Launch over $n = 1{,}000{,}000$ elements:
+
+$$
+\text{blocks} = \left\lceil \frac{1{,}000{,}000}{256} \right\rceil = 3{,}907 \qquad \text{waves} = \frac{3{,}907}{1{,}056} = 3.70
+$$
+
+Since there is no partial wave below one full one, the loss from the final wave is <Term t="wave-quantization">wave quantization</Term>:
+
+$$
+\text{efficiency} = \frac{3.70}{\lceil 3.70\rceil} = \frac{3.70}{4} = 92.5\%
+$$
+
+Perfectly acceptable. Now launch over **1,090,000** elements:
+
+$$
+\text{blocks} = \left\lceil \frac{1{,}090{,}000}{256} \right\rceil = 4{,}258 \qquad \text{waves} = \frac{4{,}258}{1{,}056} = 4.03
+$$
+
+Efficiency $= 4.03 / 5 = 80.6\%$. Four full waves hold 4,224 blocks, so this grid has 34 blocks too many — and the fifth wave is only 3.2% full while the GPU waits for it. **The extra work is 0.8%; the wasted wall clock is 19%.** Nothing in the kernel body changed.
+
+<Callout type="intuition" title="Why tiny overruns are so expensive">
+  Wave quantization has an ugly shape: the loss is zero when the grid divides evenly, and climbs steeply just past a boundary. Going from 4.00 waves to 4.01 waves costs you a 19% drop in efficiency — you pay for a whole fifth wave to run 34 blocks.
+
+  This is why grid sizes are worth checking. The cure is a **grid-stride loop**: launch exactly the resident capacity's worth of blocks and have each one loop over several elements. The grid then always fills the machine exactly once, at any problem size.
+</Callout>
+
+<Callout type="math" title="Wave quantization loss, stated once">
+  With $W$ waves of work and a machine that retires $R$ blocks per wave:
+
+  $$
+  \text{efficiency} = \frac{W}{\lceil W \rceil}
+  $$
+
+  The loss is $\lceil W\rceil - W$ whole waves' worth of idle time. **Fixes:** size the grid to a multiple of $R$ with a grid-stride loop so each block does several elements; or shrink the block size so more blocks fit per SM; or merge the launch with the neighbouring kernel. All three are free.
+</Callout>
+
+## Occupancy: what it is and what it is not
+
+Derive the register limit first. Each SM on an H100 has a 64K-register file. A 256-thread block using 128 registers per thread needs 256 × 128 = 32,768 registers, so only **two** such blocks fit per SM — regardless of how many you would like. If a compiler spills registers to local memory (which is HBM), it destroys the kernel twice over: lower <Term t="occupancy">occupancy</Term> *and* extra bandwidth traffic. That double hit is what practitioners mean by <Term t="register-pressure">register pressure</Term>.
+
+<Callout type="pitfall" title="Occupancy is a means, never a goal">
+  A register-heavy kernel can run beautifully at 25% occupancy: it has so little memory traffic per instruction that one warp already keeps the tensor cores fed. Chasing 100% occupancy there just burns registers.
+
+  The number that actually matters is **achieved bandwidth or FLOP/s versus the speed of light** — which is exactly what Nsight Compute reports and what the next lesson, *The memory hierarchy*, and Module 12.3, *The roofline model, in depth*, are about.
+
+  There is a middle ground where occupancy genuinely hurts: too *few* warps per SM and the latency of a single HBM access (~700 ns, Module 02) shows through as stalls. That is why ~50% is often the practical sweet spot rather than 100%.
+</Callout>
+
+## Warp divergence, priced
+
+Inside a warp, all 32 lanes must take the same branch. This is <Term t="warp-divergence">warp divergence</Term>, and it is why a data-dependent `if` is the most expensive control flow you can write in a kernel. If your kernel does:
+
+```python
+if x[i] > 0:      # suppose 10 of 32 lanes are positive
+    y = x * 2      # only 10 lanes want this
+else:
+    y = x * 3      # but 22 lanes want this
+```
+
+the hardware executes **both** bodies, masking off the inactive lanes. Two instructions where the source shows one `if`. If the branch is data-dependent and roughly random, you get close to the worst case: with 4 divergent paths you pay 4 instructions.
+
+$$
+\text{divergence cost} \approx \frac{\text{number of distinct paths taken}}{\text{paths in the ideal branchless version}}
+$$
+
+The fix is not clever branching; it is **branchless code**, which Module 13 will write in Triton. Replace the branch with arithmetic or a mask:
+
+```python
+mask = (x > 0)
+y = torch.where(mask, x * 2, x * 3)   # every lane computes both, no divergence
+```
+
+`torch.where` evaluates both sides but the *warp* still issues both instructions — the difference is you have made the cost explicit and fixed, rather than paying it accidentally wherever data happens to disagree.
+
+<Callout type="real" title="Where divergence actually bites in inference">
+  The kernels that suffer are not the GEMMs (those are dense, no branches) but the **epilogue** code: activation functions with data-dependent clamping, top-k and top-p sampling from Module 03, sparsity checks, and MoE routing (Module 19). Sampling in particular is inherently divergent: each sequence picks a different token, so a naive `if sampled == id` loop costs every lane the maximum path.
+
+  This is a real reason engines implement sampling as a **sort-then-scan** rather than as a loop with branches — every lane does the same work regardless of the data.
+</Callout>
+
+## What this buys you when you read a trace
+
+A Nsight Systems trace shows one bar per kernel launch. To reason about a bar you now know to ask:
+
+| Question | Answered by |
+|---|---|
+| Is the grid big enough to fill the GPU? | blocks × threads per block vs resident capacity |
+| Is the kernel stalling on memory or math? | occupancy, achieved bytes/s vs speed of light |
+| Is there a wave-quantization tail? | waves = blocks ÷ resident blocks; efficiency = W/⌈W⌉ |
+| Is register pressure hurting me? | registers per thread and spills in Nsight Compute |
+| Why is one lane in my warp idle? | divergence — see the branchless rule above |
+
+Every one of those is a launch-configuration decision, not a mathematics decision, and it is a different lever from everything in Modules 10 and 11. There, you changed *what work is done* (chunk the prefill, quantize the weights). Here you change *how the same work is placed*, and a 2× gap between your kernel and the hardware's limit is very often pure placement.
+
+<KeyNotes>
+  1. The hierarchy is thread → warp (32 threads, lockstep) → block (one SM) → grid. The hardware schedules **blocks**; it never schedules threads.
+  2. All 32 lanes of a warp are busy or all idle. A warp cannot split, so a data-dependent branch costs both sides — the basis of warp divergence.
+  3. Block size should be a multiple of 32 and usually 128–512. Blocks never straddle SMs, which is why shared-memory tiling is scoped to exactly one block.
+  4. Occupancy = resident warps ÷ SM max. It exists to hide ~700 ns HBM latency, and it is limited by **registers per thread**, not by anything you choose directly.
+  5. Registers are the real occupancy ceiling: 64K registers per SM means a 128-register 256-thread block fits only twice, and any spill to local memory is doubly catastrophic.
+  6. Wave efficiency = $W/\lceil W\rceil$. A grid at 1.05 waves throws away almost half the machine; size to a wave multiple or use a grid-stride loop.
+  7. Occupancy is a means. The number that matters is achieved bandwidth or FLOP/s against the speed of light, which Nsight Compute reports directly.
+  8. Fix divergence with `torch.where` or arithmetic, never with `if`. Sampling, MoE routing and activation epilogues are where this shows up in real inference.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'How many threads make up one warp on a current NVIDIA GPU?', numeric: true, answer: 32, tolerance: 0, unit: 'threads', why: 'A warp is exactly 32 threads issuing one instruction in lockstep on 32 lanes. The hardware schedules warps, not threads.' },
+  { q: 'A kernel launches one thread per element over 512,000 elements with 256 threads per block. How many blocks is that?', numeric: true, answer: 2000, tolerance: 10, unit: 'blocks', why: 'blocks = ceil(512,000 / 256) = 2,000 exactly. Each block is 8 warps.' },
+  { q: 'An SM has a 64K register file. A 256-thread block uses 128 registers per thread. How many such blocks fit per SM?', numeric: true, answer: 2, tolerance: 0, unit: 'blocks', why: 'Each block needs 256 × 128 = 32,768 registers. 65,536 / 32,768 = 2 blocks. Register pressure, not thread count, is the occupancy ceiling.' },
+  { q: 'Which unit does the GPU grid scheduler actually place onto SMs?', options: ['Individual threads', 'Warps directly, independent of blocks', 'Thread blocks', 'Warps of warps, called grids'], answer: 2, why: 'Blocks are scheduled onto SM slots. A block runs on one SM and holds its shared memory privately, which is why tiling is scoped to a single block.' },
+  { q: 'A grid needs 3.7 waves of blocks on a machine that fits a whole number of waves at a time. What is the wave efficiency?', numeric: true, answer: 92.5, tolerance: 3, unit: '%', why: 'efficiency = W / ceil(W) = 3.70 / 4 = 0.925, so 92.5%. The leftover 0.3 of a wave runs at the end with the GPU mostly idle.' },
+  { q: 'Why can raising occupancy past ~50% sometimes make a kernel slower?', options: ['Because more resident warps always means more memory traffic', 'Because it forces the compiler to spill registers to local memory (which is HBM)', 'Because the SM clock drops with occupancy', 'Because the GPU throttles when fully occupied'], answer: 1, why: 'Registers are finite. Packing more warps per SM means fewer registers each, which causes spills to local memory — extra HBM traffic plus lower occupancy. A register-heavy kernel does fine at 25%.' },
+  { q: 'In a warp, 10 of 32 lanes take an if-branch and 22 take the else. Roughly how many times the branch body runs?', options: ['1×', '2×, both bodies execute', '22×, only the majority path', '32×, one per lane'], answer: 1, why: 'The warp is one SIMD group — it executes both branch bodies with the unused lanes masked. Data-dependent branches cost both sides; use torch.where to make it explicit and fixed.' },
+]} />

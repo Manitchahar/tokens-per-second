@@ -1,0 +1,76 @@
+---
+title: 'Module 00 · The Big Picture'
+module: big-picture
+---
+
+## The life of a request
+
+**network → tokenize → queue → prefill → decode loop → detokenize → stream back**
+
+- **Prefill**: whole prompt in one parallel pass. Fills the KV cache, produces token 1. <span class="ink k-compute">Compute-bound</span>.
+- **Decode**: one token per step, each step reads all weights and the KV cache. <span class="ink k-memory">Memory-bound</span>.
+- **KV cache**: stored keys and values of every past token. Grows by one entry per token.
+
+## Training vs inference
+
+| | Training | Inference |
+|---|---|---|
+| Weights | change | frozen |
+| How often | once per model | every request, forever |
+| Goal | quality | latency, throughput, cost at fixed quality |
+
+## The four numbers
+
+- **Latency**: TTFT (first token) and TPOT (per token while streaming).
+- **Throughput**: output tokens/s over all users.
+- **Memory**: weights + KV cache + workspace.
+- **Cost**: dollars per million tokens.
+
+$$
+T_{\text{total}} \approx \text{TTFT} + (n-1)\cdot\text{TPOT}
+$$
+
+$$
+\text{throughput} = \frac{B}{t_{\text{step}}}, \qquad \text{per-user speed} = \frac{1}{t_{\text{step}}}
+$$
+
+$$
+\text{memory} = \text{weights} + B \cdot \text{ctx} \cdot \text{KV bytes/token} + \text{workspace}
+$$
+
+$$
+\text{\$/M tokens} = \frac{\text{GPU \$/hr}}{\text{tok/s} \times 3600} \times 10^{6}
+$$
+
+## Rules of thumb
+
+- One-user decode ≈ **weights bytes ÷ memory bandwidth**. 16 GB on an H100 (~2.7 TB/s usable) ≈ 6 ms per token.
+- Batching reuses each weight read for every user: throughput rises almost linearly until KV reads or math catch up.
+- The **KV cache**, not the model, usually limits how many users fit.
+- Raising batch size: throughput ↑, per-user speed ↓, memory ↑, cost per token ↓.
+- Always report **all four** numbers, plus hardware and batch size.
+
+## The stack
+
+| Layer | Examples |
+|---|---|
+| Product | chat UI, API, SLOs, pricing |
+| Fleet | router, replicas, autoscaler |
+| Serving engine | vLLM, SGLang, TensorRT-LLM: scheduler, batching, KV manager |
+| Model runtime | PyTorch, CUDA graphs, torch.compile, quantized weights |
+| Kernels | matmul (GEMM), attention, norms, fused ops |
+| Hardware | HBM, SMs, tensor cores, NVLink |
+
+## Debug loop
+
+**goal → measure → find bottleneck → change one thing → measure again**
+
+## Timing GPU code
+
+```python
+torch.cuda.synchronize(); t0 = time.perf_counter()
+out = model(x)
+torch.cuda.synchronize(); dt = time.perf_counter() - t0
+```
+
+GPU calls are asynchronous. No synchronize = wrong numbers.

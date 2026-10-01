@@ -1,0 +1,138 @@
+---
+title: 'Module 09 · vLLM'
+module: vllm
+---
+
+## Start it
+
+```bash
+pip install vllm
+vllm serve Qwen/Qwen2.5-7B-Instruct --dtype bfloat16 --max-model-len 8192 --port 8000
+```
+
+On an old or small GPU (Colab T4): add `--enforce-eager`, and use `--dtype float16`.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /health` | `200` once the engine can serve. |
+| `GET /v1/models` | The served model ids and `max_model_len`. |
+| `POST /v1/completions` | Raw text in, text out. |
+| `POST /v1/chat/completions` | Applies the model's chat template for you. |
+| `POST .../chat/completions` + `"stream": true` | Server-sent events, one `data:` line per token, ending `data: [DONE]`. |
+| `GET /metrics` | Prometheus counters. |
+
+Always read from the response: `usage.prompt_tokens`, `usage.completion_tokens`, `finish_reason`, and `logprobs`.
+
+## The startup budget (do this before you start the server)
+
+$$
+\text{budget} = \text{gpu\_memory\_utilization} \times M,\qquad
+\text{pool} = \text{budget} - \text{weights} - \text{reserve}
+$$
+
+- `weights = params × bytes_per_number`
+- `reserve ≈ 0.04 × M` for the CUDA context, activations and the profiling run's peak
+- `poolTokens = pool / kvBytesPerToken`
+
+Llama-3.1-8B on an H100 at `0.90`: budget 72 GB, weights 16.06 GB, reserve 3.2 GB → **pool 52.7 GB → 402k tokens → 25.1k blocks of 16**.
+
+## Memory
+
+| Model | Params | BF16 | FP8 | INT4 | KV/token (BF16) |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 0.49 B | 0.98 GB | 0.49 GB | 0.25 GB | 12 KB |
+| Llama-3.2-3B | 3.2 B | 6.4 GB | 3.2 GB | 1.6 GB | 112 KB |
+| Llama-3.1-8B | 8.03 B | 16.1 GB | 8.0 GB | 4.0 GB | 128 KB |
+| Qwen2.5-32B | 32.8 B | 65.6 GB | 32.8 GB | 16.4 GB | 256 KB |
+| Llama-3.1-70B | 70.6 B | 141 GB | 70.6 GB | 35.3 GB | 320 KB |
+
+$$
+\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_{head} \times \text{bytes}
+$$
+
+## The four flags
+
+| Flag | Changes | Default (at the time of writing) | Break it by |
+|---|---|---|---|
+| `max_model_len` | Worst-case KV per request, so worst-case concurrency | model's maximum | Setting it to the model max gives away concurrency. |
+| `gpu_memory_utilization` | Size of the whole budget, so the size of the KV pool | 0.90 | Too high → OOM at startup. Too low → small pool. |
+| `max_num_seqs` | Concurrency cap; sets per-step latency | 1024 | Above what the pool holds → preemption. |
+| `max_num_batched_tokens` | Tokens per engine iteration (chunked prefill) | version-dependent | Too high → long prompts stall everyone's decode. |
+
+$$
+\text{worst-case concurrency} = \frac{\text{poolTokens}}{\text{max\_model\_len}}
+$$
+
+8,192 → 49 concurrent · 2,048 → 196 · 1,024 → 392 (52.7 GB pool, 128 KB/token).
+
+## What Llama-3.1-8B on an H100 does at 2,048 tokens of context
+
+| Sequences | Step | Per user | Total | GPU memory |
+|---|---|---|---|---|
+| 1 | 7.6 ms | 132 tok/s | 132 | 19.5 GB |
+| 8 | 8.3 ms | 121 tok/s | 965 | 21.4 GB |
+| 32 | 10.7 ms | 93 tok/s | 2,991 | 27.9 GB |
+| 64 | 13.9 ms | 72 tok/s | 4,603 | 36.4 GB |
+| 128 | 20.3 ms | 49 tok/s | 6,304 | 53.6 GB |
+| 226 | 30.1 ms | 33 tok/s | 7,502 | 79.9 GB |
+
+$$
+t = \frac{16.06 + B\times 0.268}{2.68}\ \text{ms} + 1.5\ \text{ms},\qquad \text{memory} = 16.06 + 0.268 B + 3.2\ \text{GB}
+$$
+
+With a 30 tok/s-per-user SLO: about 226 concurrent users at about 7,500 output tok/s — which is also where the KV pool runs out. **Set the cap from the SLO, not from a round number.**
+
+## Inside one request
+
+```
+HTTP API → Tokenizer → Scheduler → Model runner → Sampler → Detokenizer → SSE
+(no GPU)   (no GPU)    (GPU-bound)  (GPU)          (GPU)     (no GPU)
+```
+
+API server and engine core are separate; keep Python off the GPU path.
+
+$$
+\text{TTFT} = t_{\text{queue}} + t_{\text{prefill}} + t_{\text{step}},\qquad
+\text{ITL} = t_{\text{step}} = \max\!\left(\frac{W + \text{KV}}{\text{BW}},\ \frac{2\,\text{params}\,B}{\text{FLOP/s}}\right) + t_{\text{overhead}}
+$$
+
+For 8B on an H100: prefill of 512 tokens ≈ 17 ms, one decode step ≈ 7.5 ms, so TTFT ≈ 24.5 ms with an empty queue.
+
+## Scheduler rules
+
+Admit a request only if **all three** hold: free KV blocks, batch below `max_num_seqs`, token budget left. Blocks are 16 tokens and are **all reserved before the request starts**: $\lceil \text{context} / 16 \rceil$ blocks × 128 KB. When a request finishes, its blocks go to a waiting request in the very next step. When the pool is empty the engine **preempts**.
+
+## Metrics and what they mean
+
+| Counter | Reads as | Act when |
+|---|---|---|
+| `num_requests_waiting` | Arrivals outrun the engine | Queue never drains → capacity, not config |
+| `num_requests_running` | Pinned at `max_num_seqs`? | Raise it if TPOT has headroom |
+| `gpu_cache_usage_perc` | Fraction of pool in use | > 90% → shorten `max_model_len` or add GPUs |
+| `num_preemptions_total` | Requests paused for memory | Non-zero and climbing → pool too small |
+| Prefix cache hit rate | Reused prompts | High on multi-turn chat (Module 10) |
+
+| Symptom | Check first | Likely fix |
+|---|---|---|
+| TTFT high, TPOT fine | `num_requests_waiting` | More replicas, or raise `max_num_seqs` |
+| TPOT high | `num_requests_running` | Raise the cap if memory allows |
+| KV above 90% | `gpu_cache_usage_perc` | Lower `max_model_len`, then `util` |
+| Preemptions climbing | pool vs traffic | Same as above |
+| TTFT jitter under long prompts | token budget per step | Lower `max_num_batched_tokens` |
+
+## Rules of thumb
+
+1. Predict the KV pool **before** starting the server; compare with the printed `GPU KV cache size`.
+2. `max_model_len` is a promise, not a performance setting. Promise your p99, not the model card.
+3. Leave 4–8 GB of headroom on the card. `util 0.95` buys 8% concurrency and risks an OOM.
+4. Change one flag per run.
+5. Warm up, then measure; three runs, take the median.
+6. Report p50/p95 TTFT **and** TPOT **and** throughput **and** the workload. Never one alone.
+7. Write the operating point down: model, GPU, dtype, flags, four numbers, date.
+8. Sampling parameters (`temperature`, `top_p`) never change cost. `max_tokens` and `n` always do.
+
+## Other flags worth knowing
+
+`--dtype`, `--quantization` (awq / gptq / fp8 — Module 11), `--tensor-parallel-size` (Module 18), `--enable-prefix-caching` (Module 10), `--block-size` (16 in V1), `--enforce-eager` (no CUDA graphs; needed on small/old GPUs), `--api-key`, `--served-model-name`, `--disable-log-requests`, `--seed`, `--token` (for gated Hugging Face repos).
+
+Defaults move between versions: read them from `vllm serve --help`, not from a blog post.

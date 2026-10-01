@@ -1,0 +1,234 @@
+---
+title: 'Benchmarking kernels against PyTorch'
+summary: 'Measure a Triton kernel so the number means something. Warm up the JIT, synchronize with CUDA events, flush L2 between reps, take a median — then convert to GB/s and TFLOP/s and judge it against the roofline.'
+objectives:
+  - Warm up a JIT-compiled kernel so compile time is not in your measurement
+  - Time with CUDA events instead of wall clock, and explain why wall clock lies
+  - Flush the L2 cache between repetitions so you measure HBM and not cache
+  - Report a median over many iterations rather than a single sample
+  - Convert a timing into achieved GB/s and TFLOP/s and judge it against the roofline
+  - Run triton.autotune and explain what it does at the first call
+---
+import BenchHarness from '@/components/viz/triton/BenchHarness.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You now have three kernels. The obvious next move is to time them against PyTorch and see whether your work paid off. This is where most kernel work goes quietly wrong, because a naive benchmark can be off by a factor of a thousand and still look plausible.
+
+The rule is simple and worth stating up front: **a kernel benchmark that measures anything other than steady-state execution is decoration.** Every step below is a way of making sure you measured the thing you meant to.
+
+## Four mistakes, and what each one costs
+
+<Scrolly>
+  <BenchHarness client:visible slot="stage" />
+
+  <Step title="1. The claim under test">
+    We have a fused kernel and want to know how fast it is — not in microseconds, but as **achieved bandwidth**, so we can compare it against the GPU's roofline and decide whether more optimization is worth it.
+  </Step>
+
+  <Step title="2. Timing the first call measures the compiler">
+    A Triton kernel is <Term t="jit">just-in-time compiled</Term>. The first call with a new signature spends tens to hundreds of milliseconds translating it. Time that call and you report the compiler, not your kernel — off by three to four orders of magnitude.
+  </Step>
+
+  <Step title="3. No synchronize measures the CPU">
+    CUDA launches are **asynchronous**: `kernel[...]()` returns before the GPU has done the work. If you time the Python call without a synchronize, you are measuring how fast your CPU can enqueue work, which is microseconds regardless of how slow the GPU is.
+  </Step>
+
+  <Step title="4. No cache flush measures L2">
+    An H100's L2 cache is about 50 MB. If you run a 4 MB tensor a hundred times in a row, after the first pass it is sitting in L2, and cache bandwidth is roughly 3× HBM bandwidth. You report a speedup that exists only in your benchmark.
+  </Step>
+
+  <Step title="5. One iteration measures noise">
+    A shared machine has other tenants. A single timed run catches whatever jitter happened to be on the GPU at that instant. Repeat many times and take a **median**, which ignores the outlier tail.
+  </Step>
+
+  <Step title="6. The honest measurement">
+    Warm up (compile once), flush L2 before each repetition, time with CUDA events, take a median over many iterations. This is the number you put in a report.
+  </Step>
+
+  <Step title="7. Read it against the roofline">
+    Convert the timing into achieved GB/s and compare to the GPU's peak bandwidth. **Above 70%: you are done optimizing.** Below 30% means there is a real problem to find — usually launch-bound or occupancy-bound.
+  </Step>
+</Scrolly>
+
+## A benchmark you can trust
+
+Here is the harness, written out. Every line corresponds to one of the mistakes above.
+
+```python
+import torch, triton
+
+def bench_kernel(fn, warmup=25, reps=200):
+    # 1. warm up: JIT-compile and let the allocator settle
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    times = []
+    for _ in range(reps):
+        # 2. flush L2: write a buffer bigger than the cache
+        cache = torch.empty(int(128e6 // 4), dtype=torch.int, device='cuda')
+        cache.zero_()
+
+        # 3. time with CUDA events, which measure GPU time directly
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) * 1e3)   # µs
+
+    times.sort()
+    return times[len(times) // 2]                     # median, µs
+```
+
+Four things to notice:
+
+**Warmup runs before anything is timed.** It compiles the kernel, lets the caching allocator reuse blocks, and warms any autotune. Twenty-five iterations is generous; ten is usually enough.
+
+**The L2 flush writes a buffer larger than the cache.** A 128 MB buffer exceeds the 50 MB L2 on an H100, so by the time your kernel runs, its input has been evicted and must come from HBM. Without this you are benchmarking the cache.
+
+**CUDA events measure the GPU, not the CPU.** `start.record()` and `end.record()` put markers on the stream; `elapsed_time` gives the elapsed GPU time between them. This is more accurate than wall clock because it excludes CPU-side queueing, and it is what every serious benchmark uses.
+
+**The median, not the mean.** A mean is dragged by outliers — one 200 ms scheduling hiccup in 200 reps adds 1 ms to your average. The median ignores them.
+
+<Callout type="pitfall" title="The mistake everyone makes once">
+  Forgetting the synchronize after `end.record()`. `elapsed_time` on an event pair that has not completed will raise or return garbage — but if you `synchronize()` *before* `start.record()` and then read the events, you are fine. The pattern above (`record`, `record`, `synchronize`, `read`) is the safe ordering. Copy it exactly.
+
+  And note that the wall-clock `time.perf_counter()` approach still works **if** you synchronize on both sides — it is just noisier, because it includes Python's own overhead.
+</Callout>
+
+Triton also ships this. `triton.testing.do_bench` is a production-grade implementation of exactly the above, and it is the right thing to reach for once you trust the method:
+
+```python
+from triton.testing import do_bench
+
+ms = do_bench(lambda: my_kernel[grid](x, y, c, n, BLOCK_SIZE=1024),
+              warmup=100, rep=500, return_mode='median')
+```
+
+`return_mode` can be `'mean'`, `'median'` or `'min'`. Median for reporting; `min` if you want the hardware's best case with all interference removed. Note that `do_bench` also does a cache flush by default — check its signature, because that default has changed between versions.
+
+## From time to the number that means something
+
+A timing in microseconds is not comparable to anything. Convert it to a **rate**. For a kernel that reads $b_{\text{read}}$ bytes and writes $b_{\text{write}}$ bytes, the achieved bandwidth is:
+
+$$
+\text{GB/s} = \frac{b_{\text{read}} + b_{\text{write}}}{t \ (\text{seconds})} \div 10^9
+$$
+
+And for one that does arithmetic, achieved FLOP/s:
+
+$$
+\text{TFLOP/s} = \frac{F}{t} \div 10^{12}
+$$
+
+These two numbers together tell you which world you are in, and it is the roofline from Module 02.
+
+<Callout type="math" title="Worked example: pricing a fused RMSNorm">
+  Our kernel processes a `[32, 4096]` FP16 tensor — batch 32 tokens, hidden 4,096.
+
+  - **Bytes:** read `x` (32 × 4,096 × 2 = 262 KB) + read `w` (8 KB) + write `out` (262 KB) = **532 KB**.
+  - **FLOPs:** square-sum over 131,072 elements (2 FLOPs each = 262 KFLOP), then scale (2 FLOPs each = 262 KFLOP) ≈ **0.52 MFLOP**. Tiny.
+  - **Arithmetic intensity:** 0.52 MFLOP ÷ 532 KB ≈ **1 FLOP/byte**. Deep on the memory slope.
+
+  If it runs in 42 µs, achieved bandwidth is $\frac{532{,}000}{42 \times 10^{-6}} \approx 12.7$ **GB/s**... which is terrible for an H100. The reason is the flush and the small size: at batch 32 the kernel is not saturating the memory system.
+
+  Push to batch 4,096 (a real prefill): bytes scale to 68 MB, and at a similar 42 µs you would be at 1.6 TB/s — about half of the H100's peak. **That is the regime where you can judge the kernel, and it is the regime that matters.** Always sweep batch before concluding anything.
+</Callout>
+
+## Autotuning: let Triton search for you
+
+Recall that `BLOCK_SIZE` is a `tl.constexpr` — a compile-time parameter baked into the kernel. Every value of it is a **separate compilation** with its own performance. Choosing it by hand means sweeping it by hand.
+
+Triton will do the sweep for you:
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+    ],
+    key=['n_cols'],        # re-tune when this changes
+)
+@triton.jit
+def softmax_kernel(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
+    ...
+
+# first call: benchmarks all 5 configs, caches the winner for n_cols
+# later calls: launches the winner directly
+```
+
+Three things to understand:
+
+1. **`key=['n_cols']`** says *when to re-tune*. Triton caches the best config per distinct value of the listed arguments. If `n_cols` is a compile-time-constant-like shape, that is one tuning run for the life of the process. If it is a runtime value that changes every call, you are tuning constantly — a disaster. **Put only slow-varying shapes in `key`.**
+2. **The tuning cost is paid once**, on the first call for a new key. It compiles and times each config. That is why warmup matters so much with autotuning: your first call might take seconds.
+3. **`num_warps`** is the other knob. It sets how many warps (32 threads) cooperate on one program. More warps means more parallelism per program but fewer blocks resident per SM. It interacts with `BLOCK_SIZE` and must be tuned jointly.
+
+<Callout type="intuition" title="Autotuning is a search, not a guarantee">
+  Triton benchmarks each config on *your* GPU, at *your* shape, in *your* dtype — so it adapts to hardware you have not seen specs for. That is genuinely valuable: the same code can prefer different blocks on a T4 and an H100, and autotune discovers that for you.
+
+  But it optimizes what you measure. If your benchmark flushes L2 incorrectly, autotune will happily pick the config that is fastest when everything is cached — which is not your production case. **Fix the benchmark before you trust the tuner.**
+</Callout>
+
+## When should you even write your own kernel?
+
+Worth stating the negative case, because writing kernels is seductive and not always right.
+
+<Callout type="real" title="The honest decision rule, at the time of writing">
+  Use Triton when **all** of these are true:
+  - The operation is elementwise, a reduction, a small tiled GEMM, or a fusion of those.
+  - PyTorch's version is measurably slow **because it is unfused or launching many kernels**, not because cuBLAS is bad.
+  - You have a benchmark that shows the win, measured honestly.
+
+  Do not write Triton when:
+  - The operation is a large GEMM — cuBLAS and cuBLASLt are extraordinarily well tuned, and you will not beat them with a beginner kernel.
+  - You have not measured. `torch.compile` with its Triton backend may already have fused it for you (Module 15).
+  - The kernel is irregular or sparse, where you need CUDA-level control.
+
+  Most of the time the honest answer for a **new** engineer is: profile first (Module 12), and if PyTorch is the bottleneck because of fusion, try `torch.compile` before hand-writing. Reach for a hand-written kernel when you have a measurement in hand showing what the compiler failed to do.
+</Callout>
+
+## Try it yourself
+
+The notebook builds the honest harness from scratch, watches each mistake inflate the result, and then runs a full autotuning sweep.
+
+<Colab nb="13-benchmark.ipynb" />
+
+<Callout type="try" title="Predict, then run">
+  1. Time a Triton kernel by calling it 100 times with `time.perf_counter()` and no synchronize. What do you actually measure, and what happens to the number if you add `torch.cuda.synchronize()` before the final read?
+  2. A tensor is 8 MB and you benchmark it 100 times in a row without a flush. On a GPU with a 50 MB L2, is your kernel reading from HBM or from cache? How do you prove it?
+  3. Convert a kernel that moves 68 MB in 42 µs into GB/s, and express it as a percentage of an H100's 3.35 TB/s.
+  4. You add `key=['n_cols']` to an autotuner where `n_cols` changes every call. What happens to performance, and why?
+</Callout>
+
+<Callout type="recap" title="The idea to remember">
+  A benchmark is a measurement instrument, and like any instrument it has to be calibrated before you trust it. Four things, always: **warm up** the JIT compile, **flush L2** so you read from HBM, **time with CUDA events** so you measure the GPU, and **take a median** over many reps so jitter does not decide the answer.
+
+  Then convert the time to a **rate** — GB/s or TFLOP/s — because a rate is the only thing comparable across kernels and GPUs. Compare it to the roofline: above 70% of peak you are done, below 30% you have a bug or a launch-bound problem. And let `triton.autotune` search block sizes for you — but only after your benchmark is honest, because the tuner optimizes whatever you hand it.
+</Callout>
+
+<KeyNotes>
+  1. Four mistakes make a kernel benchmark wrong: no warmup (measures the JIT compiler, off by ~1000×), no synchronize (measures the CPU), no L2 flush (measures cache, ~3× too fast), one iteration (measures jitter).
+  2. Warm up **before** timing. A Triton kernel JIT-compiles on first call — tens to hundreds of milliseconds.
+  3. CUDA is asynchronous. Without a synchronize, timing the Python call measures how fast you can enqueue work, not how fast the GPU runs.
+  4. Time with **CUDA events** (`start.record()` / `end.record()` / `synchronize()` / `elapsed_time`), not wall clock. It measures GPU time directly.
+  5. **Flush the L2 cache** between reps by writing a buffer larger than it (e.g. 128 MB). Otherwise a small tensor stays cached and you overstate bandwidth.
+  6. Report a **median** over many iterations, not a mean and not a single sample. `triton.testing.do_bench` does all of this correctly.
+  7. Convert time to a **rate**: GB/s and TFLOP/s. A time in microseconds compares to nothing; a rate is comparable across kernels and GPUs.
+  8. Judge against the roofline: **above 70% of peak, you are done**. Below 30% means launch-bound, occupancy-bound, or a bug.
+  9. `triton.autotune` sweeps `BLOCK_SIZE` and `num_warps` per `key`. Put only slow-varying shapes in `key`, or you retune every call.
+  10. Write Triton for **small, memory-bound, fusable** ops — not large GEMMs (cuBLAS wins), and only after `torch.compile` and a profiler have shown PyTorch is the bottleneck.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'You time a Triton kernel by calling it once with time.perf_counter(), with no warmup. What dominates the measurement?', options: ['The kernel launch', 'The JIT compilation on first call', 'The L2 cache', 'The GPU clock speed'], answer: 1, why: 'The first call with a new signature JIT-compiles the kernel — tens to hundreds of milliseconds — while the kernel itself takes microseconds. Warm up before timing or you measure the compiler.' },
+  { q: 'A fused RMSNorm reads 262 KB, reads 8 KB of weights, and writes 262 KB. How many bytes does it move in total?', numeric: true, answer: 532000, unit: 'bytes', why: '262,144 + 8,192 + 262,144 ≈ 532,480 bytes, roughly 532 KB. Read + read + write, using the actual FP16 byte counts.' },
+  { q: 'A kernel moves 68 MB in 42 µs. What is its achieved bandwidth, in GB/s?', numeric: true, answer: 1619, tolerance: 60, unit: 'GB/s', why: '68×10⁶ bytes / 42×10⁻⁶ s = 1.62×10¹² bytes/s = 1,619 GB/s. Against an H100 peak of 3,350 GB/s that is about 48% — a healthy number for a memory-bound kernel.' },
+  { q: 'Why flush the L2 cache before each timed repetition?', options: ['To warm up the GPU clocks', 'Because a small tensor stays cached between runs, so you would measure cache bandwidth instead of HBM bandwidth', 'To free memory', 'To reduce temperature'], answer: 1, why: 'An H100 L2 is about 50 MB. A repeatedly-benchmarked small tensor is served from cache, which is several times faster than HBM — so you report a speedup that does not exist in production.' },
+  { q: 'What happens if you use triton.autotune with key=[\'n_cols\'] but n_cols changes on every call?', options: ['Nothing — tuning is cached globally', 'The tuner re-runs its sweep on every call, adding large overhead', 'The kernel falls back to PyTorch', 'It raises an error'], answer: 1, why: 'Triton caches the best config per distinct value of the key arguments. If the key changes constantly, it re-tunes constantly. Put only slow-varying shapes in key.' },
+  { q: 'Your kernel achieves 82% of the H100 bandwidth roofline. What is the right next step?', options: ['Keep tuning block sizes', 'Stop optimizing this kernel — it is close to the memory limit', 'Fuse it with more operations', 'Switch to FP8'], answer: 1, why: 'Above roughly 70% of peak bandwidth a memory-bound kernel has little left to give; remaining gains would require moving fewer bytes, not faster code. Profile before tuning further.' },
+] } />

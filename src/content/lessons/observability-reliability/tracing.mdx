@@ -1,0 +1,202 @@
+---
+title: 'Tracing a request across the system'
+summary: 'One request is not one thing. Learn to break it into spans that nest, plot them as a waterfall, read the critical path, and notice the 340 ms that nothing accounted for.'
+objectives:
+  - Decide where span boundaries belong, and which of your spans must carry a parent
+  - Read a distributed trace as a waterfall and identify the critical path
+  - Decompose a latency budget into edge, queue, prefill, decode and egress
+  - Carry an identifier end to end so a slow request can be found after the fact
+  - Choose a sampling policy and say what it will and will not show you
+---
+import TraceWaterfall from '@/components/viz/observability-reliability/TraceWaterfall.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Metrics tell you that the p95 got worse. They do not tell you **which part of the system** got worse, and in an inference service "which part" is not obvious — a request might have waited 400 ms in a queue, or spent 400 ms on the GPU, or spent 400 ms in your own retry loop, and those three have three completely different fixes.
+
+This lesson is about the instrument that answers "which part": the **trace**.
+
+## Metrics aggregate, traces do not
+
+A metric is a number summed over everything that happened in a time window. It is deliberately lossy: it tells you the *shape* of the fleet and nothing about any individual event.
+
+A trace is the opposite trade. It keeps one request's entire story — every operation, its start, its end, and which operation contained which — and throws away everything about the other requests. That is why you cannot compute a p99 from traces, and why you cannot debug from metrics. **You need both**: the metric to tell you *that* there is a problem and *how big* it is, the trace to tell you *where*.
+
+<Callout type="intuition" title="The analogy that makes it stick">
+  Metrics are the **odometer** on the dashboard: cheap, always on, tells you how far you went. Traces are the **dashcam**: expensive, only records when something interesting happens, but it tells you exactly which door you scraped.
+
+  You would not debug a car with an odometer. You also cannot drive a fleet with a dashcam.
+</Callout>
+
+## Spans, and where the boundaries go
+
+A **<Term t="span">span</Term>** is one timed operation. Four fields, and only four:
+
+```json
+{
+  "name": "prefill: 512 tokens",
+  "service": "prefill-pool-2",
+  "start_ms": 108.2,
+  "duration_ms": 44.0,
+  "parent_span_id": "b71c9e04"
+}
+```
+
+Spans **nest**. A span has at most one parent, and a parent can have many children. That structure is the whole trick: the timing picture is a tree, and flattening it onto a time axis is what a waterfall view does.
+
+The arithmetic that makes the picture is simple and worth writing down, because "where did the time go" is a sum over the critical path:
+
+$$
+\text{E2E} = \text{edge} + \text{queue} + \text{prefill} + \text{decode} + \text{egress}
+$$
+
+Take the trace below: 50 + 58 + 44 + 174 + 12 = 338 ms, and every millisecond is attributable to exactly one span.
+
+<Callout type="pitfall" title="Three span boundaries people get wrong">
+  1. **One giant span for the whole request.** Technically correct and completely useless. It is the uninstrumented case wearing a span as a disguise.
+  2. **A span per kernel.** 300 spans per request is unqueryable, costs more to store than the request itself, and tells you nothing you did not already learn in Module 12 with a profiler. Trace what a *component* did, not what a kernel did.
+  3. **No parent link.** If you cannot tell which edge request a KV transfer belonged to, you cannot debug a slow request — only a slow *system*.
+</Callout>
+
+Where the boundaries belong in an inference stack, from the outside in:
+
+| Component | Span it should emit | Why it is a boundary |
+|---|---|---|
+| Edge / gateway | TLS + auth, rate limit check, tokenize, detokenize | The only place you can see client-side overhead. If this is 200 ms, no amount of GPU helps. |
+| Router | prefix-cache lookup, queue wait | Queue wait is invisible everywhere else. It is the single most common cause of a bad p95 and it exists in exactly one place. |
+| Prefill | prefill chunk (name it with the token count) | Chunked prefill means many prefills per request. Naming the size makes the cost legible. |
+| Transfer | KV copy P→D, bytes transferred | Only exists in a disaggregated deployment, and only this span tells you whether the wire was the bottleneck. |
+| Decode | one span per request covering the whole decode phase | Per-step spans are noise. What you want is "how long was this request decoding, and how many tokens did it produce". |
+| Engine | KV allocation, preemption events | A preemption is a scheduling decision with a latency cost. It belongs in the trace as an event, not inferred from a latency bump. |
+
+## Reading a waterfall
+
+The visual below is one streamed chat completion, ~1,200 prompt tokens and 180 output tokens, through a disaggregated serving stack. Each horizontal bar is a span; bar width is duration; position is when it happened.
+
+<Scrolly>
+  <TraceWaterfall client:visible slot="stage" />
+
+  <Step title="1. Eleven spans, one request">
+    Every bar here is a span someone decided was worth naming. **The set of spans is a design decision**, and it is the difference between a trace you can debug with and one you cannot.
+  </Step>
+
+  <Step title="2. The waterfall">
+    Bars on a shared time axis. The instant you can see is the instant you learn that "TTFT was 400 ms" is not a diagnosis.
+  </Step>
+
+  <Step title="3. Spans nest; the picture flattens them">
+    The KV transfer is a child of the engine span. The flat view cannot show that, so keep the `parent_span_id` and query the tree when you need it.
+  </Step>
+
+  <Step title="4. The critical path">
+    The chain of spans with no gaps between them — the <Term t="critical-path">critical path</Term>. **Its total is the request's latency.** Everything off the path happened in parallel and cost nothing — which is exactly why it is still worth measuring, and never worth optimizing first.
+  </Step>
+
+  <Step title="5. Read it top down">
+    Edge work is 50 ms and constant, so it puts a floor under your TTFT no matter how fast the GPU is. Then the queue. Then prefill. Then decode, which is 191 ms and is 181 tokens at about 1.06 ms each.
+  </Step>
+
+  <Step title="6. Queue wait is usually the answer">
+    Here, 58 of 338 ms — 17% — is spent waiting for a scheduler slot. Not a kernel problem. It vanishes with capacity or a waiting-request cap.
+  </Step>
+
+  <Step title="7. The gap nothing accounted for">
+    The grey region at the end has no span. Something took 340 ms and nobody named it. Either a component is uninstrumented or your telemetry died mid-request, and from the user's chair those are the same event.
+  </Step>
+
+  <Step title="8. Sampling, and what it costs you">
+    You cannot store every trace at 10,000 req/s. **Head sampling** decides at the front door and keeps an unbiased sample — but slow requests are a vanishing fraction, so at a 1% rate you will have almost none of them. **<Term t="tail-sampling">Tail sampling</Term>** decides after you know the outcome: keep 100% of slow and failed traces, and a fraction of fast ones. It is the only policy that keeps your p99 stories.
+  </Step>
+</Scrolly>
+
+## Carry the identifier end to end
+
+A trace is only useful if you can **find it** after the fact. That means a <Term t="trace-id">correlation identifier</Term> that survives every hop:
+
+1. The edge **mints** a `trace_id` and returns it in a response header, so a user can quote it in a bug report.
+2. Every downstream call forwards it in a header (`traceparent` is the W3C standard; OpenTelemetry uses it natively).
+3. The engine **echoes it back** with the request's internal id, so an engine-side span can be found from an edge-side span.
+4. Your client logs it with the request, so support tickets have something to search.
+
+<Callout type="real" title="What this looks like in practice">
+  At the time of writing, the mainstream serving path supports this: OpenTelemetry is the vendor-neutral standard, and the engines expose hooks for it — vLLM has a request-level id and structured logging that can be correlated. What you will build is the *glue*: header propagation through your own gateway, sampling rules, and the query you run at 3 a.m.
+
+  The part people skip is step 3 — correlating engine-internal events back to the edge request. Without it, your trace covers your gateway and stops at the door, which is exactly where the interesting part is not.
+</Callout>
+
+## Propagating context across a streaming boundary
+
+Streaming makes this harder than it looks, and it is worth being precise about why.
+
+The connection stays open for the whole response — tens of seconds. Several mechanisms that normally carry context assume a short request:
+
+- **Connection-scoped state** (an HTTP/2 stream, a keep-alive socket) is shared across many requests, so anything you store "on the connection" will be clobbered.
+- **Thread-locals** in the server process may not be the thread the stream callback runs on.
+- **A shutdown** mid-stream loses the spans you had not yet flushed.
+
+The pattern that works is: bind the trace context to the **request object**, not to the connection or the thread, and make the stream's callbacks close over it.
+
+```python
+# bind context to the request, never to the connection or the thread
+class StreamRequest:
+    def __init__(self, trace_id: str, span_stack: list[str]):
+        self.trace_id = trace_id        # stable for the whole stream
+        self.span_stack = span_stack    # the open parent chain
+
+def stream(req: StreamRequest):
+    with tracer.start_as_current_span("decode", context=req.context) as decode_span:
+        # every token event attributes to decode_span, from any callback
+        for tok in engine.stream(req.prompt, parent=decode_span.context):
+            req.span_stack[-1] = decode_span.context
+            yield tok
+        # close the span in a finally, so a client disconnect still records it
+```
+
+<Callout type="pitfall" title="The two failures you will actually see">
+  1. **Orphan spans.** The trace has a gap in the middle because the decode span was started on one thread and finished on another. Symptom: a trace that shows TTFT perfectly and then nothing for 30 seconds.
+  2. **Context lost at the async boundary.** Your `await` crossed a task boundary and the context variable was not propagated. Symptom: everything after the await attributes to a new, unparented root.
+
+  Both are cheap to fix once you know the shape, and nearly impossible to debug without traces.
+</Callout>
+
+## What to do when a span shows you something ugly
+
+A trace does not stop at diagnosis; it hands you a decision. Here is the mapping from what you see to what you do, and it is the same mapping every time:
+
+| What the span shows | What it means | The lever |
+|---|---|---|
+| Edge + auth > 20 ms | You are TLS-terminating and re-handshaking per request | Keep-alive, connection pooling, terminate TLS once |
+| Tokenize spikes on long prompts | CPU tokenization is serial with the GPU work | Cap prompt length, or tokenize in a thread pool ahead of admission |
+| Queue wait grows with load | Admission is unbounded | Concurrency cap, load shedding (next lesson) |
+| Prefill span dominates TTFT | Long prompts are hogging the batch | Chunked prefill with a token budget (Module 10) |
+| KV transfer > 10% of TTFT | The wire is in your critical path | Bigger transfer bandwidth, fewer bytes (FP8 KV, Module 11) |
+| Decode span long, step count normal | Per-step time is too slow | Bigger batch, or fewer bytes (quantize — Module 11) |
+| A span with no parent and no name | Something is uninstrumented | Add the span before you optimize anything |
+
+<Callout type="recap" title="The tracing discipline">
+  1. **Span the components**, not the kernels.
+  2. **Nest everything.** Without a parent you have a log with timestamps.
+  3. **Always span the queue.** It is where most of your unexplained latency lives.
+  4. **Mint one id at the edge** and propagate it to the last hop, including through streams.
+  5. **Tail-sample** if you sample at all, so your slowest requests survive.
+  6. When you find a gap in the trace, the first move is to **add instrumentation**, not to guess.
+</Callout>
+
+<KeyNotes>
+  1. Metrics aggregate and traces do not. The metric says *that* and *how big*; only the trace says *where*.
+  2. A span has exactly four interesting fields — name, service, start, duration — plus a parent link. Keep the parent, because the waterfall throws the tree away.
+  3. Span components, not kernels. Around 300 spans per request is unqueryable and teaches you nothing you did not get from a profiler.
+  4. **Always span the queue wait.** It is the most common cause of a bad p95 and it is invisible in every other instrument.
+  5. The **critical path** — spans with no gaps — is the latency. Work off the path happened in parallel and cost nothing to fix first.
+  6. Mint a `trace_id` at the edge and propagate it to the last hop, including through engine-internal events, or a user cannot give you anything actionable.
+  7. Bind trace context to the **request**, never to the connection or the thread; streaming connections are long-lived and shared.
+  8. Prefer **tail sampling** when you sample at all: head sampling keeps an unbiased sample of which, by construction, contains almost none of the slow requests you built traces to find.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A trace shows TTFT of 400 ms made up of: edge 30 ms, queue 12 ms, prefill 48 ms, KV transfer 9 ms, first decode step 11 ms, plus 290 ms that no span covers. What is the first thing you should do?', options: ['Add capacity to the decode pool, since decode is the phase users feel', 'Tune the prefill chunk size, since prefill dominates', 'Find and instrument the uninstrumented 290 ms before changing any capacity', 'Increase the sampling rate and wait for another trace'], answer: 2, why: 'The unattributed span is 73% of the latency. Optimizing a phase that is 19% of the request, while 73% is invisible, is the classic move that produces no improvement and a confused team. Instrument first.' },
+  { q: 'In the worked trace, decode produced 180 tokens in 191 ms of wall clock, including an 11 ms first step. What is the all-in average time per token, and what per-user speed does that imply?', numeric: true, answer: 1.06, tolerance: 0.03, unit: 'ms/token', why: 'All-in TPOT = 191 ÷ 180 ≈ 1.06 ms/token, so that user sees about 1 ÷ 0.00106 ≈ 940 tokens/s — far above the ~40 tok/s where extra speed stops being visible, which is why a service would rather have more of them than faster ones.' },
+  { q: 'Why must a streaming server bind trace context to the request object rather than the connection?', options: ['Because HTTP/2 does not allow per-connection state', 'Because a streaming connection stays open for the whole response and may be shared, so connection- or thread-scoped context gets clobbered by the next request or lost across the async boundary', 'Because tracing libraries cannot read headers', 'Because streams are always multiplexed'], answer: 1, why: 'A 30-second stream keeps the connection alive and busy. Anything stored on the connection is overwritten by the next request; anything on a thread-local is lost when the callback resumes on a different thread. The request object survives the whole stream.' },
+  { q: 'Why is tail sampling usually better than head sampling for an inference service?', options: ['It uses less storage', 'It is simpler to implement', 'Head sampling keeps an unbiased sample of requests, while tail sampling deliberately keeps slow and failed ones — which are exactly the requests you built traces for', 'It works without a trace id'], answer: 2, why: 'Head sampling at 1% gives you 1% of the fast requests and almost none of the slow ones, because slow requests are a vanishing fraction. Tail sampling keeps slow and errored traces at a much higher rate specifically so your p99 stories are recoverable.' },
+  { q: 'A trace has eleven spans, and the critical path sums to 338 ms. One span (stream out, 12 ms) runs in parallel with the final decode step. Roughly how much latency could you save by making “stream out” instant?', numeric: true, answer: 0, tolerance: 0.5, unit: 'ms', why: 'Zero. It is not on the critical path: it overlaps the decode that is running anyway. Time only counts if it is on the chain of spans with no gaps. This is the whole reason to compute the critical path before touching anything.' },
+  { q: 'Which boundary is the most commonly missed in an inference trace?', options: ['GPU kernel launches', 'The scheduler queue wait', 'TCP connect', 'Tokenizer initialization'], answer: 1, why: 'Queue wait is inside the engine and invisible from the client, from engine averages, and from kernel profiles. It is also the single most common cause of a bad p95 — and adding one span is the cheapest fix in the whole observability stack.' },
+] } />

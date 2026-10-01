@@ -1,0 +1,174 @@
+---
+title: 'Prefix caching'
+summary: 'Two people asking the same question should not cost two computes. You will learn to recognise a shared prefix, measure its hit rate, and explain why reuse is exact rather than approximate.'
+objectives:
+  - Recognise which workloads share a prefix and which do not
+  - Compute the speedup from a given hit rate, from the arithmetic
+  - Explain why a prefix cache hit is bitwise exact rather than approximate
+  - Account for block granularity when reasoning about hit rate
+  - Decide what to cache and what must never be cached
+---
+import PrefixCache from '@/components/viz/prefill-prefix/PrefixCache.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Your chat product has a 2,000-token system prompt. It defines the assistant's persona, the house style, six tools with their JSON schemas, and a few-shot example. Every single request begins with those exact same 2,000 tokens, byte for byte.
+
+Two users send a message. The engine runs 2,500 tokens of prefill for the first. Then the second arrives — and the engine runs 2,500 tokens of prefill for it too. Identical work. Identical result. Thrown away and done again.
+
+Nobody writes that bug on purpose. It is what you get if you assume every request is different. <Term t="prefix-caching">Prefix caching</Term> is the fix: notice that the first 2,000 tokens are already sitting in the KV cache, and compute only the 500 that are new.
+
+## Why it is exact, not approximate
+
+This is the part that surprises people, so let it be airtight. Take a prompt of tokens $t_1, t_2, \dots, t_n$. During prefill, the layer-$l$ key of token $i$ is:
+
+$$
+k_i^{(l)} = W_K^{(l)} x_i^{(l)} + b_K^{(l)}, \qquad
+x_i^{(l)} = R\!\left(t_1, \dots, t_{i-1}\right) + h_i^{(l-1)}
+$$
+
+The hidden state $x_i$ depends on the tokens **before it** and nothing else. So if a previous request computed $t_1, \dots, t_k$ with exactly those token IDs at exactly those positions, its cached $k_i$ and $v_i$ for $i \leq k$ are the values this request would compute.
+
+The only way it could differ is a **cache key that omits something that matters**. So a correct prefix cache must be keyed on:
+
+- the **token IDs**, in order;
+- the **positions** (so a zero-padded batch, or a shifted prompt, does not falsely match);
+- the **model, weights and dtype** — one cache per served model;
+- the **LoRA or adapter identity**, if you serve several.
+
+Hit that and reuse is not a clever approximation. It is the same number, for free. Miss the key and you silently serve garbage, which is why engines are conservative here.
+
+<Callout type="pitfall" title="The cache key is a correctness boundary, not an optimization detail">
+  Serve two models from one cache and a Llama prompt will happily match a Mistral one: same shapes, same block count, completely different numbers. The failure is silent — the response is wrong and nobody crashes. Include the model identity in the key, and if you use adapters, include the adapter identity too.
+</Callout>
+
+## The saving, from arithmetic
+
+Say a prompt is $n$ tokens, and $c$ of them are already cached. Then:
+
+$$
+t_{\text{prefill}} \approx \frac{2P\,(n - c)}{\text{peak FLOP/s} \times \text{MFU}}
+$$
+
+The whole saving is the term $(n - c)/n$, so define the **hit rate** as the fraction of prompt tokens that were reused:
+
+$$
+\text{hit rate} = \frac{c}{n}, \qquad
+t_{\text{with cache}} = t_{\text{cold}} \times (1 - \text{hit rate})
+$$
+
+It is a purely linear relationship, and it is easy to feel. Our 2,500-token prompt costs 74 ms cold on an H100. With 2,000 tokens cached:
+
+$$
+t = 29.5\ \mu\text{s} \times 500 = 14.8\ \text{ms} \quad \text{instead of} \quad 73.8\ \text{ms}
+$$
+
+Five times faster, for free. And notice what did not change: the request still waits, and 15 ms is still 15 ms. The saving is in **GPU time**, so on a busy GPU it shows up as throughput and as lower queueing delay for everyone, not just a lower number on one request.
+
+<Scrolly>
+  <PrefixCache client:visible slot="stage" />
+
+  <Step title="1. Two users, one system prompt">
+    Two people use the same chat product. Their messages differ, but both prompts start with the identical 2,000-token system prompt and tool definitions. That shared head is the opportunity.
+  </Step>
+
+  <Step title="2. The waste in plain numbers">
+    Without reuse, the second request recomputes all 2,000 shared tokens. Same weights, same input, same output — GPU time spent arriving at a number we already have.
+  </Step>
+
+  <Step title="3. The first request pays">
+    The first request must compute everything: 2,500 tokens, about 74 ms. A cold cache is not a bug, it is the cost of being first. Expect it once per shared prefix, not once per request.
+  </Step>
+
+  <Step title="4. The second one does not">
+    The second request matches 2,000 of the 2,500 tokens, so it computes only 500. Prefill drops from 74 ms to 15 ms — a fivefold saving with no approximation and no quality change.
+  </Step>
+
+  <Step title="5. Hit rate is the whole story">
+    Across a workload what matters is the average fraction of prompt tokens reused. At an 80% hit rate you pay a fifth of the prefill bill; at 40%, well over half of it.
+  </Step>
+
+  <Step title="6. Block granularity">
+    Reuse happens at the granularity of the KV blocks from Module 08. A block that is only half covered by the previous request cannot be shared, so small blocks raise the hit rate and cost a little more memory.
+  </Step>
+
+  <Step title="7. Never cache the suffix">
+    Generated tokens are the output, not the prompt. They depend on sampling, differ on every run, and must never be reused — that would be incorrect as well as pointless.
+  </Step>
+</Scrolly>
+
+## Which workloads share a prefix
+
+This is the skill the feature actually demands: reading a queue of requests and seeing the shape.
+
+| Workload | Shared prefix? | Typical hit rate | Why |
+|---|---|---|---|
+| Multi-turn chat | **Yes, big** | 60–90% | The conversation so far *is* the prefix of the next turn |
+| Agents / tool loops | **Yes** | 50–80% | Each step re-sends the whole history, plus one tool result |
+| RAG with a stable corpus | **Yes, if sorted** | 30–60% | The retrieved context is identical for similar queries — if ordering is deterministic |
+| Shared system prompt + tools | **Yes** | The whole block | Identical on every request |
+| Few-shot prompting | **Yes** | The example block | Identical on every request |
+| Independent one-shot queries | **No** | near 0 | Nothing in common but the chat template |
+| Batch/offline generation | **No** | near 0 | Deliberately unrelated prompts |
+
+<Callout type="intuition" title="The counter-intuitive one: RAG needs you to help it">
+  Two questions about the same document retrieve the same chunks, in the same order, if the retriever is deterministic. So RAG is *highly* cacheable — and routinely gets a 0% hit rate, because the retriever sorts by floating-point score and the tie order flips, or because each request adds a fresh timestamp into the prompt.
+
+  This is why you will see production systems **sort retrieved documents by document ID** before assembling the prompt. It costs nothing and it is the difference between a 40% and a 0% hit rate.
+</Callout>
+
+## Where the blocks live, and what it costs
+
+From Module 08, the KV cache is a pool of fixed-size blocks, with a table mapping each sequence to its blocks. Prefix caching is then almost free to implement on top of what you already have:
+
+- hash each block's **token IDs** as you fill it;
+- keep a map from hash to block;
+- when a request arrives, walk down as far as the hashes match, attach those blocks, and prefill only the remainder;
+- blocks are **reference-counted**, so a shared prefix is not freed while anyone still points at it.
+
+<Callout type="math" title="How big is the prize in bytes">
+  The cached prefix occupies memory whether or not you reuse it, so the question is not "does it cost memory" but "how much of your memory is idle copies of the same tokens".
+
+  Llama-3.1-8B in BF16 uses $2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes of KV per token — 128 KiB. So:
+
+  | Shared prefix | Memory per request | 100 concurrent users |
+  |---|---|---|
+  | 1,000 tokens | 125 MiB | 12.8 GB |
+  | 4,000 tokens | 500 MiB | 51.2 GB |
+
+  At 4K shared tokens, 100 concurrent chats need **51 GB of GPU memory holding the same 4,000 tokens**. On an 80 GB H100 that is nearly two thirds of the card spent on duplicates. This is a memory optimization wearing a speed optimization's clothes, and on a memory-bound decode service that is where it mostly pays.
+</Callout>
+
+## Block size sets the hit rate
+
+You cannot reuse half a block. If the previous request covered 2,016 tokens and blocks are 16 tokens wide, tokens 2,017 and up must all be recomputed. With block size $B$, the reusable amount is $B \times \lfloor c/B \rfloor$.
+
+The cost of a block is the padding in the last, partly filled block of every sequence. Averaged over a sequence of length $T$ with block size $B$, that is about $(B-1)/2$ wasted tokens:
+
+| Block size | Average waste per sequence | Typical hit rate on chat |
+|---|---|---|
+| 16 tokens | ~7 tokens | highest |
+| 64 tokens | ~32 tokens | nearly as good |
+| 256 tokens | ~128 tokens | good; long shared prefixes still hit |
+| 1,024 tokens | ~512 tokens | loses short shared prefixes |
+
+The trade is *hit rate* against *wasted memory*, and the second column is small in absolute terms — a few hundred tokens against a KV cache of hundreds of thousands. That is why the memory-frugal end is usually right: at the time of writing vLLM defaults to 16-token blocks. But if your shared prefixes are short (a few hundred tokens of system prompt) and you have memory to spare, larger blocks cost little hit rate.
+
+<KeyNotes>
+  1. A prompt's hidden states depend only on the tokens before them, so an identical prefix produces **identical** keys and values. Reuse is exact, not approximate.
+  2. The cache key must include token IDs, positions, model identity and adapter identity. An incomplete key serves wrong answers silently.
+  3. With $c$ of $n$ prompt tokens cached, prefill costs $(n-c)/n$ of cold. Hit rate is the single number that describes the win.
+  4. Multi-turn chat, agent loops and few-shot prompts share most of their prompt. Independent one-shot queries share almost nothing.
+  5. Prefix caching is largely a **memory** optimization: 128 KiB per token means a 4K shared prefix across 100 users is 51 GB of duplicates.
+  6. Reuse happens per KV block. Small blocks raise the hit rate; large blocks waste a fraction of the memory budget. 16 tokens is the memory-frugal default.
+  7. Sort retrieved RAG documents deterministically. Unstable ordering destroys the shared prefix and takes the hit rate to zero.
+  8. Never cache generated tokens: they are the output, they vary per run, and reusing them would be wrong.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A 4,000-token prompt has 3,200 tokens already in the prefix cache. What fraction of its prefill cost remains?', numeric: true, answer: 20, tolerance: 4, unit: '%', why: 'Remaining = (4000 − 3200)/4000 = 0.2, so 20% of the cold prefill cost. Prefill time is linear in the number of tokens actually computed.' },
+  { q: 'Llama-3.1-8B in BF16 stores 131,072 bytes of KV per token. How much memory does a 4,000-token shared prefix occupy per request?', numeric: true, answer: 500, tolerance: 30, unit: 'MiB', why: '4000 × 131,072 = 524,288,000 bytes = 500 MiB (512 × 10⁶ bytes in decimal terms). Across 100 concurrent users that is 50 GB of duplicate tokens.' },
+  { q: 'Why is a prefix cache hit exact rather than an approximation?', options: ['Because the engine recomputes the first block to check it', 'Because a token’s hidden state depends only on the tokens before it, so the same IDs at the same positions give identical K and V', 'Because KV cache quantization is lossless', 'Because the cache stores the final logits instead of the KV cache'], answer: 1, why: 'Within a layer, token i depends only on earlier positions through attention, which is already cached. Same token IDs plus same positions means the same keys and values — no error term.' },
+  { q: 'Your RAG service has a 0% prefix hit rate despite users asking about the same documents. What is the most likely cause?', options: ['The KV blocks are too small', 'The prefix cache is disabled', 'The retriever returns documents in unstable order, so the assembled prompt differs every request', 'The model is too large for the GPU'], answer: 2, why: 'The hit depends on the prompt being byte-identical. Nondeterministic ordering (score ties, unstable sorts) changes the token sequence and the prefix stops matching. Sorting by document ID fixes it for free.' },
+  { q: 'Which workload is least likely to benefit from prefix caching?', options: ['Multi-turn chat', 'An agent loop re-sending its whole history each step', 'Few-shot prompting', 'A batch of 10,000 unrelated one-shot queries'], answer: 3, why: 'There is nothing shared but the chat template. Cache-friendly workloads are exactly those where consecutive requests build on each other.' },
+  { q: 'A cache is keyed on token IDs and positions only. You serve two models with identical tokenizer vocabulary and shapes. What is the risk?', options: ['None, the hits are still valid', 'The cache will miss more often, costing performance', 'A prompt for one model can match another’s cached blocks and silently return wrong KV values', 'The KV cache will grow without bound'], answer: 2, why: 'Identical shapes and vocabulary let a hash match, but the weights differ, so the values are wrong. This is silent corruption, not a crash — put the model and adapter identity in the key.' },
+]} />

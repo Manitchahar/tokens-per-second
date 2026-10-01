@@ -1,0 +1,183 @@
+---
+title: 'Lab: Simulate MoE load balance'
+summary: 'Build a real mixture-of-experts layer, give its router favourites, and watch what that does to load, to quality and to communication. The in-browser simulator builds the intuition in ten minutes; the Colab notebook runs the same arithmetic on a T4, trains a router with the auxiliary loss, and asks you to reconcile every measurement with the closed-form numbers from the lessons.'
+objectives:
+  - Implement a mixture-of-experts layer in PyTorch and verify its routing and combine logic
+  - Measure load imbalance and the Gini coefficient from a real routing distribution
+  - Compute the capacity factor and the exact overflow rate it implies
+  - Train a router with the auxiliary loss and observe it drive load toward uniform
+  - Connect a measured imbalance to all-to-all communication volume and compare against measured GEMM time
+colab: 19-moe.ipynb
+---
+import MoeLoadBalance from '@/components/viz/moe/MoeLoadBalance.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last two lessons were an argument. This lab is where you measure it. You will build a working mixture-of-experts layer in PyTorch, give its router favourites, and then chase the consequences all the way through to bytes on a wire.
+
+There are two halves. The simulator takes ten minutes and builds the intuition for *which* imbalance is dangerous and why. The notebook takes an hour and gives you numbers you measured yourself, plus one experiment — training a router with the auxiliary loss — that explains why real MoE routers are not simply uniform.
+
+<Colab nb="19-moe.ipynb" />
+
+## Half one: the simulator
+
+Four controls: the model, the batch size, how sharp the router is, and the capacity factor. Everything else follows.
+
+The three numbers that matter are in the readout, and they are three different questions:
+
+- **Imbalance** is a *straggler multiplier*. At 2.0×, the busiest card does twice the work of an evenly loaded one, and in a synchronous step it sets everyone's latency.
+- **Gini** is a *reportable summary*. 0 is perfect equality, 1 is one expert taking everything.
+- **Overflow** is the *quality cost* of the capacity factor — the tokens you are dropping to get rectangular buffers.
+
+<Scrolly>
+  <MoeLoadBalance client:visible slot="stage" />
+
+  <Step title="1. Pick a model and a batch">
+    Three published MoE configurations with very different shapes: Mixtral with 8 experts and top-2, DeepSeek-MoE-16B with 64 and top-6, Qwen3-30B-A3B with 128 and top-8. Note that more experts with the same top-k means a much smaller balanced share per expert, which makes the same absolute imbalance look worse.
+  </Step>
+
+  <Step title="2. Route every token">
+    Each token picks its top-k experts. The router's preference curve is the sharpness control — flat means no specialisation, sharp means a few experts dominate. Move it and watch the bars reorganise.
+  </Step>
+
+  <Step title="3. Read the load, not the mean">
+    The dashed line is the perfectly balanced share. The interesting bar is the tallest one, compared against that line. **A mean load tells you nothing** — two models with identical means can differ by 10× in straggler risk.
+  </Step>
+
+  <Step title="4. Turn it into one number">
+    The Lorenz curve bows below the diagonal; the area between them, normalised, is the Gini coefficient. Above about 0.3 you should expect stragglers. Below 0.10, be suspicious — a router that balanced is a router that never specialised.
+  </Step>
+
+  <Step title="5. Add the capacity constraint">
+    Each expert gets $c \times$ the balanced share in slots. Push the capacity factor down and red bars appear. The predicted overflow is exactly $\max(0, 1 - c/I)$ of the hot expert's tokens — check the simulator's number against that.
+  </Step>
+
+  <Step title="6. Then pay for it on the wire">
+    The previous lesson's formula, with your measured imbalance plugged in: $f_{\text{remote}} = (1 - 1/g)\cdot I$. Imbalance is not a free inefficiency — it multiplies communication in every MoE layer, forever.
+  </Step>
+</Scrolly>
+
+**Check yourself before the notebook.** Answer these from the arithmetic, not the page:
+
+1. Mixtral, top-2 of 8, batch 512. What is the perfectly balanced share per expert, in tokens? How many assignments does the batch produce in total?
+2. The busiest expert holds 210 tokens. What is the imbalance, and what capacity factor guarantees zero overflow?
+3. You measure a Gini of 0.08 on a production router with 128 experts. Is that good news? What question does it raise?
+4. Capacity factor 1.25 and imbalance 2.0. What fraction of the hot expert's tokens overflow, and of *all* assignments?
+5. Drop the capacity factor from 2.0 to 1.25 at a Gini of 0.35. What changes: memory, communication, compute, or quality? Pick one and justify it.
+
+## Half two: the notebook
+
+<Callout type="try" title="Setup (3 minutes)">
+  Open the notebook above in Colab, choose **Runtime → Change runtime type → T4 GPU**, and run the cells top to bottom with <kbd>Shift</kbd>+<kbd>Enter</kbd>. It uses PyTorch plus optional `transformers` for section 6, so sections 1–5 run offline with nothing downloaded.
+</Callout>
+
+### 1. Build a mixture-of-experts layer
+
+Section 1 implements the whole mechanism: router matmul, softmax over all experts, top-k selection, per-expert MLP, and the weighted combine. Experts are stacked so one batched matmul runs them all — a real kernel gathers each expert's tokens and runs a dense GEMM, but the arithmetic is the same.
+
+**Expected output:** the routed-assignment count sums to `tokens × k`, the output shape is preserved, and the load is near-uniform because the router bias starts at zero. **That uniformity is artificial** and section 2 destroys it.
+
+Two things to check by hand, because they are the two bugs you will otherwise hit later: that the top-k probabilities are **renormalised to sum to 1** over the selected experts, and that the combine step indexes `topi` against the expert axis correctly.
+
+### 2. Give the router favourites
+
+Section 2 sweeps the router bias from 0 to 4 and prints imbalance, minimum load, Gini and top-3 share at each level.
+
+**What to expect.** A monotone climb. At zero bias, imbalance sits near 1.0 and the Gini is small. By a bias standard deviation of 4, the hottest expert holds several times its share.
+
+**The thing to notice:** the top-3 share saturates well below 100%. A healthy MoE uses most of its experts. If one expert took 90% of your tokens, that model is a dense model wearing a costume — and its sparsity number is a lie.
+
+### 3. Capacity factor and overflow
+
+Section 3 applies a hard per-expert capacity across a range of factors and prints the measured overflow rate next to the closed-form prediction $\max(0, 1 - c/I)$.
+
+**Expected:** the two columns agree once you account for the fact that the prediction is about the *hot expert* while the measurement divides by *all* assignments — they should differ by roughly the hot expert's share of traffic. If they disagree by much more than that, you have a bug in the capacity code.
+
+Find the smallest capacity factor with zero overflow. It should equal your measured imbalance $I$ exactly.
+
+### 4. Train a router with the auxiliary loss
+
+Section 4 implements the Switch-Transformer load-balancing loss,
+
+$$
+\mathcal{L}_{\text{aux}} = \alpha\, E \sum_{e} f_e \, P_e
+$$
+
+and trains a router on it alone, printing the imbalance at intervals.
+
+**Expected:** imbalance falls toward 1.0 and Gini toward 0. Uniform load is this loss's global minimum, so with nothing pushing the other way that is where the router goes.
+
+**Then run the experiment that matters.** Set `alpha = 0.0` and re-run: nothing changes. A router with no pressure toward balance keeps whatever preferences its initialisation had. That is the point — **the auxiliary loss is the only reason a trained MoE uses all of its experts.**
+
+The real training run minimises $\mathcal{L}_{\text{task}} + \alpha\,\mathcal{L}_{\text{aux}}$, so $\alpha$ is a dial between specialisation and balance. Too low and experts die; too high and every expert becomes an identical copy of the others, and you have paid for capacity you never used.
+
+### 5. Imbalance becomes communication
+
+Section 5 takes your measured imbalance into the all-to-all formula from the previous lesson and prints the volume at five imbalance levels. Then it measures the local grouped expert GEMM so the communication number has something real to be compared against.
+
+**Expected:** the grouped GEMM takes a few milliseconds; the all-to-all over 32 layers takes a fraction of a millisecond at NVLink speeds. So at that batch, the layer is still **locally compute-bound** — which is why MoE works well at high batch.
+
+It also prints the arithmetic intensity. Compare it to the T4's ridge point, $65\text{ TFLOP/s} \div 320\text{ GB/s} \approx 203$ FLOP/byte. A T4 has no BF16 tensor cores, which makes it a poor card for expert-heavy work — worth knowing before you benchmark on one and draw conclusions about an H100.
+
+Then sweep batch size to find where communication stops hiding behind local compute. **That crossover is the single most useful number in this lab**: it is the "when does MoE become communication-bound" answer for your GPU.
+
+### 6. Read a real trained MoE
+
+Section 6 loads the published config of Qwen1.5-MoE-A2.7B, prints its expert count, top-k, intermediate width and shared expert, then derives the expert bank size, active parameters and sparsity from the config — the same arithmetic you did by hand for Mixtral, now run against a real file.
+
+**Expected:** a large expert count with a small active count, a narrow MoE intermediate width, and a **shared expert**. That last one matters for serving: routed experts are not guaranteed to fire for every token, so a small always-on expert provides a floor of work per token. It is a serving decision as much as a modelling one.
+
+**What to measure on real router weights:** the per-expert row norms of `mlp.gate.weight`. A trained router with genuine favourites has rows whose norms differ substantially. Rows with near-identical norms have never differentiated — the signature of an under-utilised MoE.
+
+### 7. When it goes wrong
+
+Five ways an MoE layer produces a plausible model instead of a crash. The full list is at the end of the notebook; the two that have shipped more than once:
+
+**Measuring imbalance on the wrong axis.** Counts must be per *expert* across *all* tokens. Per-token counts are always exactly $k$ — perfectly balanced by construction — so the metric reads zero imbalance on a catastrophically imbalanced router, and the bug is invisible. Check the metric against a case where you know the answer.
+
+**Softmax taken over the selected experts instead of all of them.** This silently renormalises before selection and changes every gate value. The order is fixed: softmax across all $E$, then take top-$k$, then renormalise over the $k$.
+
+<Callout type="mentor" title="The habit this lab is really building">
+  Every section ends with a closed-form prediction printed next to a measurement. When they disagree, your first move is **not** to adjust the number to match — it is to find out which of the two is wrong, and why.
+
+  This is the same discipline as Module 06's reproducible benchmarks, applied to routing. Load balance is the parameter most likely to differ between your benchmark traffic and production traffic, and it is the one that quietly determines whether your MoE deployment is fast or mysteriously slow.
+</Callout>
+
+## Check yourself
+
+Answer these in your notes, with the arithmetic shown.
+
+1. Section 2 measures imbalance 2.4 and Gini 0.41. Section 3 finds zero overflow needs capacity 2.4. What is your overflow rate at capacity 1.25, as a fraction of the hot expert's tokens, and as a fraction of all assignments?
+2. Section 4 trained a router to uniform load. Give one concrete model-quality consequence of that router having *no* task loss, and explain why it is worse despite being perfectly balanced.
+3. Section 5's crossover sweep finds communication exceeding local compute at batch 8. Name one software change that would move that crossover, and one hardware change.
+4. Your production router shows Gini 0.08 across 128 experts at batch 2048. A colleague calls it healthy. What would you measure before agreeing?
+5. From the whole lab: what is the single number you would put on a dashboard to catch a routing regression in production, and what threshold would page someone?
+
+**Answers, once you have done the work:**
+
+1. Overflow of the hot expert is $\max(0, 1 - 1.25/2.4) = 47.9\%$. As a fraction of all assignments it is smaller by roughly the hot expert's traffic share, $1/8$ for Mixtral, giving about 6% overall — which is why the measured and predicted columns differ by that factor.
+2. With no task loss, every expert becomes an identical copy — the router has no reason to differentiate, so the model has $E$ copies of one expert and none of the capacity advantage that motivated the design. Perfect balance without specialisation is a dense model with extra memory and an extra matmul. **Balanced is not the goal; balanced *and* specialised is.**
+3. Software: overlap the all-to-all with independent compute, and schedule so a token's expert work is not serialised behind its dispatch — this moves the crossover down by hiding communication. Hardware: a faster or wider fabric (NVLink to NVSwitch, more links per GPU), which lowers the per-byte cost directly. Note that a faster GPU makes it *worse*, because local compute shrinks faster than the wire does.
+4. Measure whether the router's probabilities have collapsed — a Gini of 0.08 with a mean probability near $1/128$ means balance, but if the probabilities are near-uniform while the *assignments* are balanced too, check whether expert weight row norms differ. Experts with identical norms have never differentiated regardless of what the router says. Also confirm your traffic distribution resembles the router's training distribution; a router evaluated on out-of-distribution prompts can look balanced and behave badly.
+5. The straggler multiplier — imbalance $\max_e c_e / (kT/E)$ — is the number, because it is the direct multiplier on the step time of the busiest card, which in a synchronous step *is* the step time. Page when it exceeds about 1.5 for a sustained window, since above that a significant fraction of your MoE speedup is being erased by one expert. Gini is the better trend metric for dashboards; imbalance is the better paging threshold, because it maps to latency while Gini only maps to it loosely.
+
+<KeyNotes>
+  1. An MoE layer is a router matmul, a softmax across all experts, a top-k selection, a per-expert MLP, and a weighted combine. The top-k probabilities must be renormalised over the selected experts, or the layer's contribution is silently scaled wrong.
+  2. Imbalance — $\max_e c_e$ divided by the balanced share — is a straggler multiplier. In a synchronous decode step the busiest card sets everyone's latency, so this number maps directly to tokens per second.
+  3. The Gini coefficient summarises load as one reportable number: 0 is perfect equality, 1 is one expert taking everything. Above 0.3 expect stragglers; below 0.10 suspect the router never specialised.
+  4. A capacity factor of $c$ gives each expert $\lceil c\,kT/E \rceil$ slots. The hot expert overflows by exactly $\max(0, 1 - c/I)$ of its tokens, so zero overflow requires $c \geq I$. The common default of 1.25 is a starting point, not a constant.
+  5. The auxiliary loss $\alpha E \sum_e f_e P_e$ is the only thing that stops a trained MoE from collapsing onto a few experts. With it, load goes uniform; without it, dead experts are the default outcome.
+  6. Balance alone is not the goal. A router trained on the auxiliary loss alone produces experts that are identical copies, which is a dense model with extra memory and an extra matmul. The training trade-off is specialisation bought per unit of balance, controlled by $\alpha$.
+  7. Imbalance multiplies all-to-all traffic: $f_{\text{remote}} = (1 - 1/g)\cdot I$. The same router imbalance that hurts compute hurts communication in every MoE layer, forever.
+  8. At high batch on a fast fabric the MoE layer is still locally compute-bound, and the all-to-all hides behind the GEMM. At low batch, or on PCIe, the collective's latency is exposed and the layer becomes communication-bound. Find your crossover by sweeping batch size.
+  9. Measure imbalance per expert across all tokens. Per-token counts are always exactly $k$, which makes the metric read zero imbalance on a catastrophically imbalanced router.
+  10. A shared expert exists for a serving reason: routed experts are not guaranteed to fire for every token, so a small always-on expert provides a floor of work per token when the router is unpredictable.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Mixtral, top-2 of 8 experts, batch 512. How many expert assignments does the batch produce, and what is the perfectly balanced share per expert?', numeric: true, answer: 128, tolerance: 4, unit: 'tokens/expert', why: '512 tokens × 2 experts each = 1024 assignments. Divided evenly across 8 experts that is 128 per expert. A perfectly balanced router would send exactly 128 tokens to each — the number you compare the hottest expert against.' },
+  { q: 'The hottest expert holds 256 tokens where the balanced share is 128. Its capacity factor is 1.25. What fraction of that expert’s tokens overflow?', numeric: true, answer: 37.5, tolerance: 3, unit: '%', why: 'Imbalance I = 256/128 = 2.0. Capacity = 1.25 × 128 = 160 slots. Overflow = 256 − 160 = 96 tokens, which is 96/256 = 37.5% of the expert’s traffic. The closed form max(0, 1 − c/I) = 1 − 1.25/2 = 0.375 gives the same answer.' },
+  { q: 'A router is trained with only the auxiliary loss and no task loss. What does it converge to?', options: ['Perfectly uniform expert load, with experts that are effectively identical copies', 'Severely imbalanced load, because the aux loss rewards specialisation', 'A router that always picks expert 0', 'Uniform load with sharply specialised experts'], answer: 0, why: 'The aux loss α·E·Σ fₑPₑ is minimised exactly at uniform load, so that is where it goes. But with nothing in the objective rewarding useful specialisation, the experts themselves have no reason to differ. You get balanced load over redundant experts — a dense model with extra memory.' },
+  { q: 'Why does measuring load per token instead of per expert make the imbalance metric useless?', options: ['Per-token counts are noisier', 'Every token selects exactly k experts by construction, so per-token counts are always k and read as perfectly balanced no matter how skewed the router is', 'Per-token counts require more memory', 'It is faster to compute per expert'], answer: 1, why: 'The top-k selection guarantees each token has exactly k assignments, so a per-token histogram is constant by construction. A catastrophically imbalanced router still reports zero imbalance. The count must be per expert, accumulated across all tokens — this bug has shipped more than once.' },
+  { q: 'Your router shows a Gini of 0.08 across 128 experts at batch 2048. A colleague calls it healthy. What do you check first?', options: ['Nothing — lower Gini is always better', 'Whether the expert weight row norms differ, and whether your traffic resembles the router’s training distribution — near-perfect balance can mean experts never specialised', 'Whether the batch size is large enough', 'Whether capacity factor is above 1'], answer: 1, why: 'A Gini that low means the router barely differentiates. Either the experts are redundant — you paid for 128 copies of capacity you never used — or your evaluation distribution is unlike the router’s training distribution. Check the per-expert norms of the gate weights: near-identical norms mean the experts never specialised regardless of what the routing histogram says.' },
+  { q: 'Mixtral on 8 GPUs, batch 512, BF16, 31 MoE layers, hidden 4096, perfectly balanced routing. Roughly how many bytes cross the fabric per decode step, both directions?', numeric: true, answer: 227, tolerance: 25, unit: 'MB', why: 'f_remote = 1 − 1/8 = 0.875. Dispatch = 512 × 0.875 × 4096 × 2 = 3.67 MB per layer. Both directions = 7.34 MB. Times 31 layers = 227 MB per step. At NVLink’s 300 GB/s reaching about half, that is roughly 0.76 ms.' },
+]} />

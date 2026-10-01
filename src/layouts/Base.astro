@@ -1,0 +1,67 @@
+---
+import 'katex/dist/katex.min.css';
+import '../styles/global.css';
+import TopBar from '../components/site/TopBar.astro';
+import Footer from '../components/site/Footer.astro';
+import { SITE, url } from '../site';
+
+interface Props { title?: string; description?: string; wide?: boolean; bodyClass?: string }
+const { title, description = SITE.tagline, bodyClass } = Astro.props;
+const fullTitle = title ? `${title} · ${SITE.name}` : `${SITE.name}: ${SITE.tagline}`;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#0e1116" />
+    <link rel="icon" type="image/svg+xml" href={url('favicon.svg')} />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:ital,wght@0,400;0,700;1,400&family=Atkinson+Hyperlegible+Mono:wght@400;600&display=swap" />
+    <slot name="head" />
+  </head>
+  <body class={bodyClass}>
+    <!-- Shared SVG definitions: hatch for idle time, arrowheads. Referenced by every diagram. -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+      <defs>
+        <pattern id="tps-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <rect width="6" height="6" fill="#0e1116" />
+          <line x1="0" y1="0" x2="0" y2="6" stroke="#4a5262" stroke-width="2.2" />
+        </pattern>
+        <pattern id="tps-hatch-red" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <rect width="6" height="6" fill="#1a1214" />
+          <line x1="0" y1="0" x2="0" y2="6" stroke="#fc6255" stroke-width="1.6" stroke-opacity="0.7" />
+        </pattern>
+        <marker id="tps-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M1 1.5L8.5 5L1 8.5" fill="none" stroke="context-stroke" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </marker>
+        <marker id="tps-arrow-muted" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M1 1.5L8.5 5L1 8.5" fill="none" stroke="#7c8391" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </marker>
+      </defs>
+    </svg>
+    <a class="skip" href="#main">Skip to content</a>
+    <TopBar />
+    <main id="main">
+      <slot />
+    </main>
+    <Footer />
+    <script>
+      import { applyMarks } from '../scripts/progress';
+      applyMarks();
+      window.addEventListener('tps:state', () => applyMarks());
+      window.addEventListener('storage', () => applyMarks());
+    </script>
+  </body>
+</html>
+
+<style>
+  .skip { position: absolute; left: -999px; top: 8px; z-index: 100; background: var(--text); color: var(--ground); padding: 0.5rem 0.8rem; }
+  .skip:focus { left: 8px; }
+  main { min-height: calc(100vh - var(--bar-h) - 120px); }
+</style>

@@ -1,0 +1,179 @@
+---
+title: 'Lab: Write a bottleneck report'
+summary: 'Take a slow decode step on your own GPU, run the full profiling funnel, and write the one-page document that a staff engineer would actually sign off on: the bound, the metric, the evidence, the fix you tried, and what you would do next.'
+objectives:
+  - Profile a decode step and a prefill chunk as two separate experiments
+  - Split a step's byte budget and compute its arithmetic intensity
+  - Classify the step as memory- or compute-bound and quote the right efficiency
+  - Apply one fix and verify it moved the metric rather than the anecdote
+  - Write a bottleneck report with a claim, evidence, a fix and a residual-risk section
+colab: 12-bottleneck.ipynb
+---
+import BottleneckLab from '@/components/viz/profiling/BottleneckLab.tsx';
+
+You have the tools. This lab is about the thing that actually separates an engineer who can profile from an engineer who can be *trusted* with a profile: writing down what they found, with numbers, in a form someone else can check.
+
+You will profile a real decode step on your own GPU, run the funnel, and produce a one-page <Term t="bottleneck-report">bottleneck report</Term>. The deliverable is the report. Everything else is evidence for it.
+
+## The report, and why it is the deliverable
+
+An optimization nobody can verify does not survive review, and a bottleneck diagnosis that lives only in someone's head does not survive their vacation. The report is the artifact that makes the work checkable, and writing it is what forces you to actually find the bottleneck rather than guess at one.
+
+Here is the structure you will follow, and the simulator above follows exactly the same order. Click through the numbered rail to walk the funnel.
+
+<Scrolly>
+  <BottleneckLab client:visible slot="stage" />
+
+  <Step title="1. Profile the step">
+    Start with a baseline: one decode step, warmed up, at a fixed batch and context. Record the step time and export the trace. You cannot write a report about a system whose starting number you have not written down.
+  </Step>
+
+  <Step title="2. Split the byte budget">
+    Every byte a decode step reads is weights, KV cache, or attention's own reads. Compute all three from the model config. The largest one is your target, and it is often not the one you would have guessed.
+  </Step>
+
+  <Step title="3. Classify the bound">
+    Compute intensity against the ridge point. Below the ridge you are memory-bound and must quote MBU; above it, compute-bound and quote MFU. Quoting the wrong one is the most common error in a first report.
+  </Step>
+
+  <Step title="4. Compare against the floor">
+    The ideal step time is the larger of the two roofline terms. Your headroom is measured time over that floor. Below 1.15× there is nothing to win and the honest conclusion is "this is done".
+  </Step>
+
+  <Step title="5. Read the Speed of Light">
+    On your real hardware, Nsight Compute reports achieved memory and compute throughput. The higher of the two is your number. Above 80%, move on; below 60%, the stall reasons name your fix.
+  </Step>
+
+  <Step title="6. Change exactly one knob">
+    Use the controls to change one thing — weight precision, KV precision, fusion, coalescing, CUDA graphs. Two changes at once and you cannot attribute the result, which is how folklore gets written.
+  </Step>
+
+  <Step title="7. Re-profile and compare">
+    Re-run the profile and compare the metric, not the tokens per second. If MBU did not move, the fix did nothing for this phase — even if the end-to-end number drifted upward by noise.
+  </Step>
+
+  <Step title="8. Write the verdict">
+    State the bound, the metric with its number, the evidence, what you changed, what it bought, and what remains. A report that ends with a residual risk is worth ten that end with a victory.
+  </Step>
+</Scrolly>
+
+<Colab nb="12-bottleneck.ipynb" />
+
+## Part 1 · Measure your own machine
+
+Start on hardware. Everything above is arithmetic on a model; this part makes it yours.
+
+The notebook uses **Qwen2.5-0.5B-Instruct** so it runs fast on a free T4. The absolute numbers are much smaller than an 8B model's; the *ratios* are what transfer.
+
+Run these five cells and record the numbers:
+
+1. **Warm up and time a decode step** at batch 1, 8, 32, 64 over a real KV cache. Write down `t_decode(batch)`.
+2. **Split the byte budget.** The notebook computes the weight bytes and the KV bytes for your model's config. Write the ratio.
+3. **Find your weights/KV crossover.** Sweep context until the KV bytes exceed the weight bytes. Write the context at which it happens and compare it with the 122,500 ÷ batch rule from Lesson 12.5.
+4. **Compute your intensity and your ridge.** The T4's ridge is about 203 FLOP/byte. Confirm your decode step is far below it.
+5. **Measure achieved bandwidth** and express it as a percentage of your T4's 320 GB/s.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. Your decode step at batch 1 and at batch 32 should take a similar time per step. Why is that, in one sentence using the roofline?
+  2. If your measured bandwidth is 45% of peak on the T4, is that a problem? What would you check first?
+  3. At what context does your KV cache start to dominate? Is it lower or higher than on an H100, and why?
+</Callout>
+
+## Part 2 · Profile it properly
+
+Now run the real profiling funnel on the same step. The notebook has the exact code.
+
+**Stage A — PyTorch profiler.** Warm up 5 iterations, then profile 10 decode steps and print the table sorted by `self CUDA time total`. Record:
+
+- the top three ops by GPU time and their share of the total;
+- whether `silu`, `mul` and `to` appear as separate bars (they should — this is the fusion opportunity);
+- the number of kernels per step.
+
+**Stage B — Chrome trace.** Export and open `decode.json` in Perfetto. Answer, in writing:
+
+- Is the GPU row solid, or are there gaps between kernels?
+- What is the longest single bar, and does it match your Stage A answer?
+- Is there a `memset` or an allocation bar mid-step?
+
+**Stage C — Nsight Compute**, if you can install it on your machine. Run it on the longest kernel and record the **Speed of Light** numbers: memory throughput % and compute throughput %. Write down which one is higher — that is your bound, and it is now measured rather than assumed.
+
+<Callout type="recap" title="What Stage B is actually telling you">
+  | What you see | Meaning |
+  |---|---|
+  | Solid GPU row | GPU-bound. Optimize kernels. |
+  | Gaps between bars | Launch-bound. This is Module 15's problem, not a kernel problem. |
+  | `silu` and `mul` as separate bars | An un-fused epilogue. Fusing is a real win in prefill. |
+  | A long `copy_` or `index_select` | Your KV layout is being copied instead of gathered. Fix the layout. |
+  | `memset` mid-step | The allocator or a `zeros()` is in your hot path. Preallocate. |
+</Callout>
+
+## Part 3 · Make one change, and measure it
+
+Pick **one** fix from this table and apply it in the notebook. Do not apply two.
+
+| Fix | What changes | Expect to see |
+|---|---|---|
+| FP16/BF16 instead of FP32 weights | weight bytes halve | decode step time drops; MBU roughly unchanged |
+| Fused epilogue (one kernel for SiLU·mul·add) | 3 kernels become 1 | kernel count drops; prefill time drops more than decode |
+| CUDA graphs around the decode loop | launch overhead removed | step time drops by roughly the number of launches × 5 µs |
+| Larger batch | intensity rises | step time nearly flat; throughput up |
+
+Record before and after:
+
+| | Before | After |
+|---|---|---|
+| Step time (ms) | | |
+| MBU / achieved GB/s | | |
+| Kernels per step | | |
+| Tokens/s (all users) | | |
+
+<Callout type="pitfall" title="If your fix did nothing, that is a result">
+  Fusing the epilogue on a **decode** step often changes nothing measurable, because the intermediate tensor is small enough to live in L2 and you are only saving a 5 µs launch. Write that down in your report. "This fix helps prefill and does nothing for decode, because decode's activations are L2-resident" is a **better** finding than a spurious 2% win, and it is the kind of sentence that stops the next person from wasting a week.
+</Callout>
+
+## Part 4 · The deliverable: a bottleneck report
+
+Write a one-page report. This is the artifact. Keep it under 500 words plus tables.
+
+**Required sections:**
+
+1. **Claim** — one sentence. "The decode step is memory-bound and is at 76% of peak bandwidth, so there is no meaningful headroom in the kernels."
+2. **Configuration** — model, GPU, dtype, batch, context length, and the engine or code path. Reproducibility is part of the finding.
+3. **Evidence** — the measured numbers: step time, byte budget split, intensity, achieved bandwidth, and which tool produced each. Include the intensity and the ridge point so the bound is checkable.
+4. **What was tried** — each change, with its before/after metric. Include the ones that did not work, and say why.
+5. **Residual risk** — what you did *not* profile, what would change the answer, and what you would measure next. A report with no residual-risk section is a report that has not been thought about.
+
+<Callout type="mentor" title="What separates a good report from a bad one">
+  A bad report says: *"Decode is slow because of memory. I quantized the weights and it got 1.4× faster."*
+
+  A good report says: *"Decode at batch 32 / 2k context on an H100 is memory-bound: intensity 21 FLOP/byte against a ridge of 295. The step reads 24.7 GB (16.1 weights, 8.6 KV) in 10.2 ms, which is 72% of the 3.35 TB/s peak — just under the 80% line, so there is a little room but not much, and the floor is 7.4 ms. FP8 weights take it to 16.6 GB and 6.9 ms, a 1.49× win that matches the byte reduction exactly (24.7 ÷ 16.6 = 1.49), which confirms the diagnosis. Residual risk: the KV crossover at batch 32 is 3,830 tokens, so past ~4k this becomes a KV problem and weight quantization stops being the right lever — we have not measured the FP8 KV path there."*
+
+  The second one can be checked, argued with, and acted on. That is the whole difference.
+</Callout>
+
+## Part 5 · Rubric
+
+Score your report out of 20. Aim for 16+.
+
+| Criterion | Points | What earns full marks |
+|---|---|---|
+| **Claim is specific and falsifiable** | 4 | Names the bound, the metric and the number. Not "it is slow". |
+| **Evidence is reproducible** | 4 | Configuration is complete; every number traces to a named tool. |
+| **Bound is justified** | 4 | Intensity *and* ridge point are both shown, so the classification is checkable. |
+| **Fixes were verified, not assumed** | 4 | Before/after for each change, including the ones that failed. |
+| **Residual risk is real** | 4 | Names what was not measured and what would change the answer. |
+
+<Callout type="real" title="Where this skill is used">
+  This is the artifact behind every performance decision in a real inference organization. When someone asks "should we buy H200s or run more A100s?", the answer is a column of bottleneck reports: bound, metric, headroom, and what each fix bought. When a regression lands, the first question is always "what does the report say the headroom was?" — which is why a report with no numbers is worth very little.
+</Callout>
+
+<KeyNotes>
+  1. The report is the deliverable. A profile without a written, checkable conclusion is a conversation that gets forgotten.
+  2. Profile prefill and decode as separate experiments. They have different bounds and different correct metrics.
+  3. Split the byte budget into weights, KV and attention before choosing a fix. The largest term is your target, and it is often not the weights.
+  4. Classify with intensity versus the ridge point, then quote MBU for memory-bound and MFU for compute-bound. Quoting the wrong one is the classic first-report error.
+  5. Headroom is measured time over the roofline floor. Below 1.15×, the honest conclusion is that the kernel is done.
+  6. Apply one change at a time and verify by re-profiling the metric — not by comparing tokens per second, which is too noisy to attribute a 2% move.
+  7. A fix that does nothing is a finding worth writing down. "Fusion helps prefill and does nothing for decode" saves the next engineer a week.
+  8. Every report needs a residual-risk section: what you did not profile, and what would change the answer. That section is what makes it trustworthy.
+</KeyNotes>

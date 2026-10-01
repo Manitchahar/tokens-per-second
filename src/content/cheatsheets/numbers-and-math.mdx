@@ -1,0 +1,53 @@
+---
+title: 'Module 01 · Numbers & Math'
+module: numbers-and-math
+---
+
+## Bytes per number
+
+| Format | Bytes | Notes |
+|---|---|---|
+| FP32 | 4 | 1 sign, 8 exp, 23 mantissa |
+| FP16 | 2 | 5 exp, 10 mantissa, max 65,504 |
+| BF16 | 2 | 8 exp, 7 mantissa, the LLM default |
+| FP8 E4M3 | 1 | max 448, H100+ tensor cores |
+| INT8 | 1 | −128 … 127 |
+| INT4 / FP4 | 0.5 | needs a scale |
+
+**Weights GB ≈ billions of params × bytes per param.** 1 GiB = 2³⁰ ≈ 1.074 GB.
+
+## Shapes
+
+- `[B, T, D]`: batch, tokens, hidden. Heads: `[B, H, T, Dh]`, Dh = D / H.
+- Elements = product of the shape. Memory = elements × bytes.
+- Fixing an index removes a dimension; `view` never copies.
+
+## Matrix multiply
+
+$$
+[m \times k]\cdot[k \times n] \to [m \times n], \qquad \text{FLOPs} = 2mkn
+$$
+
+$$
+\text{FLOPs per token} \approx 2 \times \text{params}
+$$
+
+$$
+\text{time} \ge \text{FLOPs} / \text{FLOP/s}
+$$
+
+- Decode (m = 1): about 1 FLOP per byte loaded, so it is memory-bound.
+- Prefill (m = hundreds): the weight is reused for every token, so it is compute-bound.
+
+## Dot product & softmax
+
+$$
+q\cdot k = \sum_i q_i k_i = |q||k|\cos\theta
+$$
+
+$$
+\text{softmax}(x)_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}},\quad m=\max_j x_j
+$$
+
+- Temperature: softmax(x / T). T < 1 is sharper; T > 1 is flatter.
+- Attention scales scores by 1/√d.

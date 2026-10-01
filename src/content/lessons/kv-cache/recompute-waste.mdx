@@ -1,0 +1,203 @@
+---
+title: 'Why naive generation wastes almost everything'
+summary: 'Generation is one token at a time, and the obvious way to write it throws away almost all of the work. We count exactly how much, discover why wasted FLOPs cost less time than you would guess, and find the three places where the waste really bites.'
+objectives:
+  - Explain why an autoregressive model produces one token per step
+  - Count the token-forwards a naive generator does, and the waste as a percentage
+  - Use the roofline to explain why 99% wasted arithmetic is not 99% wasted time
+  - 'Say where the waste does become expensive: long outputs, batching and long context'
+  - Recognise the naive generation loop in real code and know why nobody ships it
+---
+import RecomputeWaste from '@/components/viz/kv-cache/RecomputeWaste.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In Module 03 you built a transformer in your head, and in Module 04 you ran one. Both ended with the same constraint: a model can only emit **one token per forward pass**, because every token it produces must be fed back in as the input for the next one. That is <Term t="autoregressive">autoregressive</Term> generation, and it is a design choice with a price tag.
+
+Here is the price tag, and it is bigger than most people expect. The obvious way to write generation is to keep appending to a list of token IDs and call the model on the whole list every time. That loop is four lines long, it is easy to read, and it does about **a hundred times more arithmetic than it needs to** for a typical request. This lesson is about measuring that, understanding exactly *why* it happens, and being precise about how much it costs — because the honest answer is more interesting than the scary one.
+
+## One token, one step
+
+Start with the sequence. A prompt of 512 tokens goes in. The model runs a full forward pass and produces one number for every token in its 128,000-word vocabulary: which token should come next. You pick one, append it, and run the whole thing again.
+
+The visual below shows what the model is asked to do on each of those steps. Scroll through it, then drag the sliders to see how the numbers move with prompt length and output length.
+
+<Scrolly>
+  <RecomputeWaste client:visible slot="stage" />
+
+  <Step title="1. One token at a time">
+    The dark red bar is the sequence: 512 prompt tokens, then generated tokens appearing one at a time. Every new token is appended, and the model is called again on the **whole** list. This is the loop you would write if nobody had told you otherwise.
+  </Step>
+
+  <Step title="2. Only one token is new">
+    Look at the green sliver at the right edge. Between step *t* and step *t*+1, **exactly one token has been added to the world**. The other 512 tokens have not changed, and neither has anything the model derives from them.
+  </Step>
+
+  <Step title="3. A naive step redoes all of it">
+    The naive loop does not know that. It hands the entire sequence back to the model and lets it recompute every key, every value, every layer's output for every token. At step *t* that is 512 + *t* token-forwards, when one would do.
+  </Step>
+
+  <Step title="4. The waste compounds">
+    The bar grows by one token per step, and it has done that work *before*. After 128 steps the model has performed **73,664 token-forwards** to produce 128 new ones. The red area is almost the entire rectangle.
+  </Step>
+
+  <Step title="5. Count the work">
+    Here is the number to remember: 73,664 token-forwards were done, 640 were needed. **99.1% of the arithmetic was thrown away.** For a 4,096-token prompt and 512 output tokens it is 99.8%.
+  </Step>
+
+  <Step title="6. Replace the red with blue">
+    Now the fix, which this module is entirely about. The old tokens' keys and values are **stored, not recomputed** — <Term t="kv-cache">the KV cache</Term>. Each step reads them back from memory (blue) and computes exactly one new token (green). Same answer, 115× less arithmetic, and the work is now linear in the output length.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### The unit of work: a token-forward
+
+From Module 02: a forward pass over a sequence of *m* tokens costs $F = 2 m P$ FLOPs, where $P$ is the parameter count — every weight touched once per token, two FLOPs per multiply-add. So the natural unit of work is the **token-forward**: one token pushed through the whole model.
+
+$$
+F = 2 P m \qquad [\text{FLOPs}]
+$$
+
+A token-forward for Llama-3.1-8B has $P = 8.03 \times 10^{9}$, so $F = 2P \approx 16.1$ GFLOP. That is the atom. Everything below counts atoms.
+
+### Counting the naive loop
+
+With a prompt of $p$ tokens and $n$ tokens to generate, a naive generator does step $i = 0, 1, \ldots, n-1$ on a sequence of $p + i$ tokens:
+
+$$
+W_{\text{naive}} = \sum_{i=0}^{n-1} (p + i) = n p + \frac{n(n-1)}{2}
+$$
+
+The cache version processes the prompt once and then one token per step:
+
+$$
+W_{\text{cached}} = p + n
+$$
+
+<Callout type="math" title="Worked example: 512-token prompt, 128 tokens out, Llama-3.1-8B">
+  $$
+  W_{\text{naive}} = 128 \times 512 + \frac{128 \times 127}{2} = 65{,}536 + 8{,}128 = 73{,}664
+  $$
+
+  $$
+  W_{\text{cached}} = 512 + 128 = 640
+  $$
+
+  Ratio $= 73{,}664 / 640 = 115$. Waste $= 1 - 640/73{,}664 = 99.13\%$.
+
+  As FLOPs: $W_{\text{naive}} \times 16.1 \approx 1.19 \times 10^{15}$, or **1.19 PFLOP thrown away** to write a short paragraph.
+</Callout>
+
+There is a cleaner way to say the same thing, and it is the one you will use when reasoning about your own service. Divide the naive total by the tokens generated:
+
+$$
+\frac{W_{\text{naive}}}{n} = p + \frac{n-1}{2}
+$$
+
+**You spend one token-forward for every token of *average* context length, to produce one token.** With a 512-token prompt and 128 output tokens that is 512 + 63.5 = **576 token-forwards per output token**. With a 32K context it is over 32,000. The cache makes the number exactly 1.
+
+| Prompt $p$ | Output $n$ | Naive token-forwards | Needed | Ratio | Wasted |
+|---|---|---|---|---|---|
+| 128 | 64 | 10,208 | 192 | 53× | 98.1% |
+| 512 | 128 | 73,664 | 640 | 115× | 99.1% |
+| 1,024 | 256 | 294,784 | 1,280 | 230× | 99.6% |
+| 4,096 | 512 | 2,227,968 | 4,608 | 484× | 99.8% |
+
+The growth is the real story. With $p = 4n$ — a prompt four times the length of the answer, which is typical — the naive cost is about $n \cdot p + n^2/2 \approx 4.5 n^2$ token-forwards, and the ratio grows **linearly with the output length**. Double the answer and you double the waste. There is no length at which this becomes acceptable.
+
+```python
+def forwards_naive(p, n):
+    """Token-forwards a recomputing generator does."""
+    return sum(p + i for i in range(n))      # n*p + n(n-1)/2
+
+def forwards_cached(p, n):
+    """Token-forwards a generator with a KV cache does."""
+    return p + n                              # the prompt once, one token per step
+
+for p, n in [(128, 64), (512, 128), (1024, 256), (4096, 512)]:
+    a, c = forwards_naive(p, n), forwards_cached(p, n)
+    print(f"p={p:>5} n={n:>4}  naive={a:>9,}  cached={c:>7,}  {a/c:6.0f}x  waste {100*(1-c/a):5.1f}%")
+```
+
+### Why 99% wasted arithmetic is not 99% wasted time
+
+This is the part that surprises everyone, and it falls straight out of Module 02's roofline.
+
+A <Term t="memory-bound">memory-bound</Term> decode step is waiting on the memory system, with the tensor cores **idle**. Feeding that idle machine a hundred times more arithmetic is nearly free in wall-clock terms. So the honest comparison on one H100 is not "115× slower" — it is about **2.2× slower** for a 128-token answer, and about 6× for a 2,048-token answer.
+
+Look at the wall-clock line in the readout above the diagram. Two seconds instead of one, for the same 128 tokens. Why so tame?
+
+<Callout type="intuition" title="Waste only costs what it is made of">
+  FLOPs and bytes are different currencies, bought at very different exchange rates. A recomputing generator spends the currency the machine has in surplus (arithmetic) and keeps the one it is short of (bandwidth). That is why 99% of the FLOPs can be worth 50% of the time.
+
+  The rule generalises: **an optimization is only worth what it saves in the scarce resource.** On a memory-bound workload, cutting bytes is worth far more than cutting FLOPs. On a compute-bound one, the reverse.
+</Callout>
+
+Recomputation is not free. It is merely paying in the wrong currency. And there are three places where the bill arrives anyway.
+
+<Callout type="pitfall" title="The three places the waste really bites">
+  **1. Long answers.** The ratio grows linearly in $n$. At 2,048 output tokens you are 6× slower; at 8,192, about 18×. The quadratic term $n(n-1)/2$ does not care how fast the GPU is.
+
+  **2. Batching — the killer.** Without a cache you cannot amortise anything. A batch of 32 conversations is 32 independent quadratic recomputations, so serving 32 users costs 32× the work instead of sharing one read of the weights. Throughput per GPU collapses, and cost per token explodes. This is why no serving engine offers it.
+
+  **3. Long context.** Once the conversation is long enough that the KV history outweighs the model, *reading* that history is the bottleneck instead. A generator that re-derives it from scratch must also write all of it again on every step, so the memory traffic is quadratic too.
+</Callout>
+
+### The loop you will see in real code
+
+Here is the naive generator, spelled out. It is four lines, and it is exactly the shape of code that gets shipped by accident.
+
+```python
+ids = tokenizer(prompt, return_tensors="pt").input_ids
+generated = []
+for _ in range(max_new_tokens):
+    logits = model(input_ids=ids).logits       # the WHOLE sequence, every call
+    nxt = int(logits[0, -1].argmax())
+    generated.append(nxt)
+    ids = torch.cat([ids, torch.tensor([[nxt]])])   # next call recomputes all of it
+```
+
+It is not hypothetical. `model.generate(..., use_cache=False)` in HuggingFace Transformers does precisely this, and it is a real option on the `generate` API because it is the honest reference implementation: no cache, no bugs, easy to check. It is how you measure what the cache is worth. It is not how you serve anyone.
+
+<Callout type="real" title="Why the cache is the substrate, not an optimization">
+  The KV cache is usually taught as a constant-factor speedup, and that undersells it. Once old keys and values live outside the model, several things that are otherwise impossible become routine:
+
+  - **Batching.** One forward pass serves every sequence in the batch, because each sequence only needs its own new row computed.
+  - **Prefix sharing.** Two requests with the same system prompt can share one set of cached keys and values (Module 10).
+  - **Paged storage.** The cache becomes a block allocator you can page in and out of a pool (Module 08).
+  - **Disaggregation.** Prefill on one GPU, decode on another, moving the cache between them (Module 21).
+  - **Speculation.** A draft model proposes several tokens; the target model verifies them all in one pass over the shared cache (Module 16).
+
+  Every one of those is a Module 05 idea wearing a later module's clothes. This is the foundation.
+</Callout>
+
+<Callout type="mentor">
+  When you profile a slow decode loop, check for this before anything clever: is the same prefix being re-processed every step? The symptom is a step time that *grows with the output length* — a clean, unmistakable signature, because a cached decode step is nearly independent of how many tokens came before.
+</Callout>
+
+## What the fix has to cost
+
+Everything in engineering is a trade. A cache is memory that is set aside, and it is written to once per generated token. Before Module 05 ends you will have computed exactly how much: **128 KB per token for Llama-3.1-8B in BF16**, 1 GB for an 8,192-token conversation, and a hard ceiling on how many conversations fit on one GPU. That ceiling, not the arithmetic, is what limits a real service.
+
+The next lesson builds the cache. Then we separate the two phases of a request, because they are different workloads that want opposite things from the hardware.
+
+<KeyNotes>
+  1. A model emits **one token per forward pass**, and each new token is fed back in. That is autoregressive generation.
+  2. Count work in **token-forwards**: one token through the whole model, worth $F = 2P$ FLOPs. 16.1 GFLOP each for Llama-3.1-8B.
+  3. A naive generator does $np + n(n-1)/2$ token-forwards. A cached one does $p + n$. For a 512-token prompt and 128 output tokens that is 73,664 against 640: **99.1% waste**.
+  4. Equivalently: a naive generator spends **one token-forward per token of average context** to produce one token. 576 forwards per token at p = 512, n = 128.
+  5. Waste is *quadratic* in the output length, so the ratio grows linearly. There is no answer length at which recomputing becomes acceptable.
+  6. 99% wasted FLOPs is only about 2.2× wasted time on an H100, because decode is memory-bound and the tensor cores are idle. **Waste costs what it is made of** — spend the surplus resource, not the scarce one.
+  7. The waste becomes expensive where the arithmetic is the scarce resource: long answers, any form of batching, and long context where KV traffic exceeds weight traffic.
+  8. `use_cache=False` is the reference implementation of this loop. Useful for measuring the cache's value, wrong for serving.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A 512-token prompt generates 128 tokens with no cache. How many token-forwards does a naive generator do?', numeric: true, answer: 73664, tolerance: 900, unit: 'token-forwards', why: 'n·p + n(n−1)/2 = 128 × 512 + 128 × 127 / 2 = 65,536 + 8,128 = 73,664.' },
+  { q: 'Same request, with a KV cache. How many token-forwards are actually needed?', numeric: true, answer: 640, tolerance: 10, unit: 'token-forwards', why: 'The prompt is processed once (512) and then one token per decode step (128), so 512 + 128 = 640. The ratio is 73,664 / 640 = 115×.' },
+  { q: 'A naive generator does 1.18 PFLOP to produce 128 tokens, yet only takes about 2.2× as long as a cached one. Why?', options: ['The extra FLOPs are free because the GPU has spare capacity', 'Decode is memory-bound, so the idle tensor cores absorb the extra arithmetic', 'The naive version skips the attention step', 'FLOPs and time are the same thing on modern GPUs'], answer: 1, why: 'A memory-bound decode step leaves the compute units idle. Recomputing converts the problem into a compute-bound one, which is a bad trade but not a 115× one. Waste costs what it is made of: bytes are scarce, FLOPs are not.' },
+  { q: 'A 1,024-token prompt generates 256 tokens with no cache. How many token-forwards is that?', numeric: true, answer: 294784, tolerance: 3000, unit: 'token-forwards', why: 'n·p + n(n−1)/2 = 256 × 1,024 + 256 × 255 / 2 = 262,144 + 32,640 = 294,784. The linear term is 89% of that, which is why the ratio looks so stable until n grows large enough for the quadratic term to matter.' },
+  { q: 'Which of these is the strongest practical reason the KV cache exists?', options: ['It makes the weights smaller', 'It lets one forward pass serve a whole batch, instead of each sequence paying quadratic cost', 'It removes the need for attention', 'It makes generation exactly reproducible'], answer: 1, why: 'With cached keys and values, every sequence in a batch only needs its own new row computed, so the weight read is shared. Without the cache a batch of 32 is 32 independent recomputations, and per-GPU throughput collapses.' },
+  { q: 'Llama-3.1-8B has 32 layers, 8 key/value heads of dimension 128, and stores BF16 numbers. About how many bytes of KV cache does one token of context cost?', numeric: true, answer: 131072, tolerance: 3000, unit: 'bytes', why: '2 (K and V) × 32 layers × 8 heads × 128 dims × 2 bytes = 131,072 bytes, which is 128 KB per token. That is the number the next lesson is about.' },
+] } />

@@ -1,0 +1,255 @@
+---
+title: 'Serving a model over HTTP'
+summary: 'Put a loaded model behind an HTTP endpoint: accept an OpenAI-compatible request, stream tokens back as server-sent events, handle concurrency honestly, and add the health, limits and shutdown a real service needs.'
+objectives:
+  - Write a streaming HTTP endpoint that emits tokens as server-sent events
+  - Explain what the OpenAI-compatible API shape buys you and how to call it
+  - Describe what concurrency costs in KV cache before it costs throughput
+  - Add the health check, request limits and graceful shutdown a production service needs
+---
+import HttpStream from '@/components/viz/first-llm/HttpStream.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A model in a notebook is a demo. A model behind an HTTP endpoint is a service, and the moment it is a service other things start to matter: other people's requests, the network, a load balancer asking whether you are alive, and what happens when you need to restart.
+
+This lesson builds that endpoint from nothing. It is the last piece of the "run your first LLM" loop — download, generate, watch, **serve**.
+
+## The shape of a request
+
+Everything arrives as one JSON object. The model never sees HTTP; the server translates JSON into tokens and translates tokens back into JSON.
+
+```json
+{
+  "model": "Qwen2.5-0.5B-Instruct",
+  "messages": [
+    {"role": "system", "content": "You are terse."},
+    {"role": "user",   "content": "What is a GPU?"}
+  ],
+  "stream": true,
+  "max_tokens": 256,
+  "temperature": 0.7
+}
+```
+
+<Callout type="real" title="Why the OpenAI-compatible shape">
+  Nearly every open inference engine accepts requests shaped like OpenAI's `POST /v1/chat/completions` and answers with the same JSON. That is deliberate: it means an application written against OpenAI can point at your local GPU server by changing a **base URL** and nothing else. Designing your own incompatible shape would throw that away, so we use theirs.
+</Callout>
+
+<Scrolly>
+  <HttpStream client:visible slot="stage" />
+
+  <Step title="1. One HTTP request">
+    A client POSTs to your server. From the server's point of view it receives bytes and owes the client bytes back. Everything else — models, batching, streaming — happens inside those two moments.
+  </Step>
+
+  <Step title="2. JSON goes in">
+    The request carries the model name, the conversation, and the generation parameters. **The client chooses the model and the limits.** Your server must validate them: an unbounded `max_tokens` is an unbounded bill.
+  </Step>
+
+  <Step title="3. The server owns the model">
+    The weights are loaded once and stay resident on the GPU between requests. Loading a model takes seconds; generating a token takes milliseconds. Load once, serve many — that is the entire reason an inference server exists at all.
+  </Step>
+
+  <Step title="4. One answer, or many">
+    You can return the whole answer in a single response, or stream it. Same endpoint, same work, same GPU time. The difference is purely when the client is allowed to see the tokens.
+  </Step>
+
+  <Step title="5. Server-sent events">
+    Streaming uses <Term t="sse">server-sent events</Term>: one long-lived HTTP response with `Content-Type: text/event-stream`, and a `data:` line per event. It is simple, works over plain HTTP, and every browser and HTTP client understands it.
+  </Step>
+
+  <Step title="6. The stream, token by token">
+    Each token is written and **flushed immediately**. Never wait to batch them — buffering in the server to "send more efficiently" reintroduces the delay streaming was supposed to remove, and holds the KV cache longer.
+  </Step>
+
+  <Step title="7. What the client sees">
+    The first token arrives after time to first token; the rest arrive at the decode rate. The client renders each one as it lands, which is exactly the behaviour of every chat product you have used.
+  </Step>
+
+  <Step title="8. Concurrency is not free">
+    Two in-flight requests means two KV caches. Before concurrency is a throughput lever it is a **memory** lever, and on a tight GPU it is an out-of-memory crash. Modules 07 and 08 are about doing this properly.
+  </Step>
+
+  <Step title="9. Health, limits, shutdown">
+    Three things every real server has from day one: a `/health` route that answers instantly without touching the GPU, a hard `max_tokens` cap, and a signal handler that stops accepting work and drains what is in flight.
+  </Step>
+</Scrolly>
+
+## The server
+
+This is a complete, working streaming server. It is about forty lines, and you should be able to explain every one.
+
+```python
+import asyncio, json, os
+import torch
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+from threading import Thread
+
+MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+MAX_TOKENS = 512          # a server-side ceiling the client cannot exceed
+
+tok = AutoTokenizer.from_pretrained(MODEL)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL, dtype=torch.bfloat16, device_map="cuda")
+model.eval()
+
+app = FastAPI()
+
+class ChatRequest(BaseModel):
+    messages: list[dict]
+    stream: bool = True
+    max_tokens: int = 256
+    temperature: float = 0.7
+
+@app.get("/health")
+def health():
+    # Must be cheap: a load balancer will hammer this route.
+    return {"status": "ok"}
+
+@app.post("/v1/chat/completions")
+async def chat(req: ChatRequest):
+    text = tok.apply_chat_template(
+        req.messages, tokenize=False, add_generation_prompt=True)
+    inputs = tok(text, return_tensors="pt").to("cuda")
+
+    # Clamp: never trust the client's limits.
+    max_new = min(req.max_tokens, MAX_TOKENS)
+
+    streamer = TextIteratorStreamer(
+        tok, skip_prompt=True, skip_special_tokens=True)
+
+    worker = Thread(target=model.generate, kwargs={
+        **inputs,
+        "max_new_tokens": max_new,
+        "temperature": req.temperature,
+        "do_sample": req.temperature > 0,
+        "streamer": streamer,
+    })
+    worker.start()
+
+    async def events():
+        try:
+            for piece in streamer:
+                yield f"data: {json.dumps({'choices':[{'delta':{'content':piece}}]})}\n\n"
+                # Yield to the event loop so other requests get a turn.
+                await asyncio.sleep(0)
+            yield "data: [DONE]\n\n"
+        finally:
+            worker.join()          # never leak a GPU thread
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+<Callout type="pitfall" title="Four things that break this in production">
+  1. **Running `generate` on the event loop.** It is a blocking, multi-second call. It must live on its own thread (as above), or the whole server stops answering while one request generates.
+  2. **Trusting the client's `max_tokens`.** A client that asks for 100,000 tokens will try to OOM your GPU. Clamp it on the server. Always.
+  3. **Not joining the worker thread.** If the client disconnects and you never `join`, the thread keeps generating against a dead connection and the KV cache never frees.
+  4. **A blocking `/health`.** If your health check touches the GPU, it will start failing exactly when you are overloaded — and a load balancer will then send you *more* traffic.
+</Callout>
+
+## Calling it
+
+From Python, with the OpenAI client pointed at your server:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-used")
+
+stream = client.chat.completions.create(
+    model="Qwen2.5-0.5B-Instruct",
+    messages=[{"role": "user", "content": "What is a GPU?"}],
+    stream=True,
+    max_tokens=128,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+Or with plain `curl`, to see the wire format yourself:
+
+```bash
+curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":32}'
+```
+
+The `-N` disables curl's output buffering — without it curl will hide the streaming from you and you will wrongly conclude the server does not stream.
+
+<Callout type="try" title="Change one thing and watch">
+  1. Set `"stream": false` and compare how the response *arrives*. Same total time, completely different experience.
+  2. Add a `print()` with a timestamp in the `events()` generator and watch the intervals between tokens. That is your decode rate, measured.
+  3. Fire two requests concurrently with `asyncio.gather`. They will interleave token by token, and both will be slower than either alone. That is real, and it is exactly the latency–throughput trade-off from Module 00.
+</Callout>
+
+## Concurrency, honestly
+
+Serving one request at a time is correct and terribly slow: while a single user generates, the GPU reads weights for one token and then waits. Let many requests share the weights and throughput rises sharply — this is the single biggest win in serving, and it is the subject of Modules 07 and 08.
+
+But every concurrent request needs its own KV cache. For Qwen2.5-0.5B at 2,048 tokens that is only about 25 MB, so you can fit hundreds on a 16 GB card. Scale the arithmetic up and the picture changes fast:
+
+| Model | KV per token (BF16) | KV at 2,048 tokens | Max conversations in 8 GB |
+|---|---|---|---|
+| Qwen2.5-0.5B | 12 KB | 25 MB | ~300 |
+| Llama-3.1-8B | 128 KB | 262 MB | ~30 |
+| Llama-3.1-70B | 320 KB | 671 MB | ~11 |
+
+Read the last column as **the price of a longer context**. Llama-3.1-70B has 80 layers to 8B's 32, so its KV cache per token is 2.5× larger even though the two models are the same family. That single row is why "just use a bigger model" is a memory decision, not a quality one.
+
+<Callout type="math" title="Where the ceiling comes from">
+  With $n$ concurrent requests at context $T$, the KV cache is $n \times T \times \text{bytes per token}$. Add the weights and you must stay under GPU memory. Solve for $n$:
+
+  $$
+  n_{\max} \approx \frac{\text{free memory}}{\text{bytes per token} \times T}
+  $$
+
+  Doubling the context halves the number of conversations you can serve with no change in code. That trade is the whole of Module 05.
+</Callout>
+
+## The operational minimum
+
+Three things to add before this is a service rather than a script:
+
+```python
+import signal
+
+@app.get("/metrics")
+def metrics():
+    return {
+        "gpu_memory_gb": torch.cuda.memory_allocated() / 1e9,
+        "model": MODEL,
+    }
+
+def shutdown(signum, frame):
+    # Stop accepting, let in-flight requests finish, then exit.
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, shutdown)   # what Kubernetes sends on delete
+```
+
+- **Health check** that answers without the GPU, so the load balancer's view of your health does not collapse under load.
+- **Metrics** — memory used, requests in flight, tokens per second. You cannot operate what you cannot see, and Module 24 is the full version of this.
+- **Graceful shutdown** on `SIGTERM`, so a rolling restart does not cut off answers in progress.
+
+<KeyNotes>
+  1. A model behind HTTP is a service. The endpoint accepts JSON and returns either one JSON answer or a stream of them; the model itself never sees HTTP.
+  2. Load the weights once and keep them resident. Loading takes seconds, generating takes milliseconds — an engine exists purely to amortise that load.
+  3. Streaming is server-sent events: one long-lived response, `Content-Type: text/event-stream`, one `data:` line per token, flushed immediately.
+  4. Never buffer tokens server-side to "send more efficiently" — that restores the delay streaming removed and holds the KV cache longer.
+  5. Always run `generate` on a separate thread and always join it, or a disconnected client leaks a GPU thread and its KV cache.
+  6. Clamp `max_tokens` on the server. An unbounded request is an unbounded bill and an out-of-memory crash.
+  7. Concurrency is a memory decision first: $n$ requests at context $T$ need $n \times T \times$ bytes-per-token of KV cache. Modules 07 and 08 make this efficient.
+  8. The OpenAI-compatible request shape means an existing app points at your GPU server by changing one base URL.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A streaming response uses which mechanism to send tokens one at a time over plain HTTP?', options: ['HTTP long-polling with repeated POSTs', 'Server-sent events: one response with a data: line per event', 'WebSocket required', 'The server buffers and sends periodically'], answer: 1, why: 'SSE keeps one HTTP response open and writes a data: line per token, flushed immediately. No WebSocket is needed, and every client understands it.' },
+  { q: 'Why must the generate() call run on a background thread in an async server?', options: ['It is faster on a thread', 'It is a long blocking call; on the event loop it would stall every other request', 'Threads use less GPU memory', 'It is required by PyTorch'], answer: 1, why: 'generate blocks for the whole generation. Called directly inside an async handler it blocks the event loop, so the server stops answering health checks and other requests for seconds.' },
+  { q: 'Llama-3.1-8B KV cache is 128 KB per token in BF16. At 2,048 tokens of context, how much KV cache does one conversation need?', numeric: true, answer: 256, tolerance: 8, unit: 'MB', why: '128 KB × 2,048 = 262,144 KB = 256 MB (using 1024-based KB here). In decimal terms it is 131,072 B/token × 2,048 ≈ 268 MB. Either way, one 8B conversation at 2K context costs about a quarter gigabyte of KV cache.' },
+  { q: 'Your /health endpoint queries the GPU for utilization. What happens when the GPU saturates?', options: ['It stays healthy', 'Health checks start failing under load, so the load balancer sends even more traffic to the overloaded server', 'The server crashes', 'Requests are rejected correctly'], answer: 1, why: 'Health must be cheap and independent of load. If it touches a busy GPU it times out exactly when you are overloaded, and a load balancer treats that as "unhealthy" and routes around you — or, in a single-replica setup, keeps hammering you.' },
+  { q: 'The client sets max_tokens to 100,000. What must the server do?', options: ['Honour it', 'Clamp it to a server-side maximum', 'Return an error', 'Truncate silently to the context length'], answer: 1, why: 'A server must never trust client-side limits. An unbounded max_tokens means unbounded generation time, unbounded KV growth and an out-of-memory crash. Clamp server-side; every production engine does.' },
+  { q: 'Two requests are in flight instead of one. What is the first-order cost of that, before any throughput gain?', options: ['Two KV caches must fit in memory', 'The GPU halves its bandwidth', 'The tokenizer runs twice as long', 'The model must be loaded twice'], answer: 0, why: 'Each in-flight request carries its own KV cache, so concurrency is first a memory question. If the caches do not fit, you get an out-of-memory error. Modules 07 and 08 address how to serve many requests from limited KV memory.' },
+]} />

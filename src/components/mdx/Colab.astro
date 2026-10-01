@@ -1,0 +1,29 @@
+---
+import Icon from '../Icon.astro';
+import { colabUrl, url } from '../../site';
+interface Props { nb: string; title?: string; gpu?: boolean }
+const { nb, title = 'Open the lab notebook', gpu = true } = Astro.props;
+---
+<div class="colab">
+  <div class="cb-text">
+    <p class="cb-title"><Icon name="flask" size={18} /> <strong>{title}</strong></p>
+    <p class="cb-help">
+      Runs free on Google Colab.{gpu && <> In Colab choose <em>Runtime → Change runtime type → T4 GPU</em> before running.</>}
+      Then run the cells top to bottom with <kbd>Shift</kbd>+<kbd>Enter</kbd>.
+    </p>
+  </div>
+  <div class="cb-actions">
+    <a class="btn k-compute" href={colabUrl(nb)} target="_blank" rel="noopener">Open in Colab <Icon name="external" size={15} /></a>
+    <a class="btn ghost" href={url('notebooks/' + nb)} download>Download .ipynb <Icon name="download" size={15} /></a>
+  </div>
+</div>
+
+<style>
+  .colab { margin: 2rem 0; display: grid; grid-template-columns: 1fr auto; gap: 1rem 1.5rem; align-items: center; padding: 1.1rem 1.2rem; border: 1px solid var(--rule-2); border-radius: 4px; background: var(--ground-2); }
+  .cb-title { display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.3rem; }
+  .cb-title :global(.icon) { color: var(--compute); }
+  .cb-help { margin: 0; font-size: 0.86rem; color: var(--text-2); }
+  .cb-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+  .btn.k-compute { background: var(--compute); border-color: var(--compute); }
+  @media (max-width: 700px) { .colab { grid-template-columns: 1fr; } }
+</style>

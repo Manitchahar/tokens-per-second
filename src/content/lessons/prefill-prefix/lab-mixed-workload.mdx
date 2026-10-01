@@ -1,0 +1,144 @@
+---
+title: 'Lab: Optimize a mixed long-prompt workload'
+summary: 'Take one GPU serving short chat prompts and long RAG prompts, and turn it from unoptimized to goodput-positive by changing one knob at a time — chunk size, prefix cache, arrival rate — and reading the percentiles the way Module 06 taught you.'
+objectives:
+  - Build a simulator of the prefill/decode engine loop
+  - Measure how long-prompt interference moves p99 TTFT
+  - Find the chunk size that removes the stall at no throughput cost
+  - Quantify the gain from prefix caching on a realistic workload
+  - Choose a configuration and defend it against the SLO
+---
+import MixedWorkload from '@/components/viz/prefill-prefix/MixedWorkload.tsx';
+
+Everything in the last two lessons is a claim about a queue. This lab is where you check the claims.
+
+You get a simulator of the engine loop — the one from *Long-prompt interference & chunked prefill* in Lesson 10.1 — and five knobs. Your job is to find the configuration that maximizes <Term t="goodput">goodput</Term>: the fraction of requests that meet an interactive SLO, not the one that maximizes raw tokens per second.
+
+<Scrolly>
+  <MixedWorkload client:visible slot="stage" />
+
+  <Step title="1. A mixed workload">
+    Short chat prompts and long RAG prompts sharing one GPU. Thirty-five percent of requests are long, because that is roughly what a product with retrieval looks like, and long prompts want the whole GPU while short ones want a slice.
+  </Step>
+
+  <Step title="2. Turn off everything">
+    Unoptimized: no chunking, no prefix cache. A long prefill takes the GPU in one step and everyone behind it waits. Notice it is the **p99**, not the mean, that collapses. Long prompts are a minority, so they barely move the average and completely destroy the tail.
+  </Step>
+
+  <Step title="3. Chunked prefill only">
+    Cut every prefill into chunks that fit one decode step. The median barely moves and total throughput barely moves, but the tail stops being a cliff. This is a fairness fix, and noticing that throughput is unchanged is the important part.
+  </Step>
+
+  <Step title="4. Add the prefix cache">
+    Every request shares a system prompt and, for the long ones, retrieved context. Cache them and long prompts now cost only their unique tokens. Both latency and throughput improve — the only lever in this lab that moves both.
+  </Step>
+
+  <Step title="5. Push the rate">
+    Raise arrivals and watch the trade-off. Throughput per user falls, total throughput rises, and goodput is the first thing to go. A saturated engine still produces plenty of tokens; it just produces most of them too late to be useful.
+  </Step>
+
+  <Step title="6. Pick the config">
+    Chunk small enough for fairness, cache as much as the tree holds, and accept the throughput ceiling that physics sets. Then raise the rate as far as goodput allows — that number, not tokens per second, is your capacity.
+  </Step>
+</Scrolly>
+
+<Colab nb="10-prefix-lab.ipynb" />
+
+## Part 1 · On the real GPU: measure the two phase costs
+
+Start on hardware. Everything above is arithmetic on paper; this part confirms the constants with your own measurements, which is what makes the rest of the lab real.
+
+Use **Qwen2.5-0.5B-Instruct**. It has 0.49B parameters, so a 1,024-token prefill is a few milliseconds on a T4 — fast enough to sweep. The ratios you measure transfer to 8B even though the absolute numbers do not, because both scale linearly in parameter count.
+
+The notebook times:
+
+1. Prefill at 128, 256, 512, 1024 tokens, in BF16 and in FP32 — confirming prefill time scales with tokens and shrinks with precision.
+2. Decode for batches of 1, 8, 32, 64 — confirming decode is memory-bound and nearly flat in batch size.
+3. The **crossover chunk size**: the chunk at which prefill time equals one decode step. This is the chunk-size formula from the lesson, measured rather than assumed.
+4. The interference penalty: time a decode step alone, then time a step that also does an 8,192-token prefill, and record the ratio.
+
+Record `c_star`, `t_prefill_per_token`, and `t_decode_step` in your notes. You will use them in Part 2.
+
+## Part 2 · Compute the interference by hand
+
+Now use your measured constants to predict what the simulator will show, *before* you run it. For a service with 32 decoding users at 1,024 context and a long prompt of $n$ tokens arriving:
+
+```
+stall_ms          = t_prefill(n) - t_decode_step        (floored at 0)
+other_users_tpot  = t_decode_step + stall_ms
+speedup_factor    = t_decode_step / other_users_tpot
+wasted_GPU_ms     = stall_ms                            (per long request)
+```
+
+Do this for prompt lengths of 2,000, 8,000 and 32,000 tokens and write the table down. The predicted `speedup_factor` at 8,000 tokens is the number that should make you wince.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. If `t_decode_step` is 20 ms and a prefill takes 236 ms, what is the worst-case TPOT for an innocent user, and how much worse is it than their normal TPOT?
+  2. Chunking to 512 tokens makes each prefill 15 ms. Why does that not slow the *long* user down much, even though they now wait 16 steps instead of 1?
+  3. If you chunk to 128 tokens, what happens to the total time for that 8,000-token prompt, and why does the extra time appear at all?
+</Callout>
+
+## Part 3 · Drive the simulator
+
+The in-browser simulator runs the same loop, deterministically, so every number is reproducible. Work in this order and record each row:
+
+| Run | Change | p50 TTFT | p99 TTFT | Mean TPOT | Throughput | Goodput |
+|---|---|---|---|---|---|---|
+| 1 | Nothing: no chunking, no cache | | | | | |
+| 2 | Prefix cache only | | | | | |
+| 3 | Chunked prefill only (512) | | | | | |
+| 4 | Both | | | | | |
+| 5 | Both, chunk 128 | | | | | |
+| 6 | Both, chunk 2048 | | | | | |
+| 7 | Both, long share 0.7 | | | | | |
+| 8 | Both, rate raised until goodput &lt; 0.9 | | | | | |
+
+Then answer these, with numbers from your own runs:
+
+1. **Which single change most improves p99?** Chunking or caching? Why do you think that is, given each targets a different mechanism?
+2. **Which change improves throughput?** Does it improve p50 as well? If they move together, explain why in terms of queueing delay.
+3. **Runs 5 and 6 vs run 4**: why does a smaller chunk cost throughput while a larger one costs fairness? Which knob is the throughput/fairness dial?
+4. **Run 7**: as the long-prompt share rises, what happens to goodput at a fixed arrival rate, and which SLO breaks first?
+5. **Run 8**: what is your maximum sustainable rate? How does it compare to a deployment with only short prompts?
+
+## Part 4 · The deliverable
+
+Write a one-page **tuning memo** for the service described in Part 1. It must contain:
+
+- the chosen configuration (chunk size, cache on/off, and the rate you would deploy at);
+- your measured p50 and p99 TTFT and mean TPOT at that configuration;
+- the predicted capacity in requests per second, from the goodput-0.9 point;
+- one sentence per knob explaining why it is set where it is;
+- a fallback: what you would change if you moved from an H100 to an A100, and why the chunk size would need recomputing;
+- a metric you would alert on in production, and the threshold.
+
+<Callout type="mentor" title="What a strong memo concludes">
+  The interesting sentence is not the configuration — it is the *capacity* and the *alert*. Anyone can copy a chunk size. The engineer's job is to say: at this rate and this SLO we serve N requests per second, we find out first from the p99, and we trip at 90% goodput. That is the sentence that gets paged at 3am — or does not.
+</Callout>
+
+## Part 5 · Take it to a real engine
+
+If you have a GPU with more than 16 GB, run vLLM with the same workload and confirm the simulator's shape:
+
+```bash
+# Chunked prefill with a 2,048-token budget and prefix caching on
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --max-model-len 16384 \
+  --enable-prefix-caching \
+  --max-num-batched-tokens 2048 \
+  --disable-log-requests
+```
+
+Send a mix of 200-token and 8,000-token prompts at a controlled rate (the notebook has a small load generator) and compare your measured p99 TTFT with the simulator's. Expect the same *shape* and a different absolute number, because a real engine adds attention implementations, scheduling fairness and launch overhead the simulator omits. **Predicting the shape and then explaining the gap is the skill.**
+
+<KeyNotes>
+
+  1. Measure prefill and decode separately before modelling anything. Prefill time scales with tokens; decode time is nearly flat in batch size.
+  2. Derive the crossover chunk size from your own measurements. It is the chunk whose prefill time equals one decode step.
+  3. Interference is a **p99** problem, not a mean problem. Long prompts are a minority of traffic and completely dominate the tail.
+  4. Chunking buys fairness at a small throughput cost. It bounds the worst wait; it does not reduce the arithmetic.
+  5. Prefix caching is the only lever in this lab that improves latency *and* throughput, because it removes GPU work rather than reordering it.
+  6. The chunk size is the fairness/throughput dial: smaller is fairer and slower, larger is faster and cliff-like.
+  7. Goodput is the capacity number: find the arrival rate at which it crosses 0.9 and deploy below it.
+  8. Recompute the chunk size when the hardware or model changes — it is a ratio of decode time to prefill time per token, and both terms move.
+</KeyNotes>

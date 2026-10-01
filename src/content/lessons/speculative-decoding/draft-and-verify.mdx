@@ -1,0 +1,228 @@
+---
+title: 'Draft & verify: the core trick'
+summary: 'Decode produces one token per step and each step re-reads every weight. Speculative decoding breaks the serial chain: something cheap guesses several tokens ahead, the real model checks the whole guess in one pass, and the wrong ones are thrown away. You learn why the check is nearly free and why being wrong costs nothing.'
+objectives:
+  - Explain why decode is memory-bound and why that makes one extra token in a step nearly free
+  - Describe the three phases of a speculative block — draft, verify, then accept the prefix
+  - Compute how many tokens a block yields from its accepted prefix plus the bonus token
+  - State what makes the technique exact rather than an approximation
+  - Implement the rejection rule that keeps the output distribution identical to plain sampling
+---
+import DraftVerify from '@/components/viz/speculative-decoding/DraftVerify.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The deepest inefficiency in LLM inference is not arithmetic. It is **waiting**.
+
+Every decode step reads all the weights to produce a single token, because token $n+1$ cannot be computed until token $n$ exists. For Llama-3.1-8B in BF16 that is 16.06 GB of weights per token. On an H100 at 3.35 TB/s that is about **4.8 ms** of unavoidable memory traffic — of which the actual useful arithmetic is a rounding error. Module 02's two-speed-limits lesson and Module 14's decode-attention lesson both ended at this same wall: **decode is memory-bound, and the weights dominate the traffic.**
+
+This module's idea attacks the wall from a direction you have not used yet. Instead of making the read cheaper, **make it produce more**. What follows is <Term t="speculative-decoding">speculative decoding</Term>.
+
+## The one-sentence idea
+
+> Something cheap guesses several tokens ahead. The real model checks all of them **in a single pass**. You keep the guesses that were right and throw away the rest.
+
+The word that matters is *single*. A naive checker would compare one draft token at a time, costing exactly as much as having decoded them. The whole trick is that the target model can score a whole block of positions at once, because of a property it already has.
+
+## Why one pass can check many tokens
+
+Recall the forward pass (Module 03). When the model processes a sequence of $T$ tokens during prefill, every position's keys and values depend only on that position and everything before it. That is the causal mask, and it has a consequence people rarely stop to appreciate:
+
+> **A forward pass over $\gamma + 1$ positions does the same work per position as a forward pass over 1 — it just has more positions to do it for.**
+
+The matrix multiplies get taller: an $M \times K$ weight matrix becomes $(M(\gamma+1)) \times K$. The attention gets a longer key sequence. The KV cache gains $\gamma + 1$ entries instead of 1.
+
+But the **weights are still read from memory exactly once.** And that is the whole cost. So:
+
+$$
+t_{\text{verify}}(\gamma) \approx t_{\text{decode}}(1) \quad \text{for small } \gamma
+$$
+
+Now put it together. If five positions cost the same as one, then a pass that produces five correct tokens is worth five decode steps — while you paid for one. That single forward pass is the <Term t="speculative-verify">verification pass</Term>, and it is the only part of the technique you did not already know how to do.
+
+<Scrolly>
+  <DraftVerify client:visible slot="stage" />
+
+  <Step title="1. Decode is one token per step">
+    Decode is strictly serial. Each step streams every weight from HBM and emits exactly one token, and the next step cannot start until that token exists. **The cost is per token, and it is paid in bytes, not arithmetic.**
+  </Step>
+
+  <Step title="2. Something cheap guesses ahead">
+    A small draft model proposes $\gamma$ tokens. They carry no guarantee — a bad guess costs nothing yet, because nothing has been committed. This is where "speculative" comes from: the work is a guess until proven.
+  </Step>
+
+  <Step title="3. The guesses are just guesses">
+    In the example the draft is right for two tokens and then wrong. That is normal. A draft model is a cheaper approximation of the target, so it agrees often, not always.
+  </Step>
+
+  <Step title="4. The target checks the whole block at once">
+    The target model runs **once** over $\gamma + 1$ positions. Every position is scored in parallel, because each depends only on the context to its left. The weights are read one time. That is the entire mechanism.
+  </Step>
+
+  <Step title="5. Keep the prefix, cut at the first rejection">
+    Walk left to right. Keep tokens matching the target's own prediction; stop at the first disagreement and discard that one and everything after. The accepted prefix is the longest prefix that was genuinely correct.
+  </Step>
+
+  <Step title="6. The last position is a free token">
+    The final position is one the draft never predicted. Whatever the target samples there is correct by definition — so every block emits at least one token, whatever the acceptance rate. This is the <Term t="bonus-token">bonus token</Term>.
+  </Step>
+
+  <Step title="7. One pass, several tokens">
+    Compare the two timelines at the bottom: several serial steps re-read the weights several times, one block reads them once. Raise $\gamma$ in the control and watch the verification cost stay flat.
+  </Step>
+
+  <Step title="8. Why the check is nearly free">
+    Because decode is memory-bound and **weight traffic does not depend on how many positions a step handles**. The block does $\gamma$ times the FLOPs, and that is the only thing that eventually makes it stop being free.
+  </Step>
+</Scrolly>
+
+## The rejection rule
+
+Here is the part that separates speculation from guessing. How exactly do you decide which drafts to keep?
+
+**The rule:** for each position $i$ in the block, let the draft have proposed $x_i$ and let the target's own distribution at that position be $p_i$. Accept $x_i$ if
+
+$$
+\frac{p_i(x_i)}{q_i(x_i)} > u, \qquad u \sim \mathrm{Uniform}(0, 1)
+$$
+
+where $q_i$ is the draft's distribution there. If the test fails, stop, discard $x_i$ and the rest, and instead **sample a replacement from a corrected distribution** — the <Term t="rejection-sampling-correction">rejection correction</Term>:
+
+$$
+p'_i(x) = \mathrm{normalize}\!\left(\max\!\left(0,\ p_i(x) - q_i(x)\right)\right)
+$$
+
+This looks like a strange formula. It is not arbitrary — it is the unique choice that makes the emitted token exactly as likely as if you had sampled from $p$ all along. The intuition: **you keep the probability mass the draft was missing.** Where the draft already put plenty of mass, trust it; where the draft had little, the correction tops it up.
+
+<Callout type="math" title="Why this preserves the distribution exactly">
+  Consider the total probability of an output value $x$. It can arrive two ways: the draft proposed $x$ and we accepted, or we rejected and sampled from $p'$. The first contributes $\sum_i q_i(x)\cdot\min\!\left(1,\ p_i(x)/q_i(x)\right)$. The second contributes the rejection branch. Added together and telescoped over $i$, the sum equals exactly $p(x)$.
+
+  The result is that **speculative decoding does not change what the model says.** It is not an approximation, not a lossy shortcut, not a "fast mode". Given the same seed it can produce the same text; without the correction rule it would be a different sampler entirely. This is the property that made it ship.
+</Callout>
+
+<Callout type="intuition" title="A Venn diagram">
+  Think of $q_i$ and $p_i$ as two opinions about the next token. Wherever they agree — both put most of their mass on " Paris" — the draft is as good as the target, so use it. Where they disagree, the region where $q$ said " Berlin" but $p$ said " Paris" is mass the draft overclaimed, and it gets subtracted out. What is left over is precisely the probability the draft failed to cover, which is what you sample from instead.
+
+  You never sample from $q$ directly. **The draft proposes; the target disposes.**
+</Callout>
+
+## Being wrong is free
+
+The most important property, and the one that makes this safe to use in production:
+
+> **A rejected draft token costs compute and nothing else.** No user ever sees it. No quality is lost.
+
+Contrast this with the alternatives you have met. Pruning attention connections changes what the model can see. Quantization changes the weights themselves. Layer skipping changes the function. All of those are bets on quality, and each one can be measured only by comparing outputs against a reference — which is expensive and, for long generations, statistical.
+
+Speculation has no such tradeoff. You can set the acceptance rate to zero and the output is still *exactly* what plain sampling gives, just slower. **The quality risk is not "slightly different", it is "identical".** What you are trading is time for nothing.
+
+## Why one draft model can draft for many requests
+
+Worth pausing on, because it explains why speculation is cheap in a way that surprises people.
+
+Drafting is not model-specific work. A drafter producing `$the capital of France is$` is doing the same thing whether the surrounding conversation is about geography, finance, or code. And the draft model is an order of magnitude cheaper than the target, so a single drafter can serve several target streams within its own step budget.
+
+This is the same batch-amortises-the-weights argument from the previous module, applied to the draft side. In an engine, drafting is typically batched across the concurrent requests that are all speculating at once. The practical consequence: **$\rho$ gets better as you add more speculative requests**, up to the point where the drafter becomes the bottleneck.
+
+<Callout type="real" title="The practical consequence: draft with a shared model">
+  This is why engines run the drafter as a batched service rather than one instance per request. If you are reading an engine's design and see a single draft model shared across a batch of speculative requests, that is the mechanism working as intended — and it means the $\rho$ you measure at batch 1 is pessimistic for the deployment you actually care about.
+</Callout>
+
+## The batching interaction, in one sentence
+
+Module 07 taught you that batching amortises the weight read across a batch. Speculation amortises the *same* weight read across $\gamma$ tokens. So they compete rather than compound, and that competition is the subject of the fourth lesson. The general rule: **the more a step already amortises, the less speculation has left to give.**
+
+## What this costs in practice
+
+Speculation is not free. You are running a second model, and it makes $\gamma$ *sequential* steps before you get to the one batched verification pass. That is the cost the next lesson quantifies, and the reason not every workload benefits.
+
+For now, the shape of the argument:
+
+- **You win:** many tokens per pass and an acceptance rate well above your draft model's cost ratio.
+- **You lose:** when the block produces barely more than one token, so you have paid for a whole verify pass to get what one decode step would have given you anyway.
+
+## The loop, in pseudocode
+
+Before the derivation, here is the whole thing as code. It is short enough to hold in your head, and every line is justified by something above.
+
+```python
+def speculative_generate(target, draft, prompt, gamma=4, max_tokens=256):
+    """One block of speculative decoding, the standard algorithm."""
+    seq, kv = prompt, target.kv_cache()          # the target's own KV cache
+    out = []
+    while len(out) < max_tokens:
+        # ── 1. DRAFT: gamma tokens, sequentially, on the cheap model ──
+        guesses, draft_ctx = [], seq
+        for _ in range(gamma):
+            x = draft.sample(draft_ctx)           # a SAMPLE, not the argmax
+            guesses.append(x)
+            draft_ctx = draft_ctx + [x]
+
+        # ── 2. VERIFY: the target scores the whole block in ONE pass ──
+        block = seq + guesses
+        p = target.logits(block)                  # [gamma+1, vocab]
+        p = softmax(p)                            # the target's own view
+
+        # the drafter's distributions at each proposed position
+        q = draft.distributions(guesses)
+
+        # ── 3. ACCEPT the prefix, cut at the first rejection ──
+        emitted = []
+        for i, x in enumerate(guesses):
+            if random() < p[i][x] / q[i][x]:      # accept with prob min(1, p/q)
+                emitted.append(x)
+            else:
+                # rejection: sample from the mass the drafter MISSED
+                resid = clamp(p[i] - q[i], min=0)
+                emitted.append(sample(resid / resid.sum()))
+                break
+        else:
+            # every draft accepted: the bonus token, sampled from p
+            emitted.append(sample(p[gamma]))
+
+        # ── 4. COMMIT: only the accepted tokens' KV are real ──
+        out.extend(emitted)
+        seq = seq + emitted                       # the rejected guesses never enter
+    return out
+```
+
+Three details in that loop carry the whole exactness argument, and each is a place a reasonable-looking implementation goes wrong:
+
+1. `draft.sample(...)` must **sample** from the draft's distribution. Using its argmax produces plausible text and the wrong distribution.
+2. The accepted token is appended **as `$x$`**, not resampled — the `q(x)` in the acceptance test cancels the `q(x)` that `$x$` was drawn with. That cancellation *is* the proof.
+3. The bonus token is **sampled** from `$p$`, because plain sampling would have sampled it too. Taking its argmax silently sharpens your output distribution.
+
+<Callout type="mentor" title="Why the KV cache makes this work">
+  Notice what is *not* in the loop. After the block, the target's KV cache contains only the accepted tokens — the rejected guesses are never appended, because they never happened. So the next block starts from a context that is exactly the context plain decoding would have had.
+
+  That is the practical reason the technique composes cleanly with everything you have built: PagedAttention's block table, continuous batching's scheduler, prefix caching. Speculation is a **decoding strategy layered on top of the engine**, not a replacement for it. An engine that can run one token can run a block.
+</Callout>
+
+<Callout type="real" title="What engines ship, at the time of writing">
+  vLLM supports n-gram and model-based speculation, plus a look-ahead decoding mode. TensorRT-LLM has supported both draft-model and Medusa-style heads. llama.cpp has shipped n-gram / prompt-lookup drafting for a long time, which is why it is popular for CPU-only setups where a second neural network would be expensive. The common thread: **a cheap proposer plus the exact verification rule**, because the rule is the part that is not an approximation and cannot be skipped.
+</Callout>
+
+## Where this leaves you
+
+You have the mechanism. Something cheap guesses $\gamma$ tokens, the target checks them all in one pass because positions are causally independent, you keep the accepted prefix, and you get a free bonus token at the end. The output is exactly what plain sampling would have produced.
+
+What you do not yet have is any way to predict whether it will be worth it. That depends on the acceptance rate — how often the draft and target agree — and on the draft model's cost relative to the target's. Those are the two numbers the next lesson derives.
+
+<KeyNotes>
+  1. Decode is memory-bound, so a step's cost is set by reading the weights, and that cost does not depend on how many token positions the step processes.
+  2. Speculative decoding uses that: a cheap proposer drafts $\gamma$ tokens, the target scores all $\gamma+1$ positions in **one** forward pass, and the weights are read once.
+  3. Accept the longest prefix of drafts that matches the target's own predictions; discard the first disagreement and everything after it.
+  4. The final position is never predicted by the draft, so its token is correct by construction and free. **Every block emits at least one token.**
+  5. The rejection rule $p'_i(x) = \mathrm{normalize}(\max(0, p_i(x) - q_i(x)))$ preserves the target's distribution exactly — speculation is not an approximation.
+  6. A rejected draft costs compute and nothing else: no user sees it and no quality is lost. The tradeoff is time, not accuracy.
+  7. Because the verification pass is $\gamma$ times taller in the matmuls, a very large $\gamma$ eventually stops being free — which is why there is a best $\gamma$, not an unbounded one.
+  8. Drafting is sequential and therefore costs real time; speculation pays only when the acceptance rate beats the draft model's cost ratio. That is the next lesson's whole subject.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why can the target model verify a whole block of gamma drafted tokens in one forward pass?', options: ['Because attention can look at future tokens during verification', 'Because each position depends only on itself and earlier context, so all positions can be scored in parallel', 'Because the draft tokens are cheap to recompute', 'Because the GPU can skip weight loading when positions are similar'], answer: 1, why: 'The causal mask means position i depends only on positions up to i. That is the same property prefill exploits to process a whole prompt in one pass. The weights are still read once, and the block is scored position-parallel.' },
+  { q: 'In a block where 2 of 4 drafted tokens are accepted, how many tokens leave the block in total?', numeric: true, answer: 3, tolerance: 0, unit: 'tokens', why: 'Two accepted drafts, plus one bonus token from the final position the draft never predicted. The rejected drafts produce nothing. Accepted = 2, so total = 2 + 1 = 3.' },
+  { q: 'Why is a speculative decoding step able to check several positions for roughly the cost of one decode step?', options: ['Because the weights are cached in registers between positions', 'Because decode is memory-bound, and weight traffic does not depend on the number of positions in a step', 'Because verification skips the KV cache', 'Because the draft tokens make the attention cheaper'], answer: 1, why: 'Decode time is dominated by streaming the weights, which is a fixed byte count per forward pass. Processing gamma+1 positions instead of 1 reads the same weights and writes gamma+1 times more KV, which is negligible next to the weights.' },
+  { q: 'What happens to the output distribution when a draft token is rejected and the corrected distribution p is used?', options: ['It shifts slightly toward lower-probability tokens', 'Nothing — the rejection rule preserves the target distribution exactly', 'It becomes deterministic', 'It becomes higher-entropy than plain sampling'], answer: 1, why: 'The corrected distribution p prime, which keeps the probability mass the draft under-covered, is constructed so the total probability of every output matches plain sampling from the target. Speculation is exact, not approximate.' },
+  { q: 'A decode step on an H100 for Llama-3.1-8B in BF16 must read 16.06 GB of weights. At 3.35 TB/s, about how long is that read?', numeric: true, answer: 4.8, tolerance: 0.6, unit: 'ms', why: '16.06 GB divided by 3.35 TB/s = 4.8 ms. That is the floor for one token, and it is why decode is memory-bound. Speculation does not shrink this number; it gets more tokens out of each one.' },
+  { q: 'Why does speculation stop being free at very large gamma?', options: ['Because the draft model runs out of memory', 'Because verification is memory-bound on the weights, so a block should be free, but the block does gamma times the FLOPs of a single decode step', 'Because the KV cache stops working', 'Because the target model can only attend to 128 positions'], answer: 1, why: 'The weight read is fixed, but the matmuls grow with the number of positions. Eventually the arithmetic, not the memory, sets the time. That is the reason there is an optimal gamma rather than "as large as possible".' },
+]} />

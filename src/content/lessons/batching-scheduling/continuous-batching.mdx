@@ -1,0 +1,199 @@
+---
+title: 'Continuous batching'
+summary: The fix for the batch tail is not a better batch, it is no batch at all. Re-forming the group every step turns a 38%-wasted static batch into a schedule where every seat produces a token on every step — and it introduces a brand-new kind of waste to hunt down.
+objectives:
+  - State the one-line rule of continuous batching and explain what it changes
+  - Measure the tail waste it removes and the wall-clock steps it saves on a real workload
+  - Compute the new waste continuous batching creates, and why the average batch is smaller than the seat count
+  - Explain why continuous batching makes prefill and decode share the same step
+  - Distinguish "no seat wasted" from "no work wasted" for a real production workload
+---
+import ContinuousBatching from '@/components/viz/batching-scheduling/ContinuousBatching.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The previous lesson ended with a number: a static batch on real traffic wastes about a third of every step. The seats are paid for, the weights are read, the KV is walked — and the request sitting in that seat finished two seconds ago.
+
+The instinctive fix is to make batches smarter: group requests of similar length together, or cut the batch when most of it is done. Both were tried, both are worse than what actually shipped. The reason is a structural fact about how the loop is written.
+
+Here is that fact. A static batch is not a collection of sequences — it is a **promise about a group**. The moment you form it, you have committed: these rows will run together, for as many steps as the slowest of them needs. Every engine that shipped a static batcher inherited that promise, and paid for it on every tail.
+
+<Term t="continuous-batching">Continuous batching</Term> breaks the promise. The batch is re-formed from scratch every engine step: sequences that finished leave, sequences that are waiting join, and a slot that is freed in step $k$ is refilled in step $k+1$. The group is never the same twice.
+
+Scroll through the visual. It is the same twelve requests run twice, on one time axis.
+
+<Scrolly>
+  <ContinuousBatching client:visible slot="stage" />
+
+  <Step title="1. The tail is dead weight">
+    This is static batching on the workload: twelve requests, six seats, ragged lengths. The engine runs 316 steps. Each row's green bar is its tokens; each row's red tail is the seat it kept after it was done. Across the whole run **38% of the seats the GPU paid for produced nothing at all**.
+  </Step>
+
+  <Step title="2. The batch is a promise">
+    Look at the shape of the red. It is not random — it is a consequence of commitment. These requests were grouped, so the group could not end until its slowest member did. The short requests were sentenced to the long one's schedule.
+  </Step>
+
+  <Step title="3. Admission: fill the seats">
+    Now switch to continuous batching. It starts identically: at engine step 1 the scheduler takes the queue and fills as many seats as it can. Step 1 is a step, a choice and a cost, exactly like static.
+  </Step>
+
+  <Step title="4. A short request finishes">
+    By step 20 the 38-token and 44-token requests are done. Their answers are complete. But in a static batch their seats would still be lit, still reading KV, still emitting nothing — that is the red tail again.
+  </Step>
+
+  <Step title="5. Its seat is now free">
+    Under continuous batching nothing holds that seat. A seat is not owned by the request that sat in it; it is owned by the scheduler. The request ended, so the seat is idle, and idle is money wasted.
+  </Step>
+
+  <Step title="6. Refill on the very next step">
+    So the scheduler fills it. At step 21 the request that has been waiting since step 5 is admitted and starts producing. No barrier, no waiting for a group to drain, no re-forming of a static batch. One step of latency is the entire cost.
+  </Step>
+
+  <Step title="7. The step time did not change">
+    This is the part worth staring at. The GPU is reading the same 16 GB of weights and roughly the same KV bytes it was reading before. The step time is essentially unchanged. **The only thing that changed is how much useful work came out of the step.**
+  </Step>
+
+  <Step title="8. What it bought">
+    The wave now finishes in 271 steps instead of 316, and the seat waste is not 38% lower — it is **0%**. Every seat produced a token at every single step. That is the entire achievement, and it is not a small one.
+  </Step>
+
+  <Step title="9. The one-line rule">
+    Form the batch fresh every step; fill freed seats immediately. Everything else in this module is a refinement of who gets those seats, how many there are, and what happens when memory runs out.
+  </Step>
+</Scrolly>
+
+## Why this is the right shape, formally
+
+Static batching pays for a rectangle and fills it with triangles:
+
+$$
+\text{slot-steps}_{\text{static}} = \sum_{\text{groups } g} \lvert g \rvert \cdot \max_{i \in g} \ell_i
+\qquad
+\text{useful} = \sum_i \ell_i
+$$
+
+Continuous batching packs perfectly, because a seat is only ever occupied while it is producing:
+
+$$
+\text{slot-steps}_{\text{cont}} = \sum_i \ell_i + (\text{seats idle for want of a request})
+$$
+
+The second term is the honest one. Under continuous batching the only seat-steps you pay for are the ones where the queue was empty — and on a loaded server that is rare.
+
+<Callout type="math" title="The waste went to zero — and that is suspicious">
+  It is worth pausing on that 0%. It is 0% *by construction of this model*, because the model assumes a seat is freed instantly and never charges for an empty seat. On a real engine two things push it back up:
+
+  - **The step is the unit of time, not the seat.** A step with 4 sequences in a 6-seat engine costs about as much as a step with 6, because the weight read is the same read. Those 2 unused seats are a real waste of *throughput*, even though no one is being billed for them.
+  - **Prefill shares the step.** Real engines batch a waiting request's prompt into the same step, and a long prefill stalls everyone.
+
+  Module 07.3 measures the first of these. It is the knob that makes continuous batching actually pay.
+</Callout>
+
+## The two kinds of waste
+
+This is the mental model to keep. There are two, they are different, and confusing them is how people conclude continuous batching is magic.
+
+**Tail waste** (what continuous batching kills): seats held by finished requests. Fixed at zero by the design.
+
+**Fill waste** (what continuous batching creates): seats that are empty because nobody is in the queue. It depends entirely on how much traffic you have relative to how many seats you offer.
+
+$$
+\text{fill waste} = 1 - \frac{\bar{B}}{\text{seats}}
+$$
+
+where $\bar{B}$ is the average number of sequences actually in the batch. On the visual's workload at 6 seats the average batch is **4.4**, so fill waste is 27% — and that is why the wall-clock saving was only 14%, not 38%.
+
+<Callout type="intuition" title="Why the average batch is never full">
+  A request is not in the batch while it is waiting. It joins when a seat opens. It leaves when it is done. So the batch is only full if requests arrive faster than seats free up. Under light traffic the queue is usually empty and the batch is half empty; under a flood it is always full and you are back to the tail problem, only with a queue in front of it instead of a batch.
+
+  **The average batch is the single most useful health metric in a serving system.** If it is near 1, you are paying for a GPU and serving one user. If it is pinned at the seat limit, you are leaving throughput on the table because nothing is queued.
+</Callout>
+
+## What actually changes in the engine loop
+
+Continuous batching is not a fancy batching policy; it is a **restructuring of the decode loop** into phases that run every step.
+
+```python
+while True:
+    # 1. retire: anyone who finished, cancelled, or got preempted frees its seat now
+    for seq in list(running):
+        if seq.done or seq.cancelled:
+            free_kv_blocks(seq)        # the whole point: free immediately
+            running.remove(seq)
+
+    # 2. schedule: fill freed seats from the waiting queue, in policy order
+    for req in waiting.by_policy():
+        if len(running) >= max_num_seqs:  break
+        if kv_blocks_free() < req.blocks_needed: break   # memory budget
+        running.append(admit(req))
+
+    # 3. one step: every running sequence advances by exactly one token
+    logits = model(running)             # one forward pass, ragged batch
+    for seq in running:
+        seq.emit(sample(logits[seq]))
+
+    # 4. loop. The batch was never the same and never will be again.
+```
+
+Three things in that loop are worth naming, because each is a real engineering decision:
+
+- **Step 2 checks memory.** Admitting a request allocates KV blocks. The scheduler cannot admit what will not fit — that is the subject of 07.4.
+- **Step 3 runs one forward pass over a ragged batch.** Sequences have different lengths and different contexts. This is only possible because PagedAttention (Module 08) gives each sequence its own contiguous view; before that, engines padded everyone to a rectangle and paid for the padding.
+- **The loop never blocks.** There is no "wait for the batch". That is the whole difference from static.
+
+<Callout type="real" title="What this looked like in practice">
+  vLLM's iteration-level scheduling, published in 2023, is continuous batching under exactly this loop: schedules at every engine iteration rather than waiting for a fixed batch to fill. It was, at the time of writing, the single largest serving-throughput win available for chat workloads, and it is the reason an 8B model on one H100 serves hundreds of concurrent conversations. SGLang and TensorRT-LLM use the same idea with different knobs; the loop is the same shape.
+</Callout>
+
+## Does it change TTFT and per-user speed?
+
+Barely, at the same seat count — and that is the point. Compare the same workload at 6 seats:
+
+| | Static | Continuous |
+|---|---|---|
+| Wall-clock steps | 316 | 271 |
+| Seat-steps paid | 1,896 | 1,182 |
+| Seat-steps that produced a token | 1,182 | 1,182 |
+| Seat steps that produced nothing | 714 (38%) | 0 |
+| Average batch size | 6 (fixed) | 4.4 of 6 seats |
+| p50 TTFT | queueing + waiting for a group | queueing + one step |
+
+TTFT improves because a request no longer waits for its group's slowest member to be *admitted*; it waits for a seat. Per-user decode speed is essentially unchanged, because the step time did not change.
+
+<Callout type="pitfall" title="Continuous batching does not make anything faster">
+  It makes the machine do the same amount of work in fewer steps and stops it paying for empty seats. If your TTFT is bad after adding continuous batching, the problem is upstream of the scheduler: you are saturated (the queue is deep), or your step time is too long. Continuous batching will not help either of those. It only helps the tail.
+</Callout>
+
+## Measuring it
+
+Four numbers to log for any engine running continuous batching. Every one is a direct readout of the loop above.
+
+```python
+avg_batch = mean(len(running) for step in steps)      # should be near your seat limit
+tail_waste = seats_idle_after_done / seats_used       # should be ~0; if not, you are not freeing promptly
+queue_depth = mean(len(waiting) for step in steps)    # 0 = starved, big = you're the bottleneck
+tokens_per_step = useful_tokens / steps               # the real throughput
+```
+
+<Callout type="mentor" title="The habit this lesson builds">
+  Every scheduling idea from here is a way to move one of two numbers: **average batch** (are we wasting seats?) and **queue depth** (are we wasting users?). If avg_batch is low and queue_depth is zero, the answer is more traffic or fewer seats. If avg_batch is at the limit and queue_depth is huge, the answer is a faster step, which means a smaller model, a faster GPU, or speculative decoding. Diagnose before tuning.
+</Callout>
+
+<KeyNotes>
+  1. A static batch is a **promise about a group**; that promise is what creates the tail waste.
+  2. Continuous batching re-forms the batch every engine step: finishers leave, waiters join, freed seats are refilled immediately.
+  3. On a ragged 12-request workload at 6 seats it cut wall-clock steps from 316 to 271 and seat waste from 38% to 0%.
+  4. Continuous batching does not speed up the GPU. It stops the GPU paying for seats that produce nothing.
+  5. There are **two** wastes: tail waste (killed by continuous batching) and fill waste (created by it).
+  6. Fill waste $= 1 - \bar{B} / \text{seats}$. Average batch $\bar{B}$ is the most useful health metric in a serving system.
+  7. The decode loop is retire → schedule (checking memory) → one step → repeat. It never blocks.
+  8. TTFT improves slightly (no more waiting for a group); per-user decode speed barely moves (the step time did not change).
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What exactly does continuous batching change each engine step?', options: ['It makes the forward pass use larger GEMMs', 'It re-forms the batch: finished sequences leave and waiting ones join into the freed seats', 'It disables the KV cache for finished requests', 'It runs several forward passes in parallel'], answer: 1, why: 'The loop is retire → schedule → one step → repeat. Finished sequences free their seats immediately and the scheduler refills them from the queue, so the group is never the same twice.' },
+  { q: 'On the visual’s workload the seat waste goes from 38% to 0%. Why is 0% a little too good to be true?', options: ['Because the model counts tokens wrong', 'Because a seat is only charged while occupied — but a step with 4 sequences in a 6-seat engine still costs the same as 6, so there is real fill waste', 'Because real engines always waste memory', 'Because continuous batching is slower than static'], answer: 1, why: 'Tail waste goes to zero by construction. Fill waste remains: empty seats in an under-full batch still waste step time, since the weight read is paid either way. That is why wall-clock savings (14%) are far smaller than the seat-waste reduction (38%).' },
+  { q: 'Twelve requests, lengths summing to 1,182 tokens, run with 6 seats for 271 steps. What is the average batch size?', numeric: true, answer: 4.4, tolerance: 0.15, unit: 'sequences', why: 'All 1,182 tokens are produced, one per sequence per step, so total seat-steps = 1,182. Spread over 271 steps: 1,182 ÷ 271 ≈ 4.36, about 4.4 of 6 seats. Fill waste = 1 − 4.4/6 ≈ 27%.' },
+  { q: 'Why is continuous batching only possible at the level of a ragged (unpadded) batch?', options: ['PagedAttention gives each sequence its own contiguous view of blocks, so sequences of different lengths can share one forward pass', 'The tokenizer sorts sequences by length', 'FlashAttention pads them all to the longest', 'It does not require a ragged batch'], answer: 0, why: 'With a dense [n × maxLen] batch, a step must keep every row alive for the longest member — the exact waste continuous batching removes. Block-based storage (Module 08) is what lets a forward pass cover ragged sequences without padding.' },
+  { q: 'TTFT is still bad after you enable continuous batching. What does that tell you?', options: ['The queue is deep — you are saturated and the problem is step time or capacity, not the tail', 'Continuous batching increases TTFT always', 'The KV cache is too small', 'The model is too big'], answer: 0, why: 'Continuous batching only removes tail waste. It does not change step time, so if requests are queued the engine is already full: your step is too long or you need more capacity. Adding more batching will not help.' },
+  { q: 'A batch of 6 requests has lengths 100, 100, 100, 20, 20, 20 tokens. Under static batching, what fraction of slot-steps produce a token?', numeric: true, answer: 60, tolerance: 2, unit: '%', why: 'Useful = 100+100+100+20+20+20 = 360. Slot-steps = 6 × 100 = 600. 360 ÷ 600 = 60%. The three 20-token requests each waste 80 seats — and that is exactly the case where a static batch of 6 (three long, three short) is much worse than a batch of 3 long plus a batch of 3 short.' },
+]}/>

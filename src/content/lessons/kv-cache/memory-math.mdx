@@ -1,0 +1,225 @@
+---
+title: 'Memory math: weights, KV cache & concurrency'
+summary: 'The division that decides how many conversations a GPU can serve. We compute KV bytes per token for every model worth knowing, find the single number that predicts capacity, and then check that number against the bandwidth each batch actually costs.'
+objectives:
+  - Name the three consumers of GPU memory and how each one scales
+  - Convert a model size and a GPU size into a conversation count without a calculator app
+  - Compute context tokens per GPU, the batch-independent number behind every capacity decision
+  - Show why fitting 100 conversations in memory does not give 100 times the throughput
+  - List the four levers that change the answer, and what each one costs
+---
+import MemoryBudget from '@/components/viz/kv-cache/MemoryBudget.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In *The four numbers you will live by* (Module 00) you were shown that when a server runs out of memory, it is almost never the model that is too big. It is the conversations. This lesson is the arithmetic behind that claim, done properly, for the models and GPUs you will actually meet — and it ends with the number that predicts your capacity better than any benchmark: **how many context tokens fit on one card.**
+
+It is a division. Once you can do it in your head, capacity planning stops being guesswork.
+
+## The budget
+
+<Scrolly>
+  <MemoryBudget client:visible slot="stage" />
+
+  <Step title="1. Everything must fit">
+    A request's working set has to live entirely in one GPU's memory. <Term t="oom">Out of memory</Term> is not a slow path, it is a crash, and in production it is the most common one. Everything else in this lesson is about staying under the line.
+  </Step>
+
+  <Step title="2. Three consumers">
+    **Weights**, paid once per GPU. **KV caches**, one per conversation in flight. A **workspace** for activations, scratch buffers and the CUDA context — budget 4% of the card and be generous, because PyTorch and your kernels will both want some.
+  </Step>
+
+  <Step title="3. Weights: a constant">
+    Llama-3.1-8B in BF16 is 8.03 billion parameters at 2 bytes each: **16.06 GB**, forever. It does not care how many users arrive, how long the conversations are, or how clever your scheduler is.
+  </Step>
+
+  <Step title="4. KV: the only one that scales">
+    One user, one token: **128 KB**. Multiply by users and by context length and you have the number that decides your batch size. This is the consumer that grows while you sleep.
+  </Step>
+
+  <Step title="5. One conversation">
+    At 4,096 tokens of context, a single Llama-3.1-8B conversation holds **512 MB** of KV cache. That is about 3% of the entire model, spent on one user's history.
+  </Step>
+
+  <Step title="6. So how many conversations?">
+    Subtract the weights and the workspace, keep 10% in hand, and divide by 512 MB. On an H100: **about 101 conversations at 4K**, 50 at 8K, 12 at 32K. The table under the bar shows all five models at once.
+  </Step>
+
+  <Step title="7. The four levers">
+    Fewer KV heads, a smaller cache format, shorter contexts, or a smaller model. Every capacity problem you will ever have is solved by one of these four or by buying another card.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### Consumer one: weights
+
+From Module 01, weight memory is parameters times bytes per parameter, and in your head the 10⁹s cancel:
+
+| Model | Parameters | BF16 | FP8 | 4-bit |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 0.49 B | 0.98 GB | 0.49 GB | 0.25 GB |
+| Llama-3.2-3B | 3.2 B | 6.4 GB | 3.2 GB | 1.6 GB |
+| Llama-3.1-8B | 8.03 B | 16.1 GB | 8.0 GB | 4.0 GB |
+| Qwen2.5-32B | 32.8 B | 65.6 GB | 32.8 GB | 16.4 GB |
+| Llama-3.1-70B | 70.6 B | 141 GB | 70.6 GB | 35.3 GB |
+| Llama-3.1-405B | 405 B | 810 GB | 405 GB | 203 GB |
+
+<Callout type="pitfall" title="The T4 trap, live">
+  Llama-3.1-8B in BF16 needs 16.06 GB, and the free Colab T4 is advertised as 16 GB. It *just* fits — because the T4's "16 GB" is really 16 GiB, or 17.2 × 10⁹ bytes, while the weights are 16.06 × 10⁹. That leaves 1.1 GB, and once the workspace and 10% headroom are taken out, **under 3,000 tokens** of KV cache: one conversation at 1K context, and an <Term t="oom">out of memory</Term> crash the moment you ask for a batch.
+
+  This is the GB-versus-GiB trap from Module 01, and it is why this module's lab uses Qwen2.5-0.5B and Qwen2.5-1.5B instead. Know your model's real size in × 10⁹ bytes, not the number on the card.
+</Callout>
+
+And note the awkward fact at the top of the table: Llama-3.1-70B in BF16 is 141 GB, which does not fit on an 80 GB A100 or H100, and does not fit on a 141 GB H200 either. **70B needs two GPUs**, or a smaller format. That is not a detail; it is the whole reason tensor parallelism exists.
+
+### Consumer two: the KV cache
+
+The formula, from the previous lesson: bytes per token is $b_{kv} = 2 L H_{kv} D b$. The *only* variables are the model's shape and the cache format. Here it is for every model worth knowing, in BF16 and in FP8:
+
+| Model | Layers | Query heads | KV heads | Grouping | KB/token BF16 | KB/token FP8 | Cache at 128K (BF16) |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 14 | 2 | 7× | **12 KB** | 6 KB | 1.5 GB |
+| Llama-3.2-3B | 28 | 24 | 8 | 3× | **112 KB** | 56 KB | 14 GB |
+| Llama-3.1-8B | 32 | 32 | 8 | 4× | **128 KB** | 64 KB | 16 GB |
+| Qwen2.5-32B | 64 | 40 | 8 | 5× | **256 KB** | 128 KB | 32 GB |
+| Llama-3.1-70B | 80 | 64 | 8 | 8× | **320 KB** | 160 KB | 40 GB |
+| Llama-3.1-405B | 126 | 64 | 8 | 8× | **504 KB** | 252 KB | 63 GB |
+
+Read the last column before you promise anyone a 128K window. At full context the 405B model's cache alone is **63 GB** — nearly as much as the entire Llama-3.1-8B model, for one conversation.
+
+### Consumer three: the workspace
+
+There is no formula here, only a habit. The CUDA context, cuBLAS handles, activations for the largest layer, the logits tensor, and whatever scratch your attention kernel wants. In this course we reserve **4% of the card**, and in production you set an explicit cap (vLLM calls it `--gpu-memory-utilization`, default 0.9) and keep the rest for fragmentation. It is a small number, but leaving it out is how a service that worked at 3 a.m. dies at 9 a.m.
+
+### The division
+
+Now the whole lesson in one line:
+
+$$
+N_{\text{max}} = \left\lfloor \frac{(M - W - S) \times 0.9}{T \cdot b_{kv}} \right\rfloor
+$$
+
+where $M$ is the card, $W$ the weights, $S$ the workspace, $T$ the context length and $b_{kv}$ the cache bytes per token. The 0.9 is headroom.
+
+<Callout type="intuition" title="Divide once, by the token, not by the request">
+  Notice that $T$ appears only in the denominator. Take it out and you get a number that does not depend on how long the conversations are, let alone how you batch:
+
+  $$
+  \text{context tokens per GPU} = \frac{(M - W - S) \times 0.9}{b_{kv}}
+  $$
+
+  This is the **capacity of the card in tokens**, and every conversation-count question is just this number divided by a context length. It is the one number worth memorising for each model-and-GPU pair you work with.
+</Callout>
+
+For **Llama-3.1-8B in BF16** ($b_{kv} = 131{,}072$ bytes, $W = 16.06$ GB, $S = 4\%$ of the card, 10% headroom):
+
+| GPU | Free after weights, workspace, headroom | Context tokens | At 1K | At 4K | At 8K | At 32K | At 128K |
+|---|---|---|---|---|---|---|---|
+| T4 (17.2 GB) | 0.39 GB | 2,980 | 2 | 0 | 0 | 0 | 0 |
+| A100 80GB | 54.7 GB | 417,000 | 407 | 101 | 50 | 12 | 3 |
+| H100 80GB | 54.7 GB | 417,000 | 407 | 101 | 50 | 12 | 3 |
+| H200 141GB | 107.4 GB | 819,000 | 799 | 199 | 99 | 24 | 6 |
+
+Two GPUs with the same memory capacity hold the same number of conversations, whatever their bandwidth or FLOPs. **Memory decides capacity; bandwidth decides how fast those conversations move.** Keeping those two questions separate is a large part of what makes an inference engineer good.
+
+<Callout type="math" title="Two more, done in your head">
+  **Qwen2.5-32B in BF16 on one A100 80GB.** Weights 65.6 GB, workspace 3.2 GB, headroom leaves 10.1 GB. Each 4K conversation costs $T b_{kv} = 4{,}096 \times 262{,}144 = 1.07$ GB. So **9 conversations**. The model fits; the service does not exist.
+
+  **Llama-3.1-70B in FP8 on one A100.** Weights 70.6 GB, workspace 3.2 GB, headroom leaves 5.6 GB. Each 4K conversation costs 1.34 GB. So **4 conversations**. An H200 holds 43 of them, ten times as many. This is why 70B deployments are usually two GPUs, a smaller model, or a shorter window.
+</Callout>
+
+### But fitting them is not the same as serving them
+
+Here is the mistake almost everyone makes once they can do the division. One hundred conversations fit in memory on an H100. Does that give you a hundred times the throughput of one conversation?
+
+No — because every decode step must read **all** the caches in the batch. Each conversation you add costs bandwidth forever, and that is the term the previous lesson called out. Llama-3.1-8B on one H100, 4,096 tokens of context each:
+
+| Conversations in the batch | KV read per step | Step time | Throughput (all users) | Speed per user |
+|---|---|---|---|---|
+| 1 | 0.5 GB | 7.7 ms | 130 tok/s | 130 tok/s |
+| 8 | 4.3 GB | 9.1 ms | 879 tok/s | 110 tok/s |
+| 32 | 17.2 GB | 13.9 ms | 2,300 tok/s | 72 tok/s |
+| 64 | 34.4 GB | 20.3 ms | 3,152 tok/s | 49 tok/s |
+| 100 | 53.7 GB | 27.5 ms | 3,636 tok/s | 36 tok/s |
+
+<Callout type="intuition" title="There is a knee, and it is early">
+  Going from 1 to 8 users nearly **7×** your throughput for a 15% loss in per-user speed: the weight read is being shared. From 32 to 100 users you get 1.6× more throughput but every user drops from 72 to 36 tokens per second, because you are now reading more cache than weights.
+
+  The knee is where the KV read overtakes the weight read, because after that point every extra user is paid for in bandwidth. For this model and context that happens at about **30 conversations**. Past it, extra concurrency costs a lot of latency for very little throughput. Finding and sitting near the knee is the job of Module 07's scheduler.
+</Callout>
+
+### The four levers
+
+1. **Fewer KV heads.** GQA already gives Llama-3.1-8B its 4× and 70B its 8×. Beyond that you are trading quality for memory, and that trade belongs to the model designer, not the serving engineer.
+2. **A smaller cache format.** FP8 or INT8 KV cache **halves** it exactly, with no change to the weights. Llama-3.1-8B goes from 128 KB to 64 KB a token, and a 4K context from 512 MB to 256 MB. Module 11 measures what it costs in output quality; at the time of writing, FP8 KV is well established on Hopper-class hardware and less well supported elsewhere.
+3. **Shorter contexts.** The cache is linear in length, so this is free and immediate. Cap the window, summarize old turns, or drop the middle. You are trading capability for concurrency, so make it an explicit product decision.
+4. **A smaller model, or more GPUs.** <Term t="quantization">Quantizing</Term> the weights halves the fixed bar; sharding a model across cards is the same arithmetic applied twice. Both are the subject of Modules 11 and 18.
+
+And one lever that is free, if your traffic allows it: **shared prefixes**. Ten requests that begin with the same 2,000-token system prompt can store those keys and values **once**. At 128 KB a token that is 262 MB you do not spend ten times. On a card with 54.7 GB free, a 4,096-token conversation costs 537 MB on its own and 275 MB once the shared prefix is paid for — so 101 concurrent conversations become 198. This is prefix caching, and it is Module 10.
+
+### Do the division in code
+
+The whole lesson is thirty lines. Keep it next to whatever you deploy with.
+
+```python
+def budget(params, layers, kv_heads, head_dim, gpu_gb=80, ctx=4096, batch=64,
+           w_bytes=2, kv_bytes=2, workspace_frac=0.04, headroom=0.10):
+    weights    = params * w_bytes
+    kv_per_tok = 2 * layers * kv_heads * head_dim * kv_bytes
+    per_seq    = ctx * kv_per_tok
+    workspace  = workspace_frac * gpu_gb * 1e9
+    free       = (gpu_gb * 1e9 - weights - workspace) * (1 - headroom)
+    return {
+        "weights_GB":       weights / 1e9,
+        "kv_per_token_KB":  kv_per_tok / 1024,
+        "per_sequence_MB":  per_seq / 1e6,
+        "batch_needs_GB":   batch * per_seq / 1e9,
+        "max_batch":        int(max(0, free) // per_seq) if per_seq else 0,
+        "context_tokens":   int(free // kv_per_tok),
+    }
+
+MODELS = {  # name: (params, layers, kv_heads, head_dim)
+    "Qwen2.5-0.5B":  (0.49e9, 24, 2, 64),
+    "Llama-3.1-8B":   (8.03e9, 32, 8, 128),
+    "Qwen2.5-32B":    (32.8e9, 64, 8, 128),
+    "Llama-3.1-70B":  (70.6e9, 80, 8, 128),
+}
+
+for name, shape in MODELS.items():
+    for gpu in (16, 80, 141):
+        r = budget(*shape, gpu_gb=gpu)
+        print(f"{name:<16} {gpu:>4} GB  weights {r['weights_GB']:6.1f}  "
+              f"{r['kv_per_token_KB']:5.0f} KB/tok  "
+              f"{r['context_tokens']:>9,} tok  {r['max_batch']:>5} seqs @4K")
+```
+
+Change `kv_bytes=1` to see FP8 KV, `headroom=0.05` to see what greed buys you, and `ctx=32768` to watch every number in the table collapse at once.
+
+<Callout type="real" title="What the engines tell you">
+  vLLM prints the same arithmetic under different names. `model_config` gives the weight size, `--max-model-len` is your $T$, `--gpu-memory-utilization` (0.9 by default) is the headroom, and the startup log reports how many KV blocks it could allocate — that number divided by the block size is exactly $N_{\max}$ above. SGLang and TensorRT-LLM report the same quantities. When a log line says a model will not fit, this is the arithmetic it is doing.
+</Callout>
+
+<Callout type="mentor">
+  Two habits. First, before you propose a model on a GPU, compute $b_{kv}$ from the config and divide the free memory by it — thirty seconds, and it answers most "can we serve this?" questions. Second, remember that capacity is not throughput: a card can hold 100 conversations and still be unable to read their caches fast enough to keep them all under 40 tokens per second. Ask both questions, every time.
+</Callout>
+
+<KeyNotes>
+  1. Three consumers: **weights** (fixed), **KV cache** (grows with users × context), **workspace** (budget 4% of the card, plus explicit headroom).
+  2. $N_{\max} = \lfloor (M - W - S) \cdot 0.9 \div (T b_{kv}) \rfloor$. Everything else in serving is a consequence of this division.
+  3. The batch-independent form: **context tokens per GPU** $= (M - W - S) \cdot 0.9 \div b_{kv}$. 417,000 for Llama-3.1-8B on an 80 GB card.
+  4. $b_{kv}$ comes only from the model's shape: $b_{kv} = 2 L H_{kv} D b$. 12 KB for Qwen2.5-0.5B, 128 KB for Llama-3.1-8B, 504 KB for Llama-3.1-405B.
+  5. **Memory decides capacity; bandwidth decides speed.** An A100 and an H100 with the same memory hold the same conversations.
+  6. Llama-3.1-8B BF16 is 16.06 GB, so it barely fits the T4's 16 *GiB* — one conversation at 1K, then out of memory. Llama-3.1-70B BF16 is 141 GB and fits on **no** single card, including the 141 GB H200.
+  7. Qwen2.5-32B in BF16 on an A100 holds **9** conversations at 4K. Llama-3.1-70B in FP8 on an A100 holds **4**. "It fits" is not a serving plan.
+  8. Fitting 100 conversations is not serving them: every extra conversation's cache is read every step. Throughput 130 → 2,300 tok/s from 1 to 32 users, then only 3,636 by 100, with per-user speed falling from 130 to 36 tok/s.
+  9. The four levers: fewer KV heads, FP8/INT8 cache, shorter contexts, smaller model or more GPUs. Plus shared prefixes, which are free if your traffic has them.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B, BF16, on an 80 GB H100 with 4% workspace and 10% headroom. How many context tokens can the card hold in total?', numeric: true, answer: 417000, tolerance: 12000, unit: 'tokens', why: 'Free = (80 − 16.06 − 3.2) × 0.9 = 54.7 GB. Divide by 131,072 bytes a token = 417,000 tokens. That is 101 conversations of 4,096 tokens, or 13 of 32,768.' },
+  { q: 'Qwen2.5-32B has 64 layers and 8 key/value heads of dimension 128. In BF16, how many bytes of KV cache does one token of context cost?', numeric: true, answer: 262144, tolerance: 4000, unit: 'bytes', why: '2 (K and V) × 64 layers × 8 heads × 128 dims × 2 bytes = 262,144 bytes = 256 KB per token. A 4K conversation is then 1.07 GB, which is why only 9 of them fit beside 65.6 GB of weights on an A100.' },
+  { q: 'Why does having 100 conversations fit in GPU memory not give you 100 times the throughput of one?', options: ['The weights have to be copied per conversation', 'Every decode step must read all 100 caches, so each extra conversation costs bandwidth forever', 'Only 32 sequences can run in one CUDA stream', 'The scheduler drops the rest'], answer: 1, why: 'A decode step reads the weights once plus the whole batch’s KV cache. From 1 to 32 users throughput goes 130 → 2,300 tok/s, but from 32 to 100 it only reaches 3,636 tok/s while per-user speed drops from 72 to 36 tok/s.' },
+  { q: 'Llama-3.1-70B in BF16 needs 141 GB of weights. What does that tell you?', options: ['It fits on an H200 with 141 GB', 'It needs two GPUs, or a smaller format such as FP8 or 4-bit', 'It fits on a T4 with careful memory management', 'Nothing, because weights can be streamed from disk'], answer: 1, why: '141.2 × 10⁹ bytes does not fit on 141 × 10⁹ of H200 memory, nor on 80 GB of A100 or H100. Real 70B deployments use tensor parallelism across at least two cards, or FP8/4-bit weights, or both.' },
+  { q: 'Which change halves your KV cache memory with no change to the model weights?', options: ['Store the cache in FP8 or INT8 instead of BF16', 'Double the number of KV heads', 'Increase the context length', 'Use a larger batch size'], answer: 0, why: 'The cache format is an independent choice from the weight format. FP8 or INT8 KV cache halves the bytes per token exactly — 128 KB becomes 64 KB for Llama-3.1-8B. Module 11 covers what it costs in output quality.' },
+  { q: 'Ten requests share the same 2,000-token system prompt, and the engine stores that prefix once instead of ten times. For Llama-3.1-8B in BF16, about how much KV memory does that save per request?', numeric: true, answer: 262, tolerance: 20, unit: 'MB', why: '2,000 tokens × 131,072 bytes = 262 MB saved per request, and the prefix is stored once for all ten. On an 80 GB card a 4,096-token conversation then costs 275 MB instead of 537 MB, which takes 198 concurrent conversations instead of 101. That is the basis of prefix caching in Module 10.' },
+] } />

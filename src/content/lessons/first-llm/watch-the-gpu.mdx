@@ -1,0 +1,166 @@
+---
+title: 'Watching the GPU work'
+summary: 'Put a real generation on a timeline and watch it: a compute-bound prefill burst, memory-bound decode steps, host-side gaps, and a memory trace that only ever climbs. Learn to read nvidia-smi while your model runs.'
+objectives:
+  - Describe what the GPU does during prefill versus decode, and why the two behave differently
+  - Measure time to first token and time per output token separately, using CUDA events
+  - Explain why GPU utilization is not the same as efficiency
+  - Read nvidia-smi and PyTorch memory stats while a model is generating
+---
+import GpuTimeline from '@/components/viz/first-llm/GpuTimeline.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Your model produced text. Something ran. But "something ran" is not an explanation, and an inference engineer's whole job is turning "it feels slow" into "here is the number, here is the cause, here is the fix".
+
+This lesson is the habit that makes the rest of the course possible: put one request on a timeline, watch the GPU, and read what it tells you.
+
+## One request, to scale
+
+Take `generate()` with a 128-token prompt and 24 tokens to produce, and draw the elapsed time honestly. It does not look like a smooth ribbon of work. It looks like a **fast burst, then a long train of tiny steps, then silence**.
+
+<Scrolly>
+  <GpuTimeline client:visible slot="stage" />
+
+  <Step title="1. One request on the timeline">
+    The whole call is laid out on a real time axis. Two regions matter: a wide one on the left (prefill) and a long thin one on the right (decode). Everything an inference engineer optimises lives in one of those two regions, and they have different causes.
+  </Step>
+
+  <Step title="2. Prefill: a burst of compute">
+    Prefill pushes the entire prompt through the network in one parallel pass. Hundreds of tokens' worth of rows go through every matrix multiply at once, so arithmetic intensity is high and the tensor cores are genuinely busy. This is the **compute-bound** phase you met on the roofline.
+  </Step>
+
+  <Step title="3. The KV cache starts growing">
+    As prefill proceeds it stores a key and a value for every prompt token. Nothing is freed during the request. From this point on every decode step reads this cache, and it grows by exactly one token per step.
+  </Step>
+
+  <Step title="4. Decode: small steps, one token">
+    Each decode step handles a single token but must still read **every weight in the model**. The work per step is small, so each step is short and **memory-bound**. Notice the decode stretch is long in time even though each step is tiny.
+  </Step>
+
+  <Step title="5. The gap between tokens">
+    Look at the hatched slivers. Part of every step is the GPU doing nothing while Python samples, detokenises and calls the next step. These are <Term t="idle">idle</Term> time your user still waits through — and the first thing CUDA graphs and `torch.compile` exist to remove.
+  </Step>
+
+  <Step title="6. Utilization is not the whole story">
+    The bar underneath measures how much of a decode step the GPU was actually busy. On a small model, driven from Python one user at a time, that number is low. **Low utilization means poor efficiency, not a broken GPU** — and it is the baseline every optimisation in Modules 15 and 16 attacks.
+  </Step>
+
+  <Step title="7. Memory climbs, it does not fall">
+    The trace below is the honest picture of memory during a request: a step up per generated token, never a step down. Long answers on small GPUs do not crash because the model is too big; they crash because this line ran off the top of the card.
+  </Step>
+
+  <Step title="8. Time to first token">
+    The wait before token 1 is marked. It is prefill, plus any queueing. Everything after is the decode rate. These are **different numbers with different fixes**, and a report that gives you only "total latency" has told you almost nothing.
+  </Step>
+
+  <Step title="9. Read your own GPU">
+    Open a second terminal, run `nvidia-smi -l 1`, and run your own generation. Watch utilization and memory while the text appears. Doing this once teaches the lesson permanently.
+  </Step>
+</Scrolly>
+
+## Measure it properly
+
+Two numbers, measured separately, with the timing discipline from Module 02's software-stack lesson: warm up, use CUDA events, average.
+
+```python
+import torch, time
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(MODEL)
+model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda")
+
+def bench_generate(prompt, max_new=32, iters=5):
+    text = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False, add_generation_prompt=True)
+    ids = tok(text, return_tensors="pt").to("cuda")
+    plen = ids["input_ids"].shape[1]
+
+    # Warm up: first call pays kernel compilation and lazy allocation.
+    model.generate(**ids, max_new_tokens=max_new, do_sample=False)
+    torch.cuda.synchronize()
+
+    tts, dts = [], []
+    for _ in range(iters):
+        s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+        torch.cuda.synchronize()
+        s.record()
+        out = model.generate(**ids, max_new_tokens=max_new, do_sample=False)
+        e.record()
+        torch.cuda.synchronize()
+        total = s.elapsed_time(e)                       # ms
+        tts.append(total * plen / (plen + max_new))      # rough: scale to the prefill share
+        dts.append((total - tts[-1]) / max_new)
+
+    return sum(tts) / iters, sum(dts) / iters
+```
+
+<Callout type="pitfall" title="The warm-up run is not optional">
+  The very first `generate` on a fresh process is typically 2–10× slower than every subsequent one: cuBLAS picks kernels, memory is allocated lazily, and pages are faulted in. Time it and every conclusion you draw is wrong. Warm up, then measure. Module 06 makes this a formal methodology, and it is worth internalising now.
+</Callout>
+
+<Callout type="math" title="What the numbers should look like">
+  With Qwen2.5-0.5B on a T4, expect roughly:
+  - **Time to first token:** 10–30 ms for a short prompt — dominated by prefill, so it grows with prompt length.
+  - **Time per output token:** 2–4 ms — dominated by reading ~1 GB of weights, so it is nearly constant regardless of prompt length.
+
+  If your measured per-token time is much larger than your weight bytes ÷ bandwidth, the gap is launch overhead and host time. That gap is your work.
+</Callout>
+
+## Reading `nvidia-smi`
+
+Run this in a second terminal while a generation is going:
+
+```bash
+nvidia-smi -l 1
+```
+
+You will see utilisation, memory, temperature and power refreshing once a second. The three columns that matter for inference:
+
+| Column | Healthy | What bad looks like |
+|---|---|---|
+| `GPU-Util` | High during prefill; dips between decode steps | Pinned near 0% while tokens are being produced → host-bound or CPU bottleneck |
+| `Memory-Used` | Grows once at load, then steps up slowly | A sudden jump or a crash → KV cache growing without bound |
+| `Power` | Near the card's cap when busy | High utilisation but low power → waiting, not computing |
+
+From PyTorch you can get the same picture in code, which is what you will do in a real service:
+
+```python
+print(torch.cuda.memory_allocated() / 1e9, "GB allocated")
+print(torch.cuda.max_memory_allocated() / 1e9, "GB peak")
+print(torch.cuda.memory_reserved() / 1e9, "GB reserved by the caching allocator")
+```
+
+<Callout type="intuition" title="Why utilization is a trap">
+  GPU-Util means "was any kernel running during this sample" — it is a boolean averaged over time, not a measure of useful work. A GPU can sit at 95% utilization doing a memory-bound copy that achieves a fraction of its bandwidth. **Always pair utilization with a throughput number** (tokens per second) and a memory number. Two metrics beat one, every time.
+</Callout>
+
+## What to look at, in order
+
+When a generation feels slow, work down this list. It is roughly the order of how often each is the culprit.
+
+1. **Is it TTFT or TPOT?** A long silent pause before any text is prefill or queueing. Smooth-but-slow text is decode.
+2. **Is the GPU idle?** Low utilisation with tokens still arriving means Python is the bottleneck, not the GPU. Fewer, larger operations; `torch.compile`; CUDA graphs (Module 15).
+3. **Is it memory-bound?** Compare your measured per-token time to `weight bytes ÷ bandwidth`. Close to it means you are at the floor and only batching or quantization will help.
+4. **Is it compute-bound?** Only true during prefill with a long prompt. Then the fix is a faster kernel or a smaller model.
+5. **Is memory the constraint?** Rising memory with long answers points at the KV cache. Module 05 is entirely about this.
+
+<KeyNotes>
+  1. One generate() call is a compute-bound prefill burst followed by a long train of memory-bound decode steps, then idle time.
+  2. Prefill processes the whole prompt in parallel and is compute-bound; decode emits one token per step, reads all weights, and is memory-bound.
+  3. Time to first token (prefill) and time per output token (decode) are different numbers with different causes. Report them separately.
+  4. Always warm up before timing, then use CUDA events — the first call on a fresh process is 2–10× slower.
+  5. GPU utilization is not efficiency. Pair it with tokens per second and memory before drawing any conclusion.
+  6. Memory climbs one step per generated token and never falls during a request — that stair-step is the KV cache, and it is why long answers OOM small GPUs.
+  7. The debug order is: TTFT or TPOT → GPU idle? → memory-bound? → compute-bound? → memory pressure?
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'During decode, why is the GPU memory-bound rather than compute-bound?', options: ['Because Python is slow', 'Because each step does little math but must read every weight and the KV cache', 'Because decode uses the CPU', 'Because tokens are sampled on the GPU'], answer: 1, why: 'Decode handles one token, so there is not enough arithmetic to keep the tensor cores busy, but it streams the entire model plus the KV cache from HBM. Low arithmetic intensity, high bytes: memory-bound.' },
+  { q: 'Time to first token is dominated by which phase?', options: ['Decode', 'Prefill', 'Sampling', 'Detokenization'], answer: 1, why: 'TTFT covers everything before the first generated token appears: queueing plus prefill of the whole prompt. After that, each token arrives at the decode rate.' },
+  { q: 'You warm up, then find per-token time is much larger than (weight bytes ÷ bandwidth). What does that gap most likely mean?', options: ['The GPU is compute-bound', 'Host-side overhead: launch and Python time, so the GPU is idle part of each step', 'The model is too large', 'The prompt is too long'], answer: 1, why: 'The bandwidth figure is the floor for reading the weights. If you are well above it, the extra time is not bytes — it is launches, synchronization and Python between steps. That gap is what torch.compile and CUDA graphs remove.' },
+  { q: 'Qwen2.5-0.5B has 24 layers, 2 KV heads and head_dim 64, stored in BF16. How many bytes does its KV cache add per generated token? (2 for K and V, 2 bytes per number.)', numeric: true, answer: 12288, tolerance: 100, unit: 'bytes', why: 'KV bytes per token = 2 (K and V) × layers × KV heads × head dim × bytes = 2 × 24 × 2 × 64 × 2 = 12,288 bytes, which is exactly 12 KB. Small per token, but it grows linearly: at 8,192 tokens of context it is about 100 MB per conversation.' },
+  { q: 'GPU-Util shows 95% while tokens are produced, but throughput is low. What is the correct interpretation?', options: ['The GPU is healthy, nothing to see', 'High utilization means a kernel was running, not that it was efficient; check throughput and memory too', 'Throughput must be measured wrong', 'The model is compute-bound'], answer: 1, why: 'Utilization is "was any kernel running", averaged. A memory-bound kernel can run constantly and still achieve little useful work. Pair it with tokens per second and a memory number before concluding anything.' },
+  { q: 'Why does GPU memory only ever increase during a single request, never decrease?', options: ['A leak in PyTorch', 'The KV cache grows with each generated token and is only freed when the request ends', 'Weights are duplicated per token', 'The caching allocator never frees'], answer: 1, why: 'Each generated token adds its key and value to the cache, and nothing is evicted mid-request. Memory returns only when the request finishes and the cache is released. That stair-step is why long answers OOM.' },
+]} />

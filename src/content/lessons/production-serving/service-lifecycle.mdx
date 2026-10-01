@@ -1,0 +1,188 @@
+---
+title: 'Warm-up, health checks & graceful shutdown'
+summary: 'A replica has four states, and three of them are not "serving". Readiness, liveness and startup probes answer three different questions and confusing them is the single most common cause of self-inflicted outages. Graceful shutdown turns a deploy from a truncation event into a non-event — provided your drain timeout outlasts your longest request.'
+objectives:
+  - Distinguish readiness, liveness and startup probes, and state which failure each should cause
+  - Design a warm-up that measures a condition rather than sleeping a fixed time
+  - Size a drain timeout from your longest expected request, with the arithmetic
+  - Explain why a probe that flaps turns a small GPU hiccup into a fleet-wide restart loop
+  - Decide what a replica should do with a client disconnect mid-generation
+---
+import ReplicaLifecycle from '@/components/viz/production-serving/ReplicaLifecycle.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A container running is not a container serving. The gap between those two states is where an inference service spends a surprising amount of its life, and every minute in that gap is a minute you are paying for a GPU that is not answering anyone.
+
+This lesson is about that gap. Four states — **starting, serving, draining, gone** — and the mechanisms that move a replica correctly between them. Two of those mechanisms are things you probably already have configured and have never looked at: your health checks and your termination handling. Both are quietly load-bearing, and both fail in ways that look like something else entirely.
+
+## The four states
+
+<Scrolly>
+  <ReplicaLifecycle client:visible slot="stage" />
+
+  <Step title="1. A replica is created">
+    The platform makes a container and starts a process. From the load balancer's point of view this replica does not exist. The **<Term t="readiness-probe">readiness probe</Term>** is what will tell it otherwise, and until that probe passes, this replica is invisible.
+  </Step>
+
+  <Step title="2. Readiness is false">
+    Throughout startup and warm-up, readiness must be **failing**. This is the whole job of the readiness probe during this phase: it is the mechanism that keeps a half-built server away from traffic. A replica that passes readiness before it can actually generate tokens is worse than a replica that never starts.
+  </Step>
+
+  <Step title="3. Warm-up finishes and readiness flips">
+    Readiness flips exactly once, at the moment the replica is honest — graphs captured, kernels chosen, caches populated, decode at steady-state speed. This is the <Term t="startup-budget">startup budget</Term> you priced in the last lesson, now seen from the other side: it is the interval during which you have capacity that does not yet count.
+  </Step>
+
+  <Step title="4. Serving">
+    The only band on the timeline that produces user value. Everything else in this lesson is about getting into it and out of it without losing requests.
+  </Step>
+
+  <Step title="5. SIGTERM arrives">
+    A deploy, a scale-down, a node drain, a preemption. The platform sends SIGTERM and starts a clock. **This clock does not negotiate.** When it expires the process is killed, and this is the only thing standing between a routine deploy and a page.
+  </Step>
+
+  <Step title="6. Readiness flips false, draining begins">
+    <Term t="graceful-shutdown">Graceful shutdown</Term> is: stop accepting new requests, keep serving what you have. New arrivals go to the rest of the fleet; in-flight requests finish here. The replica is <Term t="draining">draining</Term>, and it is still useful during this window — it is just no longer a candidate for new work.
+  </Step>
+
+  <Step title="7. The drain deadline lands">
+    The clock runs out. Anything still generating at that instant is truncated: the user's stream simply stops mid-sentence, with no error, because the TCP connection closed cleanly. Move the sliders — a longer output length or a slower time-per-token lengthens each generation and pushes more requests past the deadline.
+  </Step>
+
+  <Step title="8. Capacity over the whole life">
+    The uncomfortable summary. Between creation and readiness, and again from SIGTERM to exit, you are holding a GPU that produces nothing. Draining replicas are partly useful. Startup replicas are entirely useless — which is exactly the cost the last lesson's arithmetic was about.
+  </Step>
+</Scrolly>
+
+## Three probes, three questions
+
+This is the part where most incidents are born, so it is worth being precise. There are three probes and they look nearly identical in a config file.
+
+| Probe | Question it answers | Failing means | Consequence of a failure |
+|---|---|---|---|
+| <Term t="startup-probe">Startup</Term> | "Has this process finished booting?" | still starting | **wait longer** (no action) |
+| <Term t="readiness-probe">Readiness</Term> | "Should this replica get traffic right now?" | not ready to serve | **remove from the load balancer**, keep running |
+| <Term t="liveness-probe">Liveness</Term> | "Is this process hopelessly stuck?" | deadlocked / wedged | **kill and restart it** |
+
+<Callout type="pitfall" title="The mistake that takes down a fleet: liveness that flaps">
+  A liveness failure **restarts the replica**. So a liveness probe that is sensitive to a brief GPU hiccup, a memory spike or a slow scheduler turn converts a 2-second wobble into a restart — which costs a full cold start, which drops capacity, which increases load on the remaining replicas, which makes more of them wobble. That is a positive feedback loop, and it turns a mild problem into an outage.
+
+  The rule: **liveness should be almost impossible to fail while the process is still making progress.** Probe something that is only false when the process is genuinely wedged — a watchdog thread that stops updating, a health endpoint that returns 500 only if the main loop has not ticked. Never make liveness depend on a latency threshold. "p99 latency is high" is a readiness and alerting signal; it is not evidence the process is dead.
+</Callout>
+
+<Callout type="intuition" title="Why readiness should fail fast and liveness should fail slow">
+  Think about what each failure costs. Failing readiness costs you a replica's worth of capacity for a moment — annoying but survivable, and the fleet rebalances. Failing liveness costs you a **cold start**, which is the most expensive event in this entire module.
+
+  So readiness wants a short timeout and few failures before it gives up, because it is the fast, cheap lever. Liveness wants a long timeout and many consecutive failures, because it is the sledgehammer. And the startup probe exists precisely so that a slow boot is never interpreted by the liveness probe as a hang — the two interact, which is why treating them as one thing goes wrong.
+</Callout>
+
+<Callout type="real" title="What this looks like in a real serving container">
+  At the time of writing, vLLM and similar engines expose health endpoints that reflect the engine's own state — whether the model is loaded, whether it is still initialising, whether it has hit a fatal error. Wiring those into readiness and liveness is exactly right: readiness means "the engine says it is loaded and can accept work", liveness means "the process is still responsive". A GPU that falls off the bus, or a CUDA error the engine cannot recover from, shows up as a failing liveness and a replica restart — which is the correct outcome, because that replica is genuinely finished.
+</Callout>
+
+## Warm-up: measure, don't sleep
+
+The last lesson established what warm-up is. Now the design question: how does a replica *know* it is warm enough to accept traffic?
+
+The answer has to be a measurement, because the alternative cannot work. A fixed sleep is wrong in both directions at once: too long on a fast node (wasting capacity you already paid for) and too short on a slow one (letting traffic hit an unwarmed replica). Node speed varies with CPU generation, page cache state, disk contention from other tenants, and model size. You cannot know the right constant.
+
+<Callout type="math" title="A concrete readiness condition">
+  Run warm-up traffic continuously at startup and flip readiness when the observed decode step time stops improving. Concretely:
+
+  $$
+  \text{ready when } \frac{t_{\text{step}}(\tau)}{t_{\text{step}}^{*}} \le 1.1
+  $$
+
+  where $t_{\text{step}}$ is the most recent measured decode step time and $t_{\text{step}}^{*}$ is the last step time that improved on its predecessor. In plain terms: **you are warm when two consecutive measurements agree within 10%.** The threshold is a judgement call — 1.1 is tight, 1.3 is forgiving — but the *shape* is what matters, and the shape is right because it adapts to the node instead of assuming it.
+</Callout>
+
+Three things to get right about the warm-up traffic itself, each of which is a real trap:
+
+<Callout type="pitfall" title="Warm up the shape you serve, not the shape that is convenient">
+  Engine caches are shape-specialised. Warm-up at 512 tokens with batch 1 does not populate the path for a 32k request at batch 32. Send warm-up traffic that spans the **context lengths and batch buckets you actually admit**, and if you have a long-context endpoint, include one long request in the warm-up set.
+
+  The subtle failure is the prefix cache. If your warm-up sends the *same* prompt repeatedly, you will populate and then repeatedly hit the prefix cache — you will measure a configuration your real traffic rarely sees, and the replica will pass readiness while cold for the requests that actually arrive. **Use varied prompts.**
+</Callout>
+
+<Callout type="intuition" title="Why the first real request is the dangerous one">
+  Every lazily-taken path in your stack — a kernel compiled on first shape, an allocator arena grown on demand, a cache populated on first hit — fires on the first real request if warm-up did not already trigger it. The consequence is that one unlucky user pays for your startup optimisation, and because which user it hits is effectively random, it shows up as an unexplained p99 spike rather than a correlated outage.
+
+  Warm-up converts that from an unpredictable tail into a predictable startup budget. It is the same move as pre-compiling before you serve: pay the cost in a phase you control rather than one your users sample.
+</Callout>
+
+## Graceful shutdown, and the arithmetic that makes it real
+
+A drain is only correct if it outlasts the work it is draining. That is not a tuning preference — it is a bound you can compute from two numbers you already measure: how long a generation takes, and how long you allow a replica to drain.
+
+$$
+t_{\text{drain}} \geq t_{\text{longest\ in-flight request}}
+$$
+
+And a generation's duration, from the metrics module:
+
+$$
+t_{\text{request}} \approx t_{\text{TTFT}} + t_{\text{TPOT}} \times \text{output tokens}
+$$
+
+<Callout type="math" title="Sizing the drain timeout, worked">
+  Interactive chat: TTFT of 400 ms, TPOT of 25 ms per token, p99 output length 800 tokens.
+
+  $$
+  t_{\text{request}} = 0.4 + 0.025 \times 800 = 0.4 + 20 = 20.4\ \text{s}
+  $$
+
+  So a 30-second drain timeout is comfortable, and a 10-second one truncates a large share of your p99 generations on **every deploy**. Now the same product serving long-form generation — 4,000 output tokens at 25 ms:
+
+  $$
+  t_{\text{request}} = 0.4 + 0.025 \times 4000 = 100.4\ \text{s}
+  $$
+
+  Now your 30-second timeout truncates *most* of them. Same server, same drain config, completely different failure — because the timeout was tuned against an implicit assumption about output length. **The drain timeout and the max generation length are one decision**, and whichever you lower, lower the other in the same review.
+</Callout>
+
+<Callout type="pitfall" title="A short drain timeout fails silently, which is why it survives code review">
+  A replica killed mid-generation does not return an HTTP error. The stream ends — cleanly, from the client's perspective — and the user has half an answer. Depending on your client this surfaces as a truncated UI, a `null` completion, or a JSON parse failure. None of those say "drain timeout".
+
+  This is why a truncated-generation bug can sit in a production service for months. It only appears on deploys and scale-downs, it correlates with long outputs, and the error message points at the client. When you see "responses occasionally cut off, but only sometimes and mostly at deploy time", reach for the drain timeout before you reach for anything in the model.
+</Callout>
+
+Three implementation details that decide whether your drain actually works:
+
+1. **Stop accepting first.** The readiness probe must fail *before* the drain begins, not at the same moment or after. If readiness is still passing, the load balancer keeps sending new requests to a replica that is trying to finish old ones, and it will never drain — it just keeps taking new work until the deadline. This is a race, and the probe flip has to win it.
+2. **The HTTP server must stop listening on new connections while in-flight ones finish.** Most frameworks need you to sequence this explicitly; a naive SIGTERM handler that immediately closes the listener drops queued-but-unaccepted requests.
+3. **Watch the clock against the *longest* request, not the mean.** At SIGTERM, look at your own in-flight set. If anything will not finish in the remaining budget, you have a choice: extend (if the platform allows), or abort that request explicitly with an error so the client retries — which is strictly better than a silent truncation, because a retry is invisible and a half-answer is not.
+
+<Callout type="mentor" title="The client-disconnect question you get asked in interviews">
+  When a user closes the tab mid-generation, the generation should stop. Every engine does this, and the arithmetic is exactly Module 08's: an abandoned generation still consumes a KV block and a slot in the running batch for as long as it would have run. Cancel it. The only reason to keep generating is if your product depends on it — a batch job whose results are collected later, for example — and that should be an explicit, separate endpoint with its own lifecycle, not the default behaviour of a streaming chat API.
+</Callout>
+
+## The whole picture
+
+<Callout type="recap">
+  - **Starting** — readiness fails, capacity does not count, and this is the interval the previous lesson priced.
+  - **Serving** — the only band that produces value.
+  - **Draining** — readiness already false, in-flight work finishing, bounded by a deadline you chose.
+  - **Gone** — the process is dead, and whatever was still generating is lost.
+</Callout>
+
+Put the two lessons together and you have the shape of a deploy: the new replicas pay a cold start during which they contribute nothing, then warm up and pass readiness, then take traffic while the old replicas drain. **For the entire rollout, both fleets are running and neither is idle** — which is what makes capacity during a deploy a real number to plan for, and what the next lesson's canaries have to fit inside.
+
+<KeyNotes>
+  1. Readiness, liveness and startup answer different questions: remove from the load balancer, kill and restart, and wait longer respectively. Confusing them is the most common cause of self-inflicted outages.
+  2. Liveness must be nearly impossible to fail while the process makes progress. A latency-sensitive liveness probe turns a GPU hiccup into a restart storm, because restarts cost cold starts, which reduce capacity, which cause more hiccups.
+  3. Warm-up should flip readiness on a **measured condition** (decode step time stable within ~10%), never a fixed sleep — node speed varies too much for a constant to be right.
+  4. Warm-up traffic must match the shapes you serve (context lengths, batch buckets) and use **varied prompts**, or you will have measured a configuration your real traffic never hits.
+  5. `t_drain ≥ t_TTFT + t_TPOT × output_tokens`. At 400 ms TTFT, 25 ms TPOT and 800 output tokens that is 20.4 s — so a 10-second drain timeout truncates a large share of p99 generations on every deploy.
+  6. The drain timeout and the maximum generation length are one decision. Whichever you shorten, shorten the other in the same change review.
+  7. Flip readiness false **before** the drain starts, and stop the listener while finishing in-flight connections — otherwise new requests keep arriving and the replica never drains.
+  8. A request killed mid-generation returns no error. The stream just ends, which is why drain-timeout bugs get blamed on clients and survive for months. Abort explicitly when a request cannot finish inside the budget.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A replica is running at p95 TTFT 400 ms and TPOT 25 ms. One user\'s stream has already produced 300 tokens when the replica begins draining. How much longer does that request need, and what drain timeout keeps it safe?', numeric: true, answer: 8, tolerance: 1, unit: 's', why: 'It has 300 tokens left to generate, so 300 × 25 ms = 7.5 s of decode still to go. A drain timeout of about 8 s or more keeps that request intact; anything shorter truncates it. Note this is the *remaining* time, not the whole request — which is why a drain budget only has to cover work that has not been done yet, and why long requests that start late in the drain window are the ones at risk.' },
+  { q: 'Your service has p95 TTFT 400 ms and TPOT 25 ms, with a 900-token p99 output length. What drain timeout guarantees a p99 generation is never truncated?', numeric: true, answer: 23, tolerance: 2, unit: 's', why: 't = TTFT + TPOT × tokens = 0.4 s + 0.025 s/token × 900 tokens = 0.4 + 22.5 = 22.9 s, so 23 s with a little margin. Round up to 30 s in practice. Anything under this truncates a share of your p99 generations on every single deploy.' },
+  { q: 'A GPU driver hiccup makes your liveness endpoint return 500 for about 3 seconds, then recover. Your liveness timeout is 10 s with 3 consecutive failures required, and each restart costs a 240-second cold start. What actually happens?', options: ['Nothing — a 3-second hiccup is below the 10-second timeout', 'Replicas restart, cold-start, and drop capacity, which loads the survivors further and risks a feedback loop', 'Only the affected replica restarts and the fleet absorbs it with no other effect', 'The readiness probe absorbs it and nothing restarts'], answer: 1, why: 'Three consecutive failures at a short interval exceeds the required threshold, so liveness fires and the replica restarts — paying a 240-second cold start during which it serves nothing. Capacity drops, load per remaining replica rises, and more of them wobble. That is the positive feedback loop liveness probes are designed to avoid: liveness must be nearly impossible to fail while the process is making progress, because a restart is the most expensive event in the module.' },
+  { q: 'A replica is draining after SIGTERM and is still passing its readiness probe. What goes wrong?', options: ['Nothing — draining and serving are compatible', 'The load balancer keeps sending it new requests, so it never empties and gets killed at the deadline still holding live work', 'It will crash because the engine cannot serve while draining', 'It drains twice as fast'], answer: 1, why: 'Readiness is the only thing that removes a replica from the load balancer. If it is still passing, new requests keep arriving to fill the space in-flight ones free, and the replica cannot possibly drain before the deadline. Readiness must flip false before the drain begins, and the HTTP listener must stop accepting while in-flight connections finish.' },
+  { q: 'Why does warm-up traffic need varied prompts rather than one repeated prompt?', options: ['To populate the embedding cache for more vocabulary', 'Because repeated prompts populate and repeatedly hit the prefix cache, so you measure a configuration your real traffic rarely hits and pass readiness while cold for actual requests', 'Because engines deduplicate identical requests and skip them', 'To exercise the tokenizer'], answer: 1, why: 'Prefix caching (Module 10) means an identical prompt is served from cached KV blocks. Warm-up with one prompt therefore measures a cache-hit path rather than the real prefill-plus-decode path. Readiness flips on a warm number that does not reflect production traffic. This is the inverse of the benchmark trap from Module 11 — there it inflated throughput, here it produces a falsely-ready replica.' },
+  { q: 'Your server is killed mid-generation during a drain. What does the client observe, and why does this bug survive so long in real services?', options: ['A 500 error naming the drain timeout, so it is easy to trace', 'A stream that simply ends mid-answer with no error, appearing only on deploys and scale-downs, so it correlates with nothing and gets blamed on the client', 'A retry that transparently succeeds, so it costs nothing', 'A corrupted response that fails JSON parsing on the client'], answer: 1, why: 'The TCP connection closes cleanly, so there is no error to report — the user has half an answer. It only appears on deploys and scale-downs (so only sometimes), it correlates with long outputs, and the symptom points at the client. If a service shows responses occasionally cut off, mostly at deploy time, check the drain timeout first.' },
+  { q: 'A user closes the browser tab mid-generation. What should the server do, and what is the cost of not doing it?', options: ['Keep generating so the result is available later; the cost is only disk space', 'Cancel the generation; an abandoned one keeps occupying a KV block and a running-batch slot for as long as it would have run', 'Finish the current token then stop; the cost is one wasted token per disconnect', 'Nothing — HTTP semantics require the server to complete the response'], answer: 1, why: 'Every engine supports cancellation, and the arithmetic from Module 08 applies directly: an abandoned generation holds a KV block and a batch slot until it would have finished, so it reduces concurrency for every real user still waiting. If your product genuinely needs results after the client disconnects, that belongs on a separate batch endpoint with its own lifecycle, not as default streaming behaviour.' },
+]}/>

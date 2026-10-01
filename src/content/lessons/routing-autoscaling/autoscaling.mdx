@@ -1,0 +1,165 @@
+---
+title: 'Autoscaling on the right signals'
+summary: 'Adding GPUs is easy; knowing when to add them is the job. You will learn why CPU-based autoscaling fails on inference, which metrics lead the overload cliff, and how to size a replica count from your own measured capacity.'
+objectives:
+  - Explain why CPU utilisation is a poor autoscaling signal for a GPU inference replica
+  - Describe the shape of the goodput curve and locate the cliff from measurements
+  - Choose leading signals — queue depth, SLO pressure, KV occupancy — and explain why they lead
+  - Compute a safe replica count with headroom from per-replica capacity
+  - Explain why scaling in requires draining and why thrashing happens
+---
+import Autoscaler from '@/components/viz/routing-autoscaling/Autoscaler.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every web service you have ever run autoscales on CPU. When the web tier gets hot, add web servers. It worked for a decade, and then someone pointed it at an LLM replica and it did nothing at all.
+
+This lesson is about why, and what to watch instead.
+
+## Why CPU is useless here
+
+A GPU inference replica is not idle when it is underloaded. The scheduler runs in a tight loop: plan a step, launch kernels, read results, sample, repeat. The CPU is saturated **at every concurrency level**, because the CPU's job is to keep the GPU fed and the GPU is always at least partly idle waiting for the next batch to be assembled.
+
+Concretely: a replica serving one request and a replica serving two hundred both show a CPU core at 100%. The only thing that changed is the batch size in each engine step — a number that lives inside the engine, not on the OS. **CPU cannot see the thing that matters**, so it can never be the signal.
+
+The metrics that *can* see it come straight from the engine's own telemetry (Module 09): running and waiting sequences, KV cache occupancy, per-step time, and the TTFT/TPOT distributions.
+
+## The cliff, and why it is a cliff
+
+Here is the shape that matters. Sweep the arrival rate against a fixed fleet and watch goodput (the fraction of requests meeting the SLO) fall off what this module calls <Term t="goodput-cliff">the goodput cliff</Term>:
+
+| Rate (req/s) | p50 TTFT | p99 TTFT | Mean TPOT | Goodput |
+|---|---|---|---|---|
+| 8 | 27 ms | 530 ms | 9.7 ms | **100%** |
+| 12 | 37 ms | 524 ms | 11.3 ms | **100%** |
+| 14 | 44 ms | 572 ms | 12.5 ms | **100%** |
+| 16 | 45 ms | 579 ms | 13.2 ms | **100%** |
+| 20 | 66 ms | 1,081 ms | 17.2 ms | **98%** |
+| 26 | 173 ms | 2,243 ms | 37.7 ms | **70%** |
+| 34 | 2,306 ms | 38,016 ms | 50.2 ms | **6%** |
+
+Read the shape, not the individual numbers. Through the first four rows the fleet is comfortable: adding traffic costs almost nothing in latency. Then it degrades gracefully for a while, and then it **falls off a cliff** — between 26 and 34 req/s, goodput goes from 70% to 6% while throughput barely moves. That is the signature of queueing: once the system saturates, extra arrivals do not make more progress, they just wait longer.
+
+<Callout type="intuition" title="Why throughput stays flat while goodput collapses">
+  Throughput is *total tokens per second*. When a replica is saturated, it is already producing tokens as fast as the memory bus allows — the physical ceiling from Module 05. Adding more requests cannot raise it. But those extra requests are waiting in a queue, so their TTFT explodes. **Throughput measures the GPU; goodput measures the user.** They come apart exactly when you need them not to.
+</Callout>
+
+<Scrolly>
+  <Autoscaler client:visible slot="stage" />
+
+  <Step title="1. CPU is the wrong signal">
+    A classic autoscaler watches CPU and memory. On an inference replica, CPU is pinned near 100% by the scheduler whether one request or two hundred are in flight. The GPU is the bottleneck; the CPU is just the thing feeding it.
+  </Step>
+
+  <Step title="2. The goodput cliff">
+    Sweep the rate. Goodput holds at 100% out to about 20 req/s, dips to 70% by 26, and then falls to 6% by 34. Throughput, the dashed line, keeps climbing gently the whole way. Below the cliff you are fine; above it, tokens keep coming and are useless.
+  </Step>
+
+  <Step title="3. Queue depth is the signal">
+    The amber curve is mean queue wait. It starts rising well before the goodput curve turns — it is a leading indicator, because latency *is* queueing delay and queue depth measures it directly. Watch this curve to know the cliff is coming.
+  </Step>
+
+  <Step title="4. Scale out ahead of time">
+    A new replica is not free. It must be scheduled, the image pulled, the weights loaded and warmed (Module 22) — tens of seconds to minutes. Scaling on *current* load is always too late. Act on predicted load and keep headroom.
+  </Step>
+
+  <Step title="5. Read the whole window">
+    One gauge is easy to fool. A burst of very long prompts raises memory pressure without raising request rate; a burst of short ones does the reverse. Watch request rate, KV occupancy and long-prompt share together.
+  </Step>
+
+  <Step title="6. Scale in carefully">
+    Scaling in is riskier than scaling out. Removing a replica that still holds in-flight KV cache interrupts those requests, so drain it first — stop sending it new work, let it finish, then take it away.
+  </Step>
+
+  <Step title="7. The three controls">
+    Every autoscaler, however elaborate, is these: a target (the queue depth or SLO-derived concurrency you aim for), a window (how long you average over), and bounds. Get the bounds wrong and you either thrash or run dry.
+  </Step>
+</Scrolly>
+
+## The three signals that work
+
+A <Term t="autoscaling-signal">scaling signal</Term> has to move before the thing you care about moves. Three do:
+
+**Queue depth (waiting sequences per replica).** The most direct and most common. It leads latency because latency is queueing. Caveat: it is a *count*, so a fleet serving very long prompts looks busier than one serving short ones at the same depth. Normalise by context length if your mix is wide.
+
+**SLO-derived concurrency.** Pick the number of concurrent users that keep a replica inside its SLO, and scale to keep the fleet-wide count near *target users × replicas*. This is Little's law (Module 06) run forward, and it has the virtue of being <Term t="slo-derived-concurrency">self-correcting</Term>: if latency degrades, the *admissible* concurrency drops, and the scaler sees that the fleet is over its target.
+
+**KV cache occupancy (fraction of pool used).** Directly measures the constraint that actually binds. It catches the case that catches the others — a fleet where every queue is short but a few very long contexts are filling memory. Use it as a guard rail, not the primary trigger.
+
+<Callout type="pitfall" title="The trap: scaling on a metric you are simultaneously optimizing">
+  If you scale on queue depth and your router balances on queue depth, you have built a loop. The router evens the queues, the queues look flat, the scaler sees no pressure, and then one replica's memory fills. Route on KV occupancy and scale on queue depth (or vice versa) — **the two signals must not be the same quantity**, or they cannot see each other.
+</Callout>
+
+## Sizing a fleet with headroom
+
+From the previous lesson, one H100 running Llama-3.1-8B retires about **26 req/s** at a 50 ms TPOT and a 1 s TTFT budget, given a 1,150-token mean context. That single number, times your offered rate, gives the floor:
+
+$$
+\text{replicas} = \frac{\text{offered rate}}{26\ \text{req/s}}
+$$
+
+But it is a floor, not a plan, for two reasons:
+
+1. **A new replica takes time to become useful.** During a scale-up the extra capacity you just paid for is still loading weights. You must scale *before* you need it.
+2. **The cliff is steep.** From the table, going from 100% to 70% goodput costs only a modest latency increase, but the last stretch from 70% to 6% is catastrophic. A fleet sized to average load will sit near the top of the cliff on any bad day.
+
+A common rule: size for **peak**, not mean, and hold one replica of spare capacity so a scale-up has somewhere to land the traffic. If your peak-to-mean ratio is 3×, you are running at one-third to one-half of your peak capacity at quiet times — which is the price of not failing at peak.
+
+<Callout type="math" title="Worked example: sizing for a peak">
+  Offered rate averages 12 req/s and peaks at 36 req/s on weekday mornings. Floor: 36 / 26 = 1.4, so 2 replicas. With one spare: 3. Now check it against the cliff — 3 replicas at 36 req/s is 12 req/s each, comfortably inside the safe zone you measured. **Two replicas would have been 18 req/s each: 70% goodput, a 2.2-second p99, and users you cannot get back.**
+</Callout>
+
+## The oscillation problem
+
+A scaler that reacts to a lagging signal <Term t="scaling-oscillation">oscillates</Term>. Traffic rises, the scaler adds replicas, the metric falls, the scaler removes them, the metric rises again — and now you are paying to add and remove GPUs several times an hour while users see latency spikes each cycle.
+
+Three things prevent it, and you want all three:
+
+- **A long enough window.** Averaging over 30–60 seconds of a metric that reacts in milliseconds just adds lag. The <Term t="autoscaling-window">autoscaling window</Term> should be several times your step time, and ideally longer than the scale-up time of a replica.
+- **Asymmetric rates.** Scale out fast (one replica per interval, or step directly to the predicted need) and scale in slowly (a much longer window, and only if the metric has been low for a while). Being late to remove capacity costs money; being late to add it costs users.
+- **Bounds.** A minimum replica count so you never <Term t="scale-to-zero">scale to zero</Term> and eat a cold start on traffic, and a maximum so one bad metric cannot empty your cluster.
+
+<Callout type="mentor" title="What to say in a design review">
+  "We scale on waiting-sequences-per-replica over a 60-second window, targeting the concurrency that keeps p99 TTFT under our SLO. We add up to four replicas per minute and remove at most one per five minutes. We floor at two replicas so we never cold-start, and we cap KV pool use at 85% so a long-context request cannot starve the batch."
+</Callout>
+
+## Predicting, not reacting
+
+Everything above is reactive: something got worse, so add capacity. But a new replica is useless until its weights are loaded and warm (Module 22), and on most managed platforms that is tens of seconds to several minutes. If you wait for the signal, the signal has already cost you the SLO.
+
+So add a second term: a prediction of where load *will* be. The cheapest effective version looks at the arrival rate's recent slope rather than its level.
+
+$$
+\text{projected rate} = \text{current rate} + \text{slope} \times \text{scale-up time}
+$$
+
+That is deliberately crude, and it is enough. Suppose your rate is 20 req/s and rising at 2 req/s per second, and a new replica takes 40 seconds to become useful. Right now you have some number of replicas, and if you do nothing you will be at 20 + 2 × 40 = 100 req/s by the time help arrives. That is not a modest adjustment — it is past the cliff several times over, and no amount of scaling inside those 40 seconds will save it.
+
+Two refinements matter more than the formula:
+
+**Use more than one window.** A single slope is noisy. A short window (say 30 seconds) catches a spike that a long window would smooth away; a long window (5 minutes) captures the trend you cannot unsee. Most production systems require both to agree before scaling out.
+
+**Cap how far you will scale on a prediction.** A slope is an extrapolation, and extrapolations break. Bound it: never add more than half your current fleet on a single prediction, and never act on a slope computed from fewer than a few samples.
+
+<Callout type="pitfall" title="A predictive scaler can be worse than a reactive one">
+  If your slope calculation is noisy, a predictive scaler does something a reactive one never does: it adds GPUs that were never needed. On a spiky workload with a small fleet you can end up adding ten replicas for a spike that lasted ten seconds, then spend twenty minutes scaling them all back out — and pay for the whole exercise. This is the oscillation failure from the previous section, one step earlier in the loop, and it is why the caps above are not optional.
+</Callout>
+
+<KeyNotes>
+  1. CPU is pinned on an inference replica at any concurrency, so CPU-based autoscaling does nothing. Watch the engine's own metrics instead.
+  2. Goodput falls off a cliff past saturation — 70% at 26 req/s to 6% at 34 in the measured sweep — while throughput stays nearly flat.
+  3. Throughput measures the GPU; goodput measures the user. They come apart exactly when overload begins.
+  4. Queue depth leads latency because latency is queueing delay. It is the most useful autoscaling signal for this workload.
+  5. Do not route and scale on the same metric, or the router hides the pressure from the scaler.
+  6. Size for peak with one spare replica: a new replica is useless until its weights are loaded and warm.
+  7. Scale out fast and scale in slowly, over a long window, with a minimum and maximum. That is what stops oscillation.
+  8. Drain a replica before removing it — its in-flight KV cache holds real requests.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Your fleet sustains 5,800 output tokens per second but goodput has fallen to 10%. Which statement best describes the system?', options: ['The fleet is running below capacity and needs fewer replicas', 'It is saturated: the GPU is producing as fast as it can, but most requests are queueing and will arrive too late to matter', 'The model is broken and needs restarting', 'Throughput and goodput measure the same thing, so one of the numbers is wrong'], answer: 1, why: 'Throughput is total tokens per second and is already at the memory-bandwidth ceiling from Module 05. Goodput counts only requests that met their SLO. When the two come apart, you are past saturation: the GPU is full and the users are queueing.' },
+  { q: 'Why is queue depth a better autoscaling signal than p99 latency?', options: ['It is cheaper to compute', 'Because latency is dominated by queueing delay, so queue depth rises first and warns you before users feel it', 'Because p99 cannot be computed in real time', 'Because queue depth never fluctuates'], answer: 1, why: 'A request\'s latency is queue time plus its own work. Queue depth rises as the system approaches saturation, before that queue time becomes visible in p99. It is a leading indicator, which is exactly what you want when a new replica takes a minute to warm up.' },
+  { q: 'You route on least-KV-tokens and also autoscale on KV cache occupancy. What is the risk?', options: ['None, they reinforce each other', 'The router and the scaler are reading the same signal, so the router can mask the pressure the scaler is supposed to see', 'KV occupancy cannot be measured per replica', 'It will cause the fleet to scale to zero'], answer: 1, why: 'When both read the same quantity they form a loop: the router evens the load, the metric looks healthy, and the scaler never fires — until a long context fills a pool the router was not watching. Use different signals for routing and scaling.' },
+  { q: 'A scaler adds 4 replicas, the metric recovers, it removes 4, and the metric worsens again — repeating every few minutes. What are the two fixes?', options: ['Add a maximum replica count only', 'Shorten the scale-in window and make both directions symmetric', 'Lengthen the averaging window and make scale-in slower than scale-out', 'Switch the signal to CPU utilisation'], answer: 2, why: 'Oscillation comes from reacting to a lagging signal too eagerly. A longer window averages out noise, and asymmetric rates (fast out, slow in) stop the fleet from cycling. Being late to remove capacity costs money; being late to add it costs users.' },
+  { q: 'Your arrival rate is 20 req/s and climbing at 2 req/s per second. A new replica takes 40 seconds to load its weights and become useful. If you wait for the current metric to degrade before scaling, what rate will you be facing when the help arrives?', numeric: true, answer: 100, tolerance: 3, unit: 'req/s', why: '20 + 2 × 40 = 100 req/s. This is why scaling must be anticipatory: the 40 seconds you spend waiting are 40 seconds in which the new replica cannot help at all. Project the load forward by the scale-up time and act on that.' },
+  { q: 'A fleet of replicas each sustains 26 req/s at the SLO. Peak offered rate is 36 req/s. Sizing for peak with one spare replica, how many replicas should you run?', numeric: true, answer: 3, tolerance: 0, unit: 'replicas', why: '36 / 26 = 1.4, so the floor is 2, plus one spare = 3. Running only 2 would put 18 req/s on each, which the measured sweep shows is around 70% goodput and a multi-second p99.' },
+] } />

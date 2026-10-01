@@ -1,0 +1,234 @@
+---
+title: 'Project: Model a disaggregated system'
+summary: 'Take a real workload, size a disaggregated fleet from first principles, and defend the recommendation against the monolithic alternative. You will produce a design doc, a sizing matrix, and a sensitivity analysis that says when the design breaks.'
+objectives:
+  - Build a sizing model that computes both pool sizes from four workload inputs'
+  - Identify which constraint binds each pool, and report it rather than hiding it'
+  - Sweep the workload space and locate where the disaggregated design stops working'
+  - Compare disaggregated and shared fleets on TPOT, capacity and cost'
+  - Write a design recommendation an engineer could act on'
+colab: 21-kv-handoff.ipynb
+---
+import PoolPlanner from '@/components/viz/disaggregation/PoolPlanner.tsx';
+
+Everything in the last two lessons was a formula applied to numbers someone else chose. This project makes you choose them.
+
+You will design a disaggregated serving system for a real workload, size it, sweep it, find where it breaks, and write a recommendation. The deliverable is a **design document with a defensible number in it** — not a diagram, and not a benchmark.
+
+<Scrolly>
+  <PoolPlanner client:visible slot="stage" />
+
+  <Step title="1. Four inputs decide everything">
+    Arrivals per second, prompt length, answer length, target concurrency. Every other quantity in this project is a formula from this course applied to those four. Change one and watch which pool moves.
+  </Step>
+
+  <Step title="2. Size the prefill pool">
+    Prefill is compute-bound, so its pool is sized by FLOPs: GPU-seconds of work needed per second, rounded up. Prefill instances are nearly stateless, so this pool is cheap to scale and easy to reason about.
+  </Step>
+
+  <Step title="3. Size the decode pool, twice">
+    Decode is bound by throughput *and* by KV memory. Whichever demands more instances is the binding constraint. Report which one it was — that single fact is often the most useful line in the whole document.
+  </Step>
+
+  <Step title="4. The shared-fleet trap">
+    Sizing a shared fleet by decode alone does not make the prefill work disappear. It relocates it onto the decode GPUs, where it inflates every streaming user's step time.
+  </Step>
+
+  <Step title="5. The verdict">
+    Same fleet, two arrangements. Compare TPOT, decode capacity and utilisation. The comparison is the argument, and every cell of it should trace back to a formula you can point at.
+  </Step>
+
+  <Step title="6. Sweep the workload">
+    A design that works at 20 requests per second can collapse at 40. Sweep arrivals, prompt length and context, and record the fleet size each combination demands.
+  </Step>
+
+  <Step title="7. Find the crossover">
+    The load at which both pools reach full utilisation at the same time is where the design is balanced. Past that point one pool idles while the other saturates, and the split stops paying.
+  </Step>
+
+  <Step title="8. Write the recommendation">
+    Finish in one sentence: how many of each, for which workload, against which SLO, and what evidence would change your mind. That sentence is the deliverable; everything else is its support.
+  </Step>
+</Scrolly>
+
+<Colab nb="21-kv-handoff.ipynb" />
+
+## What you are building
+
+| Part | What it does | Lesson it comes from |
+|---|---|---|
+| **Inputs** | Four workload numbers, plus hardware, link speed and precision | *Why separate prefill and decode* |
+| **Sizing** | Both pool counts, with the binding constraint named for each | *KV transfer, pool sizing & routing* |
+| **Verification** | The transfer share on your real link, and a memory fit check | the notebook above |
+| **Comparison** | Disaggregated vs shared, on TPOT, capacity, utilisation and cost | *KV transfer, pool sizing & routing* |
+| **Sweep** | Fleet size across arrivals × prompt length × context | both lessons |
+| **Verdict** | A recommendation, its assumptions, and its failure modes | everything |
+
+## The deliverable
+
+1. **`model.py`** — the sizing model. No hard-coded answers; four inputs in, both pool sizes out, with the binding constraint reported.
+2. **`sweep.py`** — a driver that runs the model across a workload grid and emits `sweep.csv`.
+3. **`DESIGN.md`** — the design doc: inputs, sizing, the comparison table, the sweep, the crossover, and a recommendation.
+4. **`SENSITIVITY.md`** — what breaks the design, and by how much.
+
+<Callout type="real" title="What makes a sizing document credible">
+  A reader must be able to answer four questions from it alone: **what workload** you sized for (distribution, not a single number), **what hardware and fabric** you assumed, **which constraint bound** each pool, and **what would invalidate the result**. A document that omits the fourth is a document that will be discovered to be wrong in production.
+
+  Reproduce the lesson's worked example first — 20 req/s, 4,096-token prompts, 256-token answers, 512 concurrent at 4K context on H100s — and confirm you get 3 prefill + 5 decode. A model that cannot reproduce a known answer is not ready to produce an unknown one.
+</Callout>
+
+## Step 1 · The model
+
+Build it from the two formulas, and make the binding constraints explicit rather than folded into a `min()`.
+
+```python
+def size(workload, hw):
+    """Return both pool sizes and the constraint that bound each."""
+    # --- prefill: bound by FLOPs ---
+    t_per_token = 2 * workload.params / (hw.flops * hw.mfu)
+    gpu_seconds = workload.arrivals * workload.prompt_tokens * t_per_token
+    prefill = max(1, math.ceil(gpu_seconds))
+
+    # --- decode: bound by throughput AND KV memory ---
+    kv_per_seq = workload.ctx * kv_bytes_per_token(workload) * workload.kv_bytes
+    free = hw.mem - workload.params * workload.weight_bytes - 0.04 * hw.mem
+    seqs_per_gpu = max(1, int(free // kv_per_seq))
+    per_gpu = seqs_per_gpu / decode_step_time(seqs_per_gpu, workload, hw)
+
+    by_tput = max(1, math.ceil(workload.arrivals * workload.answer_tokens / per_gpu))
+    by_mem = max(1, math.ceil(workload.concurrency / seqs_per_gpu))
+
+    return Pool(
+        prefill=prefill,
+        decode=max(by_tput, by_mem),
+        decode_bound=('kv_memory' if by_mem >= by_tput else 'throughput'),
+        ...
+    )
+```
+
+**Requirements:**
+
+- Read the model and hardware specs from a config, not from constants scattered through the function.
+- Return the binding constraint, never just the number.
+- Compute the **transfer share** and refuse to emit a design where it exceeds your stated budget.
+- Size both pools from **p99**, and say so. Mean prompt length understates prefill demand badly.
+
+## Step 2 · Verification against hardware
+
+Run the Colab notebook above on a free T4 and feed its measured constants back into the model. You are checking that the formulas are not merely self-consistent but match real hardware:
+
+- Does your model's KV-bytes-per-token match the measured value from the notebook?
+- Is your measured transfer share under 10% of a measured decode step?
+- Does your model's decode-step time match the measured one at the same batch?
+
+Report the ratio of predicted to measured for each. A ratio outside 0.8–1.25 means a constant is wrong — most often the MFU or MBU assumption, which you inherited from earlier modules and never checked on this hardware.
+
+<Callout type="pitfall" title="The three ways a sizing model lies">
+  1. **Using mean prompt length.** Prefill cost is linear in prompt length, so a mean understates the pool. Size on p99, or on p99 of a realistic mixture (short chat majority, long RAG tail).
+  2. **Ignoring the KV constraint because throughput looks fine.** In the lesson's example, throughput wanted 2 decode GPUs and KV memory wanted 5. Sizing by throughput alone ships a fleet that OOMs on day one.
+  3. **Quoting theoretical link bandwidth.** A 400 GbE NIC does not deliver 400 Gb/s. Use an achieved figure — ideally your own measured one — and remember it is a floor, not a promise.
+</Callout>
+
+## Step 3 · The comparison
+
+Build the table that is the actual argument. For the same workload, show both arrangements:
+
+| | Shared fleet | Disaggregated |
+|---|---|---|
+| Total GPUs | | |
+| TPOT for a streaming user | | |
+| Decode capacity (tok/s) | | |
+| Meets the SLO? | | |
+| Cost per million output tokens | | |
+| p99 behaviour under a burst | | |
+
+Two things must be honest here. First, the shared-fleet row must include the prefill duty cycle — a shared fleet does not get to skip prefill. Second, the cost row must use real GPU prices from the `perfModel` table, because "we spent three more GPUs" only becomes an argument when it has a dollar figure.
+
+<Callout type="math" title="Keep the sweep inside your time budget">
+  The model is pure arithmetic, so the sweep is nearly free — a $4 \times 4 \times 4$ grid is 64 cells and runs in well under a second. Spend the saved time on the **third axis**: vary the link speed from 25 GbE to NVLink. That axis is where disaggregation lives or dies, and it is the one people skip.
+</Callout>
+
+## Step 4 · The sweep and the crossover
+
+Sweep arrivals × prompt length × context, and record fleet size per cell. Then find and report:
+
+- **The crossover load** — where prefill and decode pools reach equal utilisation. Below it, prefill is the constraint; above it, decode is.
+- **The saturation point** — the arrival rate at which your design stops meeting the SLO.
+- **The most fragile axis** — which single input, moved by how much, breaks the design first.
+
+That last one is the most valuable output of the whole project, because it tells a future operator which knob not to touch.
+
+## Extend it (pick at least two)
+
+- **A cost model across precision.** Re-run the sweep with FP8 weights and FP8 KV. Both pools shrink the KV constraint; does the design change, or was prefill always binding?
+- **A failure-mode section.** Model a prefill instance dying mid-handoff. What does the decode side see, and how would a retry avoid double-counting the transfer?
+- **A TPOT-versus-cost Pareto frontier.** Plot achievable TPOT against dollars per million tokens across link speeds and pool ratios. Where does the frontier flatten, and what does that tell you not to spend on?
+- **A queueing extension.** Replace the closed-loop model with Little's law from Module 06 and predict p99 rather than mean. Does the crossover move?
+- **An autoscaling controller.** Write the control loop that adds prefill instances when p99 prefill queue depth rises. What is the oscillation risk?
+
+## Check yourself
+
+Before calling it done, answer these. If any answer is "no", the design is not finished.
+
+1. Does your model reproduce the lesson's worked example exactly — 3 prefill, 5 decode, bound by KV memory?
+2. Can you state the binding constraint for each pool in one sentence each?
+3. Is every pool sized from a **p99**, with the distribution written down?
+4. Does your measured transfer share (from the notebook) fall under your stated budget, on your stated link?
+5. Have you named the most fragile axis and the amount that breaks it?
+6. Does the recommendation survive a reviewer who asks "what if traffic doubles?" — with a number, not an adjective?
+7. Could someone else re-run `model.py` and `sweep.py` and land on the same numbers without asking you a question?
+
+## Acceptance criteria
+
+**Correctness**
+- Both pool sizes computed from formulas, with the binding constraint returned and displayed.
+- Sizes derived from p99 workload inputs, with the distribution stated.
+- Predicted-to-measured ratios reported for KV bytes, transfer time and decode step, all within 0.8–1.25 or explained.
+
+**Coverage**
+- At least a $4 \times 4 \times 4$ sweep over arrivals, prompt length and context.
+- Link speed varied as a fourth axis.
+- Crossover, saturation point and most fragile axis each located and reported.
+
+**Decision quality**
+- A comparison table covering TPOT, capacity, SLO verdict and cost per million tokens.
+- A recommendation in one sentence, with the assumptions it depends on listed.
+- A failure-mode section naming at least two ways the design breaks in production.
+
+**Communication**
+- `DESIGN.md` is readable by an engineer who has not read this course.
+- Every number traces to a formula or a measurement, with no unexplained constants.
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | Predicted and measured agree within 0.8–1.25 with the discrepancy explained. The sweep includes link speed and finds a real crossover. The recommendation survives a doubling of traffic with a number attached, and the failure-mode section describes a mid-handoff failure precisely enough to write a retry for. The most fragile axis is identified and defended. |
+| **Proficient** | Meets all acceptance criteria. Both pools sized correctly with binding constraints named, a real sweep, a comparison table with cost, and a defensible recommendation. The measured-versus-predicted check is present but covers fewer quantities. |
+| **Developing** | Sizes both pools from mean rather than p99, or omits the binding constraint from the output. The comparison is qualitative ("split is faster") with no cost column. The sweep varies one axis only. |
+| **Beginning** | Reports pool sizes with no derivation, or forgets that a shared fleet must still perform prefill — inflating its apparent decode capacity. No measurement, no sweep, no failure modes. |
+
+<Callout type="mentor" title="The habit that separates the top band">
+  The strongest versions of this project all do the same unglamorous thing: **they report a ratio between predicted and measured, and they refuse to hide a bad one.**
+
+  A model that says "predicted 30.1 ms, measured 27.4 ms, ratio 0.91" tells the reader how much to trust it. A model that reports only its prediction tells them nothing. The ratio is not an embarrassment to be smoothed over — it is the most valuable number in the document, because it is the one that says whether your constants match the hardware in front of you.
+</Callout>
+
+## Where this goes next
+
+- **Module 22 (Production Serving)** — take your recommendation and make it survive a deploy: warm-up, health checks, graceful shutdown, and rolling upgrades across two pools.
+- **Module 23 (Routing, Autoscaling & Orchestration)** — implement the bin-packing router from the last lesson, and write the control loop that scales each pool independently.
+- **Module 25 (Observability & Reliability)** — decide which per-pool metrics you would alert on, and what a mid-handoff failure looks like in a dashboard.
+
+Your sizing model becomes the first section of any capacity plan you ever write. Keep it.
+
+<KeyNotes>
+  1. Four inputs decide the whole design — arrivals, prompt length, answer length, concurrency. Everything else is a formula from this course.
+  2. Size prefill by FLOPs (GPU-seconds per second, rounded up) and decode by **both** throughput and KV residency, taking the larger.
+  3. Always report **which constraint bound**. It is usually the most useful line in the design document.
+  4. Size from p99, never the mean: prefill cost is linear in prompt length, so a mean understates the pool.
+  5. Validate predicted against **measured** on real hardware and report the ratio. Outside 0.8–1.25, a constant is wrong — usually MFU or MBU.
+  6. The shared-fleet baseline must include prefill duty. A shared fleet does not get to skip prefill; it just pays for it inside every decode step.
+  7. Sweep link speed as an axis. It is where disaggregation lives or dies, and the axis people forget.
+  8. Report the **most fragile axis** and how much breaks it — that tells a future operator which knob not to turn, and it is the output that ages best.
+</KeyNotes>

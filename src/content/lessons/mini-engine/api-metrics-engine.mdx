@@ -1,0 +1,276 @@
+---
+title: 'Step 4: Streaming API & metrics'
+summary: 'Finish the engine: put it behind HTTP, stream tokens as they are produced, and export the counters that tell you whether it is healthy. You will build the SSE layer, the detokenizer, and a `/metrics` endpoint — then check your whole engine against a real vLLM.'
+objectives:
+  - Serve a streamed response with SSE and measure TTFT, TPOT and ITL correctly
+  - Verify the identity end-to-end = TTFT + (n−1) × TPOT as a timing self-test
+  - Handle incremental detokenization without emitting mojibake
+  - Decouple the network from the GPU loop with a bounded output queue
+  - Export the counters and histograms a serving dashboard actually needs
+---
+import ApiMetrics from '@/components/viz/mini-engine/ApiMetrics.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have a runner, a scheduler and a KV manager. What you do not have is a server, and without one nobody can use any of it. This lesson adds the API layer — and, more importantly, adds the **instrumentation**. An engine you cannot measure is a program that runs, and an engine you can measure is a service you can operate.
+
+The last build in this module is also where you find out whether the previous three actually work.
+
+## Three clocks, not one
+
+<Scrolly>
+  <ApiMetrics client:visible slot="stage" />
+
+  <Step title="1. Three clocks">
+    A request is judged by three numbers: <Term t="ttft">TTFT</Term>, <Term t="tpot">TPOT</Term>, and end-to-end. Measure them on a **streamed** response from a client-side clock, or you are measuring something else — typically the buffering of a framework that held everything until the end.
+  </Step>
+
+  <Step title="2. Where TTFT goes">
+    TTFT is queue wait plus prefill plus one decode step. On a loaded server the queue term is usually the biggest, and it is the term a kernel profiler cannot see: nothing is running on the GPU while a request waits its turn.
+  </Step>
+
+  <Step title="3. The stream, token by token">
+    One chunk per token, and the first chunk leaves as soon as the first token exists. This is the whole reason streaming matters: a non-streaming response has TTFT equal to end-to-end latency, so a 20-second generation shows nothing for 20 seconds.
+  </Step>
+
+  <Step title="4. SSE framing">
+    Server-sent events: one `data:` line per chunk, and a final `data: [DONE]`. The connection stays open for the whole generation. This is what `stream: true` does in the OpenAI-compatible API.
+  </Step>
+
+  <Step title="5. The detokenizer trap">
+    A token is not a character. `"though"` can be two tokens, and `"café"` can be three tokens arriving as fragments of one multi-byte UTF-8 sequence. Stream raw ids and your client renders mojibake — the bug is in the API layer, not the model.
+  </Step>
+
+  <Step title="6. Decoupling the network">
+    Pushing tokens straight to the socket couples the network to the GPU loop, so one slow client adds its latency to everyone. A bounded queue plus a writer thread means a 200 ms socket write never lands inside a 7 ms step.
+  </Step>
+
+  <Step title="7. Counters every iteration">
+    Five counters per iteration cost microseconds and become the raw material of every dashboard you will ever build for this engine. They are also the cheapest thing you can add and the hardest to retrofit.
+  </Step>
+
+  <Step title="8. The four that matter">
+    Running count, waiting count, cache usage, preemption count. **Waiting count is the leading indicator**: throughput still looks healthy while it climbs, and then p99 diverges without warning.
+  </Step>
+</Scrolly>
+
+## The SSE endpoint
+
+```python
+@app.post("/v1/completions")
+async def completions(req: Request):
+    body = await req.json()
+    prompt_ids = tokenizer.encode(body["prompt"])
+    request = Request(prompt_ids, max_tokens=body.get("max_tokens", 128),
+                      stream=body.get("stream", False))
+    scheduler.add_request(request)          # returns immediately; TTFT clock is running
+
+    async def event_stream():
+        async for token_id in request.stream():     # fed by the engine loop
+            text = detokenizer.decode(token_id)
+            yield f"data: {json.dumps({'choices': [{'text': text}]})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    if body.get("stream"):
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return await collect(request)
+```
+
+Two things make this correct rather than merely working:
+
+- **`add_request` returns immediately.** If tokenization or JSON parsing happened inside the engine loop, a burst of arrivals would stall decode for everyone. It is all async, and the GPU loop never waits on it.
+- **The stream reads a queue the engine fills.** The engine pushes `token_id` onto `request.queue` and moves on. The `async for` above is the only thing that touches the socket.
+
+<Callout type="pitfall" title="The buffering bug that looks like a broken model">
+  Returning a `StreamingResponse` whose generator does `text = "".join(all_tokens)` first and then yields the whole string. The response is technically streamed and the headers are correct, but TTFT is now equal to end-to-end latency. The symptom users report is "the model hangs then dumps everything at once", and the cause is in your API layer.
+</Callout>
+
+## The detokenizer
+
+Incremental detokenization is a small, finicky problem. The rule that handles almost all of it:
+
+```python
+class Detokenizer:
+    """Emit text incrementally, holding back an incomplete trailing character."""
+
+    def __init__(self, tokenizer):
+        self.tok = tokenizer
+        self.pending = ""          # text of a character not yet complete
+
+    def decode(self, token_id: int) -> str:
+        # decode the single token alone, so no cross-token merges happen
+        piece = self.tok.decode([token_id])
+        if not piece:
+            return ""
+        combined = self.pending + piece
+        # hold back the longest suffix that is not yet valid UTF-8
+        for cut in range(min(3, len(combined)), 0, -1):
+            head, tail = combined[:-cut], combined[-cut:]
+            try:
+                head.encode("utf-8").decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            self.pending = tail
+            return head
+        self.pending = combined
+        return ""
+```
+
+The rule is one sentence: **never emit a suffix of a character.** Try dropping one, two or three trailing bytes and emit the shortest prefix that is valid UTF-8; whatever you dropped is pending until the next token completes it.
+
+In practice, use the tokenizer library's own incremental decode rather than hand-rolling this — **but write the test either way**, because it is the bug that ships.
+
+<Callout type="math" title="The identity that validates your whole instrument">
+  For any request generating $n$ tokens:
+
+  $$
+  \text{E2E} \approx \text{TTFT} + (n - 1) \times \text{TPOT}
+  $$
+
+  This is arithmetic, not an approximation with slack — the only error is the final socket flush. **If it fails by more than a few percent, you have a timing bug**, and no other number you measure is trustworthy. Make it the first assertion in your harness.
+</Callout>
+
+## The counters
+
+Record these once per iteration, before you need them and before you know which ones you will need:
+
+```python
+class Metrics:
+    def __init__(self):
+        self.running = Gauge("vllm:num_requests_running")
+        self.waiting = Gauge("vllm:num_requests_waiting")
+        self.cache_usage = Gauge("vllm:gpu_cache_usage_perc")
+        self.preemptions = Counter("vllm:preemption_count")
+        self.iter_tokens = Counter("vllm:iteration_tokens_total")
+        self.ttft = Histogram("vllm:time_to_first_token_seconds")
+        self.tpot = Histogram("vllm:time_per_output_token_seconds")
+        self.itl = Histogram("vllm:inter_token_latency_seconds")
+
+    def record_iteration(self, scheduler, token_count):
+        self.running.set(len(scheduler.running))
+        self.waiting.set(len(scheduler.waiting))
+        self.cache_usage.set(scheduler.kv.blocks_used() / scheduler.kv.total_blocks)
+        self.iter_tokens.inc(token_count)
+```
+
+| Metric | Type | Reads as |
+|---|---|---|
+| `num_requests_running` | gauge | the live batch; flat means saturated |
+| `num_requests_waiting` | gauge | **queue depth**; the leading indicator of TTFT |
+| `gpu_cache_usage_perc` | gauge | above 0.95 means preemption is starting |
+| `preemption_count` | counter | non-zero means you are past capacity |
+| `iteration_tokens_total` | counter | ÷ wall time = your real throughput |
+| `time_to_first_token_seconds` | histogram | p50 / p95 / p99 TTFT |
+| `inter_token_latency_seconds` | histogram | the gap *between* tokens; catches stutter |
+
+<Callout type="intuition" title="Why throughput counters lie">
+  `iteration_tokens_total` divided by wall time is the number that says the engine is working. It is also the number that stays perfectly flat while the system collapses: more requests in flight means more tokens per second **and** worse latency for everyone, right up until the queue diverges. This is Module 06's goodput argument in one metric — always pair throughput with a latency percentile, and prefer goodput to either.
+</Callout>
+
+## The four dashboards, and what each one is for
+
+Module 24's dashboards, specialised to an engine. You only need four panels, and each answers one question a different person will ask.
+
+**1. Saturation.** Running count and waiting count, over time.
+
+| Waiting count | Reading |
+|---|---|
+| ~0, running at the cap | healthy, at capacity by choice |
+| rising steadily | **under-provisioned**, or `max_num_seqs` is too low |
+| rising with throughput flat | past capacity; latency is about to diverge |
+| spiking then draining | bursty arrivals; you may need admission control |
+
+This is the panel that pages you, and it pages you *early* — before latency is affected — because waiting count is the leading indicator.
+
+**2. Memory pressure.** `gpu_cache_usage_perc` and `preemption_count`.
+
+Cache usage above 0.95 means the next allocation fails. A non-zero preemption count means it already has. Neither is an alert you want to discover from a user complaint.
+
+**3. Latency distribution.** TTFT and ITL histograms, p50/p95/p99, never a mean.
+
+The mean of a latency distribution is a number describing no actual request. If your dashboard shows one number per metric, it is showing you the wrong one.
+
+**4. Throughput and goodput.** Output tokens per second, and the subset that met your SLO.
+
+These two together are the honest summary of a serving system. Throughput alone will happily report a healthy number while every user waits.
+
+<Callout type="real" title="The alert worth having first">
+  ```yaml
+  - alert: EngineQueueGrowing
+    expr: rate(vllm:num_requests_waiting[5m]) > 0.5
+    for: 10m
+  ```
+  
+  This fires while the system is still meeting its SLO — which is exactly when you can still do something about it. Alerting on p99 latency instead fires when it is already too late: at that point the only remaining options are adding capacity or shedding load.
+</Callout>
+
+## Test the layer you cannot see
+
+The API layer is where a "the GPU is idle" bug hides. Three checks that take ten minutes and catch most of it:
+
+```bash
+# 1. is it actually streaming, byte by byte?
+curl -N -s localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"m","prompt":"Count to twenty","max_tokens":60,"stream":true}' \
+  | while IFS= read -r line; do printf '%s %s\n' "$(date +%s.%N)" "$line"; done
+```
+
+If those timestamps arrive in a burst at the end, you are buffering. Compare the first timestamp against your TTFT metric: **if they disagree, one of them is wrong**, and the client-side one is the one to believe.
+
+```bash
+# 2. does one slow client hurt the others?
+# open two streams; throttle one with `tc`, then compare the other's ITLs
+```
+
+```python
+# 3. do the two paths agree?
+assert stream_text == non_stream_text      # same engine, same seed
+```
+
+<Callout type="pitfall" title="The GIL trap you already know about">
+  A synchronous `time.sleep`, a blocking file read, or a `requests.get` to another service inside an `async def` handler blocks the **entire event loop** — every other request, not just this one. The symptom is a TTFT histogram with a long thin tail and a median that looks perfect, which is why it is so confusing in practice. If your p50 is fine and your p99 is terrible, look for blocking code in the async path first.
+</Callout>
+
+## Put it all together and check it
+
+The moment of truth is a diff against `transformers`. If your engine and `model.generate()` do not produce identical tokens at temperature 0, you have a bug, and it is in one of four places:
+
+| Symptom | Likely cause |
+|---|---|
+| Wrong from token 1 | Sampling params, chat template, or the first prefill |
+| Drifts after a few tokens | K/V written at the wrong slot — the write-before-attend bug |
+| Wrong only under batching | Position ids or RoPE offsets computed from the batch index instead of the sequence |
+| Wrong only on shared prefixes | Prefix hash collision, or a refcount freeing a live block |
+
+```python
+# the check that finds all four
+out_engine  = my_engine.generate(prompt, max_tokens=64, temperature=0.0)
+out_hf      = hf_model.generate(prompt, max_tokens=64, do_sample=False)
+assert out_engine == out_hf, next(i for i, (a, b) in enumerate(zip(out_engine, out_hf)) if a != b)
+```
+
+Running this at batch size 1, then batch size 8, with and without prefix caching, is worth more than every unit test you will write. It localises a bug to a stage in one run.
+
+<KeyNotes>
+  1. Three clocks: **TTFT**, **TPOT**, end-to-end. Measure them on a streamed response from a client-side clock.
+  2. `add_request` must return immediately. Tokenizing inside the engine loop stalls decode for everyone.
+  3. Stream one chunk per token, and send the first chunk as soon as the first token exists — otherwise TTFT equals end-to-end.
+  4. Tokens are not characters. Incremental detokenization must buffer incomplete UTF-8 sequences or clients get mojibake.
+  5. Decouple the network with a bounded queue and a writer thread, so one slow client cannot add its latency to the whole batch.
+  6. Validate $\text{E2E} \approx \text{TTFT} + (n-1)\times\text{TPOT}$ first. If it fails, you have a timing bug and nothing else is trustworthy.
+  7. Record five counters per iteration: running, waiting, cache usage, preemptions, tokens. They cost microseconds and cannot be retrofitted.
+  8. **Waiting count is the leading indicator** — throughput stays flat while it climbs, then latency diverges.
+  9. Never report throughput alone. Pair it with a latency percentile, and prefer goodput to either.
+  10. Diff against `transformers.generate()` at temperature 0, at batch 1 and batch 8, with and without prefix caching. It localises a bug to a stage in one run.
+  11. Four panels are enough: saturation, memory pressure, latency distribution, throughput-with-goodput. Alert on the **waiting count**, not on p99 — it fires while you can still act.
+  12. If p50 latency is fine and p99 is terrible, look for blocking code inside an `async def` first. A synchronous call stalls every request, not just one.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A request takes 400 ms to first token, then generates 40 more tokens at 12 tokens per second. What is end-to-end latency, in seconds?', numeric: true, answer: 3.73, tolerance: 0.15, unit: 's', why: 'E2E = TTFT + (n − 1) × TPOT. The first of the 40 tokens is already inside TTFT, so 39 gaps remain. TPOT = 1/12 s, so 0.400 + 39 × 0.0833 = 0.400 + 3.25 = 3.65 s. Using n instead of n − 1 double-counts the first token.' },
+  { q: 'Your streaming endpoint returns a StreamingResponse, but users see nothing for 4 seconds and then the whole answer. What is the bug?', options: ['TTFT is too high', 'The generator collects all tokens before yielding the first one, so TTFT has become end-to-end latency', 'The client is not reading the stream', 'The tokenizer is too slow'], answer: 1, why: 'The response is technically streamed and the headers are right, but nothing is yielded until generation finishes. The first byte is what the user perceives as TTFT.' },
+  { q: 'Throughput is flat, p50 TTFT is stable, and p99 is climbing steadily. Which metric is telling you first?', options: ['num_requests_running', 'num_requests_waiting', 'gpu_cache_usage_perc', 'iteration_tokens_total'], answer: 1, why: 'The waiting count rises as long as arrivals outpace retirements, before it shows up in any latency percentile. It is the leading indicator; throughput and even p50 stay healthy while it climbs.' },
+  { q: 'Which metric tells you that an engine is past capacity rather than merely busy?', numeric: true, answer: 1, tolerance: 0, unit: 'metric', why: 'A rising preemption count. It means allocation is failing and the scheduler is evicting live sequences — no scheduling policy fixes that; you need more KV memory, shorter contexts or a lower max_model_len.' },
+  { q: 'Your engine matches transformers at batch size 1 but drifts after ~10 tokens at batch size 8. What is the most likely cause?', options: ['A bad chat template', 'Position ids or RoPE offsets computed from the batch index rather than each sequence’s true token count', 'A non-seeded sampler', 'An oversized max_num_seqs'], answer: 1, why: 'Everything correct at batch 1 points at how the batch is assembled. RoPE positions must come from each sequence’s own token count; deriving them from the row index only breaks once batched.' },
+  { q: 'A client renders “naïve” with replacement characters. Where is the bug most likely?', options: ['In the GPU kernel', 'In the detokenizer: it is emitting a partial multi-byte UTF-8 sequence instead of buffering it', 'In the scheduler’s admission policy', 'In the KV block size'], answer: 1, why: 'A multi-byte character can span several tokens. The API layer must hold back an incomplete trailing UTF-8 sequence until the rest arrives, or the client receives bytes that are not yet a character.' },
+]} />

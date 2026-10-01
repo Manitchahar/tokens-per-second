@@ -1,0 +1,227 @@
+---
+title: 'The Triton programming model: vector add'
+summary: 'Write your first GPU kernel in Python. Learn the one idea Triton asks you to think about instead of threads — a grid of independent programs — and see why block size and masking decide whether it is fast.'
+objectives:
+  - Write a complete Triton vector-add kernel and explain what each line does
+  - Use program_id and tl.arange to give each program its own slice of the data
+  - Mask a block so one kernel handles any length, including a ragged edge
+  - Predict how grid size and block size change launch overhead and GPU utilization
+  - Read a kernel’s compiled metadata and use it to guess where time goes
+---
+import LaunchGrid from '@/components/viz/triton/LaunchGrid.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In Module 02 you learned that a GPU is thousands of simple cores and that a forward pass is hundreds of <Term t="kernel">kernel</Term> launches. Everything so far, you wrote in PyTorch and let the stack below you decide how that work actually reaches the silicon.
+
+Now you go one level down. <Term t="triton">Triton</Term> is an open-source language for writing GPU kernels in Python — you write a function, Triton compiles it for the specific GPU you are on, and it runs at the speed of hand-written CUDA. It is how most of the fast inference kernels actually in production today were written, including the fused attention and normalization kernels you will meet in Module 14 and Module 15.
+
+We start with the smallest possible kernel: add two vectors. It is deliberately trivial, because the point is not the arithmetic. The point is the **programming model** — the one idea you have to unlearn and replace.
+
+<Callout type="mentor" title="How to read this module">
+  Every lesson here ends with a kernel you can run on a free Colab T4. Write them. A Triton kernel is unusual in that reading about it teaches you almost nothing: the mental model only clicks once you have seen a grid launch 128 programs to move 256 bytes.
+</Callout>
+
+## The idea that replaces threads
+
+Here is the entire conceptual shift, and it is small.
+
+<Scrolly>
+  <LaunchGrid client:visible slot="stage" />
+
+  <Step title="1. You write a program, not a thread">
+    In CUDA you are told to think in threads: each thread has an index, you compute what to load from it, and 32 of them are bound into a warp that executes in lockstep. In Triton you write **one program**, and a program is handed to a whole block of threads to run cooperatively. You never see a thread.
+  </Step>
+
+  <Step title="2. Your function is launched once per program">
+    Adding two vectors of $N$ elements means launching a **grid** of programs. Every program runs your function body with its own index. The grid is what gives you parallelism for free — you declare the shape of the work, not the coordination.
+  </Step>
+
+  <Step title="3. Each program asks which one it is">
+    The single most important line is `pid = tl.program_id(0)`. It returns this program's position in the grid. That number is the *only* thing that distinguishes one program from another, and it is how each one finds the slice of data it owns.
+  </Step>
+
+  <Step title="4. A program owns a block of elements">
+    Instead of one element, a program handles `BLOCK_SIZE` of them at once, as a vector. `tl.arange(0, BLOCK_SIZE)` builds the offsets within the block, so program `p` covers elements $p \times \text{BLOCK}$ through $p \times \text{BLOCK} + \text{BLOCK} - 1$. The offsets are a vector, not a loop counter.
+  </Step>
+
+  <Step title="5. The ragged edge needs a mask">
+    A grid rarely divides the length evenly. With $N = 128$ and `BLOCK_SIZE = 32` you get exactly 4 programs, but with $N = 100$ the last block runs off the end. A **mask** — `offs < N` — makes the out-of-range lanes load nothing and store nothing, so **one kernel serves any length**.
+  </Step>
+
+  <Step title="6. Block size is a real design decision">
+    Set `BLOCK_SIZE = 1` and you launch 128 programs to move 256 bytes. Each launch costs about 5 µs of CPU-side work, so you would spend ~640 µs of overhead to move data that takes 0.4 µs. The GPU finishes one element and immediately runs out of work.
+  </Step>
+
+  <Step title="7. One launch, one output">
+    At `BLOCK_SIZE = 128`, a single program does the whole vector: ~4 µs total, and the 5 µs launch overhead is not even visible. **The arithmetic is identical.** You changed nothing about the math and got a 160× difference in time — purely from the shape of the work.
+  </Step>
+</Scrolly>
+
+That last point is the one to hold on to. GPU performance is not about how clever your arithmetic is; it is about how you shape work so the hardware is never waiting.
+
+## The kernel, line by line
+
+Here is the whole thing, and it is genuinely complete — this runs.
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, c_ptr, n, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)                     # which program am I?
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)   # my slice of the vector
+    mask = offs < n                            # ignore anything past the end
+    a = tl.load(x_ptr + offs, mask=mask)       # gather my elements of x
+    b = tl.load(y_ptr + offs, mask=mask)       # gather my elements of y
+    tl.store(c_ptr + offs, a + b, mask=mask)   # scatter the sum into c
+
+def add(x, y):
+    c = torch.empty_like(x)
+    n = x.numel()
+    BLOCK_SIZE = 128
+    grid = (triton.cdiv(n, BLOCK_SIZE),)       # how many programs to launch
+    add_kernel[grid](x, y, c, n, BLOCK_SIZE=BLOCK_SIZE)
+    return c
+```
+
+Let me take each piece, because each one answers a question you would otherwise have to guess.
+
+**`@triton.jit`** marks the function as a kernel. It does not run on the CPU — it is compiled for the GPU. The first time you call it with a given set of argument types and dtypes, Triton translates it to machine code (this is <Term t="jit">just-in-time compilation</Term>) and caches the result. Call it a second time with the same signature and it launches the cached binary in a few microseconds. Call it with a different tensor dtype and it compiles again.
+
+**`pid = tl.program_id(0)`** returns this program's index along grid dimension 0. For a 1-D grid it is simply a counter from 0 to `grid[0] - 1`. Triton grids can be 2-D or 3-D (the `0`, `1`, `2` argument picks the axis), which is how a kernel that tiles a matrix addresses a row and a column — but for a vector, one dimension is enough.
+
+**`offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)`** is the heart of it. `tl.arange(0, BLOCK_SIZE)` creates a vector of the values `[0, 1, 2, ..., BLOCK_SIZE - 1]` — the offsets *within* one block. Adding `pid * BLOCK_SIZE` shifts that vector so program 1 covers 32..63, program 2 covers 64..95, and so on. **This is not a loop.** Where CUDA would write `for (int i = 0; i < 32; i++)`, Triton writes one vectorized expression and the compiler emits the equivalent SIMD instructions for the whole block at once.
+
+**`BLOCK_SIZE: tl.constexpr`** marks the parameter as a compile-time constant. This matters: because it is baked into the compiled code, Triton can unroll and vectorize around it. It also means the value is part of the kernel's *signature* — changing it triggers a recompile. That is the mechanism behind <Term t="autotuning">autotuning</Term> later.
+
+**`tl.load(x_ptr + offs, mask=mask)`** performs a gather. The pointer arithmetic on a *vector* of offsets does not index one element; it loads `BLOCK_SIZE` elements in parallel, each from its own address. The `mask` says which lanes are real. Lanes where the mask is false are **not loaded at all** — Triton does not read out of bounds, it just skips them.
+
+**`mask = offs < n`** is the <Term t="masking">masking</Term> idea, and it is worth dwelling on. Without it, the last program of a ragged grid would read past the end of the tensor — into whatever memory is next, which might be another tensor, which might not be mapped at all. With it, the kernel is correct for *every* `n` without a single special case. Real kernels mask on **every** load and store, always.
+
+<Callout type="pitfall" title="The mask must be on the store too">
+  Masking the load but forgetting the store is the classic Triton bug. The load is safe — it skipped the bad lanes — but the store would still write them, scribbling past the end of `c` and corrupting whatever tensor lives there. You will corrupt memory, see a wrong number somewhere else, and spend an afternoon. Rule: **load and store always take the same mask.**
+</Callout>
+
+**`grid = (triton.cdiv(n, BLOCK_SIZE),)`** computes how many programs to launch. `triton.cdiv(a, b)` is ceiling division, so `cdiv(100, 32) = 4` — enough programs to cover 100 elements with blocks of 32 (the last one mostly masked off). Launching `add_kernel[grid](...)` runs one program per grid entry.
+
+**`tl.store(c_ptr + offs, a + b, mask=mask)`** writes the result. The whole kernel is: find your slice, load it, add it, store it. There is no loop, no thread index, no shared memory, no barrier.
+
+## Why block size decides everything
+
+`BLOCK_SIZE` is the only real tuning knob in this kernel, and its effect is easy to derive.
+
+<Callout type="math" title="Worked example: launch overhead versus useful work">
+  Each launch costs about five microseconds of CPU-side time. Our vector is $N = 128$ FP16 elements, so moving it means reading 256 bytes and writing 256 bytes: 512 bytes. A T4 has about 320 GB/s, so the data itself takes $\frac{512}{320 \times 10^9} \approx 1.6\ \mu s$ — call it about 2 µs.
+
+  Now price three block sizes:
+
+  | `BLOCK_SIZE` | Programs | Launch overhead | Data time | Total |
+  |---|---|---|---|---|
+  | 1 | 128 | 640 µs | 1.6 µs | ~640 µs |
+  | 8 | 16 | 80 µs | 1.6 µs | ~82 µs |
+  | 128 | 1 | 5 µs | 1.6 µs | ~7 µs |
+
+  Same arithmetic. Same bytes. The first row spends **99.8% of its time launching kernels**. And note the total is not simply `programs × 5 µs` — launches are asynchronous and overlap, so the real cost lands between the two extremes. The shape is what matters, and the shape was wrong.
+</Callout>
+
+This is not a toy problem. It is the same failure you measured in Module 02, when a decode GEMM turned out to be memory-bound: the GPU finished the math long before the bytes arrived. `BLOCK_SIZE` is how you give it enough work per program to amortize the setup, and enough programs to keep every SM busy.
+
+There is a second constraint pushing the other way. Each program holds `BLOCK_SIZE` numbers live in **registers** while it works. Make the block too large and those registers spill to slower memory — the data has to make a second trip. That is why `tl.next_power_of_2` is used for block sizes: the hardware wants powers of two, and Triton will pad a non-power-of-two block to one, wasting the padded lanes.
+
+<Callout type="intuition" title="Pick the block size from the grid, not from taste">
+  A good starting rule, and the one to start from before you tune:
+
+  - Want a few thousand programs total, so a T4's 40 SMs and an H100's 132 each get several.
+  - But not so many that launch overhead shows up.
+  - And a block small enough that registers do not spill.
+
+  For a 1M-element tensor on a T4, `BLOCK_SIZE = 1024` gives ~1,000 programs, each moving 2 KB. That is in the right zone. For our toy 128-element vector, the whole thing is one program.
+</Callout>
+
+## Blocks are not threads: what the hardware does with your program
+
+The thing that makes this fast is not the Python syntax. It is what the compiler does with your one block.
+
+When you launch a grid of `P` programs and each program declares `BLOCK_SIZE` elements, Triton does not run your block on one core. It runs it on a **warp** or several — a group of 32 (or 64, on newer architectures) hardware threads that execute in lockstep, exactly as in Module 02. Your `tl.arange(0, 1024)` block is distributed across those threads so that each lane loads a different element, and those lanes are arranged so that **consecutive lanes read consecutive addresses**. That is coalescing, and it is why `offs = pid * BLOCK + tl.arange(...)` — a contiguous run — is the fast idiom, while a strided or shuffled access pattern is slow.
+
+So the abstraction is honest, not a fiction: a program *is* a warp-wide cooperative operation. You just do not have to manage the warp.
+
+<Callout type="real" title="What this costs at launch">
+  Triton is not free. A `@triton.jit` kernel that is not already compiled pays a **one-time compile cost**, typically tens to hundreds of milliseconds, the first time it sees a given signature. That is why every serious kernel has to be warmed up before you time it, and why a benchmark that measures the very first call is measuring the compiler. Module 12's profiling workflow applies here unchanged.
+</Callout>
+
+## A grid in two dimensions
+
+You will not stay in one dimension. The moment you write a kernel that tiles a matrix, you want a 2-D grid so program `(i, j)` handles tile `(i, j)` without computing a flat index yourself.
+
+```python
+@triton.jit
+def add_2d(x_ptr, c_ptr, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    pid_m = tl.program_id(0)      # which row-block
+    pid_n = tl.program_id(1)      # which column-block
+    rows = pid_m * BM + tl.arange(0, BM)      # a vector of BM row offsets
+    cols = pid_n * BN + tl.arange(0, BN)      # a vector of BN column offsets
+    mask = (rows[:, None] < M) & (cols[None, :] < N)   # 2-D mask
+    offs = rows[:, None] * N + cols[None, :]            # 2-D offsets
+    a = tl.load(x_ptr + offs, mask=mask)
+    tl.store(c_ptr + offs, a * 2, mask=mask)
+
+grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+add_2d[grid](x, c, M, N, BM=64, BN=64)
+```
+
+Three things to notice:
+
+1. **Broadcasting.** `rows[:, None]` makes a column vector and `cols[None, :]` makes a row vector; adding them forms the full `BM × BN` grid of offsets. This is the same row/column broadcasting you used for the matrix shapes back in Module 01, applied to index arithmetic instead of data.
+2. **The mask is 2-D too.** `&` combines two conditions into one `BM × BN` boolean tile. The rule from the 1-D case is unchanged: same mask on load and store.
+3. **`program_id(1)`** gives the second axis. This is how the tiled GEMMs in Module 14's attention kernels are structured.
+
+## When Triton is the wrong tool
+
+Being able to write a kernel does not mean you should. Triton is the right tool when the work is **elementwise, a reduction, a fused sequence of those, or a small tiled GEMM** — precisely the operations that dominate inference. It compiles to good code for all of those because they are regular and the compiler can reason about them.
+
+It is the wrong tool when the operation is deeply irregular — a sparse gather with unpredictable access, or a kernel that needs fine-grained control over registers and shared memory. There, you are writing CUDA and fighting the compiler for the last 20%. For inference, that situation is rare; elementwise and reduction work is most of the runtime.
+
+<Callout type="real" title="Where this sits in a real engine">
+  At the time of writing, the Triton kernels you will write by hand in this module are the same *kind* of thing that production inference engines ship. vLLM ships Triton implementations of fused RMSNorm, rotary embeddings, quantized GEMMs and sampling; PyTorch's `torch.compile` with its Triton backend generates this class of kernel automatically from your PyTorch code. Module 15 covers that compiler path. The skill you are building here — recognising when a memory-bound sequence of small ops should be one kernel — is what makes both of those legible to you.
+</Callout>
+
+## Try it yourself
+
+The notebook has the whole exercise, plus a correctness check against PyTorch and a block-size sweep you run yourself. The three things to predict before you run it:
+
+<Colab nb="13-vector-add.ipynb" />
+
+<Callout type="try" title="Predict, then run">
+  1. For $N = 4096$ on a T4 with `BLOCK_SIZE` of 16, 128, 1024 and 4096 — how many programs launch at each size, and which is fastest? Write the predictions down first.
+  2. If you drop the `mask=mask` from the store only (keeping it on the load), does the kernel get an error, produce wrong output, or appear to work? Why?
+  3. Measure the same kernel in FP32. Why is it *slower* in wall-clock time on a T4 even though it is doing identical arithmetic? (Hint: it is not doing identical arithmetic — check the bytes.)
+</Callout>
+
+<Callout type="recap" title="The idea to remember">
+  CUDA asks you to write a thread. Triton asks you to write a **program** and hands it a block of threads to run cooperatively. You tell the grid how many programs to launch, each program learns its own index from `program_id`, and together they cover the data exactly once.
+
+  That is the whole model. `tl.arange` gives you the within-block offsets, `program_id` gives you the block's origin, a mask makes the edges safe, and `BLOCK_SIZE` decides whether you launch one program or a thousand. Everything else in this module is this idea applied to work that is harder than adding.
+</Callout>
+
+<KeyNotes>
+  1. A Triton kernel is a **grid of independent programs**. You write one program body and declare the grid size; parallelism is given to you.
+  2. `tl.program_id(0)` returns which program is running. It is the only thing that tells a program which slice of the data it owns.
+  3. `tl.arange(0, BLOCK_SIZE)` builds the offsets within a block. `pid * BLOCK_SIZE + arange(...)` gives that program's global offsets — a vector expression, not a loop.
+  4. **Always mask**, with the *same* mask on load and store. A grid that divides the length evenly still needs it for the general case, and a mismatched store corrupts memory.
+  5. `BLOCK_SIZE: tl.constexpr` is a compile-time constant. Changing it compiles a new kernel — which is exactly what autotuning exploits later.
+  6. Block size decides launch overhead versus register pressure. Too small and you spend all your time launching; too large and registers spill to slower memory.
+  7. Contiguous `arange` offsets matter: they coalesce into the 128-byte fetches from Module 02. A program *is* a warp-wide cooperative operation; you just never manage the warp.
+  8. Kernels are **just-in-time compiled** — the first call with a new signature pays a compile cost. Warm up before you time anything.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A Triton kernel launches 32 programs on a vector of 512 elements. What is BLOCK_SIZE?', options: ['16', '32', '512', '1,024'], answer: 0, why: 'Programs × BLOCK_SIZE must cover N, so 32 × 16 = 512. With BLOCK_SIZE = 32 the grid would cover 1,024 elements and half the lanes would be masked off.' },
+  { q: 'In the vector-add kernel, what does tl.program_id(0) return?', options: ['The thread number within the warp', 'The index of this program in the launch grid', 'The address the program should load from', 'The number of elements per block'], answer: 1, why: 'It returns the calling program’s position in the grid — 0, 1, 2, ... That is how a program learns which slice of the data it owns.' },
+  { q: 'You launch a Triton kernel over 1,048,576 elements with BLOCK_SIZE = 1024. How many programs are in the grid?', numeric: true, answer: 1024, unit: 'programs', why: '1,048,576 / 1024 = 1,024 programs exactly — a power-of-two grid, so no program is masked off at the edge.' },
+  { q: 'Moving a 512-element FP16 vector means reading 1,024 bytes and writing 1,024 bytes. On a T4 at roughly 320 GB/s, how many microseconds does the data movement alone take? (Answer to about 3 significant figures.)', numeric: true, answer: 6.4, tolerance: 0.5, unit: 'µs', why: '2,048 bytes total ÷ 320e9 bytes/s = 6.4e-9 s = 6.4 µs. Compare that to the ~5 µs cost of one launch: at this size the launch is most of the time.' },
+  { q: 'Why must the same mask be used on tl.load and tl.store?', options: ['It makes the kernel faster', 'Triton requires it syntactically', 'A masked load skips out-of-range lanes, but an unmasked store would still write them, corrupting memory past the end', 'It lets the kernel skip the mask on the next call'], answer: 2, why: 'The mask is what prevents the kernel from touching addresses outside the tensor. Load without it and you read past the end; store without it and you write past the end, which silently corrupts another tensor.' },
+  { q: 'Which change would NOT reduce the launch overhead of a Triton kernel?', options: ['Increase BLOCK_SIZE so fewer programs launch', 'Pre-compile / warm up the kernel before timing', 'Remove the mask to shorten the index arithmetic', 'Cache the compiled kernel so the JIT is not re-run'], answer: 2, why: 'Removing the mask does not reduce the number of launches or the compile cost — it just makes the kernel wrong for any length that is not a multiple of BLOCK_SIZE.' },
+] } />

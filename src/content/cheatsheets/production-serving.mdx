@@ -1,0 +1,179 @@
+---
+title: 'Module 22 · Production Serving'
+module: production-serving
+---
+
+## The startup path
+
+A replica is not ready when its process exists. Six phases, in order:
+
+```
+process launch & imports  →  read checkpoint  →  copy weights into HBM
+        →  capture CUDA graphs  →  autotune kernels  →  warm-up
+```
+
+| Phase | Scales with | Typical lever |
+|---|---|---|
+| Process launch & imports | dependency tree | trim imports, lazy loading |
+| Checkpoint read | model size ÷ storage | pre-pull, warm pool, local NVMe |
+| Copy into HBM | model size ÷ PCIe | rarely the bottleneck |
+| Graph capture | **number of batch shapes** | admit fewer shapes |
+| Autotune | kernel candidates | cache results in the image |
+| Warm-up | steps × decode time | warm the shapes you serve |
+
+## The cold-start formulas
+
+$$
+t_{\text{read}} = \frac{\text{weight bytes}}{\text{storage throughput}}, \qquad
+\text{weight bytes} = P \times b
+$$
+
+$P$ = parameters, $b$ = bytes per weight (2 = BF16, 1 = FP8/INT8, 0.5 = INT4).
+
+**Worked:** Llama-3.1-8B BF16 = 16.1 GB. At 1.2 GB/s → **13.4 s**. Same bytes over PCIe (24 GB/s) → **0.7 s**. Storage dominates by ~20×.
+
+**The ceiling that matters** — largest model you can cold-start at all:
+
+$$
+P_{\max} = \frac{\text{budget} \times \text{throughput}}{b}
+$$
+
+| Budget | Storage | $b=2$ | $b=1$ |
+|---|---|---|---|
+| 120 s | 1.2 GB/s | 72 B | 144 B |
+| 120 s | 5 GB/s | 300 B | 600 B |
+| 300 s | 1.2 GB/s | 180 B | 360 B |
+
+- **Page cache** turns a cold read into a RAM read: restarts on a warm node are far cheaper than new nodes. Measure cold starts on a deliberately emptied node.
+- **Convert weights offline.** $R$ replicas × $C$ seconds online = $R \times C$ of identical work. 12 replicas × 180 s = **36 min** vs **3 min** once.
+- **safetensors** is memory-mappable (near-zero load latency) and cannot execute code — a security property, not a convenience.
+
+## Three probes, three questions
+
+| Probe | Question | Failing means |
+|---|---|---|
+| startup | "finished booting?" | wait longer |
+| readiness | "should this get traffic now?" | remove from load balancer |
+| liveness | "hopelessly stuck?" | kill and restart |
+
+- Readiness **must** fail throughout startup and warm-up, and must flip false **before** a drain begins.
+- Liveness must be **nearly impossible to fail while progress is being made** — never gate it on latency. A flapping liveness probe causes restart → cold start → less capacity → more flaps.
+- Readiness: short timeout, few failures. Liveness: long timeout, many consecutive failures.
+
+## Warm-up
+
+$$
+\text{ready when } \frac{t_{\text{step}}(\tau)}{t_{\text{step}}^{*}} \le 1.1
+$$
+
+Ready when two consecutive measurements agree within 10%. **Never a fixed sleep** — node speed varies.
+
+Warm-up traffic must match served shapes (context lengths, batch buckets) and use **varied prompts** (a repeated prompt populates and hits the prefix cache, so you measure a path production never takes).
+
+## Graceful shutdown
+
+$$
+t_{\text{drain}} \ge t_{\text{request}} \approx t_{\text{TTFT}} + t_{\text{TPOT}} \times \text{output tokens}
+$$
+
+**Worked:** 400 ms TTFT, 25 ms TPOT, 800 tokens → 20.4 s. Add 50% margin → **~30 s**.
+
+| Output tokens | t_TPOT 25 ms | Drain needed (+50%) |
+|---|---|---|
+| 400 | 10.4 s | 16 s |
+| 800 | 20.4 s | 31 s |
+| 2000 | 50.4 s | 76 s |
+| 4000 | 100.4 s | 151 s |
+
+**The drain timeout and max generation length are one decision.** Shorten one, shorten the other.
+
+- A request killed mid-generation returns **no error** — the stream just ends. Symptom: "responses cut off, only at deploy time". Always blame the drain timeout first.
+- Sequence: flip readiness → stop the listener → finish in-flight → exit before the deadline.
+- Cancel on client disconnect. An abandoned generation holds a KV block and a batch slot until it would have finished.
+
+## Release strategies
+
+| Strategy | Peak replicas | Exposure | Rollback | Use for |
+|---|---|---|---|---|
+| **Rolling** | $N + S$ | all, gradually | minutes | default; weight refreshes |
+| **Canary** | $N$ | a slice | seconds | any behaviour change |
+| **Shadow** | $\approx 2N$ | **none** | instant | risky migrations |
+| **Blue/green** | \$2N$ always | none after switch | instant | seconds-level rollback tolerance |
+
+$$
+\text{peak} = N + S, \qquad \text{min serving} = N - U, \qquad
+t_{\text{rollout}} \approx \frac{N}{S}\times\big(t_{\text{cold}} + t_{\text{drain}}\big)
+$$
+
+Worked: $N=8$, $S=3$, cold 240 s, drain 60 s → 2.67 waves → **~13 min**. Cut cold starts to 60 s → **~6 min**. Cold-start work is deploy-frequency work.
+
+- Keep $U = 1$ unless you have measured the survivors hold the load.
+- Shadow cost: \$5\%$ of a \$120/h fleet for 30 min = **\$3**. Shadowing 100% for a week is 168 h of a second fleet for an answer 5% for half an hour would have given.
+
+## Canaries
+
+Requests needed to detect a regression of rate $r$ at 95% confidence:
+
+$$
+n \ge \frac{\ln 0.05}{\ln (1-r)}
+$$
+
+| Regression $r$ | Requests needed |
+|---|---|
+| 10% | 29 |
+| 5% | 58 |
+| 4% | 74 |
+| 2% | 149 |
+| 1% | 298 |
+
+Halving the regression you want to catch roughly **doubles** the traffic you need — which is why subtle quality changes slip through canaries sized for obvious failures.
+
+Design rules:
+1. Randomise **per request**, not per user or session.
+2. Compare against the **contemporaneous** baseline, not last week.
+3. Pre-commit the metric, threshold and time window **before** deploying.
+4. Sample outputs for human review — a canary that only measures latency ships a faster, wrong model.
+
+## Versioning
+
+Four things move as one unit, under one version string:
+
+1. **Weights** 2. **Code** 3. **Tokenizer + chat template** 4. **Sampling defaults**
+
+- Publish it in `/v1/models`, log it **per request**. You cannot roll back what you cannot identify.
+- Version skew exists for the whole duration of every rollout. Keep the request/response schema, chat template and model identity compatible for that duration.
+- Rollback is a property of your artifacts: keep the old weights and image, and **time it by actually performing one**.
+- Keep a kill switch that works without shipping code. If a fix requires a deploy, you cannot stop the bleeding.
+
+## The nine production gates
+
+1. **Version pinning** — weights + code + tokenizer under one string, logged per request
+2. **Cold-start budget** — measured p50/p99, under your scale-up reaction target
+3. **Memory headroom ≥ 10%** — the KV pool must survive peak
+4. **Measured warm-up** — condition-based, not a sleep
+5. **Three separate probes** — with a test proving each is distinct
+6. **Drain ≥ longest request** — computed from TTFT, TPOT and max output
+7. **Canary with a threshold** — pre-committed, and actually run
+8. **Rollback timed** — performed, not estimated
+9. **Error budget with an owner** — and a stated consequence when exhausted
+
+## SLOs
+
+$$
+\text{error budget} = 1 - \text{SLO target}
+$$
+
+99.9% → 0.1% of requests → **43 minutes in a month**. An error budget with no stated consequence is a dashboard, not a policy.
+
+## Pitfalls
+
+1. **Import time is not model time.** ~18 s of interpreter and dependency loading is independent of model size and surprises everyone on small models.
+2. **Tuning the PCIe copy while the disk read is cold** optimises the 0.7 s term instead of the 13 s term.
+3. **A warm page cache makes every startup measurement optimistic.** Measure on a node you emptied.
+4. **A liveness probe with a latency threshold** is the classic restart-storm generator.
+5. **A drain timeout shorter than your p99 output** silently truncates generations on every deploy, and it gets blamed on the client.
+6. **Readiness that flips at the same moment as the drain** lets new requests keep arriving, so the replica never empties.
+7. **A sleep-based warm-up** passes its probe and is still slow for the first hundred requests.
+8. **Rolling updates are never instantaneous.** Version skew is the duration of your rollout, and during it you pay for both fleets.
+9. **An always-green canary has told you nothing.** A loose threshold or too-small slice looks exactly like a safe release.
+10. **Rollback you have not performed is a hypothesis.** Time it in staging against your incident tolerance.

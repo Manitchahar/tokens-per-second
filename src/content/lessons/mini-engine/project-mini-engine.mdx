@@ -1,0 +1,188 @@
+---
+title: 'Project: Benchmark your engine against vLLM'
+summary: 'You wrote four components. Now prove they work and find out what they cost. Ship a mini engine that matches transformers token for token, an OpenAI-compatible server, and a report comparing your engine against vLLM on the same workload — with the gap attributed to a specific component, not to "Python".'
+objectives:
+  - Validate the engine against transformers.generate() and localise any mismatch to a component
+  - Ship a streaming, OpenAI-compatible server with correct TTFT, TPOT and ITL measurement
+  - Benchmark your engine and vLLM through one harness on one pinned workload
+  - Attribute the throughput gap to a named component with a measured number behind it
+  - Write a report another engineer could use to decide whether to ship yours or vLLM's
+colab: 27-mini-engine.ipynb
+---
+
+You have four components and no engine. This project turns them into one, proves it is correct, and then measures what it costs against the best open-source implementation in the world.
+
+The comparison is not the point. **The attribution is.** Anyone can print "vLLM is 12× faster". The valuable deliverable is "vLLM is 12× faster, and 9× of that is the fused paged-attention kernel and 2× is CUDA graphs — my scheduler is within 15% of vLLM's". That sentence is what an inference engineer produces, and it is only possible because you built both sides of the line yourself.
+
+<Colab nb="27-mini-engine.ipynb" />
+
+## The deliverable
+
+A repository containing:
+
+1. **`mini_engine/`** — the package: `runner.py`, `scheduler.py`, `kv_manager.py`, `api.py`, `metrics.py`. The notebook gives you the load-bearing parts; the rest is yours.
+2. **`serve.py`** — an OpenAI-compatible server. `POST /v1/completions` with `stream: true`, `GET /health`, `GET /metrics`.
+3. **`benchmark.py`** — one harness, two backends, one workload.
+4. **`report.md`** — the comparison, the attribution, and a recommendation.
+5. **`parity.txt`** — the output of your token-for-token check against `transformers`.
+
+<Callout type="real" title="The parity check is the whole project in one command">
+  ```bash
+  python -m pytest test_parity.py -q
+  ```
+  
+  This asserts that `mini_engine.generate(prompt)` and `transformers.generate(prompt)` return **identical token ids** at temperature 0, at batch size 1 and 8, with and without prefix caching, and for prompts containing multi-byte characters.
+  
+  Everything else in this project is a performance claim. This one is a correctness claim, and without it every number you report is a measurement of a broken engine. Run it before you run anything else, and run it again after every change.
+</Callout>
+
+## Step 1 · Make it correct
+
+The notebook's Check 2a is your first gate. Before any benchmarking, your engine must produce byte-identical token ids to `transformers`.
+
+Run it across this matrix, and treat each failure as pointing at a stage:
+
+| Test | Passing means | If it fails |
+|---|---|---|
+| batch 1, temperature 0 | prefill and decode are right | sampling params, template, or the first prefill |
+| batch 8, temperature 0 | batching preserves semantics | positions/RoPE derived from batch index instead of sequence length |
+| with prefix caching on | hashing and refcounts are right | hash collision, or a block freed while still referenced |
+| prompt with `café`, `日本語` | detokenization is right | emitting a partial UTF-8 sequence |
+| `max_tokens` reached exactly | stop conditions are right | off-by-one in the length check |
+
+<Callout type="pitfall" title="The parity failure that never raises">
+  A refcount bug. Request A and request B share a prefix block. B finishes, decrements the count from 2 to 1 — correctly, if you wrote `> 0` instead of `== 0`. If you wrote `if count == 1: free`, you free a block that A is still reading. The engine does not crash: A's attention reads another sequence's keys and values and produces **fluent, wrong text**. Parity testing at batch 8 with prefix caching on is the only thing that catches this.
+</Callout>
+
+## Step 2 · Put it behind HTTP
+
+Requirements, in priority order:
+
+1. **Streaming.** One SSE `data:` line per token, terminated by `data: [DONE]`. The first line must leave as soon as the first token exists — verify by watching the raw socket, not the client library.
+2. **Non-streaming.** Same engine, collected. Useful as a control: its TTFT should equal end-to-end, and that difference is how you prove streaming is real.
+3. **`/metrics`.** Prometheus text format. Running, waiting, cache usage, preemptions, TTFT histogram, ITL histogram.
+4. **A bounded output queue.** One slow client must not add latency to other requests. Test it: throttle one connection and confirm the others' ITLs do not move.
+
+<Callout type="math" title="Validate your instrument before you trust it">
+  For every request, check:
+
+  $$
+  \left| \text{E2E} - \left( \text{TTFT} + (n-1)\times \text{TPOT} \right) \right| \Big/ \text{E2E} < 0.05
+  $$
+
+  If this fails, your timing is wrong and **no other number in the report means anything**. This is Module 06's lesson, and it is the single most common reason a benchmark in a real engineering discussion turns out to be worthless.
+</Callout>
+
+## Step 3 · One harness, two engines
+
+The comparison is only fair if both engines run through identical code. Your `benchmark.py` must:
+
+- read one **pinned workload file** (`workload.json`: seed, prompt token ids, `max_new` per request)
+- drive both backends through the **same** client-side timing function
+- stream both, store **every ITL** raw
+- warm up, then repeat **at least 3 times** per configuration
+- report **medians and p95**, never a bare mean
+- record the full config beside every result
+
+```python
+def benchmark(backend, workload, concurrency, warmup=2, repeats=3):
+    for _ in range(warmup):
+        run(backend, workload, concurrency)
+    runs = [run(backend, workload, concurrency) for _ in range(repeats)]
+    return summarise(runs)          # medians + p95, raw samples retained
+```
+
+<Callout type="intuition" title="Why your engine will lose, and why that is fine">
+  vLLM uses fused, hand-written CUDA kernels for paged attention, CUDA graphs to eliminate launch overhead, quantized and fused pointwise ops, and a model runner written in C++ extensions. A PyTorch engine in Python has none of these. **Your engine will be several times slower and that is the expected result.**
+  
+  What makes the project valuable is not winning. It is that after this project you can *name* the reason you lost, with a number attached — and that name is exactly the thing you would put in a design doc or an interview answer.
+</Callout>
+
+## Step 4 · Attribute the gap
+
+This is the graded core. Take the throughput ratio and decompose it. A reasonable decomposition, each term **measured** rather than guessed:
+
+| Candidate | How to measure its contribution |
+|---|---|
+| **Attention kernel** | Time one decode step at batch 1, context 1k, in your engine vs in vLLM, with everything else fixed. The difference is the paged-attention kernel plus gather cost. |
+| **Launch overhead** | Count kernels per step (Nsight or `torch.profiler`) in both. Multiply by measured per-launch cost. Module 15's launch-overhead lesson gives you the per-launch number. |
+| **Scheduler** | Compare your TPOT at the same batch size and context. If yours is close, your scheduler is fine and you have said something true. |
+| **Memory traffic** | Compare achieved GB/s against the roofline floor from Module 02. If you are at 60% of the floor and vLLM is at 85%, the gap is kernel quality, not architecture. |
+| **Streaming overhead** | Compare in-process throughput against over-HTTP throughput. The difference is your API layer, and it is the part you can fix cheaply. |
+
+<Callout type="mentor" title="How to write the sentence">
+  Bad: *"vLLM is 12× faster than my engine."*
+  
+  Unhelpful: *"vLLM is faster because it is better optimized."*
+  
+  What an engineer actually delivers:
+  
+  > *"At batch 32 / 1k context on a T4, vLLM sustains 640 output tok/s against my engine's 71 — a 9× gap. 6.5× of that is attention: my step takes 14.2 ms against vLLM's 2.1 ms for the same gather, and profiling shows my step launches 610 kernels where vLLM launches 34. My scheduler contributes under 5%: at matched batch size our TPOT differs by 3%, and our block allocation is identical. The remaining ~1.5× is Python launch overhead in the engine loop, which CUDA graphs would recover."*
+  
+  Every clause in that sentence is a measurement you can point at. **That is the deliverable.**
+</Callout>
+
+## Step 5 · Sweep, then write
+
+Sweep `max_num_seqs ∈ [1, 2, 4, 8, 16, 32]` and context ∈ `[512, 2k, 8k]` for both engines. Then answer, with numbers:
+
+1. Where does your step time stop being flat in batch? Does it match $\text{B}_{\text{knee}} = \text{weights} / (\text{context} \times \text{KV/token})$?
+2. At what batch size does your engine begin preempting? Is it where your arithmetic said it would?
+3. What is your prefix-cache hit rate on a workload with a shared system prompt, and what would vLLM's be?
+4. Which engine would you ship for a 200-user chat service at 4k context, and what is the single change that would flip the answer?
+
+## Acceptance criteria
+
+**Correctness**
+- `parity.txt` shows identical token ids to `transformers` across all five rows of the matrix.
+- The E2E identity holds within 5% on every request in the report.
+- Memory never exceeds the budget at any point, asserted in code rather than assumed.
+- The streaming and non-streaming paths produce identical text.
+
+**Coverage**
+- Both engines measured through one harness on one pinned workload file.
+- At least 3 repeats per configuration, reported as medians with p95 preserved and raw samples retained.
+- Batch and context sweeps for both engines.
+- Every result carries the config needed to reproduce it.
+
+**Attribution**
+- The throughput gap is decomposed into at least three named components.
+- Each component's contribution is **measured**, not estimated from intuition.
+- The report states which gap is architectural and which is fixable in software.
+
+**Communication**
+- `report.md` has a comparison table, a per-component breakdown, and a one-sentence recommendation.
+- A reader who has never seen your code can reach the same recommendation.
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | Parity holds across the whole matrix. Both engines measured through one pinned harness with variance reported. The gap is decomposed into named components, each with a measurement behind it, and the report distinguishes the architectural gap from the software-fixable one. The recommendation names a specific change and predicts its effect. |
+| **Proficient** | Parity holds at batch 1 and batch 8. Both engines benchmarked on one workload with medians and p95. The gap is explained with at least two named components and some measurement. The recommendation is defensible. |
+| **Developing** | Parity holds at batch 1 only, or the harness compares engines through different code paths. Throughput numbers exist but variance is unreported and the explanation is qualitative. The recommendation is asserted rather than derived. |
+| **Beginning** | Parity fails somewhere and was not debugged. Or the harness measures one engine properly and the other approximately. Or the comparison is a single number with no attribution. |
+
+<Callout type="try" title="Two extensions worth doing">
+  - **Implement one optimisation properly** — CUDA graphs on your decode step, or a fused RMSNorm+RoPE from Module 13 — and re-measure. Then report the ratio it recovered. This converts a limitation into a result.
+  - **Make parity fail, then find it.** Disable refcounting, run the batch-8 prefix test, and record the wrong output. Then fix it. Knowing the shape of that failure is worth more than never having seen it.
+</Callout>
+
+## Where this goes next
+
+- **Module 28 · Research & Capstone** — you now own an instrument and understand its internals, which is the position from which reading the PagedAttention paper is a short step rather than a wall.
+- **Module 17 · The Engine Landscape** — your matrix is the honest version of the comparison table that lesson asks for.
+- **A job** — "I wrote an inference engine and benchmarked it against vLLM" is a sentence that starts interviews. Bring the report.
+
+<KeyNotes>
+  1. Parity against `transformers.generate()` comes before every performance claim. Without it you are benchmarking a broken engine.
+  2. A refcount bug produces fluent, wrong output rather than a crash. Batch-8 parity with prefix caching on is what catches it.
+  3. Both engines must run through **one** harness, one pinned workload, streaming, client-side, with raw ITLs stored.
+  4. Validate $\text{E2E} \approx \text{TTFT} + (n-1)\times\text{TPOT}$ before trusting any number in the report.
+  5. Your engine losing to vLLM is the expected outcome. **Attributing the loss is the project.**
+  6. Decompose the gap into named, *measured* components: attention kernel, launch overhead, scheduler, achieved bandwidth, streaming.
+  7. Compare achieved GB/s against the Module 02 roofline floor to tell kernel quality apart from architecture.
+  8. Report medians and p95 with variance, at least 3 repeats per cell, warm-up discarded.
+  9. Separate the **architectural** gap (you will never match a fused CUDA kernel in Python) from the **software-fixable** one (CUDA graphs, fused ops, fewer launches). Only one of those is worth engineering effort.
+  10. The deliverable is one defensible sentence: who wins, by how much, on which axis, and why.
+</KeyNotes>

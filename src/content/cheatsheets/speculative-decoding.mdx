@@ -1,0 +1,143 @@
+---
+title: 'Module 16 · Speculative Decoding'
+module: speculative-decoding
+---
+
+## The two numbers
+
+Never confuse these. Both are called "alpha" in the literature.
+
+| | Symbol | Meaning | Set by |
+|---|---|---|---|
+| **Acceptance rate** | $a$ | how often a drafted token is one the target would also produce | your **text** and model pair |
+| **Draft cost ratio** | $\rho$ | one drafted token ÷ one target decode step | your **hardware** and model sizes |
+
+**Win exactly when $a > \rho$.** $\gamma$ cancels from this condition.
+
+## The block
+
+1. **Draft** $\gamma$ tokens with something cheap (stops at the first rejection).
+2. **Verify** all $\gamma+1$ positions in **one** forward pass on the target.
+3. **Accept** the longest prefix matching the target's own predictions; discard the first disagreement and everything after.
+4. **Bonus token** from the final position — never predicted by the draft, so free. Every block emits ≥ 1 token.
+
+## The formulas
+
+$$
+d = \mathbb{E}[\text{drafts paid}] = \frac{1 - a^{\gamma}}{1 - a}
+$$
+
+$$
+\mathbb{E}[\text{tokens per block}] = 1 + a\,d
+\qquad\qquad
+\text{cost} = 1 + \rho\,d \quad \text{(decode-step units)}
+$$
+
+$$
+\boxed{\ \text{speedup} = \frac{1 + a\,d}{1 + \rho\,d}\ >\ 1 \iff a > \rho\ }
+$$
+
+Forward passes per delivered token: $\;\dfrac{\gamma+1}{\mathbb{E}[\text{tokens}]}$
+
+Tokens per block ceiling: $\;1/(1-a)$ — set by predictability, not by $\gamma$.
+
+## Why verification is nearly free
+
+Decode is memory-bound, so a step's cost is the weight read — and weight traffic does not depend on how many positions the step handles.
+
+$$
+t_{\text{verify}}(\gamma) \approx t_{\text{decode}}(1) \quad \text{while memory-bound}
+$$
+
+It stops being free when the $\gamma \times$ FLOPs overtake the memory term. **Measure the ratio** — it is the premise of everything.
+
+## Exactness
+
+Accept $x$ with probability $\min\!\left(1, \frac{p(x)}{q(x)}\right)$; on rejection sample from
+
+$$
+p'(x) = \text{normalize}\!\left(\max(0,\ p(x) - q(x))\right)
+$$
+
+Proof: accepted branch $\Rightarrow \min(p,q)$; rejected branch $\Rightarrow \max(0, p-q)$; and $\min(p,q) + \max(0,p-q) = p$ **term by term**. Nothing approximated.
+
+**Three details that break it** (all silent — no exception raised):
+
+1. the proposal must be **sampled from $q$**, not `q.argmax()`;
+2. an accepted token is emitted **as $x$**, not resampled — the $q(x)$ cancels;
+3. the bonus token is **sampled from $p$**, not `p.argmax()`.
+
+Greedy decoding needs its own rule: accept iff draft == target argmax.
+
+## The methods, as points on the plane
+
+| Method | $\rho$ | $a$ (typical) | Needs training? |
+|---|---|---|---|
+| Prompt lookup | ~0.005 | ~0.30 | no |
+| N-gram | ~0.01 | ~0.35 | no |
+| Medusa | ~0.10 | ~0.60 | yes (heads) |
+| **Draft model** (1B → 8B) | ~0.125 | ~0.72 | no |
+| EAGLE | ~0.15 | ~0.78 | yes |
+| MTP | ~0.20 | ~0.80 | yes (checkpoint) |
+
+*Illustrative magnitudes — measure your own.* No method dominates; they trade cost against accuracy along a frontier.
+
+## Worked example
+
+Llama-3.1-8B, Llama-3.2-1B draft, $a = 0.72$, $\rho = 0.125$, $\gamma = 4$:
+
+$$
+d = \frac{1-0.72^{4}}{0.28} = 2.612 \quad
+\text{tokens} = 1 + 0.72(2.612) = 2.88 \quad
+\text{cost} = 1 + 0.125(2.612) = 1.327
+$$
+
+$$
+\text{speedup} = \frac{2.88}{1.327} = \mathbf{2.17\times}
+$$
+
+## Where it wins, and where it does not
+
+| Wins | Loses |
+|---|---|
+| low batch, memory-bound steps | high batch, compute-bound steps |
+| small models | draft model close in size to target |
+| predictable text (code, extraction, templates) | novel text, creative writing |
+| latency-sensitive serving | throughput-optimised serving |
+| long outputs | very short outputs (worsens TTFT) |
+
+- **Latency, not throughput.** Batching already amortises the same weight read.
+- **$\gamma+1$ passes**, so large fixed per-step overhead is multiplied, not hidden. Compile + CUDA-graph first (Module 15).
+- **Short outputs never amortise**, and the first token waits for the whole first block.
+
+## Decision procedure
+
+1. Measure $a$ on **your** traffic (few hundred real prompts).
+2. Measure $\rho$ on **your** card at your batch size.
+3. $a > \rho$? Sweep $\gamma$ once, take the flat part of the curve, enable.
+4. Not for a neural drafter? Try prompt lookup / n-gram — $\rho \approx 0$ needs almost any acceptance to win.
+
+## Pitfalls
+
+1. **Argmax instead of sampling from $q$.** The classic silent bug — output distribution shifts, no error.
+2. **Sampling the bonus token as argmax.** Only visible when the whole block is accepted.
+3. **Normalising a variable-length histogram by trial count.** Divide by tokens *emitted*.
+4. **Assuming $\rho$ = parameter ratio.** Fixed per-step overhead makes it larger, worst on slow cards.
+5. **Measuring $a$ on benchmark prompts.** Acceptance is a property of your content.
+6. **Speculating at high batch.** The premise is gone; expect a loss.
+7. **Enabling for all traffic.** Acceptance varies by task; gate it per request class.
+
+## Reference numbers
+
+| Quantity | Value |
+|---|---|
+| KV bytes/token, Llama-3.1-8B BF16 | 131,072 |
+| Weights, Llama-3.1-8B BF16 | 16.06 GB → 4.8 ms at 3.35 TB/s |
+| Verify/decode ratio, $\gamma \le 16$, H100 | ~1.00× |
+| Decode step, H100 / T4 (8B, ctx 2K) | ~7.6 ms / ~65 ms |
+| Tokens per block, $a = 0.72$ | 1.72 ($\gamma$=1) → 3.57 (ceiling) |
+| Break-even acceptance | $= \rho$, independent of $\gamma$ |
+
+## In the engines
+
+At the time of writing, vLLM offers n-gram and model-based speculation plus look-ahead decoding; TensorRT-LLM supports draft models and Medusa-style heads; llama.cpp ships n-gram / prompt-lookup drafting. **Verify before you quote a speedup** — and check whether your measurement was latency or throughput.

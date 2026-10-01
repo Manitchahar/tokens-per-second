@@ -1,0 +1,189 @@
+---
+title: 'Module 18 · Multi-GPU Parallelism'
+module: multi-gpu
+---
+
+## The one-line decision procedure
+
+> **Quantize before you shard. Tensor-parallel inside the NVLink island. Pipeline across nodes.
+> Replicate for everything else. Context-parallel only when one single sequence will not fit any other way.**
+
+Run it in order:
+
+| # | Question | If yes |
+|---|---|---|
+| 1 | Does `weights + KV` fit in `0.96 × capacity`? | **Replicate.** Stop. |
+| 2 | Does it fit at FP8 or INT4? | **Quantize + replicate.** |
+| 3 | Is the blocker KV (long ctx / big batch)? | **Tensor parallel** (divides KV by $t$ for free) |
+| 3 | Is the blocker weights (huge model, short ctx)? | **TP** in the node, then **PP** across it |
+| 4 | Must it cross the node boundary? | **PP only** — TP's $L$ factor kills it on InfiniBand |
+| 5 | Throughput-bound or latency-bound? | Replicas / keep $P$ small |
+
+## Interconnects
+
+| Link | GB/s (one way) | Latency | $\rho = B_{mem}/B$ | What lives here |
+|---|---|---|---|---|
+| PCIe 4.0 x16 | 32 | ~2.5 µs | 105 (H100) | host ↔ GPU, the fallback |
+| PCIe 5.0 x16 | 64 | ~2.0 µs | 52 | host ↔ GPU |
+| NVLink 3 (A100 SXM) | 300 | ~1.2 µs | 11 | **the island** |
+| NVLink 4 (H100 SXM) | 450 | ~0.9 µs | 7.4 | **the island** |
+| NVLink 5 (B200) | 900 | ~0.8 µs | 3.7 | **the island** |
+| InfiniBand NDR | 50 | ~2.0 µs | 67 | between nodes |
+
+**Bottom to top is 28x.** An 8-GPU NVLink node is a different machine from 8 PCIe-attached cards.
+
+## Message cost
+
+$$
+t = t_{lat} + \frac{S}{B \cdot \eta}, \qquad \eta \approx 0.7\text{–}0.9
+$$
+
+Crossover $S^* = t_{lat} \cdot B \cdot \eta$: **~344 KB on NVLink 4.** Above it, bandwidth; below, latency.
+**Count messages, not bytes** — each message pays $t_{lat}$ again.
+
+## Collectives
+
+| Primitive | Does | Ring cost per GPU |
+|---|---|---|
+| Broadcast | one → all | $P-1$ |
+| Reduce-scatter | sum, keep 1/$P$ | $(P-1)/P$ |
+| All-gather | shards → all | $(P-1)/P$ |
+| **All-reduce** | sum → identical everywhere | $\frac{2(P-1)}{P}$ |
+| All-to-all | permutation | $\frac{2(P-1)}{P}$ |
+
+**All-reduce = reduce-scatter + all-gather.** Ring factor: 1 (P=2), 1.5 (P=4), 1.75 (P=8), → 2.
+Ring is bandwidth-optimal, latency $O(P)$; tree is $O(\log P)$ depth and bandwidth-suboptimal. Small messages want tree.
+
+## Sizes
+
+$$
+\text{weights} = P_{params} \cdot b, \qquad \text{KV/token} = 2 L n_{kv} d \cdot b
+$$
+
+| Model | weights BF16 | KV/token | legal TP |
+|---|---|---|---|
+| Qwen2.5-1.5B | 3.1 GB | 112 KiB | 1, 2 |
+| **Llama-3.1-8B** | **16.1 GB** | **128 KiB** | 1, 2, 4, 8 |
+| Qwen2.5-32B | 65.6 GB | 256 KiB | 1, 2, 4, 8 |
+| Llama-3.1-70B | 141 GB | 320 KiB | 1, 2, 4, 8 |
+
+Usable memory $\approx 0.96 \times$ capacity (≈4% CUDA context + workspaces).
+
+## Tensor parallelism
+
+**Megatron block:** column-parallel $W_1$ (no comm) → row-parallel $W_2$ (partial sums).
+**One all-gather in, one all-reduce out, per layer.**
+
+$$
+\text{TP bytes/fwd} = 2L \cdot \frac{2(t-1)}{t} \cdot B\,T\,h \cdot 2
+$$
+
+| | Llama-70B, $t{=}P{=}8$, batch 32, decode |
+|---|---|
+| TP=8 | 147 MB, **72% of the step** on InfiniBand |
+| PP=8 | 3.67 MB, **1.8% of the step** |
+
+Legality: $t$ must divide query heads, **KV heads**, and MLP intermediate size.
+**GQA's KV head count is usually the binding constraint** (8 for Llama, 2 for Qwen-1.5B).
+
+Memory falls as $\frac{1}{t}$ for **both weights and KV** (each rank owns whole heads).
+Time falls sublinearly: memory and compute fall as $\frac{1}{t}$, collectives do not fall at all.
+
+## Pipeline parallelism
+
+**Split layers.** One activation per boundary; $P-1$ boundaries, not 2L.
+
+$$
+\text{PP bytes/fwd} = (P-1)\cdot B\,T\,h \cdot 2, \qquad \text{bubble} = \frac{P-1}{M+P-1}
+$$
+
+| $P$ | $M$ | bubble |
+|---|---|---|
+| 4 | 1 | 75% |
+| 4 | 4 | 43% |
+| 4 | 8 | 27% |
+| 4 | 16 | 16% |
+| 8 | 16 | 30% |
+| 8 | 32 | 18% |
+
+**Rule: $M \geq 4P$.** Bubble is a function of *load*, not hardware — a faster link does not shrink it.
+Both weights **and** KV divide by $P$ (KV along layers, not tokens), so memory-wise PP and TP are
+interchangeable at equal GPU count; what differs is the bubble and the 50x communication.
+Legality: PP needs only $P \leq L$; TP needs $t \mid n_{kv}$. A PP-only plan means TP was blocked.
+
+## Data & context parallelism
+
+**Replicas:** full model per GPU, zero communication, linear throughput. The default.
+
+**Data parallel:** free at inference (weights read-only). Only costs if one request spans GPUs.
+
+**Context parallel:** split the sequence $P$ ways.
+
+$$
+\text{CP bytes/layer} = \frac{P-1}{P} \times \text{whole KV cache}
+$$
+
+| H100, 128k ctx, 8B, batch 1 | $P{=}2$ | $P{=}4$ | $P{=}8$ |
+|---|---|---|---|
+| KV per GPU | 8.6 GB | 4.3 GB | 2.1 GB |
+| comm per fwd | 8.6 GB | 12.9 GB | 15.1 GB |
+
+**Penalty** $=\dfrac{(P-1)/P \times kv/B_{link}\eta}{1/P \times kv/B_{mem}} = (P-1)\dfrac{B_{mem}}{B_{link}\eta} = (P-1)\rho$
+
+The KV cache **cancels** — the penalty is independent of model and context, and is > 1 for every $P > 1$.
+
+| H100, $\rho$ to fabric | $P{=}2$ | $P{=}4$ | $P{=}8$ |
+|---|---|---|---|
+| NVLink 5 | 4.4x | 13.1x | 30.7x |
+| NVLink 4 | 8.8x | 26.3x | 61.3x |
+| InfiniBand NDR | 78.8x | 236.5x | 551.8x |
+| PCIe 4.0 | 130.9x | 392.6x | 916.0x |
+
+**CP is never a speed optimisation.** For long context, the order is: shorten context → quantize KV → **TP (free $\frac{1}{t}$)** → tier KV → CP last.
+
+## Sequence parallelism
+
+Split the token dim of the LayerNorm / dropout regions across the TP group so memory-bound ops
+are not repeated per rank. Cheap: one all-gather or all-reduce per region.
+
+## 2D / 3D parallelism
+
+| Axis | Splits | Constraint | Must stay inside |
+|---|---|---|---|
+| TP | matrices in a layer | $t \mid n_{kv}$ | **the node** (NVLink) |
+| PP | layers | $P \leq L$ | any fabric |
+| DP / replica | the batch | none | any fabric |
+
+$$t \times P \times R \leq \text{GPUs}, \qquad \text{throughput} = R \times \text{per-replica}$$
+
+**Memory per GPU** = $\frac{\text{weights}}{tP} + \frac{\text{KV}}{t}$ for a $t \times P$ grid.
+
+## Reference numbers (H100 SXM, NVLink 4, BF16)
+
+| Quantity | Value |
+|---|---|
+| H100 memory BW / FLOPs | 3.35 TB/s / 989 TFLOP/s |
+| H100 ridge point | ~295 FLOP/byte |
+| NVLink 4 one way / latency | 450 GB/s / ~0.9 µs |
+| TP crossover payload | ~344 KB |
+| Ring all-reduce at TP=8 | 1.75 × payload |
+| Collective launch overhead | tens of µs — **measure it** |
+| TP comm overhead, 8B b32, NVLink | ~1% |
+| TP comm overhead, 70B b32, PCIe | ~30% |
+
+## The three sentences
+
+1. **Price every message** as `latency + bytes/(bandwidth × efficiency)`, and count messages — 160 tiny collectives per forward pass cost more in launch overhead than the bytes.
+2. **Tensor parallelism splits matrices and pays in bytes; pipeline splits layers and pays in idle time.** 40x less traffic for PP is why TP lives inside the node and PP crosses it.
+3. **If it fits, replicate.** Sharding is a capacity tool, not a speed tool, and the most common multi-GPU mistake is reaching for it when the model was never too big.
+
+## Failure modes
+
+| Symptom | Cause |
+|---|---|
+| Adding GPUs made it slower | TP over PCIe/IB — $\rho > 100$ |
+| Throughput fine, p99 TPOT terrible | PP bubble filled by few requests |
+| Pipeline idle despite full batch | $M < 2P$; microbatches capped by concurrency |
+| "Illegal tensor-parallel size" | $t \nmid n_{kv}$ — GQA cap |
+| Throughput halved vs 2 replicas | DP all-reduce across replicas; drop it |
+| Forward pass 3–30% of step | collective launched outside the CUDA graph (Module 15) |

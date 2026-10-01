@@ -1,0 +1,121 @@
+---
+title: Dot products & softmax
+summary: The two tiny operations at the heart of attention. A dot product measures how similar two vectors are; softmax turns any list of scores into probabilities.
+objectives:
+  - Compute a dot product and explain it geometrically (alignment)
+  - Compute softmax by hand and explain why it uses exponentials
+  - Explain what temperature does to a softmax distribution
+  - Explain the "subtract the max" trick and why kernels need it
+---
+import DotSoftmax from '@/components/viz/math/DotSoftmax.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Attention, the mechanism that lets each token look back at earlier tokens, is built from two small operations. A **dot product** measures how relevant one token is to another. **Softmax** turns those relevance scores into weights that add up to 1. Sampling the next word uses softmax too. Learn these two and the scariest-looking equation in the field, $\text{softmax}(QK^\top/\sqrt{d})V$, becomes plain.
+
+## Arrows, scores and probabilities
+
+Scroll through, then drag the **query direction** slider and watch the scores and probabilities respond.
+
+<Scrolly>
+  <DotSoftmax client:visible slot="stage" />
+
+  <Step title="1. A vector is an arrow">
+    A vector with 2 numbers, like q = (3, 1), is an arrow: 3 steps right, 1 step up. Real attention heads use 128 numbers per vector. You cannot draw 128 dimensions, but the geometry works exactly the same.
+  </Step>
+
+  <Step title="2. The dot product">
+    The **dot product** of two vectors multiplies matching coordinates and adds them up:
+
+    $q \cdot k = q_1 k_1 + q_2 k_2 + \dots + q_d k_d$
+
+    For q = (3, 1) and k = (2, 2): 3 × 2 + 1 × 2 = **8**. You already used this: every cell of a matrix multiply is one dot product.
+  </Step>
+
+  <Step title="3. Alignment = similarity">
+    Geometrically, $q \cdot k = |q|\,|k| \cos\theta$, where θ is the angle between the arrows. So the dot product is **large when they point the same way**, zero when perpendicular, and negative when opposite.
+
+    Drag the query around. Whichever key it points toward scores highest. In attention, the query asks *"what am I looking for?"* and each key says *"this is what I contain"*. The dot product measures the match.
+  </Step>
+
+  <Step title="4. Exponentiate">
+    We want weights that are all **positive** and sum to 1. Step one: raise *e* ≈ 2.718 to the power of each score. Negative scores become small positive numbers; big scores become *huge* numbers.
+
+    Exponentials exaggerate differences: a score 2 higher becomes e² ≈ 7.4× bigger.
+  </Step>
+
+  <Step title="5. Normalize: softmax">
+    Divide each exponential by their sum. Now they are positive and add to exactly 1 (100%). That's **softmax**:
+
+    $\text{softmax}(x)_i = \dfrac{e^{x_i}}{\sum_j e^{x_j}}$
+
+    It is a "soft" version of picking the maximum: the winner gets most of the weight, but the others keep a share.
+  </Step>
+
+  <Step title="6. Temperature">
+    Divide the scores by a **temperature** T before the softmax. **T < 1** stretches differences, so the winner takes nearly everything (sharper). **T > 1** shrinks differences, so the probabilities flatten toward equal.
+
+    Try the temperature slider. This is the exact same knob as the *temperature* setting in a chatbot API. You will meet it again in sampling (Module 03).
+  </Step>
+
+  <Step title="7. Staying numerically safe">
+    e^100 is about 2.7 × 10⁴³, far too big for FP16 (which tops out at 65,504, about e^11). Real code subtracts the largest score first:
+
+    $\text{softmax}(x)_i = \dfrac{e^{x_i - m}}{\sum_j e^{x_j - m}}, \quad m = \max_j x_j$
+
+    The e^(−m) factors cancel top and bottom, so the answer is identical, but now every exponent is ≤ 0 and every e^x is between 0 and 1. No overflow. FlashAttention (Module 14) is built on a clever extension of this exact trick.
+  </Step>
+</Scrolly>
+
+## Work it by hand once
+
+Scores $x = [2, 1, 0]$:
+
+| | token A | token B | token C | sum |
+|---|---|---|---|---|
+| score $x_i$ | 2 | 1 | 0 | |
+| $e^{x_i}$ | 7.39 | 2.72 | 1.00 | 11.11 |
+| softmax | **0.665** | 0.245 | 0.090 | 1.000 |
+
+With temperature T = 0.5 the scores become [4, 2, 0] → softmax ≈ [0.867, 0.117, 0.016]: sharper. With T = 2 they become [1, 0.5, 0] → ≈ [0.506, 0.307, 0.186]: flatter.
+
+## Why the scaling √d shows up in attention
+
+With 128-number vectors, dot products add up 128 terms, so they get large, and a softmax over large scores becomes almost one-hot (all weight on one key). Attention divides scores by $\sqrt{d}$ (for d = 128, about 11.3) to keep them in a sensible range. That is literally a fixed temperature of √d. You will see it in the attention formula next module.
+
+## In code
+
+```python
+import torch
+
+scores = torch.tensor([2.0, 1.0, 0.0])
+
+manual = scores.exp() / scores.exp().sum()
+safe   = (scores - scores.max()).exp() / (scores - scores.max()).exp().sum()
+builtin = torch.softmax(scores, dim=-1)
+
+print(manual, safe, builtin)                      # all three: [0.665, 0.245, 0.090]
+print(torch.softmax(scores / 0.5, dim=-1))        # temperature 0.5: sharper
+print(torch.softmax(scores / 2.0, dim=-1))        # temperature 2.0: flatter
+```
+
+<Callout type="real">
+  In a decode step, attention runs a softmax over *every previous token* for every head in every layer. For a 32-layer model with 32 heads and 8,000 tokens of context, that is 32 × 32 × 8,000 ≈ 8 million exponentials per generated token. Tiny operations add up. Where softmax runs, and whether its inputs sit in fast on-chip memory, decides much of attention's speed.
+</Callout>
+
+<KeyNotes>
+  1. **Dot product** = sum of pairwise products = |q||k|cos θ. Large when vectors point the same way: a similarity score.
+  2. Each cell of a matrix multiply is a dot product; attention scores are dot products of queries with keys.
+  3. **Softmax** = exponentiate, then divide by the sum. Positive outputs that sum to 1; exaggerates the largest.
+  4. **Temperature** divides scores before softmax: T < 1 sharper, T > 1 flatter.
+  5. Subtract the max before exponentiating. Same result, no overflow. Every real kernel does this.
+  6. Attention scales scores by 1/√d to keep them from making softmax too peaky.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What is the dot product of (1, 2, 3) and (4, 0, −1)?', numeric: true, answer: 1, tolerance: 0, why: '1×4 + 2×0 + 3×(−1) = 4 + 0 − 3 = 1.' },
+  { q: 'Two vectors point in exactly opposite directions. Their dot product is…', options: ['Zero', 'Positive and large', 'Negative', 'Always exactly −1'], answer: 2, why: 'cos 180° = −1, so the dot product is −|q||k|: negative. It equals −1 only if both have length 1.' },
+  { q: 'Softmax of [0, 0, 0, 0]?', options: ['[0, 0, 0, 0]', '[0.25, 0.25, 0.25, 0.25]', '[1, 0, 0, 0]', 'Undefined'], answer: 1, why: 'e⁰ = 1 for each, sum = 4, so each gets 1/4.' },
+  { q: 'Softmax of [2, 1, 0]: what is the probability of the first entry (as a decimal)?', numeric: true, answer: 0.665, tolerance: 0.005, why: 'e² / (e² + e¹ + e⁰) = 7.389 / 11.107 ≈ 0.665.' },
+  { q: 'You lower the temperature from 1.0 to 0.2. The resulting distribution…', options: ['Becomes flatter', 'Becomes sharper: the top choice dominates', 'Stays the same', 'Sums to more than 1'], answer: 1, why: 'Dividing by 0.2 multiplies the scores by 5, stretching the gaps, so the largest takes almost all the probability.' },
+  { q: 'Why do kernels subtract the maximum score before exponentiating?', options: ['To make it faster', 'To change the result slightly for stability', 'To avoid overflow; the result is mathematically identical', 'To make negative scores positive'], answer: 2, why: 'e^(x − m) / Σ e^(x − m) equals e^x / Σ e^x, since e^(−m) cancels. All exponents become ≤ 0, so nothing overflows.' },
+]} />

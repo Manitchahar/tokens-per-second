@@ -1,0 +1,233 @@
+---
+title: 'Profiling prefill vs decode'
+summary: 'The same weights, the same kernels, two completely different profiles. How to profile each phase separately, which single number to quote for each, and why the optimizations that help one phase are frequently useless — or actively harmful — for the other.'
+objectives:
+  - Profile a prefill pass and a decode step as two separate experiments
+  - Quote MFU for prefill and MBU for decode, and say why the distinction matters
+  - Split a decode step's byte budget between weights and KV cache, and act on the split
+  - Explain how attention overtakes the GEMMs as context grows
+  - Verify an optimization by re-profiling rather than by re-benchmarking tokens per second
+---
+import PhaseTrace from '@/components/viz/profiling/PhaseTrace.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every optimization you have done so far has been aimed at one phase. Chunked prefill and prefix caching are prefill work. Quantization helps both but for different reasons. Continuous batching is decode work.
+
+Here is the discipline that keeps that straight: **profile the two phases separately, and compare them.** Almost every bad inference optimization is a prefill optimization that was never verified on decode, or the reverse.
+
+## Two experiments, never one
+
+A real request does both phases back to back. Profiling them together gives you a number that describes neither. So: two runs, two traces.
+
+```python
+# ── Experiment 1: PREFILL ─────────────────────────────────
+# A long prompt, one sequence, no generation. Isolates the forward pass.
+with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+    model(input_ids, use_cache=True)
+    torch.cuda.synchronize()
+prof.export_chrome_trace("prefill.json")
+
+# ── Experiment 2: DECODE ──────────────────────────────────
+# Warm a cache, then time only the steady-state single-token steps.
+with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+    for _ in range(20):
+        out = model(next_token, past_key_values=cache, use_cache=True)
+    torch.cuda.synchronize()
+prof.export_chrome_trace("decode.json")
+```
+
+Two details that matter and are usually wrong:
+
+**For decode, warm the cache first.** The first decode step includes cache allocation and any reshaping. Profile step 5 onwards, not step 1.
+
+**For prefill, use a prompt long enough to be compute-bound.** A 32-token prompt is memory-bound for the same reason decode is. Use 512 or more, and note that this is also why engines set a chunk budget (Module 10).
+
+<Scrolly>
+  <PhaseTrace client:visible slot="stage" />
+
+  <Step title="1. Two traces, side by side">
+    The same transformer block, profiled during a 512-token prefill chunk and during one decode step with 32 active sequences. The kernel *names* are identical. Almost nothing else is.
+  </Step>
+
+  <Step title="2. Prefill is all GEMM">
+    Thousands of rows per weight matrix means high arithmetic intensity, so the profile is dominated by large cuBLAS GEMM bars with almost nothing between them. This is what a healthy compute-bound profile looks like.
+  </Step>
+
+  <Step title="3. Quote MFU here">
+    A 60% MFU on a prefill GEMM is good. Below 50% on a large square matrix means cuBLAS picked a poor algorithm for that shape — which is a real, fixable finding.
+  </Step>
+
+  <Step title="4. Decode has the same bars and none of the headroom">
+    The GEMM is now one row per sequence. Same code, same library, same weights — but bound by streaming 16 GB from HBM. The profile *looks* similar, which is exactly why you must measure rather than eyeball.
+  </Step>
+
+  <Step title="5. The number is MBU">
+    The decode step reads its byte budget at some fraction of peak bandwidth. At 76% it is at its floor. Quoting MFU for decode (which will read ~3%) tells you nothing, for the padding reasons in Module 12.3.
+  </Step>
+
+  <Step title="6. Context moves the balance">
+    As context grows the KV cache becomes the dominant stream and the attention bar overtakes the GEMMs. Watch the split below the timelines as you drag context: at 32k the answer to "what is decode slow" is no longer "the weights".
+  </Step>
+
+  <Step title="7. The fix lists do not overlap">
+    Prefill wants better GEMMs and fused elementwise ops. Decode wants **fewer bytes** — quantization, paged layout, a larger batch — and almost never a better GEMM, because there is nothing wrong with it.
+  </Step>
+
+  <Step title="8. Verify with the profiler">
+    Re-run the same phase with the same shapes and compare the metric: MBU or MFU, not tokens per second. If the number did not move, the fix did not work, no matter what the end-to-end benchmark says.
+  </Step>
+</Scrolly>
+
+## Prefill: what the profile should look like
+
+A 512-token chunk of Llama-3.1-8B, on an H100:
+
+| Op | Time | Share | Bound | Healthy? |
+|---|---|---|---|---|
+| QKV projection GEMM | 3.1 ms | 15% | compute | 55–65% MFU |
+| Attention (flash) | 4.0 ms | 19% | compute | context-dependent |
+| O projection GEMM | 1.9 ms | 9% | compute | yes |
+| Gate/up GEMM | 4.6 ms | 22% | compute | yes |
+| SiLU × multiply | 1.8 ms | 8% | memory | **two passes — fuse** |
+| Down projection GEMM | 3.2 ms | 15% | compute | yes |
+| RMSNorm, RoPE, lm_head | 1.6 ms | 7% | memory | mostly fused already |
+| Gaps / launch overhead | 1.5 ms | 7% | idle | Module 15 |
+
+The finding is the same one from Lesson 12.4: **the elementwise ops**. `silu` and `mul` are two separate kernels over the `[512, 28672]` MLP intermediate, and they run in all 32 layers.
+
+Count the traffic per layer. The tensor is 512 × 28,672 × 2 = 29.4 MB. `silu` reads it and writes a result: 58.7 MB. `mul` then reads *two* tensors and writes one: 88 MB. Unfused, that is 147 MB per layer, or 4.7 GB for the chunk. Fused into one kernel it is 88 MB per layer — 2.8 GB — because the intermediate never reaches memory at all.
+
+$$
+t_{\text{unfused}} = \frac{147\ \text{MB} \times 32}{3.35\ \text{TB/s} \times 0.85} = 1.65\ \text{ms},
+\qquad
+t_{\text{fused}} = \frac{88\ \text{MB} \times 32}{3.35\ \text{TB/s} \times 0.85} = 0.99\ \text{ms}
+$$
+
+So fusion saves about **0.66 ms on a 21 ms chunk — a 3% win**, for thirty lines of Triton (Module 13). Note that the saving is exactly the bytes you no longer write, which is the signature of a correct memory-bound diagnosis.
+
+<Callout type="math" title="Where the 8% went, and why the arithmetic must be explicit">
+  You cannot get this number by guessing "elementwise ops are slow". You get it by counting bytes:
+
+  - unfused: 147 MB per layer × 32 layers = 4.7 GB
+  - fused: 88 MB per layer × 32 layers = 2.8 GB
+  - difference: 1.9 GB ÷ (3.35 TB/s × 0.85) = **0.66 ms**
+
+  Multiply by 32 layers before you divide. Reporting the per-layer saving as the per-chunk saving understates the win by 32× — and understating a win is how a real 3% improvement gets dismissed as noise.
+</Callout>
+
+<Callout type="math" title="The prefill number, computed">
+  For Llama-3.1-8B at $m = 512$:
+
+  $$
+  F = 2 \cdot 512 \cdot 8.03\times 10^9 = 8.2\ \text{TFLOP}
+  $$
+
+  At 60% MFU on an H100: 8.2 ÷ (989 × 0.6) = 13.8 ms of pure GEMM, plus the quadratic attention term and the elementwise passes. The total lands around 21 ms, which is what the trace shows. **If your measured prefill is 40 ms, you have a 2× problem and the profile will say which half.**
+</Callout>
+
+## Decode: where the bytes are
+
+The decode step's entire job is to read bytes. Split the budget and you know what to attack.
+
+For Llama-3.1-8B in BF16 at batch $B$ and context $T$:
+
+$$
+B_{\text{total}} = \underbrace{P \cdot 2}_{\text{weights}} + \underbrace{B \cdot T \cdot 131{,}072}_{\text{KV cache}}
+$$
+
+| Batch | Context | Weights | KV cache | KV share | Bound by |
+|---|---|---|---|---|---|
+| 1 | 2,048 | 16.1 GB | 0.27 GB | 1.6% | weights |
+| 32 | 2,048 | 16.1 GB | 8.6 GB | 35% | weights |
+| 32 | 8,192 | 16.1 GB | 34.4 GB | 68% | **KV cache** |
+| 64 | 32,768 | 16.1 GB | 275 GB | 94% | **KV cache** |
+
+<Callout type="math" title="The crossover, solved">
+  Set the two terms equal to find where KV overtakes weights. This is the <Term t="kv-crossover">weights/KV crossover</Term>:
+
+  $$
+  B \cdot T \cdot 131{,}072 = 8.03\times 10^9 \cdot 2
+  \qquad\Longrightarrow\qquad
+  T = \frac{16.06\times 10^9}{B \cdot 131{,}072} = \frac{122{,}500}{B}
+  $$
+
+  | Batch | Crossover context |
+  |---|---|
+  | 1 | 122,000 tokens (never happens) |
+  | 8 | 15,300 tokens |
+  | 32 | 3,830 tokens |
+  | 128 | 957 tokens |
+
+  **This is the single most useful number in this lesson.** Below the crossover, decode is a weights problem and you should quantize the weights. Above it, decode is a KV problem and you should quantize the KV cache or shorten the context. At batch 32 the crossover is under 4k tokens, so most modern chat services with RAG are KV-bound.
+
+  The formula is worth committing to memory, because it generalizes. For any model, the crossover context is simply the weight bytes divided by the per-sequence KV bytes per token:
+
+  $$
+  T_{\text{cross}} = \frac{P \cdot b_w}{B \cdot \text{KV/token}}
+  $$
+
+  Two consequences follow that are worth stating plainly. First, **crossover falls linearly with batch**, so the higher the concurrency you run to get throughput, the sooner you become KV-bound. A deployment that tunes for maximum throughput has silently changed which optimization is correct. Second, **crossover falls with model size**: a 70B model has seven times the weight bytes of an 8B model at a similar KV cost, so it stays weights-bound at contexts where a small model is already KV-bound.
+
+  Check this against your own workload before choosing a quantization scheme. It takes one multiplication and it changes what you should be optimizing for six months from now.
+</Callout>
+
+## Attention overtakes the GEMMs
+
+At long context the attention bar is no longer a rounding error. From Module 02, attention intensity grows linearly with $T$ while the GEMMs' intensity is fixed by their shape, so eventually attention's *compute* term becomes the floor too.
+
+$$
+t_{\text{attn}} \approx \frac{4 T^2 d}{\text{peak} \times \text{MFU}}, \qquad
+t_{\text{GEMM}} \approx \frac{2Pd}{\text{peak} \times \text{MFU}}
+$$
+
+They are equal when 4T²d = 2Pd, i.e. at $T = \sqrt{P/2}$. For Llama-3.1-8B that is $\sqrt{4\times 10^9} \approx 63{,}000$ tokens of pure FLOPs. In practice attention becomes the *bandwidth* problem far earlier — at 8k context it is already the second-longest bar, and the standard fixes are the ones in Module 14: FlashAttention to cut its memory traffic, and decode-specific attention kernels that exploit $q$ having one row.
+
+<Callout type="pitfall" title="The optimization that helps prefill and hurts decode">
+  **Fusing the SiLU and the multiply** (Module 13) is a clear win in prefill: you save a launch and a round trip.
+
+  In decode it is worth much less, because the tensors are `[32, 28672]` — 1.8 MB, which is L2-resident on an H100. You are saving a launch (about 5 µs) on a step that takes 20 ms. **Measured on decode, it is noise.**
+
+  The mirror image is worse: **increasing batch size** is nearly free on prefill (the GEMM is already compute-bound) and is the single biggest lever on decode. If you only benchmarked prefill you will conclude batching does not matter. It is the whole of Module 07.
+</Callout>
+
+## Verifying a fix
+
+The rule from Module 12.4, applied to phases: **verify with the profiler, not with the end-to-end number.**
+
+| You changed | Re-profile | Success looks like |
+|---|---|---|
+| Fused SiLU+mul | Prefill chunk | `silu` and `mul` bars gone; one bar, half the time |
+| Quantized weights | Decode step | MBU up or step time down at equal batch |
+| Quantized KV | Decode step at 8k+ | KV bytes in the memory chart down ~50% |
+| CUDA graphs | Decode step | gaps in the trace collapse |
+| Different attention backend | Both phases | attention bar shorter at equal context |
+| Larger batch | Decode step | step time nearly flat, throughput up |
+
+<Callout type="recap" title="The phase discipline, in six lines">
+  1. Profile prefill and decode as **separate** runs with real shapes.
+  2. Prefill: quote **MFU**. Healthy is 55–65% on a large GEMM.
+  3. Decode: quote **MBU**. Healthy is 75–90%.
+  4. Split the decode byte budget into weights and KV; act on whichever is larger.
+  5. The weights/KV crossover is at $T = 122{,}500/B$ tokens — check it against your workload.
+  6. Any fix must move the phase's own metric. If it does not, it did not work.
+</Callout>
+
+<KeyNotes>
+  1. Profile prefill and decode separately, always. Together they describe neither, and a 32-token "prefill" is really a memory-bound decode.
+  2. Prefill is **MFU** territory: 55–65% on a large GEMM is healthy, and below 50% means cuBLAS chose badly for the shape.
+  3. Decode is **MBU** territory: 75–90% is healthy. MFU will read ~3% because of tile padding, which is meaningless.
+  4. A decode step reads $P\cdot 2 + B\cdot T\cdot 131{,}072$ bytes. Which term dominates decides whether you should quantize weights or KV.
+  5. The weights/KV crossover is $T = 122{,}500/B$ tokens: 3,830 at batch 32, 957 at batch 128. Most modern RAG chat is KV-bound.
+  6. Fusing elementwise ops is a prefill win and decode noise, because decode's tensors are L2-resident. Always check which phase you are in.
+  7. Increasing batch size is nearly free in prefill and the biggest single lever in decode. A prefill-only benchmark will tell you it does not matter. It does.
+  8. Verify every fix by re-profiling that phase and comparing MBU or MFU. End-to-end tokens per second is too noisy to attribute a 2% change.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B, BF16, batch 32. At what context length does the KV cache start to exceed the weights in bytes read per decode step?', numeric: true, answer: 3830, tolerance: 260, unit: 'tokens', why: 'Set B·T·131,072 = P·2 → T = 122,500/B = 122,500/32 ≈ 3,830 tokens. Above this, decode is a KV-cache problem, not a weights problem.' },
+  { q: 'A decode step reports 4% MFU. Is that a problem?', options: ['Yes — 4% is far too low', 'No — decode is memory-bound, so MFU is expected to be tiny. Check MBU instead', 'Yes — it means the GPU is idle', 'No, because the model is too small'], answer: 1, why: 'Decode does ~1 FLOP per byte, so it is memory-bound by construction and MFU is meaningless for it. Quote MBU: 75–90% is a healthy decode step.' },
+  { q: 'You fuse the SiLU and multiply into one kernel and measure end-to-end tokens per second. The number moved by less than 1%. Why?', options: ['The fusion is broken', 'In decode the intermediate tensor is L2-resident, so you only saved a ~5 µs launch on a 20 ms step — it is a prefill optimization', 'Tokens per second is the wrong metric, use MFU', 'The GPU clock throttled'], answer: 1, why: 'At batch 32 the [32, 28672] intermediate is ~1.8 MB and lives in L2. The fusion saves a launch, not bandwidth. The same change on a 512-token prefill chunk is a real 2% win.' },
+  { q: 'A prefill GEMM on a 4096×4096 matrix achieves 42% MFU. What does that suggest?', options: ['Nothing, 42% is normal for prefill', 'Something is wrong — cuBLAS is likely choosing a poor algorithm for this shape, and 50%+ should be reachable', 'The kernel is memory-bound', 'The batch size is too small'], answer: 1, why: 'Large square BF16 GEMMs reach 55–65% MFU from cuBLAS. At 42% there is roughly 1.4× available: try a different library, a different layout, or a Triton kernel (Module 13).' },
+  { q: 'At batch 128, what is the weights/KV crossover context for Llama-3.1-8B?', numeric: true, answer: 957, tolerance: 70, unit: 'tokens', why: 'T = 122,500 / 128 ≈ 957 tokens. At large batch, KV dominates almost immediately, which is why long-context serving is fundamentally a KV-cache problem.' },
+  { q: 'Which single change helps decode most, and barely touches prefill?', options: ['Quantizing the weights', 'Fusing RMSNorm', 'Increasing the batch size', 'Using a faster sampling implementation'], answer: 2, why: 'Prefill is already compute-bound with a saturated GEMM, so extra rows cost little. Decode step time is nearly flat in batch (Module 05), so batch is close to free throughput. This is the whole argument of continuous batching.' },
+]} />

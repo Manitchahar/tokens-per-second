@@ -1,0 +1,270 @@
+---
+title: 'Data parallelism & context parallelism'
+summary: 'The two strategies that do not split the math: replicas for throughput, context parallelism for a single sequence too long to fit. You will learn when each is free, when each is a trap, and how to put all four strategies into one decision procedure.'
+objectives:
+  - 'Explain why data parallelism is free at inference and when it stops being free'
+  - 'Compute the context-parallel KV exchange volume and derive its penalty factor, and show that it exceeds 1 on every fabric'
+  - 'Compare context parallelism against quantization and tiered KV (Module 20) for very long prompts'
+  - 'Derive replica parallelism’s memory and cost implications, including the KV-cache-sharing variant'
+  - 'Apply a single decision procedure that picks among quantization, TP, PP, CP and replicas'
+---
+import DataContextSplit from '@/components/viz/multi-gpu/DataContextSplit.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You now have three tools. Tensor parallelism splits matrices and pays in bytes. Pipeline parallelism splits layers and pays in idle time. Both are about **fitting one model across GPUs so one request can use them all**.
+
+This lesson covers the remaining two, and the honest truth about both: **they are usually not the first thing you reach for.**
+
+- <Term t="replica-parallelism">Replica parallelism</Term> — several complete copies, different requests, **zero communication**. Buys throughput, not capability.
+- <Term t="context-parallelism">Context parallelism</Term> — one request, split across GPUs by sequence position. **Expensive.** The right tool only in one specific situation.
+
+## Replicas: the parallelism you forget to count
+
+Run the same model on eight GPUs and give each one an eighth of the traffic. Every GPU holds the whole model. No collectives, ever.
+
+$$
+\text{throughput} = R \times \text{throughput of one copy}
+$$
+
+for $R$ replicas, at the cost of $R$ times the memory (for weights) and $R$ times the money. It is the least glamorous parallelism in the course and by far the most used.
+
+<Callout type="intuition" title="Why replicas are how inference actually scales">
+  Every production deployment you have met in this course — vLLM in Module 09, the autoscaler in Module 23 — scales by adding replicas, not by sharding. The reason is that serving throughput is limited by *memory bandwidth*, not by model size. Once the model fits, adding copies is the only move that increases throughput per dollar, because it has no coordination cost at all.
+
+  Sharding exists to make a model *fit*. Replication exists to make it *fast*. Conflating the two is the most common architectural mistake in multi-GPU inference.
+</Callout>
+
+Replica parallelism has one memory wrinkle worth knowing, because it is a real production technique. If several requests share a long prefix (Module 10), all replicas want the same cached prefix blocks. Copying them into every replica wastes memory $R$ times. A shared prefix across replicas is worth $R \times$ the prefix length in tokens of saved memory — which is why prefix-aware routing (Module 23) is about cache locality, not just load balance.
+
+### And the variant nobody calls data parallelism
+
+There is a hybrid worth naming, because it comes up in practice. Take two 8-GPU nodes, each running a full TP=8 replica, and put an **all-reduce across the two replicas once per forward pass**. Each replica then sees the sum of both batches. This is true <Term t="data-parallelism">data parallelism</Term>, and it is the third axis of a 3D-parallel deployment.
+
+- Throughput: **halves** relative to two independent replicas (you are now one big model serving one batch).
+- Latency for a single request: **unchanged** — it lives in one replica.
+- TP degrees in a single collective: **halved** — 8 instead of 16, so communication is cheaper and efficiency higher.
+- Weights are duplicated: 16 GPUs hold the same 8-GPU model.
+
+This is real (it is the data-parallel axis of Megatron-LM and DeepSpeed-Ulysses-style designs), and the trade is: pay for duplicate weights and a cross-node all-reduce to buy higher parallel efficiency and lower per-token latency. **For latency-sensitive serving it sometimes wins. For pure throughput it never does** — you should be running independent replicas.
+
+<Scrolly>
+  <DataContextSplit client:visible slot="stage" />
+
+  <Step title="1. Replicas: no communication at all">
+    Three complete copies, three different requests, nothing crosses the wire. This is the cheapest throughput available, and it is what production serving actually scales with.
+  </Step>
+
+  <Step title="2. Data parallelism, and when it costs">
+    Because inference weights are read-only, different requests on different GPUs need no sync. The exception is one request spread across GPUs — and that is not data parallelism, it is context parallelism.
+  </Step>
+
+  <Step title="3. Context parallelism splits the sequence">
+    Llama-3.1-8B at 128k tokens of context needs 16 GB of KV. Split the sequence four ways and each GPU holds 4 GB. That is the entire appeal.
+  </Step>
+
+  <Step title="4. Attention is global, so K and V must rotate">
+    Token 40,000 attends to tokens 0 and 20,000, which live on other GPUs. Every layer, the K and V shards rotate around a ring: P-1 rotations of a 1/P slice.
+  </Step>
+
+  <Step title="5. What it saves, and what it costs">
+    Per-GPU KV falls by exactly P, and so does the local attention read. The communication does **not** fall by P — nearly the whole cache crosses the wire.
+  </Step>
+
+  <Step title="6. The price scales with context">
+    Over PCIe this all-to-all is catastrophic. Over NVLink it survives at moderate context and fails at long context. Move the context slider and watch the slowdown.
+  </Step>
+
+<Step title="7. The penalty question">
+    Is the link faster than the memory you gave up? Over NVLink at $P = 4$ the answer is no by **26x** — and over PCIe by 393x. The penalty starts above 1 and grows with $P$, so there is no break-even degree at all.
+  </Step>
+
+  <Step title="8. The four-way decision">
+    Replicas for throughput, quantization for memory, TP to fit in a node, PP to cross nodes, CP only when one single sequence will not fit any other way.
+  </Step>
+</Scrolly>
+
+## Context parallelism, honestly
+
+Split one sequence into $P$ contiguous slices. GPU $i$ holds tokens $[iT/P, (i+1)T/P)$ and computes the Q, K, V **only for its own slice** — so its KV cache is $\frac{1}{P}$ of the total. Attention still has to see everything, so before each attention layer the K and V shards are rotated around a ring.
+
+Each GPU receives $(P-1)/P$ of the whole cache per layer, because it ends up holding every other GPU's slice once:
+
+$$
+\text{CP bytes per layer} = \frac{P-1}{P} \times \underbrace{B \cdot T \cdot 2Ln_{kv}d \cdot 2}_{\text{whole KV cache}}
+$$
+
+Note what that is: **essentially the entire KV cache, per layer, per forward pass.** Here is the rotation, which is the only unusual thing about it:
+
+```python
+def ring_attention(q, k, v, p, rank):
+    """q, k, v: this rank's 1/p slice. Returns attention over the WHOLE sequence."""
+    # q stays local — only K and V have to circulate
+    for step in range(p - 1):                       # p-1 rotations
+        k_next, v_next = recv_from((rank + 1) % p)  # blocking send/recv over the link
+        send_to((rank - 1) % p, k, v)               # hand off our slice
+        k, v = k_next, v_next
+
+    # now every rank has all p slices of K and V, concatenated in ring order.
+    # Reorder into token order, then attend. The mask is NOT is_causal: rank r's
+    # queries sit at positions r*T/p .. (r+1)*T/p, so it must attend to everything
+    # before its own last position, and nothing after. A plain causal mask would
+    # let rank 2's queries see rank 3's tokens.
+    k_all, v_all = reorder_by_token_position(k, v)
+    mask = causal_mask_for_absolute_positions(q_positions(rank, p), total_positions(p))
+    return F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=mask)
+```
+
+The loop is `p - 1` iterations, and each iteration moves $\frac{1}{p}$ of the cache. Multiply: $(p-1)/p$ of the whole thing. **That is the entire cost of context parallelism, and it is why the memory saving does not survive contact with the bandwidth.**
+
+<Callout type="math" title="Worked: Llama-3.1-8B, 32k context, batch 1, CP=4">
+  KV bytes per token (Module 05): $\text{KV/token} = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ B.
+  Whole cache: $\text{whole cache} = 32{,}768 \times 131{,}072 \approx 4.29$ GB. Per GPU with CP=4: **1.07 GB**. Memory solved.
+
+  Now the bill. $\frac{P-1}{P} = 0.75$, so **3.22 GB per layer**, times 32 layers = **103 GB per forward pass**.
+
+  Over NVLink 4 (450 GB/s, 85%): $t = 103\times 10^9 / (450\times 10^9 \times 0.85) = 269$ µs per forward pass. With 256 cache misses per forward pass this is partly hidden, but it is a real 0.27 ms on every step.
+
+  Over PCIe 4.0 (32 GB/s, 80%): $t = 103\times 10^9 / (32\times 10^9 \times 0.8) = 4.03$ ms. **That alone is most of a decode step.** CP over PCIe is not a tuning problem, it is a broken idea.
+
+  Local attention read at CP=4 is 1.07 GB at 2.68 TB/s = 400 µs — but every one of those bytes arrived over the wire first. **CP trades local memory traffic for network traffic at a ratio of roughly 1:1.1, and the network is always slower.** That is why it is a last resort.
+</Callout>
+
+<Callout type="pitfall" title="Context parallelism is not how you serve long context">
+  The industry answer to a 128k context on one GPU is, in order:
+
+  1. **Shorten the context.** Real prompts are usually not that long; $R$AG chunks, summarisation, or a smaller `max_model_len` often solve it.
+  2. **Quantize the KV cache** (Module 11). FP8 KV halves it directly, with no communication at all.
+  3. **Tensor parallelism.** It divides the KV cache by $t$ as a side effect of dividing heads — with **no all-to-all**, because each rank owns whole heads and attends locally.
+  4. **Tiered KV** (Module 20): keep hot tokens on GPU, spill cold ones to CPU memory or disk.
+  5. **Context parallelism.** Last, because it is the only one that costs communication.
+
+  Step 3 is the one people miss. TP gives you the same memory reduction as CP for the same $P$, at a fraction of the cost, because it exploits head structure instead of fighting it.
+</Callout>
+
+## The penalty, not a break-even
+
+There is one comparison that settles whether context parallelism is worth anything, and it is not the one people usually reach for.
+
+Per GPU, the attention read costs the local $\frac{1}{P}$ slice out of HBM. The ring costs $(P-1)/P$ of the whole cache over one link. Their ratio:
+
+$$
+\boxed{\;\text{penalty} = \frac{(P-1)/P \times \text{kv} / B_{link}\eta}{1/P \times \text{kv} / B_{mem}} = (P-1) \cdot \frac{B_{mem}}{B_{link}\eta} = (P-1)\rho\;}
+$$
+
+Read what just happened. **The KV cache cancels completely.** The penalty depends on nothing but the degree and the ratio $\rho$ from lesson one — and it is *always greater than 1* for $P > 1$, on every fabric that exists.
+
+| H100 ($B_{mem}$ = 3.35 TB/s) | $P=2$ | $P=4$ | $P=8$ |
+|---|---|---|---|
+| NVLink 5 (900 GB/s, 85%) | 4.4x | 13.1x | 30.7x |
+| NVLink 4 (450 GB/s, 85%) | 8.8x | 26.3x | 61.3x |
+| InfiniBand NDR (50 GB/s, 85%) | 78.8x | 236.5x | 551.8x |
+| PCIe 4.0 (32 GB/s, 80%) | 130.9x | 392.6x | 916.0x |
+
+<Callout type="intuition" title="Context parallelism is never faster. Not slow — never.">
+  People usually look for a break-even degree here. There isn't one. Over PCIe at $P = 2$, context parallelism makes the attention read **131 times** more expensive; over PCIe at $P = 4$, **393 times**. The penalty starts above 1 and grows linearly with $P$, on every fabric that exists.
+
+  So the question is not "does it pay?" — it is **"is this request otherwise impossible?"** A single 512k-context request whose KV is 68 GB on an 8B model might genuinely have nowhere else to go. Everything else should not use it.
+</Callout>
+
+<Callout type="pitfall" title="Context parallelism is not how you serve long context">
+  The industry answer to a 128k context on one GPU is, in order:
+
+  1. **Shorten the context.** Real prompts are usually not that long; RAG chunking, summarisation, or a smaller `max_model_len` often solves it.
+  2. **Quantize the KV cache** (Module 11). FP8 halves it directly, with no communication at all.
+  3. **Tensor parallelism.** It divides the KV cache by $t$ as a side effect of dividing heads — with **no all-to-all**, because each rank owns whole heads and attends locally.
+  4. **Tiered KV** (Module 20): keep hot tokens on GPU, spill cold ones to CPU memory or disk.
+  5. **Context parallelism.** Last, because it is the only one that costs communication.
+
+  Step 3 is the one people miss. TP gives you the same memory reduction as CP for the same $P$ at **zero all-to-all traffic** — because it exploits head structure instead of fighting it. Over NVLink at $P = 4$ that is the difference between a 26x penalty and nothing at all.
+</Callout>
+
+<Callout type="real" title="Where context parallelism does show up">
+  It is not a fiction: ring attention with context parallelism is a well-established technique for training very long sequences, where activation memory rather than KV memory is the wall and there is no quantization to fall back on. And Module 21's prefill/decode disaggregation transfers KV between nodes for the same reason — because sometimes one sequence really does have to span machines.
+
+  In serving, though, the question is nearly always "could I have done this with TP, or with less context?" — and the answer usually is yes. Use CP when the answer is genuinely no.
+</Callout>
+
+## Two more axes you will meet
+
+Before the decision procedure, two terms that show up in every framework's flags and are worth defining now.
+
+**<Term t="sequence-parallelism">Sequence parallelism</Term>** is a companion to tensor parallelism, not a competitor. Inside a TP group, the attention and MLP regions are split by head and by column, but the **LayerNorm, the residual adds, and the dropout regions** operate on the full hidden state — so every rank redundantly computes them on the whole tensor. Sequence parallelism splits those regions along the *token* dimension instead, so each rank handles $\frac{1}{t}$ of the tokens there too.
+
+The cost is one extra small all-gather or all-reduce around each of those regions — the same hidden-state tensor you were already sending, but now for an operation that is memory-bound and cheap. The benefit is that the memory-bound ops stop being $t\times$ redundant. It is why real TP implementations offer `--enable-sequence-parallelism` (Megatron) or `--enable-sp` (DeepSpeed). **If you are running TP and see LayerNorm or the residual add showing up in your profile, this is why.**
+
+**<Term t="expert-parallelism">Expert parallelism</Term>** is the multi-GPU form of a Mixture-of-Experts layer, and Module 19 is entirely about it. Each GPU owns a subset of experts and holds those experts' weights permanently; tokens are routed to the right GPU with an <Term t="all-to-all">all-to-all</Term> and combined with a second one. The collective is different from everything in this module: an all-to-all is a **permutation**, not a reduction, so it cannot be built from all-gather plus reduce-scatter, and its cost depends on how *skewed* the routing is — not just on batch size.
+
+The reason it belongs in this lesson: expert parallelism has the same shape as tensor parallelism (shard a layer's parameters, use a collective per layer) but the opposite communication profile. Tensor parallelism sends the same bytes to every GPU; expert parallelism sends each token's bytes to exactly one GPU and nothing to the others. **The all-to-all cost is therefore proportional to how unevenly tokens are distributed** — which is the hot-expert problem Module 19 opens with.
+
+<Callout type="recap" title="The parallelisms at a glance">
+  | Scheme | Splits by | Collective per layer | Volume scales with |
+  |---|---|---|---|
+  | Replica / data | the batch | none | — |
+  | Tensor | head / column | all-reduce ×2 | layers $L$ × tokens $T$ |
+  | Sequence | the token dim | 1 small gather | layers $L$ |
+  | Pipeline | the layer index | 1 send per boundary ($P-1$ total) | stages $P$ |
+  | Context | the sequence | all-to-all | layers $L$ × cache size |
+  | Expert | the expert index | all-to-all ×2 | routing skew |
+</Callout>
+
+## Putting all four together
+
+Every architecture decision in this module reduces to five questions, in this order. This is the deliverable of the module.
+
+<Callout type="recap" title="The decision procedure">
+  **1. Does the model fit on one GPU with room for the KV cache?**
+  - Weights (2 bytes per parameter) plus batch × context × KV bytes per token. If yes → **replicas**. Stop here. Sharding a model that fits is pure overhead.
+
+  **2. If not, does it fit in 8 or 4 bits?**
+  - FP8 halves weights; 4-bit quarters them. If it fits → **quantize and replicate**. This is almost always cheaper than buying a second GPU.
+
+  **3. Still too big. What is the actual blocker — weights or KV?**
+  - **KV-dominated** (long context, high batch): **tensor parallelism** divides the KV cache by $t$ for free. If that is not enough, shorten context or tier the KV.
+  - **Weight-dominated** (huge model, short context): **tensor parallelism inside the node**, then **pipeline parallelism** to cross it.
+
+  **4. Where does it have to cross?**
+  - Inside an NVLink island: TP is affordable (0.1–2% overhead).
+  - Between nodes over InfiniBand: only PP's coarse communication survives. TP's $L$ factor kills it.
+  - Across PCIe: neither is good. Replicas are usually better than a bad pipeline.
+
+  **5. What is your actual load?**
+  - **Throughput-bound, high concurrency:** replicas, always. Sharding buys you nothing.
+  - **Latency-bound, low concurrency:** pipeline's bubble is your enemy. Keep $P$ small, use TP, and accept lower throughput per GPU.
+  - This question is why the "right" answer is a function of your traffic, not of the model.
+</Callout>
+
+<Callout type="mentor" title="The thing nobody tells you">
+  Most multi-GPU inference problems are not parallelism problems at all. They are **capacity** problems: you needed more GPUs because your workload had grown, and you reached for sharding because it was the interesting tool.
+
+  The honest sequence is: measure whether you are memory-bound or bandwidth-bound (Module 12), check whether you have headroom (Module 06's operating envelope), and only then reach for a second GPU. A framework that lets you shard a model across 8 GPUs when 4 replicas of a quantized version would be faster, cheaper and simpler is a tool with too many options — not a win.
+</Callout>
+
+## Where this leaves the module
+
+- **Replicas** are the default: zero communication, linear throughput, no capability gain. Scale with these until you cannot.
+- **Data parallelism** is free at inference because weights are read-only; it costs only when a single request spans GPUs, which is not data parallelism.
+- **Context parallelism** divides KV memory by $P$ but moves essentially the whole cache per layer. It is never faster — not on NVLink, not anywhere — and tensor parallelism achieves the same memory reduction for free.
+- The penalty is one line: **$(P-1)B_{mem}/(B_{link}\eta) = (P-1)\rho$**. The KV cache cancels out, and it exceeds 1 for every $P > 1$.
+- The four strategies compose: quantize first, TP inside the island, PP across it, replicas for the rest.
+
+The lab makes you do this on real configurations and real numbers — including a Colab notebook where a single T4 runs the simulated multi-GPU step so you can verify the arithmetic against measured times.
+
+<KeyNotes>
+  1. Replica parallelism copies the whole model on every GPU with **zero communication**. It multiplies throughput and never improves a single request's latency.
+  2. Inference data parallelism is free because weights are read-only; the hybrid variant (all-reduce across replicas) trades throughput for lower latency and lower TP degree, and is rarely right for throughput serving.
+  3. Context parallelism splits one sequence P ways: KV memory per GPU falls by P, but each layer moves (P-1)/P of the entire KV cache.
+  4. For Llama-3.1-8B at 32k context with CP=4, that is 103 GB per forward pass — 269 µs over NVLink, 4 ms over PCIe. CP over PCIe is broken, not slow.
+  5. Context parallelism's penalty is $(P-1)\rho$: it exceeds 1 for every $P > 1$ on every fabric, so it is never a speed optimisation — only a way to fit a request that has nowhere else to go.
+  6. Context parallelism is the **last** resort for long context. Shorten it, quantize the KV, tensor-parallel (free 1/t), or tier it — in that order.
+  7. TP divides the KV cache by t with no all-to-all, because each rank owns whole heads and attends locally. This is why TP usually beats CP for the same memory goal.
+  8. The decision order is: fits alone → replicas; fits quantized → quantize; KV-bound → TP; weight-bound → TP then PP; then check your actual load before adding either.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B (32 layers, 8 KV heads, head dim 128, BF16) at 32,768 tokens of context, split across 4 GPUs by context parallelism. How many bytes cross the ring per forward pass?', numeric: true, answer: 107900000000, tolerance: 6000000000, unit: 'bytes', why: 'KV/token = 2·32·8·128·2 = 131,072 B. Whole cache = 32,768 · 131,072 = 4.295 GB. Ring factor (P-1)/P = 0.75, so 3.22 GB per layer, times 32 layers = 103 GB. Nearly the whole cache crosses the wire every forward pass.' },
+  { q: 'An H100 has 3.35 TB/s of memory bandwidth. Over NVLink 4 (450 GB/s, 85% efficiency), what is the context-parallel penalty on the attention read at P=4, given penalty = (P-1)·B_mem/(B_link·η)?', numeric: true, answer: 26, tolerance: 1, unit: 'x', why: '(4-1) × 3.35e12 / (450e9 × 0.85) = 3 × 3.35e12 / 382.5e9 ≈ 26.3x. The KV cache cancels out of this ratio entirely, so the penalty depends only on the degree and rho — and it exceeds 1 for every P > 1. Over PCIe the same calculation gives 393x.' },
+  { q: 'You need 8× the throughput of one Llama-3.1-8B replica on H100s, and the model fits on one GPU. What should you do?', options: ['Tensor-parallel across 8 GPUs', 'Run 8 independent replicas with traffic split between them', 'Pipeline across 8 GPUs', 'Context-parallel across 8 GPUs'], answer: 1, why: 'The model fits, so sharding buys no capability — only coordination cost. Replica parallelism gives exactly 8× throughput with zero communication, no bubble, and no divisibility constraints. This is how production serving actually scales.' },
+  { q: 'Why does tensor parallelism usually beat context parallelism for the same per-GPU KV memory reduction?', options: ['TP moves fewer bytes per layer', 'TP divides the KV cache by t because each rank owns whole KV heads and attends over the whole local cache — no all-to-all is needed, since the cache is already sharded by head', 'CP is compute-bound', 'TP uses less memory for weights'], answer: 1, why: 'Both give a 1/P KV split, but TP gets it from head structure for free. CP must actively rotate K and V every layer because the split is by sequence position and attention is global. Same memory goal, vastly different communication bill.' },
+  { q: 'A pipeline has 8 stages. At what micro-batch count does the bubble first fall below 10%?', numeric: true, answer: 64, tolerance: 5, unit: 'micro-batches', why: '(8-1)/(M+7) < 0.10 → 7 < 0.10M + 0.7 → M > 63. So M = 64 gives 7/71 = 9.9%. This is exactly the M ≥ 4P rule of thumb: 4·8 = 32 is the "acceptable" target, 8P is "good".' },
+  { q: 'Which of these is the correct order of escalation for a model that does not fit on one GPU?', options: ['Tensor parallel, then pipeline, then quantize, then replicas', 'Quantize first (it is nearly free), then tensor-parallel inside the node, then pipeline across nodes, replicas for the remaining throughput', 'Context parallel first, since it divides the cache most evenly', 'Replicas first, since more GPUs is always the answer'], answer: 1, why: 'Quantization buys memory for no communication cost and usually makes the whole problem disappear. If it is not enough, TP fits the model in a node; PP then carries it across nodes; and whatever throughput remains is served by replicas. Context parallel is last, and only for a single sequence that will not fit otherwise.' },
+] } />

@@ -1,0 +1,232 @@
+---
+title: 'Diffusion inference'
+summary: 'Diffusion has no tokens, no KV cache and no autoregressive loop. It runs one network over the whole image, twenty to fifty times, and every step re-reads every weight. That makes it compute-bound where LLM decode is memory-bound — which inverts almost every purchasing and optimisation intuition you have built in this course.'
+objectives:
+  - Explain the structure of a diffusion sampling loop and where it differs from autoregressive decoding
+  - Compute the latent shape and token-equivalent cost of an image
+  - Show from bandwidth utilisation why a denoising step is compute-bound
+  - Explain why activations, not weights, decide the batch size in diffusion
+  - Compare the available latency levers and what each one costs in quality
+---
+import Diffusion from '@/components/viz/specialized-workloads/Diffusion.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every workload so far in this course has had the same skeleton: read the weights, produce one token, repeat. The KV cache made that efficient by never recomputing. Everything in Modules 05 through 20 is a refinement of that loop.
+
+Diffusion throws the loop away.
+
+There is no token. There is no KV cache, because there is nothing to cache — every one of the 20 to 50 steps re-reads every weight and recomputes everything. And instead of producing something small, each step processes the *entire image*.
+
+The result is a workload that is **compute-bound where LLM decode is memory-bound.** That single fact inverts most of the instincts this course has built.
+
+<Callout type="mentor" title="The one-sentence difference">
+  LLM decode asks "how fast can I read the weights?" Diffusion asks "how fast can I multiply?" Same GPU, opposite constraint, opposite optimisation priorities, opposite buying criteria.
+</Callout>
+
+## The latent, and why 512×512 is really 64×64
+
+A diffusion U-Net never sees pixels. It sees a **latent**: the image downsampled by 8 and given 4 channels.
+
+$$
+512 \div 8 = 64 \quad\Rightarrow\quad \text{latent shape} = 4 \times 64 \times 64 = \boxed{16{,}384 \text{ values}}
+$$
+
+Compare the image itself: 3 × 512 × 512 = 786,432 values. The latent is **48× smaller**. Every denoising step runs over those 16,384 values; the full-resolution pixels only exist at the very end, when a VAE decoder expands the final latent back into an image.
+
+So diffusion *is* token-like in one respect: it has a natural unit of work. One latent position is roughly one token. At 16,384 units per image, a single image is a long sequence — but processed all at once, in parallel, every step.
+
+<Scrolly>
+  <Diffusion client:visible slot="stage" />
+
+  <Step title="1. Diffusion is not autoregressive">
+    No tokens, no KV cache, no incremental decoding. **Every step recomputes everything from the whole image.**
+  </Step>
+
+  <Step title="2. The latent: why 512×512 is really 64×64">
+    Downsampled 8× with 4 channels — 16,384 values instead of 786,432. The whole model works at this size until the final decode.
+  </Step>
+
+  <Step title="3. The loop runs 20–50 times">
+    Each step takes the current latent plus a timestep and predicts less noise. **This is prefill's shape, repeated N times** — not decode's shape.
+  </Step>
+
+  <Step title="4. Where it sits on the roofline">
+    A step moves its bytes in about 2% of the time full bandwidth would allow. **The compute units are the constraint**, not memory.
+  </Step>
+
+  <Step title="5. The contrast with LLM decode">
+    LLM decode runs at 60–80% of peak bandwidth. Diffusion steps run at ~2%. **Same card, opposite conclusions about what to buy.**
+  </Step>
+
+  <Step title="6. Guidance doubles the batch">
+    Classifier-free guidance runs the U-Net twice per step. Not a refinement — the standard recipe, and it costs exactly 2×.
+  </Step>
+
+  <Step title="7. VAE decode: one huge kernel at the end">
+    Runs once, at full resolution, and is the memory peak of the whole request. **Easy to overlook because it happens once.**
+  </Step>
+
+  <Step title="8. The latency levers">
+    Fewer steps, a smaller model, or cached features. **Two of the three change the image; only one is free.**
+  </Step>
+</Scrolly>
+
+## Why it is compute-bound
+
+This is the claim that drives everything else, so let me show it rather than assert it.
+
+Take Stable Diffusion 1.5 at 512×512 on an A100 (2.0 TB/s peak bandwidth). One denoising step touches roughly every weight plus the live activations:
+
+$$
+\text{bytes per step} \approx \underbrace{0.86\text{e}9 \times 2}_{\text{weights}} + \underbrace{320 \times 512 \times 512 \times 2 \times 6}_{\text{widest activations}} \approx \boxed{2.7\text{ GB}}
+$$
+
+Published A100 timings for SD 1.5 with classifier-free guidance put a 20-step 512×512 image at about **1.2 seconds**, so roughly 55 ms per step. How long would those 2.7 GB take to move at *full* bandwidth?
+
+$$
+\frac{2.7\text{ GB}}{2.0\text{ TB/s}} = \boxed{1.35\text{ ms}}
+$$
+
+Compare with the actual 55 ms:
+
+$$
+\text{bandwidth utilisation} = \frac{1.35}{55} = \boxed{2.5\%}
+$$
+
+The step spends 55 milliseconds moving bytes that would take 1.35 milliseconds at full speed. It is nowhere near memory-bound — it is deeply compute-bound.
+
+| workload | bandwidth utilisation | bound by |
+|---|---|---|
+| LLM decode, batch 1 | ~20–35% | memory |
+| LLM decode, batch 32+ | 60–80% | memory |
+| **diffusion denoising step** | **~2%** | **compute** |
+
+<Callout type="math" title="Why this inverts your buying criteria">
+  A memory-bound workload rewards **memory bandwidth**. That is why HBM has become the scarce resource in LLM serving, why GQA and KV quantization (Modules 03, 11) matter so much, and why the decode step is a bandwidth problem above all else.
+
+  A compute-bound workload rewards **FLOP/s and tensor-core throughput**, and is largely indifferent to memory bandwidth. So for a diffusion workload, a card with more compute and less bandwidth is the better card — the opposite of the LLM-serving conclusion.
+
+  This is Module 12's roofline model doing exactly what it is for: telling you *which* of the two limits a workload is against, and therefore which knob to turn.
+</Callout>
+
+## The memory story: activations, not weights
+
+Diffusion's memory is unusual, and it is the part that catches people out. At 512×512, the U-Net's highest-resolution blocks carry 320 channels, so a single feature-map tensor is:
+
+$$
+320 \times 512 \times 512 \times 2\text{ B} = \boxed{168\text{ MB}}
+$$
+
+And several of them are live at once — roughly six tensors across the widest stage of the forward pass:
+
+$$
+168 \text{ MB} \times 6 \approx \boxed{1.0\text{ GB per image}}
+$$
+
+Compare the weights: 0.86B U-Net parameters plus VAE and text encoder, about **2.1 GB total**, shared across every image in the batch.
+
+$$
+\underbrace{2.1\text{ GB}}_{\text{weights, once}} \quad\text{vs}\quad \underbrace{1.0\text{ GB} \times \text{batch}}_{\text{activations, per image}}
+$$
+
+**Activations overtake the weights at batch 2.** For an 8B LLM the weights dominate until batch 20 or so; for a diffusion model the crossover is immediate.
+
+<Callout type="pitfall" title="This is why diffusion OOMs at batch 2">
+  People arrive from LLM serving expecting a large batch to fit comfortably, and SD 1.5 OOMs on an A100 at batch 4 while a 7B LLM happily runs 128. Nothing is wrong — the weight-to-activation ratio is simply reversed.
+
+  On an A100 (80 GB) with 2.1 GB of weights, the activations leave 78 GB, so about 77 images fit by this estimate. In practice you get far fewer, because real U-Nets hold more than six live tensors and attention at the top level needs a workspace. **Treat any activation estimate as a lower bound.**
+</Callout>
+
+Two mitigations, both standard practice:
+
+- **Attention slicing / tiling.** Break the self-attention at high resolution into chunks so it never materialises the full 16,384 × 16,384 attention matrix. Costs some speed, saves a great deal of memory.
+- **Lower resolution or fewer channels.** 512×512 → 256×256 quarters the activations and the FLOPs together.
+
+## The latency levers
+
+Four, and only one is free.
+
+**Fewer steps.** Latency is *exactly linear* in step count. SD 1.5 at 20 steps takes 1.2 s; at 10 steps, 0.6 s. But the image quality curve flattens, and below roughly 15 steps the images visibly degrade.
+
+**Distilled few-step models.** SDXL-Turbo is the same 2.6B U-Net trained to work in 4 steps instead of 30. That is a **5.6× latency win** and a genuinely different image — but it is a training-time decision, and it is the single largest lever available.
+
+| model | steps | seconds/image on A100 | relative |
+|---|---|---|---|
+| SDXL base | 30 | 4.5 | 1.0× |
+| SDXL-Turbo | 4 | 0.8 | **0.18×** |
+| SD 1.5 | 20 | 1.2 | 0.27× |
+| SD 1.5 at 10 steps | 10 | 0.6 | 0.13× |
+
+**Classifier-free guidance.** This is not a lever for saving time — it is a cost. Guidance runs the U-Net twice per step, once on the prompt and once on an empty prompt, then combines them. Published timings above already include it. **It is a 2× tax on every step**, and it is what makes images follow the prompt.
+
+**Feature caching.** There is no prefix cache, but there is an analogue: later denoising steps change the latent only slightly, so shallow U-Net features barely move and can be reused.
+
+| cache mode | step compute retained | quality impact |
+|---|---|---|
+| none | 100% | reference |
+| cumulative | ~35% | small |
+| residual | ~15% | very small |
+
+<Callout type="intuition" title="Why feature caching is not free even though it looks like prefix caching">
+  In an LLM, the KV for a prefix is *identical* on the next request, so reusing it is exact. In diffusion, the features depend on the latent, and the latent changes every step. Caching them is an approximation that gets worse as the step index grows.
+
+  So there is no correctness guarantee — unlike prefix caching, where a hit is bit-exact. Caching buys you speed by accepting a small quality cost, and the honest framing is that it is a lossy optimisation, not a free one.
+</Callout>
+
+## Batching, which behaves differently than you expect
+
+Since diffusion is compute-bound, batching should behave the way prefill behaves: nearly free. And it is — up to the activation limit.
+
+On an A100 with SD 1.5:
+
+| batch | seconds per image | images/second |
+|---|---|---|
+| 1 | 1.2 | 0.83 |
+| 4 | 1.2 | 3.33 |
+| 8 | 1.2 | 6.67 |
+
+Per-image latency is unchanged, because the extra images ride along on spare compute. **This is the same free-lunch structure as prefill batching** — and it is why diffusion throughput scales so cleanly with batch, until activations stop fitting.
+
+<Callout type="real" title="What differs from LLM serving, concretely">
+  In LLM serving, batch size trades latency against throughput and you have to pick a point on the curve (Module 06). In diffusion, latency per image is flat in batch, so there is no such trade-off — **you should always run the largest batch that fits**, because there is no latency cost.
+
+  The constraint flips sides entirely: in LLM serving, memory limits batch; in diffusion, activations limit batch far earlier than weights do. And in both cases there is no KV cache to manage, which also means none of Module 08's paging machinery applies.
+</Callout>
+
+## Sizing a diffusion service
+
+| decision | guidance |
+|---|---|
+| model | smaller U-Net is a bigger win than more steps |
+| steps | the largest count that meets your latency SLO; few-step models win outright |
+| resolution | FLOPs and activations both scale with pixels — 1024² costs ~4× 512² |
+| batch | as large as activations allow; per-image latency is flat |
+| attention | slicing/tiling to fit; costs some speed |
+| guidance | assume 2×; it is not optional in practice |
+
+<Callout type="try" title="Check yourself before continuing">
+  1. At 512×512 with a factor-8 downsample and 4 latent channels, what is the latent shape, and how many fewer values is that than the RGB image?
+  2. A denoising step on SD 1.5 moves about 2.7 GB and takes 55 ms on an A100 with 2.0 TB/s. What is its bandwidth utilisation, and what does that tell you it is bound by?
+  3. The U-Net's widest feature map at 512×512 is 320 channels in FP16. How large is one tensor, and at what batch size do activations exceed the weights?
+  4. Diffusion per-image latency is flat in batch size while LLM decode latency is not. Why?
+  5. SDXL base takes 30 steps and SDXL-Turbo takes 4 on the same 2.6B U-Net. What is the latency ratio, and what kind of decision produced it?
+</Callout>
+
+<KeyNotes>
+  1. Diffusion has no tokens, no KV cache and no autoregressive loop. Each step re-reads every weight and recomputes the whole image — so it is prefill's shape repeated N times, not decode's shape.
+  2. A 512×512 image is processed as a 4×64×64 latent: 16,384 values, **48× fewer than the 786,432 RGB values**. Full resolution exists only at the final VAE decode.
+  3. A denoising step uses about **2.5% of peak bandwidth** against LLM decode's 60–80%, so it is deeply compute-bound. Diffusion workloads reward FLOP/s, not memory bandwidth — the inverse of LLM serving.
+  4. Activations, not weights, limit batch size: the widest feature map is 168 MB and several are live, so **1 GB per image against 2.1 GB of weights**. Activations overtake weights at batch 2.
+  5. Latency is exactly linear in step count, but the quality curve flattens — so distilled few-step models (SDXL-Turbo: 30 steps to 4) are the largest lever, at **5.6×** and a different image.
+  6. Classifier-free guidance runs the U-Net twice per step. It is a 2× tax, not a saving, and published timings already include it.
+  7. Feature caching retains 15–35% of step compute with a small quality cost. It is a **lossy approximation**, unlike prefix caching where a hit is bit-exact.
+  8. Diffusion per-image latency is flat in batch, so there is no latency–throughput trade-off — always run the largest batch that fits, bounded by activations rather than weights.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A 512×512 image is downsampled by 8 with 4 latent channels. How many values does the latent hold, versus the RGB image?', numeric: true, answer: 16384, tolerance: 100, unit: 'values', why: 'Latent: 4 × 64 × 64 = 16,384. RGB image: 3 × 512 × 512 = 786,432. The latent is 48× smaller, and it is what every denoising step operates on. Full resolution appears only at the final VAE decode.' },
+  { q: 'An SD 1.5 denoising step moves about 2.7 GB in 55 ms on an A100 with 2.0 TB/s. What fraction of peak bandwidth does it use?', numeric: true, answer: 2.5, tolerance: 0.5, unit: '%', why: '2.7 GB / 2.0 TB/s = 1.35 ms to move those bytes at full bandwidth. 1.35 / 55 = 2.5%. At 2.5% of peak bandwidth the step is nowhere near memory-bound — it is compute-bound, which is why a diffusion workload rewards FLOP/s and is largely indifferent to memory bandwidth.' },
+  { q: 'The widest U-Net feature map at 512×512 is 320 channels in FP16. How many bytes is one tensor, and roughly what batch size makes activations exceed the 2.1 GB of weights?', numeric: true, answer: 168, tolerance: 10, unit: 'MB', why: '320 × 512 × 512 × 2 = 167.8 MB per tensor. With about six live tensors that is ~1.0 GB per image, so activations pass the 2.1 GB of weights at batch 2. Compare with an 8B LLM, where weights dominate until batch 20 — the weight-to-activation ratio is simply reversed here.' },
+  { q: 'Why is a diffusion denoising step compute-bound while an LLM decode step is memory-bound?', options: ['Diffusion uses fewer FLOPs per byte because it is less efficient code', 'A diffusion step re-reads every weight and recomputes the whole image, giving high arithmetic intensity; decode reads weights once per step for a small batch, so bytes dominate', 'LLM models are memory-hungry architectures', 'Diffusion runs at higher clock speeds'], answer: 1, why: 'The distinguishing quantity is FLOP per byte moved. A U-Net step runs dense convolutions over 320×512×512 feature maps, so it does enormous arithmetic per byte. An LLM decode step reads 16 GB of weights to produce one token — arithmetic intensity around 1 FLOP per byte, deep in the memory-bound region. Hence 2.5% bandwidth utilisation versus 60-80%.' },
+  { q: 'SDXL base takes 30 steps and SDXL-Turbo takes 4, on the same 2.6B U-Net. What is the latency ratio, and what produced it?', options: ['About 7.5× faster, because the U-Net was made smaller', 'About 5.6× faster, because the model was distilled to work in few steps', 'About 2× faster, because guidance was disabled', 'No difference — step count does not affect latency'], answer: 1, why: '30/4 = 7.5 in step count, and published A100 timings are 4.5 s versus 0.8 s, a factor of 5.6 — the difference is the fixed VAE decode amortised over fewer steps. The win comes from distillation at training time, not from a smaller network, and it produces a genuinely different image. Guidance being on in both means it is not the cause.' },
+]} />

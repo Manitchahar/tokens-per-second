@@ -1,0 +1,125 @@
+---
+title: 'Module 07 · Batching & Scheduling'
+module: batching-scheduling
+---
+
+Standing example: **Llama-3.1-8B in BF16 on one 80 GB H100.** 32 layers, 8 KV heads, head dim 128. Spec numbers are approximate public figures.
+
+## The step model
+
+$$
+t_{\text{step}} = \max(t_{\text{weights}} + t_{\text{KV}},\ t_{\text{math}}) + t_{\text{overhead}}
+$$
+
+$$
+t_{\text{weights}} = \frac{M \cdot w}{\text{bw} \cdot \text{MBU}}
+\qquad
+t_{\text{KV}} = \frac{B \cdot c \cdot k}{\text{bw} \cdot \text{MBU}}
+\qquad
+t_{\text{math}} = \frac{2 \cdot M \cdot B}{\text{FLOP/s} \cdot \text{MFU}}
+$$
+
+$M$ params, $w$ bytes/weight, $B$ batch, $c$ context, $k$ bytes KV per token per sequence.
+
+**The weight term does not grow with $B$. That single fact is the whole module.**
+
+## Memory
+
+$$
+k = 2 \cdot L \cdot H_{kv} \cdot D_h \cdot b = 131{,}072 \text{ B} = 128 \text{ KiB}
+$$
+
+$$
+\text{KV per seat} = c \cdot k
+\qquad
+\text{seats} = \frac{\text{budget}}{c \cdot k}
+$$
+
+| Llama-3.1-8B, BF16 | Bytes |
+|---|---|
+| Weights | 16.06 GB |
+| KV per token | 128 KiB |
+| KV per seat @ 2,048 | 256 MiB |
+| KV per seat @ 8,192 | 1.0 GiB |
+
+## Decode step vs batch (H100, 2,048 ctx)
+
+| Seats | Weight | KV | Math | Step | Throughput | Per user |
+|---|---|---|---|---|---|---|
+| 1 | 6.0 ms | 0.1 ms | 0.03 ms | 7.6 ms | 132 tok/s | 132 tok/s |
+| 8 | 6.0 ms | 0.8 ms | 0.2 ms | 8.3 ms | 965 tok/s | 121 tok/s |
+| 32 | 6.0 ms | 3.2 ms | 0.9 ms | 10.7 ms | 2,991 tok/s | 93 tok/s |
+| 64 | 6.0 ms | 6.4 ms | 1.9 ms | 13.9 ms | 4,603 tok/s | 72 tok/s |
+| 128 | 6.0 ms | 12.8 ms | 3.8 ms | 20.3 ms | 6,301 tok/s | 49 tok/s |
+| 196 | 6.0 ms | 19.6 ms | 5.8 ms | 27.1 ms | 7,226 tok/s | 37 tok/s |
+
+Marginal return collapses past ~128: 1→8 seats is **7.3×** throughput for a 9% slower step; 128→196 is **1.15×** for a 34% slower step.
+
+Prefill on the same GPU: 512 tok ≈ 17 ms · 2,048 tok ≈ 63 ms · 8,192 tok ≈ 244 ms.
+
+## The engine loop
+
+```
+every step:
+  1. retire    finished / cancelled / preempted free their seat NOW
+  2. schedule  fill freed seats from the waiting queue, in policy order,
+               checking the KV budget (not just the seat count)
+  3. step      one forward pass; every running sequence emits one token
+```
+
+Never blocks. Never waits for a group.
+
+## Two wastes — do not confuse them
+
+| Waste | Cause | Killed by |
+|---|---|---|
+| **Tail waste** | seat held by a finished request | continuous batching → 0 |
+| **Fill waste** | no request waiting to fill the seat | more traffic, not more seats |
+
+$$
+\text{static waste} = 1 - \frac{\sum_i \ell_i}{n \cdot \max_i \ell_i}
+\qquad
+\text{fill waste} = 1 - \frac{\bar{B}}{\text{seats}}
+$$
+
+Measured, 12 ragged requests at 6 seats: static 316 steps / 38% seat waste; continuous 271 steps / **0%** seat waste, average batch 4.4 of 6.
+
+## The three knobs
+
+| Knob | Bounds | Start at |
+|---|---|---|
+| `max_num_seqs` | sequences decoding at once | derive from the KV budget |
+| `gpu_memory_utilization` | fraction of HBM the engine claims | 0.90 |
+| `max_num_batched_tokens` | tokens processed in one step | 2,048 |
+
+At 0.90 of an 80 GB H100: budget $= 0.9 \times 80 - 16.06 - 3.2 = 52.7$ GB → **196 seats @ 2,048 ctx**, **49 @ 8,192**. Size it on *typical* context, never the maximum.
+
+## Diagnose before tuning
+
+| avg batch | queue | Diagnosis | Do |
+|---|---|---|---|
+| low | empty | **Starved** | more traffic; seats are not the constraint |
+| at limit | deep | **Saturated** | shorten the step; more seats will hurt |
+| high | deep | **Prefill storm** | lower `max_num_batched_tokens`; chunk the prefill |
+| high | deep, TPOT↑ | contexts too long | cap context; FP8 KV halves it |
+
+## Queue policies
+
+| Policy | Rule | Fails when |
+|---|---|---|
+| FIFO | arrival order | a long request blocks everyone behind it |
+| Priority | priority first | sustained high-priority load starves the rest |
+| Shortest-first | shortest job first | long requests starve |
+| Aging | priority rises with wait | — (this is the cure for starvation) |
+
+- **Head-of-line blocking**: a 200-step request holds its seat for 200 steps; a request arriving at step 5 waits 195.
+- **Cancellation** is free: free the seat the step the client disconnects.
+- **Preemption** evicts a sequence and **replays every token it had streamed**. Evict the *newest* — it has generated the least. It is a safety net against OOM, not a source of throughput (forcing it cost 19% wall-clock and 77 recomputed tokens for no gain).
+
+## Rules of thumb
+
+- The first ~8–32 seats are nearly free; past ~128 at 2K context, seats are expensive.
+- Continuous batching removes the tail, never the step time. If TTFT is bad, look at the queue.
+- A 2,048-token prefill stalls ~4.5 decode steps at 64 seats.
+- Log **average batch**, **queue depth**, **step time**, **p99 TTFT**. Those four explain nearly every serving problem.
+- Never ship raw priority: it is starvation with a nicer name.

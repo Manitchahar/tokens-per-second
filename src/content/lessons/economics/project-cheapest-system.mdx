@@ -1,0 +1,291 @@
+---
+title: 'Project: The cheapest system that meets the SLO'
+summary: 'Take a real workload, write a real SLO, and find the cheapest configuration that meets it — model size, precision, GPU, concurrency and fleet, priced from arithmetic and verified against measurements. The deliverable is a decision document an engineer could act on.'
+objectives:
+  - 'State a workload and an SLO precisely enough that two engineers would size it the same way'
+  - 'Build a candidate matrix of configurations, with derived and measured columns kept apart'
+  - 'Eliminate candidates on hard constraints before scoring anything on value'
+  - 'Choose an operating point and a fleet, and defend the choice with goodput per dollar'
+  - 'Write the one-paragraph decision document, including what would change your mind'
+colab: 25-cost-lab.ipynb
+---
+
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have three lessons of arithmetic. This project turns them into a decision.
+
+The deliverable is a document that answers one question — **what is the cheapest system that meets our SLO?** — with a number attached to every claim, and enough provenance that somebody else could check the arithmetic and disagree with you.
+
+That last part is the actual skill. Anyone can produce a cost per token. The job is producing one that survives review.
+
+<Callout type="mentor" title="This is the shape of a real technical proposal">
+  In practice this document appears in three places: a design doc before you build, a cost review when finance asks why the bill moved, and a post-mortem after something broke. Write it so that all three are served — which means every number carries its workload, and every conclusion names what would overturn it.
+</Callout>
+
+## What you are building
+
+A **decision document** plus the **harness that produced it**. Four parts:
+
+| Part | What it is | Built from |
+|---|---|---|
+| **Workload & SLO** | The traffic shape you are sizing for, and the promise you must keep | Lesson 06, this lesson |
+| **Candidate matrix** | Every configuration you considered, with derived and measured columns kept apart | Lessons 25.1, 25.2 |
+| **Operating point & fleet** | The chosen configuration, its concurrency, and how many of them | This lesson |
+| **Sensitivity** | What would change the answer | Everything |
+
+The optional notebook below lets you verify the arithmetic against a real GPU. You do not need a T4 to complete the project — but running it will separate the configurations you *derived* from the ones you *measured*, which is the distinction the whole document rests on.
+
+<Colab nb="25-cost-lab.ipynb" />
+
+## Step 1 · Write the workload down
+
+Everything downstream inherits this section, so make it precise. Two engineers reading it should compute the same numbers.
+
+**What to state:**
+
+- **Model** — name and parameter count, and whether you control the choice.
+- **Prompt and output length distributions** — not averages. The median and the p90, because the tail is where the money is (Module 06).
+- **Arrival rate** — requests per second at peak sustained, not instantaneous spike.
+- **Concurrency you intend** — the batch size you will actually run.
+- **Traffic shape** — interactive chat, overnight batch, or a mixture, and the proportion of each.
+
+<Callout type="math" title="Why distributions and not averages">
+  Machine time per request is $t_{pre} + n_{out}\,t_{step}/B$, and it is close to **linear in output length**. So the *mean* machine time is driven by the *tail* of the output distribution, and a p90 of 800 tokens with a p50 of 120 means your real cost per request is closer to the tail than to the median.
+
+  A product with a median of 50 output tokens and a p95 of 2,000 is not a cheap product. This is the same lesson as "mean latency describes no actual request", applied to money instead of milliseconds.
+</Callout>
+
+**A worked example you can copy** — a customer-support assistant:
+
+| Property | Value |
+|---|---|
+| Model | Llama-3.1-8B-Instruct (chosen in Module 04) |
+| Prompt length | median 600, p90 2,400 (long conversation history) |
+| Output length | median 180, p90 600 (a paragraph to a few paragraphs) |
+| Arrival rate | 8 req/s at peak sustained, ~0.3 req/s overnight |
+| Intended concurrency | 64 streams |
+| Prefix reuse | 400-token shared system prompt, high reuse |
+
+## Step 2 · Write the SLO down
+
+From Module 06, an SLO has four parts. Write all four, and write them **before** you look at any cost number — otherwise you will unconsciously pick a config that meets the SLO you can afford rather than the one you should.
+
+> **p95 TTFT under 600 ms and p95 TPOT under 40 ms, over any rolling 5-minute window, at 8 req/s.**
+
+That is the promise. Everything below is judged against it.
+
+<Callout type="pitfall" title="The SLO is a constraint, not a target">
+  A candidate that misses the SLO is **eliminated**, not scored badly. This is the hard-constraint discipline from Module 17, and it runs *before* any cost comparison — a configuration that cannot meet the promise can never be the cheapest acceptable system, however cheap it looks.
+
+  The most common failure here is quietly relaxing the SLO to fit a cheaper configuration. Write the SLO first, in writing, and treat it as fixed.
+</Callout>
+
+## Step 3 · Build the candidate matrix
+
+Enumerate configurations across the four axes that actually move cost. For the worked example:
+
+| Axis | Values to try |
+|---|---|
+| **Model size** | 8B, 32B (and 70B if quality demands it) |
+| **Precision** | BF16, FP8, INT4 (Module 11) |
+| **GPU** | A100 80GB, H100, H200 (Module 25.2) |
+| **Concurrency** | 32, 64, 128 streams |
+
+That is 3 × 3 × 3 × 3 = 81 configurations. You do not score 81 — you **eliminate** most of them and score the survivors.
+
+### Keep the column kinds apart
+
+From Module 17, three kinds of column, never mixed:
+
+| Kind | Example | Confidence |
+|---|---|---|
+| **Derived** | weights 16.1 GB, KV pool, max streams, machine s/request | Exact, from your arithmetic |
+| **Measured** | tok/s at the operating point, p95 TTFT, SLO pass rate | High, if your harness contract held |
+| **Structural** | does this engine have an INT4 path for this model, is a build required | Certain, from documentation |
+
+<Callout type="math" title="Derived column: free, exact, and it eliminates first">
+  For each candidate you can compute, with no GPU:
+
+  $$
+  \text{weights} = P \times \text{bytes per weight}, \quad
+  \text{KV bytes/token} = 2 \times L \times H_{kv} \times d_h \times \text{bytes}
+  $$
+
+  $$
+  \text{max streams} = \frac{\text{mem} - \text{weights} - \text{reserve}}{\text{KV bytes/token} \times \text{context}}
+  $$
+
+  Here is that column for the support-assistant workload, at 64 streams and 2,048 tokens of context on an 80 GB card. Every number is arithmetic:
+
+  | Model | Precision | Weights | Max streams on H100 | Fits 64 streams? | \$/M output |
+  |---|---|---|---|---|---|
+  | Llama-3.1-8B | BF16 | 16.1 GB | 226 | yes | 0.227 |
+  | **Llama-3.1-8B** | **FP8** | **8.0 GB** | **256** | **yes** | **0.201** |
+  | Llama-3.1-8B | INT4 | 4.0 GB | 271 | yes | 0.198 |
+  | Qwen2.5-32B | BF16 | 65.6 GB | 20 | **no — needs 64** | 0.708 |
+  | Qwen2.5-32B | FP8 | 32.8 GB | 81 | yes | 0.593 |
+  | Qwen2.5-32B | INT4 | 16.4 GB | 112 | yes | 0.556 |
+
+  *(Derived from weight and KV arithmetic at MBU 0.8, MFU 0.55, with the MBU discount for lower precision from lesson 25.1. Approximate — measure before you commit.)*
+
+  Three things are already decided by that table, with no benchmark run at all:
+
+  - **The 32B model costs about 3× the price per token** of the 8B. That is the argument you will have with whoever wants the bigger model, and it is an arithmetic argument.
+  - **BF16 32B is eliminated** — 65.6 GB of weights leaves only 20 streams' worth of KV on an 80 GB card, so 64 concurrent streams is impossible. It is not "slow"; it does not run.
+  - **FP8 is the sweet spot**: it lands far closer to INT4 (0.198) than to BF16 (0.227), so you are buying almost all of the saving at a quality bar far easier to defend (Module 11).
+
+  The derived column eliminated one candidate outright and ordered the rest, for free, before a single GPU was switched on.
+</Callout>
+
+## Step 4 · Eliminate, then score
+
+Apply in this order. **The order matters more than the arithmetic.**
+
+**Stage 1 — hard constraints.** Each of these is a yes/no, and a candidate that fails one is out:
+
+- Does the model fit, with room for KV and a reserve?
+- Does it meet the SLO at the intended concurrency? (measured)
+- Is there an engine path for this precision on this GPU?
+
+**Stage 2 — score the survivors** on value per dollar, with weights you write down *before* you compute the scores.
+
+**Stage 3 — sensitivity.** If your top two are within about 10%, say so and name the tie-breaker explicitly.
+
+<Callout type="intuition" title="How to weight the criteria">
+  For most interactive products the weighting is close to:
+
+  - **Goodput per dollar** — 3.0 (it is the deliverable)
+  - **SLO headroom at peak** — 2.5 (how much room before you break)
+  - **Quality vs the best available** — 3.0 (a cheaper model that fails the eval is not cheaper)
+  - **Operational simplicity** — 1.0 (fewer moving parts)
+  - **Team familiarity** — 0.5 (tie-breaker only)
+
+  The weight *is* the argument. If your product is overnight batch with no latency SLO, the weights are completely different — and that is a legitimate choice, provided you say so.
+</Callout>
+
+## Step 5 · Choose the operating point and the fleet
+
+From lesson 25.3, for the surviving configuration:
+
+1. **Operating point** — the concurrency maximizing goodput per dollar, *subject to the SLO*. Not peak throughput.
+2. **Per-replica capacity** — derived max streams, minus a margin.
+3. **Fleet** — arrival rate × machine seconds per request ÷ target utilization, rounded up, plus committed headroom.
+
+<Callout type="math" title="The fleet arithmetic, in one block">
+  At the chosen operating point (Llama-3.1-8B, FP8 weights, H100, 64 streams, 600-in/180-out):
+
+  $$
+  t_{pre} \approx 19.7\ \text{ms}, \quad t_{step} \approx 7.0\ \text{ms}
+  $$
+
+  $$
+  m = 0.0197 + \frac{180 \times 0.0070}{64} = 0.0197 + 0.0197 = 0.039\ \text{GPU-seconds per request}
+  $$
+
+  At 8 req/s, busy GPUs $= 8 \times 0.039 = 0.31$. Dividing by a 60% target gives 0.52 cards, so **one card is the floor**.
+
+  Note how FP8 earns its place: at 8.0 GB of weights instead of 16.1, the step drops from 9.7 ms to 7.0 ms and the cost per million output tokens from \$0.18 to \$0.15 — a **16% saving**, from halving the bytes each step must read. That is the memory-bound argument from lesson 25.2 doing exactly what it should.
+
+  One card is not a deployment. Committed floor **2** (\$3,650/month), autoscale to 4 on queue depth, because a single-card service has no spare capacity for a deploy, a node drain, or a spike — and because at 8 req/s the margin is thin.
+</Callout>
+
+## Step 6 · Sensitivity: what would change your mind
+
+This is the section that separates a decision from a preference, and it is the one most often omitted.
+
+**State, explicitly:**
+
+- **The cheapest upgrade path.** If output length grows 2×, does the configuration still win?
+- **The utilization threshold.** At what average utilization does the bill double?
+- **The hardware price break.** At what H100 price would an A100 become the better choice? (Use the break-even test from lesson 25.2.)
+- **The quality cliff.** At what quality regression does the cheaper model stop being acceptable? (Module 11's eval harness.)
+- **The SLO you would relax.** If you had to trade latency for cost, how far would you go — and who signs off?
+
+<Callout type="pitfall" title="The question that catches teams out">
+  "What happens when a new model releases?" is not a sensitivity, it is a hope.
+
+  The real version: at what point does a model upgrade become worth more than the engineering cost of validating it? For most teams the answer is "when the incumbent fails the eval on traffic we care about" — and that eval has to already exist, or the question is unanswerable.
+</Callout>
+
+## Extend it (pick at least two)
+
+- **A/B two precisions on real traffic.** FP8 versus BF16 on the same harness, interleaved, with a quality check. Report whether the difference exceeds your run-to-run spread (Module 17).
+- **A traffic-mix sweep.** Compute the bill across chat / RAG / batch profiles and show where the crossover between two configurations lies.
+- **A fleet simulator.** Build the in-browser simulator your own team would use: arrival rate, machine time per request, target utilization → fleet size and monthly bill, with a cost-per-request readout.
+- **A break-even table across five GPU prices.** Show the price at which each candidate becomes the winner, so the decision survives a pricing change.
+- **A cost regression test.** Save the derived cost per token in version control and fail CI when it moves more than 10% without a reviewed change.
+
+## Check yourself
+
+Answer these before you call it done. If any answer is "no", the document is not finished.
+
+1. Could a colleague who has never seen your work recompute your machine-seconds figure from what you wrote? (Name the model, GPU, precision, concurrency and both length distributions.)
+2. Is your SLO written down **before** any cost number, and does every candidate explicitly pass or fail it?
+3. Have you separated derived, measured and structural columns, and labelled every cell?
+4. Did you eliminate on hard constraints *before* scoring on value?
+5. Does your document state the operating point, the fleet, and the monthly bill — each with a number?
+6. Have you named what would change your mind, with thresholds?
+7. Is there a cheaper configuration you rejected for a *stated* reason rather than a vague one?
+
+## Acceptance criteria
+
+**Rigor**
+- The workload section states distributions (median and p90), not averages, for both prompt and output.
+- The SLO has all four parts and was written before any cost was computed.
+- Every configuration in the matrix is labelled derived, measured or structural.
+- Candidates are eliminated on hard constraints before any scoring.
+
+**Decision quality**
+- The chosen configuration is justified by goodput per dollar, not by peak throughput.
+- The operating point is justified against the SLO, with a measured or explicitly-labelled-derived basis.
+- The fleet has a floor, a committed number, a headroom argument and a scaling trigger.
+
+**Communication**
+- The document states the decision in one sentence, with a number attached.
+- Every claim has a sensitivity attached, with thresholds.
+- A reader can disagree with a specific claim and say which number is wrong.
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | Eliminates on constraints first, scores survivors by goodput per dollar, and ships a sensitivity section with real thresholds. The fleet has a committed floor and a named scaling trigger. Someone else could recompute the machine-seconds figure from the document alone. The decision is stated in one sentence with a number attached. |
+| **Proficient** | Meets all acceptance criteria. Matrix is built and labelled, SLO is written, decision is defended by a goodput-per-dollar number. Sensitivity is present but qualitative. |
+| **Developing** | Reaches a defensible configuration but the matrix mixes measured and derived numbers in a column, or the SLO is relaxed to fit the cheaper option, or the fleet is sized at peak with no headroom argument. |
+| **Beginning** | Quotes a cost per token with no workload, no GPU, no precision, or compares candidates that do not fit in memory. |
+
+<Callout type="mentor" title="The habit that separates the top band">
+  Everyone in the top band **runs the arithmetic twice, from scratch, in a different order.**
+
+  Once from the identity outward — machine seconds, then price. Once from the bill inward — "we spend \$3,650 a month, so we can afford N GPU-seconds per hour, so we can afford M seconds per request" — and checks the two agree.
+
+  A document where those two agree is one you can defend in a review. A document where only one was computed is one you are hoping about.
+</Callout>
+
+## Where this goes next
+
+- **Module 26 (Specialized Workloads)** changes the workload, not the method. Agents and reasoning models produce far more tokens per request; batch RL rollouts are pure throughput with no SLO; multi-LoRA and multimodal change the fit arithmetic entirely. The identity holds; the inputs move.
+- **Module 27 (Build a Mini Inference Engine)** is where you find out which of your assumptions were load-bearing. You will measure the thing you costed, and they will differ.
+
+Keep this document. It is the first artifact you can put in front of someone who decides whether to trust your numbers.
+
+<KeyNotes>
+  1. A decision document answers **one question with a number**: what is the cheapest system that meets the SLO? Everything else in it is provenance.
+  2. **Write the workload and the SLO before any cost arithmetic.** Otherwise you will unconsciously pick the configuration that fits the budget rather than the one that fits the promise.
+  3. Use **distributions, not averages**, for prompt and output length. Machine time is near-linear in output length, so the p90 drives your bill.
+  4. The **derived column eliminates half your matrix for free**: weights, KV pool and max streams are arithmetic, and a candidate that does not fit is not a candidate.
+  5. **Hard constraints run before scoring.** Missing the SLO eliminates a configuration; it does not score it badly. Relaxing the SLO to fit a cheaper option is the most common failure in this project.
+  6. Keep **derived, measured and structural** columns apart and label every cell — the discipline from Module 17, now applied to money.
+  7. Report the fleet as **floor + committed headroom + a named scaling trigger**. Sized at peak sustained utilization, with no spare, it will fail the first deploy.
+  8. Ship a **sensitivity section with thresholds**: what utilization doubles the bill, what output length flips the answer, what price makes the cheaper card win. A decision without one is a preference.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Your SLO is p95 TTFT under 600 ms. A configuration costs \$0.12 per million output tokens and delivers a p95 TTFT of 900 ms. How should it be treated?', options: ['Score it well because it is cheap', 'Eliminate it — a candidate that misses the SLO cannot be the cheapest acceptable system however cheap it is', 'Relax the SLO to 900 ms and keep it', 'Average it with a passing candidate'], answer: 1, why: 'The SLO is a hard constraint, not a weighted criterion. It runs before any scoring. The failure mode to avoid is quietly relaxing the SLO to fit the cheaper option — write the SLO first, in writing, and hold it fixed.' },
+  { q: 'A candidate needs 40 GB of weights and the card has 24 GB. What is the correct treatment?', options: ['Score it, since the per-token cost is good', 'Eliminate it on the derived column, before any measurement', 'Shrink the batch until it fits', 'Try it and see'], answer: 1, why: 'Weight arithmetic is exact and free. A candidate that does not fit is eliminated on the derived column before a single benchmark is run — which is why you build that column first. Trying smaller batches does not help when the weights alone exceed memory.' },
+  { q: 'At 60% target utilization, 20 req/s, and 0.1 GPU-seconds per request, what is the committed floor?', numeric: true, answer: 4, tolerance: 0, unit: 'GPUs', why: '20 × 0.1 = 2 GPUs busy. Divided by 0.6 = 3.33, rounded up to 4. The rounding is not noise — the fourth card is the headroom for a deploy, a node drain and a spike.' },
+  { q: 'In your matrix, Qwen2.5-32B in BF16 costs \$0.708 per million output tokens and Llama-3.1-8B in BF16 costs \$0.227. The quality eval says the 32B is required. Roughly how many times more does the 32B cost per token?', numeric: true, answer: 3.1, tolerance: 0.5, unit: '×', why: '0.708 ÷ 0.227 ≈ 3.1. That ratio is the argument the decision turns on: it is the price of the quality requirement, expressed as a number rather than an opinion. It belongs in the decision document so the person who wants the 32B can see what the quality is costing them.' },
+  { q: 'Why does machine time per request respond to output length far more than to GPU generation?', options: ['Output length is random', 'Machine time is near-linear in n_out, so doubling the answer doubles the decode term, while a GPU generation moves t_step by tens of percent', 'GPUs do not affect cost', 'Longer outputs use less memory'], answer: 1, why: 'The decode term is n_out × t_step / B. Output length multiplies it directly and completely; a hardware change scales t_step by perhaps 30–60%. So the shape of your traffic dominates the hardware you buy — which is why measuring the output-length distribution comes before choosing a GPU.' },
+  { q: 'What is the point of the sensitivity section?', options: ['To make the document longer', 'To state, with thresholds, what would overturn the decision', 'To show you considered more options', 'To justify the SLO'], answer: 1, why: 'A decision without stated thresholds for reversal is a preference. The useful version names the numbers: at what utilization does the bill double, at what output length does a cheaper configuration overtake this one, at what GPU price does the break-even test flip.' },
+  { q: 'Your top two candidates differ by 6% in goodput per dollar. What is the defensible action?', options: ['Pick the winner, since 6% is 6%', 'Say the cost argument is exhausted and choose on fit, operational familiarity and availability, stating that the spread was under 10%', 'Average them into a compromise configuration', 'Re-measure until the gap is larger'], answer: 1, why: 'A 6% spread is inside the noise of most real cost models and inside the run-to-run spread of most real measurements. Choosing on operational grounds is then the right call — but it has to be written down as a deliberate decision, because silently picking one would imply the numbers decided it.' },
+]} />

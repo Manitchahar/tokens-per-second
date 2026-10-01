@@ -1,0 +1,208 @@
+---
+title: 'Multi-head attention, MQA & GQA'
+summary: 'One attention head returns one average. Split the hidden state and each head learns its own — then discover why the key and value heads did not have to keep up, and how that single decision controls how many users fit on one GPU.'
+objectives:
+  - Explain why a model uses several attention heads instead of one
+  - State the head_dim rule and compute the number of heads from hidden size
+  - Distinguish multi-head, multi-query and grouped-query attention by KV head count
+  - Compute the KV cache bytes per token for any model from its config
+  - Explain precisely what GQA saves (bytes) and what it does not (FLOPs)
+---
+import HeadsViz from '@/components/viz/transformers/HeadsViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+03.4 ended with one attention head, 128 numbers wide. This lesson asks the obvious question: what if you did that several times at once? And then the question that separates people who understand transformers from people who have read about them: **why are the key and value heads allowed to be fewer than the query heads?**
+
+That second question has a fourfold effect on how many users one GPU can serve. It is the highest-leverage piece of arithmetic in this module.
+
+## Why more than one head
+
+A single head returns a **single weighted average** of the value vectors. One average per token. Now consider the token *bank* in *"the bank of the river closed"*. To understand it you want two different averages at once:
+
+- an average that mostly copies **the**, so you know you are still inside a noun phrase
+- an average that mostly reaches back to **river**, so you know which *bank* is meant
+
+One average cannot be both. So split the 4,096-number hidden state into 32 slices of 128, let each slice have its own $W_Q$, $W_K$, $W_V$, and let each produce its own average. Concatenate the 32 outputs back into 4,096 numbers and project them with $W_O$.
+
+<Callout type="intuition" title="Heads are parallel, not sequential">
+  Thirty-two heads are **not** thirty-two sequential attention operations. They are a batched matrix multiply: $[32 \times T \times 128] \cdot [128 \times T]$. The GPU issues the same number of kernels as for one head, with 32× the rows. Running 32 heads is close to free in wall-clock time and costs only the extra weights.
+</Callout>
+
+### The head_dim rule
+
+There is one non-obvious convention: **head_dim stays at 128 even as the model grows.** The hidden size changes; the head count changes with it.
+
+| Model | Hidden | Query heads | Head dim |
+|---|---|---|---|
+| Qwen2.5-0.5B | 896 | 14 | **64** |
+| Llama-3.2-3B | 3,072 | 24 | **128** |
+| Llama-3.1-8B | 4,096 | 32 | **128** |
+| Qwen2.5-32B | 5,120 | 40 | **128** |
+| Llama-3.1-70B | 8,192 | 64 | **128** |
+
+So $\text{head\_dim} = d_{\text{model}} / n_{\text{heads}}$, and for most modern models that quotient is 128. Holding it constant means the RoPE frequency spectrum from 03.3 has the same shape in every model, and the softmax statistics inside each head stay comparable across widths.
+
+## Then K and V do not have to keep up
+
+Here is the design decision that matters for inference. Full multi-head attention gives **every** head its own key and value. But look at what a key actually does: it exists so that some other token's query can score against it. Queries are numerous and independent. Keys and values are a *shared resource* that every query reads.
+
+Nothing in the mathematics requires $n_{kv} = n_q$. Three choices:
+
+| Style | Query heads | KV heads | Group size | Used by |
+|---|---|---|---|---|
+| **MHA** — multi-head | 32 | 32 | 1 | GPT-2, GPT-3, Llama-2-7B |
+| **MQA** — multi-query | 32 | **1** | 32 | Grok-1, some Llama-2-70B releases |
+| **GQA** — grouped-query | 32 | **8** | 4 | Llama-3.1, Llama-3.2, Qwen2, Mistral |
+
+GQA is the compromise, and it is what nearly every current open model uses: 32 query heads, 8 key/value heads, four queries sharing each key and value. At the time of writing it is the default choice, and the reason is arithmetic.
+
+<Scrolly>
+  <HeadsViz client:visible slot="stage" />
+
+  <Step title="1. One head is not enough">
+    One head gives one average per token. The token *bank* needs an average that copies *the* and another that reaches back to *river*. A single weighted average cannot be both things at once.
+  </Step>
+
+  <Step title="2. Split the hidden state into heads">
+    4,096 numbers cut into 32 slices of 128. Every head sees the same vector and has its own $W_Q$, $W_K$, $W_V$; the 32 outputs are concatenated back to 4,096 and projected by $W_O$.
+  </Step>
+
+  <Step title="3. Many heads in parallel">
+    Not sequential. `[32 × T × 128] · [128 × T]` is one batched matmul, so 32 heads cost roughly the same wall-clock time as one — only the weights are extra, and only **16.7%** of the model.
+  </Step>
+
+  <Step title="4. Then K and V do not have to keep up">
+    Keys and values are a shared resource that every query reads. Nothing requires $n_{kv} = n_q$. Switch the segmented control and watch the fan-out change.
+  </Step>
+
+  <Step title="5. MQA: one KV head for everything">
+    Give all 32 queries a single shared key and value head. The KV cache becomes 1/32 of full multi-head attention. Quality drops a little; the saving is enormous.
+  </Step>
+
+  <Step title="6. GQA: groups in between">
+    **Grouped-query attention.** 8 KV heads shared four ways. Llama-3.1-8B has 32 query heads and 8 KV heads; Qwen2.5-0.5B has 14 and 2, a group of seven. Almost all of the saving, almost none of the quality loss.
+  </Step>
+
+  <Step title="7. What GQA costs and saves">
+    **Bytes, not FLOPs.** Every query head still scores against every key, so the attention arithmetic is identical. What shrinks is what is *stored* per token and *read* per decode step: KV cache size and KV read bandwidth.
+  </Step>
+
+  <Step title="8. The numbers on real models">
+    KV cache per token is $B = 2\,L\,n_{kv}\,128 \times 2$ bytes. Qwen2.5-32B has 64 layers but 8 KV heads, so it holds **256 KiB per token** — *less* than Llama-3.1-70B's 320, from a model with half the parameters.
+  </Step>
+</Scrolly>
+
+## The formula that decides your concurrency
+
+$$
+\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_{\text{head}} \times b
+$$
+
+Five things, and only five things: layers, KV heads, head dim, bytes per number, and the factor 2 for keys and values. Compute it for the models in this course:
+
+| Model | $L$ | $n_{kv}$ | $d_h$ | Per token | At 4K | At 32K |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 2 | 64 | **12 KiB** | 48 MiB | 375 MiB |
+| Llama-3.2-3B | 28 | 8 | 128 | **112 KiB** | 448 MiB | 3.5 GiB |
+| Llama-3.1-8B | 32 | 8 | 128 | **128 KiB** | 512 MiB | 4.0 GiB |
+| Qwen2.5-32B | 64 | 8 | 128 | **256 KiB** | 1.00 GiB | 8.0 GiB |
+| Llama-3.1-70B | 80 | 8 | 128 | **320 KiB** | 1.25 GiB | 10.0 GiB |
+
+And the same formula for the pre-GQA models, which is where the design change shows its value:
+
+| Model | $L$ | $n_{kv}$ | Per token | At 4K | vs. GQA equivalent |
+|---|---|---|---|---|---|
+| Llama-2-7B | 32 | **32** | **512 KiB** | 2.00 GiB | 4× Llama-3.1-8B |
+| Llama-3.1-8B | 32 | 8 | 128 KiB | 512 MiB | — |
+
+<Callout type="math" title="What GQA bought Llama-3.1-8B">
+  Same layer count, same head dim, same model size — but 8 KV heads instead of 32. That is 128 KiB per token instead of 512 KiB, so at 32K context one sequence holds 4.0 GiB instead of 16.0 GiB.
+
+  On an H100 with 16.1 GB of weights and about 62 GB left after overhead, that is the difference between **15 users** and **3**. Nothing else in the model changed. This single config field is worth more than most architectural ideas people get excited about.
+</Callout>
+
+<Callout type="pitfall" title="The mistake this lesson exists to prevent">
+  Assuming $n_{kv} = n_q$. If you size a KV cache for Llama-3.1-8B using 32 KV heads you will be **4× over budget**, and at 32K context you will be 16.0 GiB per sequence instead of 4.0 GiB. You will either OOM or quietly run at a quarter of the concurrency you planned. Read `num_key_value_heads` from the config. It is not always the same as `num_attention_heads`.
+</Callout>
+
+## What GQA does *not* save
+
+Be precise here, because it is easy to over-claim:
+
+**FLOPs are unchanged.** Attention arithmetic is $F = 2\,T^2 d_{\text{model}}$ for the scores and the same for the mix, regardless of how many KV heads there are. 32 query heads each score all $T$ keys, whatever those keys are shared with.
+
+**Weights barely change.** $W_Q$ and $W_O$ are still 4096 × 4096. Only $W_K$ and $W_V$ shrink, from 16.78 M to 4.19 M each — 25.7 M saved out of 218 M per layer, or 11.8% of the model's weights.
+
+What GQA saves, exactly:
+
+- **KV cache storage** — the big one, up to 32× with MQA and typically 4× with GQA
+- **KV read bandwidth during decode** — proportionally, because each decode step reads the whole cache
+- **KV write bandwidth** — one write per token per layer instead of one per head
+
+**Put that on the roofline from Module 02.** Decode at context $T$ is memory-bound, and each step reads the weights once (16.1 GB for Llama-3.1-8B) plus the KV cache ($T \times 128$ KiB with GQA, $T \times 512$ KiB with MHA):
+
+| Context | GQA reads | MHA would read | GQA speed-up |
+|---|---|---|---|
+| 8,192 tokens | 17.1 GB | 20.2 GB | 1.18× |
+| 32,768 tokens | 20.1 GB | 32.1 GB | 1.60× |
+
+And for *batching* it is the concurrency number that matters: 4× more sequences in the same memory means 4× the aggregate throughput at the same latency. GQA is a throughput multiplier, and it compounds with everything else you do.
+
+## In code
+
+GQA is three lines. After projecting K and V you repeat each KV head to match the number of query heads:
+
+```python
+import torch
+
+class GroupedAttention(torch.nn.Module):
+    def __init__(self, d=4096, n_heads=32, n_kv_heads=8, d_head=128):
+        super().__init__()
+        self.n, self.kv = n_heads, n_kv_heads
+        self.q = torch.nn.Linear(d, n_heads * d_head, bias=False)        # 4096 -> 4096
+        self.k = torch.nn.Linear(d, n_kv_heads * d_head, bias=False)      # 4096 -> 1024
+        self.v = torch.nn.Linear(d, n_kv_heads * d_head, bias=False)      # 4096 -> 1024
+        self.o = torch.nn.Linear(n_heads * d_head, d, bias=False)
+
+    def forward(self, x, cache=None):
+        B, T, _ = x.shape
+        q = self.q(x).view(B, T, self.n, -1).transpose(1, 2)             # [B, 32, T, 128]
+        k = self.k(x).view(B, T, self.kv, -1).transpose(1, 2)            # [B,  8, T, 128]
+        v = self.v(x).view(B, T, self.kv, -1).transpose(1, 2)
+        # append to the KV cache, then share each KV head with 4 queries
+        if cache is not None: k, v = cache.append(k, v)
+        k = k.repeat_interleave(self.n // self.kv, dim=1)                # [B, 32, T, 128]
+        v = v.repeat_interleave(self.n // self.kv, dim=1)
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=cache is None)
+        return self.o(y.transpose(1, 2).reshape(B, T, -1))
+```
+
+`repeat_interleave` is the whole trick. Note what is *not* there: no extra parameters, no extra math in the kernel that has to know about groups. A good implementation repeats once into on-chip memory and the kernel never notices.
+
+<Callout type="real" title="What engines actually do at the time of writing">
+  vLLM and SGLang store the KV cache with $n_{kv}$ heads per token, because that is what the model actually produces. When a kernel needs all 32, the expansion happens inside the attention kernel, usually for a block of queries at a time so the repeated heads stay in SRAM and are never written to HBM. TensorRT-LLM does the same thing with a separate decode kernel specialised for few queries against many keys. The saving is real and it is entirely inside that kernel — which is why Module 14 spends a lesson on decode attention.
+</Callout>
+
+<Callout type="try" title="Measure the GQA saving yourself">
+  In the module notebook, load a GQA model and an MHA-era model, print `config.num_attention_heads` and `config.num_key_value_heads` for each, and compute the KV bytes per token from the formula above. Then run one decode step on both at the same context length and time it. If the models differ in size the timing will not be clean — which is itself the lesson: **compare the formula, not the clock, when the models differ.**
+</Callout>
+
+<KeyNotes>
+  1. **head_dim = hidden / heads**, and it stays at **128** as models grow. Llama-3.1-8B: 4096 / 32 = 128. Qwen2.5-0.5B is the exception at 64.
+  2. Heads run **in parallel** as a batched matmul, not sequentially. 32 heads cost nearly the same wall-clock time as one; only the weights are extra, and attention is 16.7% of Llama-3.1-8B.
+  3. Keys and values are a **shared resource**; nothing requires $n_{kv} = n_q$. **MHA** = 32/32, **MQA** = 32/1, **GQA** = 32/8.
+  4. **$B_{KV} = 2 \times L \times n_{kv} \times d_h \times b$ bytes per token.** Five factors. Read `num_key_value_heads` from the config, never assume it equals `num_attention_heads`.
+  5. Per token: Qwen2.5-0.5B 12 KiB · Llama-3.2-3B 112 KiB · Llama-3.1-8B 128 KiB · Qwen2.5-32B 256 KiB · Llama-3.1-70B 320 KiB.
+  6. **Qwen2.5-32B has a smaller KV cache per token than Llama-3.1-70B** (256 vs 320 KiB) despite half the parameters — fewer layers' worth of growth beats more parameters.
+  7. Llama-2-7B (MHA, 32 KV heads) costs 512 KiB/token, 4× Llama-3.1-8B. At 32K context that is 16.0 GiB per sequence instead of 4.0 GiB: about 15 users instead of 3 on the same GPU.
+  8. **GQA saves bytes, not FLOPs.** Attention arithmetic is $F = 2T^2d_{\text{model}}$ regardless of head sharing; what shrinks is KV storage, KV read bandwidth and KV write bandwidth.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B has 32 layers, 8 KV heads and head_dim 128, in BF16. How many bytes of KV cache does one token take?', numeric: true, answer: 131072, tolerance: 500, unit: 'bytes', why: '2 (K and V) × 32 layers × 8 KV heads × 128 head_dim × 2 bytes = 131,072 bytes = 128 KiB per token.' },
+  { q: 'Llama-2-7B has 32 layers and 32 KV heads of dim 128, in BF16. Its KV cache per token, in KiB?', numeric: true, answer: 512, tolerance: 6, unit: 'KiB', why: '2 × 32 × 32 × 128 × 2 = 524,288 bytes = 512 KiB — exactly 4× Llama-3.1-8B, because 8 KV heads instead of 32.' },
+  { q: 'Qwen2.5-32B has 64 layers and 8 KV heads. Llama-3.1-70B has 80 layers and 8 KV heads. Which has the smaller KV cache per token?', options: ['Qwen2.5-32B, because it has fewer parameters', 'Llama-3.1-70B, because it is a bigger model', 'They are identical', 'It depends on the batch size'], answer: 0, why: 'Qwen2.5-32B: 2 × 64 × 8 × 128 × 2 = 256 KiB/token. Llama-3.1-70B: 2 × 80 × 8 × 128 × 2 = 320 KiB/token. Layer count and KV head count decide this, not parameter count.' },
+  { q: 'Grouped-query attention shrinks the KV cache. What does it not change?', options: ['The number of FLOPs attention performs', 'The KV cache size per token', 'The bytes read per decode step', 'The number of query heads'], answer: 0, why: 'Every query head still scores against every key, so the attention arithmetic 2·T²·d_model is unchanged. GQA is purely a byte reduction: storage, KV reads and KV writes.' },
+  { q: 'A model has hidden size 5,120 and 40 attention heads. What is its head_dim?', numeric: true, answer: 128, tolerance: 0, why: '5,120 / 40 = 128. Head dim is held at 128 across most modern models — Llama-3.1-8B is 4096/32, Llama-3.1-70B is 8192/64 — so RoPE frequencies and softmax statistics stay comparable.' },
+  { q: 'Llama-3.1-8B, 32K context, BF16. How much KV cache does one sequence hold, in GiB?', numeric: true, answer: 4, tolerance: 0.15, unit: 'GiB', why: '32,768 tokens × 131,072 bytes = 4,294,967,296 bytes = 4.0 GiB. The same sequence under Llama-2-7B-style MHA would need 16.0 GiB.' },
+] } />

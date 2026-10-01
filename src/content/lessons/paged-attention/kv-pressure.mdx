@@ -1,0 +1,238 @@
+---
+title: 'Running out: preemption, swap & recompute'
+summary: 'Paging removes fragmentation, not demand. When the pool is genuinely full, an engine has three honest options: queue, recompute, or swap — and the right one depends on arithmetic you can do before it happens.'
+objectives:
+  - Distinguish the moment the pool is full from the moment it is merely fragmented
+  - Explain what preemption means in a continuous-batching engine
+  - Compare the cost of recompute and swap for a given victim and pick correctly
+  - Compute the eviction policy threshold from prefill throughput and PCIe bandwidth
+  - Explain why the visible cost of eviction is a p99 tail rather than a throughput change
+---
+import KvPressure from '@/components/viz/paged-attention/KvPressure.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A pool with 300 free blocks can still fail. Ten thousand requests, 8,000 tokens each, 10,000 blocks total: the pool is 100% full, and no allocator cleverness anywhere would have helped. Paging guarantees you only fail when you are **honestly** out of memory. It does not make memory appear.
+
+So what does an engine do when a request needs a block and there is none? This is the last piece of KV memory management, and it is where the latency trade-offs get sharp.
+
+## The moment of failure
+
+To grow by one token, a request needs one more free block. Suppose there are none. Concretely, for Llama-3.1-8B in BF16:
+
+$$
+\text{one block (16 tokens)} = 16 \times 131{,}072 = 2{,}097{,}152\ \text{bytes} = 2\ \text{MB}
+$$
+
+So "the pool is full" means: every block id is on somebody's block table. There are three things an engine can do, and they are not equally painful.
+
+<Scrolly>
+  <KvPressure client:visible slot="stage" />
+
+  <Step title="1. The pool fills up">
+    Four requests are decoding. Each one's KV cache grows a 2 MB block every 16 tokens. Eventually the 256 MB pool is 100% committed and the next `free_list.pop()` would fail.
+  </Step>
+
+  <Step title="2. A new request needs a block">
+    Request E arrives and needs one more block for its own growth. There is none. This is the moment every KV memory policy exists for — and notice it is **honest** failure, not fragmentation.
+  </Step>
+
+  <Step title="3. Policy 1: admission control">
+    The cheapest option: **do not admit E into the pool yet**. It waits in the queue. Nothing running is disturbed, nothing is recomputed. The cost is E's waiting time.
+  </Step>
+
+  <Step title="4. Policy 2: preempt and recompute">
+    Pick a victim already in the pool, **evict** it (free its blocks), and rebuild it later by running <Term t="prefill">prefill</Term> over its prompt and generated tokens again. No host memory, no PCIe. The FLOPs are paid twice.
+  </Step>
+
+  <Step title="5. Policy 3: preempt and swap">
+    Same eviction, but first **copy the victim's KV blocks to host memory** (CPU RAM). On restore, copy them back. You pay PCIe bandwidth instead of recompute FLOPs.
+  </Step>
+
+  <Step title="6. Recompute, priced">
+    A 900-token victim, rebuilt: 900 tokens of prefill. For Llama-3.1-8B on an H100 reaching about 500 TFLOP/s effective, that is roughly 14 TFLOP of work and costs about **29 ms**. Paid fresh at every eviction.
+  </Step>
+
+  <Step title="7. Swap, priced">
+    The same victim: 900 × 131,072 ≈ 118 MB down and 118 MB back. Over PCIe Gen4 (~24 GB/s each way), about **5 ms down, 5 ms back**. Far cheaper than the 29 ms of recompute.
+  </Step>
+
+  <Step title="8. Choosing, and the tail">
+    Here swap wins on time. But both costs scale with victim length, so length cancels out of the comparison — what decides it is **prefill throughput versus link bandwidth**, a property of your machine. Either way the cost lands on a few unlucky requests: it moves the **p99**, not average throughput.
+  </Step>
+</Scrolly>
+
+## Preemption
+
+<Term t="preemption">**Preemption**</Term> means taking resources away from a request that is already running. This is worth pausing on, because it is genuinely alien to serving.
+
+The one guarantee a streaming API makes is monotonic progress: once a request starts generating, tokens keep coming until it finishes. You do not expect a server to take a half-finished answer away, freeze it, and resume it twenty minutes later — the user's connection is long gone.
+
+So what does "preempting" a request actually mean in practice?
+
+- **It does not usually mean pausing a visible stream.** In vLLM's default scheduler, if preemption is needed, the victim is typically the request with the **most recently arrived** token (i.e., the newest request in the running batch), which minimizes wasted work: it has generated the fewest tokens so far. When swapped out and later restored, its already-generated tokens are **discarded and regenerated** (or re-served from the swap copy). To a naive client this looks like a stall, not a correctness break.
+- **The guarantee is preserved** because the *engine* controls what the client sees: it simply pauses streaming and resumes when the request is scheduled again. As long as the client tolerates a pause (which any SSE connection does, being told to wait), no correctness is violated — only latency.
+- **Swap (with CPU offload) does preserve the generated tokens**: they come back with the data. **Recompute regenerates them**, which can even produce a different continuation unless sampling is seeded deterministically per position. Engines that recompute therefore usually serve preemption victims with deterministic sampling on resume.
+
+<Callout type="pitfall" title="If your client has a hard timeout, preemption hurts">
+  A preempted-and-recomputed request can see a latency spike far beyond its normal p99 — hundreds of milliseconds to seconds. Any client with an aggressive request timeout will see errors that look like crashes. If that is your deployment, either give enough pool headroom to avoid preemption, or enable swap so restores are fast. This is exactly the p99-versus-average lesson from Module 06.
+</Callout>
+
+<Callout type="intuition" title="Why preemption should scare you">
+  Preemption is a **livelock risk**, not a memory error. A preempted request goes back to the waiting queue. If the pool is saturated, it may never be scheduled again — it sits there holding no memory, making no progress, waiting for a slot that never opens because the requests ahead of it are also competing. Under sustained overload, the set of preempted requests grows monotonically while throughput stays flat.
+
+  The cure is not a better victim rule. It is to **stop accepting work the pool cannot hold** (admission control), or to raise capacity. Preemption is a safety valve for brief spikes; running on it permanently is running with a system that is undersized.
+</Callout>
+
+## What preemption actually costs end to end
+
+The three-step cost of a preempted request, which you should be able to estimate for your own deployment:
+
+1. **Eviction**: O(blocks) bookkeeping, negligible. Write the victim's block ids back to the free list.
+2. **Offload** (swap) or **discard** (recompute): this is the real cost, priced above.
+3. **Restore**: load the data back or re-prefill, then **re-join the batch**. The request restarts its decode loop, so it also loses whatever batching position it had — it will be at the back of the queue for the next step.
+
+Note that step 3 is not just latency. A restored request re-enters the running batch, so every other request's next step is delayed by one. **Preemption is a shared cost**, not a private one: it degrades the whole batch, not only the victim. That is why an engine that preempts frequently shows p99 degradation across the board rather than just for the unlucky requests.
+
+<Callout type="math" title="Sizing for a spike, not for the average">
+  Suppose p50 load is 200 concurrent requests but you see bursts to 350 for 30 seconds a minute. If the pool holds 300, that burst will preempt about 50 requests every minute — and each preempted request pays the restore cost.
+
+  Options, in order of preference:
+  - **Raise capacity** so 350 fits. Costs money, harms nothing.
+  - **Raise `max_model_len`**? No — that shrinks the pool. Wrong direction.
+  - **Admit-control**: reject new requests above a concurrency cap. Costs you the spike's tail.
+  - **Absorb it** with swap, sized for about 50 requests × their KV.
+
+  The first option is always cheapest when the hardware exists. Estimation here is how you decide whether it does.
+</Callout>
+
+## Recompute vs swap, by the arithmetic
+
+The decision is a comparison you can do **before** the pressure hits, per victim. Two costs:
+
+**Recompute cost** (victim with context $C$ tokens, on a GPU with effective prefill throughput $P$ tok/s):
+
+$$
+t_{\text{recompute}} = \frac{C}{P}
+$$
+
+**Swap cost** (context $C$, PCIe bandwidth $B_{\text{pcie}}$ each way, one write + one read):
+
+$$
+t_{\text{swap}} = \frac{2\,C \times 131{,}072}{B_{\text{pcie}}}
+$$
+
+<Callout type="math" title="Find the crossover">
+  Recompute beats swap when $\frac{C}{P} < \frac{2 C \times 131{,}072}{B_{\text{pcie}}}$, and $C$ cancels:
+
+  $$
+  \frac{1}{P} < \frac{2 \times 131{,}072}{B_{\text{pcie}}} \quad\Longrightarrow\quad P > \frac{B_{\text{pcie}}}{262{,}144}
+  $$
+
+  On an H100 with effective prefill $P = 20{,}000$ tok/s: $\frac{B_{\text{pcie}}}{262{,}144} < 20{,}000 \Rightarrow B_{\text{pcie}} < 5.2$ **GB/s**.
+
+  PCIe Gen4 x16 is ~24 GB/s, Gen5 ~50 GB/s — both **above** 5.2. So for a model that prefills at 20k tok/s, swap's PCIe link is fast enough that **swap usually wins**, no matter the victim length. On a slower prefill GPU (or a much smaller model with lower $P$) the picture flips toward recompute. The takeaway: it is not about victim length at all — it is about **your prefill throughput versus your link bandwidth**.
+</Callout>
+
+That cancellation is the interesting part, and it corrects the intuition the visual gave. The victim's length scales both costs identically. What decides it is a property of the *machine*: how fast you can recompute (FLOP/s, via $P$) versus how fast you can copy (bytes/s, via $B_{\text{pcie}}$).
+
+For the visual's numbers: recomputing a 900-token victim at 20k tok/s costs about 45 ms. Swapping it moves 118 MB down and 118 MB back over PCIe at 24 GB/s, about 10 ms. Swap wins by roughly 4.5×. On a model whose prefill rate $P$ is only 1,000 tok/s, recompute would be 900 ms and swap would still be 10 ms — swap wins even harder.
+
+<Callout type="real" title="What vLLM actually does, and what you set">
+  At the time of writing, vLLM supports CPU offload of KV blocks (it calls the budget `--swap-space`, in GB of host memory). Whether it recomputes or swaps depends on the scheduler's policy and configuration; the practical levers you have are: size the KV pool generously (raise `--gpu-memory-utilization` a little, or `--max-model-len`), and decide how much host memory to allow for swap. Engines differ here, which is why this lesson's job is the arithmetic, not the flag name — you can now compute the right answer for your hardware. Module 09 will wire the arithmetic to vLLM's actual defaults.
+</Callout>
+
+## How you would notice, in production
+
+Preemption is easy to miss and worth instrumenting, because it degrades latency long before it degrades anything you are already watching.
+
+**The tell is preemption count versus running-batch size.** If the engine reports that it preempted requests this step, and your `vllm:num_requests_waiting` grows while `vllm:num_requests_running` stays flat, you are memory-bound, not compute-bound. Adding more compute will do nothing; only more KV capacity or lower context lengths will.
+
+**A second tell: TTFT is fine, TPOT is not.** Preemption hits requests mid-generation. So the requests that suffer are long ones, and the symptom is a p99 TPOT tail that appears at load thresholds — it looks like the system has a cliff at some concurrency number, because it does.
+
+<Callout type="intuition" title="Preemption looks like a mysterious cliff">
+  The reason this catches people is that the effect is a **threshold**, not a slope. Below 90% pool occupancy, preemption essentially never happens and everything looks perfect. Cross 100% and suddenly 5% of requests stall for a second. Nothing degrades gradually in between. When you see a workload behave like that, memory pressure is the first hypothesis, not the last — check occupancy before you start tuning batch sizes or kernels.
+</Callout>
+
+**The diagnostic that settles it.** Compare peak pool occupancy against 100%. If it pins at 100% during your load test, your KV pool is the bottleneck and everything else in your tuning is noise. If it peaks at 60%, memory is not your problem and you should go back to Modules 07 and 12.
+
+## Who gets evicted
+
+Whichever policy you pick, you must choose a **victim**, and that choice is its own small design space:
+
+| Rule | Rationale | Watch out |
+|---|---|---|
+| **Newest first** (fewest generated tokens) | Minimizes wasted decode work; the victim has produced little. | Can starve long prompts. |
+| **Oldest first** | Simple; roughly FIFO-fair by arrival. | Evicts a request that did lots of work; recompute is expensive. |
+| **Shortest context first** | Minimizes the per-restore cost. | Frees least per eviction, so you evict often. |
+| **Lowest priority** | The only rule that is *right* if you have tiers of service. | Requires you to have defined tiers. |
+
+<Callout type="intuition" title="Why the default is 'newest first'">
+  A request that has generated 300 tokens has already made the GPU do 300 steps of real work. Throwing that away (recompute) or pausing it (swap) wastes the most. A request that just started has invested almost nothing. So when forced to pick a victim, throwing away the least-invested work is the choice that hurts least — the same instinct as evicting the least-recently-used cache line. The cost of this rule is starvation risk for long prompts, which is why engines pair it with admission limits (a cap on how many long requests run at once) rather than letting it run unbounded.
+</Callout>
+
+## Starvation, and why admission limits beat eviction
+
+The failure mode of newest-first deserves its own paragraph, because it is the one that will actually page someone at 3am.
+
+Suppose a long request needs 8,000 tokens and the pool holds 6,000. It will grow to 6,000, get preempted at the next boundary, and — if it is restored to the same pool — grow again to the same point. It makes **no forward progress at all**, forever. The pool is large enough for many short requests and permanently too small for this one. The system looks healthy: throughput is fine, GPU utilization is 100%, and one request never finishes.
+
+This is a livelock, not a crash, and it will not show up in an average.
+
+<Callout type="pitfall" title="The fix is to refuse the request, not to keep evicting it">
+  If a request's *total* length cannot fit in the pool, it must be **rejected at admission** (or served with a shorter `max_model_len`). Retrying it forever wastes capacity that other users could have used. Check at admission whether `prompt + max_new_tokens` fits in the pool; if not, return an error immediately rather than accepting it into a pool that cannot hold it.
+
+  This is <Term t="admission-control">admission control</Term>, and it is the cheapest and most robust of the three policies precisely because it is the only one that cannot fail halfway.
+</Callout>
+
+The general shape of the argument applies beyond KV memory, and it is worth internalising: **when a resource cannot satisfy a unit of work, the correct response is to refuse the work, not to interleave it with a probability of ever finishing.** The second looks like utilization and is actually waste.
+
+## Sizing the pool so this never happens
+
+You can avoid the whole policy space with arithmetic. Given a model, a GPU and a workload, the pool needs to hold the *longest request you intend to serve*, and then some.
+
+<Callout type="math" title="Pool sizing, worked">
+  Llama-3.1-8B on one A100 80GB. Weights 16 GB, CUDA context and activations ~3 GB, leave 10% headroom. Pool budget:
+
+  $$
+  \text{pool} = (80 - 16 - 3) \times 0.9 \approx 55\ \text{GB}
+  $$
+
+  At 131,072 bytes per token that works out to roughly 420,000 tokens of context.
+
+  **Check the worst case:** a single 32,768-token request needs 4.3 GB, so it fits many times over. **Check the typical case:** at 1,000 tokens per request, 420 concurrent requests. **Check the binding case:** if you promise 131,072-token requests, only 3 fit at once, and you will be preempting constantly.
+
+  The lesson: size the pool against your **longest promised request**, and set `max_model_len` to match. Those two numbers must be decided together, and the second is the one you tell the client about.
+</Callout>
+
+<Callout type="intuition" title="Why engines print the KV cache size at startup">
+  Every serious engine logs the fraction of GPU memory it assigned to the KV pool and how many blocks that is, because it is the single number that determines your concurrency. If you see a tiny number, your `--gpu-memory-utilization` is too low and you are leaving capacity on the table. If the pool is large but preemption still shows up in your p99, your requests are longer than you thought. That log line is the first thing to read when a serving problem turns out to be a memory problem.
+</Callout>
+
+## The honest summary
+
+<Callout type="recap">
+  - **Admission control** is always available, always cheapest, and is the honest answer to "the pool is full": E waits.
+  - **Recompute** trades FLOPs for memory: no host RAM, no PCIe, but you rebuild from scratch. Cheapest when prefill is fast relative to your link (rare on modern GPUs).
+  - **Swap** trades PCIe bytes for FLOPs: fast restore, but it needs host memory sized for the number of preempted requests.
+  - **All of them** are about the same thing: deciding **whose progress to sacrifice when memory runs short**, and making that decision cheap enough that the sacrifice is rare. This is why the previous two lessons — packing efficiently (no fragmentation) and sharing prefixes (avoid storing duplicates) — are the *primary* defense. Preemption is the fallback for when demand genuinely exceeds the pool.
+</Callout>
+
+<KeyNotes>
+  1. Paging guarantees failure is **honest** (pool genuinely 100% full), not fragmentation. It does not create memory.
+  2. "The pool is full" fires when a request needs one 2 MB block (16 tokens × 128 KiB) and none is free.
+  3. **Admission control** (queue the newcomer) is the cheapest policy and the safest: nothing running is disturbed.
+  4. **Recompute** rebuilds a victim by re-running prefill on its prompt + generated tokens. It costs FLOPs, no host memory, no PCIe.
+  5. **Swap** copies a victim's KV blocks to host RAM and back. It costs PCIe bytes, ~10 ms for a 900-token victim on Gen4, versus ~45 ms to recompute it.
+  6. Recompute-vs-swap cancels the victim's length: the winner is decided by **prefill throughput vs PCIe bandwidth** ($P > B_{\text{pcie}}/262{,}144$), a property of the machine, not the victim.
+  7. **Preemption** takes resources from a running request, which delays its stream (a p99 tail) but not its correctness — the engine just pauses and resumes it.
+  8. "Newest first" eviction minimizes wasted work but risks starving long prompts; pair it with an admission cap on long requests.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B BF16, block size 16. How many bytes is one KV block, across all 32 layers?', numeric: true, answer: 2097152, tolerance: 20000, unit: 'bytes', why: '16 tokens × 131,072 bytes per token (all layers) = 2,097,152 bytes = 2 MB.' },
+  { q: 'A victim has 900 tokens of context. Recomputing it costs how long on a GPU that prefills at 20,000 tokens/s?', numeric: true, answer: 45, tolerance: 5, unit: 'ms', why: '900 ÷ 20,000 s = 0.045 s = 45 ms of pure prefill, paid again on every restore.' },
+  { q: 'Recompute and swap both cost time proportional to the victim length. So what actually decides which is cheaper?', options: ['The victim length', 'Prefill throughput versus PCIe bandwidth (a property of the machine)', 'How many requests are in the batch', 'The block size'], answer: 1, why: 't_recompute = C/P and t_swap = 2·C·131072/B_pcie. The C cancels, so the winner depends only on P versus B_pcie — your GPU’s prefill rate against your link’s bandwidth.' },
+  { q: 'A 900-token victim is swapped to host memory and back over PCIe Gen4 (~24 GB/s each way). About how long does the round trip take?', numeric: true, answer: 10, tolerance: 3, unit: 'ms', why: '900 × 131,072 ≈ 118 MB. Write 118 MB ÷ 24 GB/s ≈ 5 ms, read back another ≈ 5 ms, so about 10 ms — far less than the 45 ms to recompute.' },
+  { q: 'Why is “evict the newest request” the common default victim rule?', options: ['It is the fairest by arrival time', 'The newest request has invested the least decode work, so discarding it wastes the least', 'Newest requests have the smallest KV caches', 'It is required for correctness'], answer: 1, why: 'A just-started request has produced few tokens; preempting it discards the least work and the shortest cache, so restore is cheapest. The cost is that long prompts can starve, which needs an admission cap.' },
+  { q: 'Paging removed fragmentation in this course. When the pool is 100% full, why can a request still fail to get a block?', options: ['A bug in the allocator', 'Because paging removes fragmentation, not demand — the pool is genuinely out of blocks', 'Because the block table overflowed', 'Because blocks must be contiguous'], answer: 1, why: 'Paging guarantees the failure is honest: all block ids are owned. The remedy is not a cleverer allocator but a policy — queue, recompute, or swap — chosen by the arithmetic above.' },
+]}/>

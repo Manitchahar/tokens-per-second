@@ -1,0 +1,208 @@
+---
+title: 'Module 27 · Build a Mini Inference Engine'
+module: mini-engine
+---
+
+## What you are building
+
+Five files, each adding one idea. This is the whole engine.
+
+| File | Responsibility |
+|---|---|
+| `runner.py` | Weights, KV cache tensors, **one forward pass**. No scheduling. |
+| `scheduler.py` | Who is in the batch this iteration. Admission, eviction, budget. |
+| `kv_manager.py` | Blocks of 16 tokens, block table, page table, prefix hash, eviction. |
+| `api.py` | HTTP in, token stream out (SSE). |
+| `metrics.py` | Counters and histograms exported per iteration. |
+
+The dependency rule: `scheduler → kv_manager → runner`. Nothing points back. A real engine keeps this too.
+
+## The one forward pass
+
+Decode is a batched matrix multiply. For `B` sequences each contributing one token:
+
+$$
+h \leftarrow h + \text{Attn}(\text{RMSNorm}(h)), \qquad h \leftarrow h + \text{MLP}(\text{RMSNorm}(h))
+$$
+
+per layer, then the LM head, then sample.
+
+Shapes for one step with `B` sequences at context `T`:
+
+| Tensor | Shape | Notes |
+|---|---|---|
+| input ids | `[B]` | one token per sequence |
+| residual `h` | `[B, d_model]` | e.g. `[96, 4096]` |
+| Q | `[B, n_heads, d_head]` | this step only |
+| K, V (new) | `[B, n_kv, d_head]` | **written** to the cache |
+| K, V (read) | `[B, T, n_kv, d_head]` | gathered from blocks, includes the new one |
+| logits | `[B, vocab]` | 128,256 wide for Llama-3.1 |
+
+**A decode step reads 16 GB and does 16 GFLOP for Llama-3.1-8B.** Intensity ≈ 1 FLOP/byte, memory-bound, and batching does not change that — it changes how many tokens the read produces.
+
+## KV cache arithmetic
+
+$$
+\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_{head} \times \text{bytes}
+$$
+
+| Model | L | n_kv | d_head | BF16 KV/token |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 2 | 64 | 12 KB |
+| Llama-3.2-3B | 28 | 8 | 128 | 112 KB |
+| Llama-3.1-8B | 32 | 8 | 128 | 128 KB |
+| Qwen2.5-32B | 64 | 8 | 128 | 256 KB |
+| Llama-3.1-70B | 80 | 8 | 128 | 320 KB |
+
+$$
+\text{KV per request} = \text{context} \times \text{KV/token}, \qquad
+\text{blocks} = \left\lceil \frac{\text{context}}{16} \right\rceil
+$$
+
+Llama-3.1-8B at 8k tokens: `8192 × 128 KB = 1.0 GB`, `8192/16 = 512` blocks.
+
+## The memory budget
+
+$$
+\text{pool} = \text{gpu\_memory\_utilization} \times M - \text{weights} - \text{reserve}
+$$
+
+$$
+\text{poolTokens} = \frac{\text{pool}}{\text{KV bytes per token}}, \qquad
+\text{poolBlocks} = \frac{\text{poolTokens}}{16}
+$$
+
+Llama-3.1-8B on an H100 at `0.90`: `72 − 16.06 − 3.2 = 52.7 GB` → **402k tokens** → **25.1k blocks**.
+
+$$
+\text{max concurrency} = \frac{\text{poolBlocks}}{\lceil \text{maxContext}/16 \rceil}
+$$
+
+At `maxContext = 8192` that is `25,100 / 512 ≈ 49` concurrent sequences. **Set `max_model_len` low and concurrency goes up for free.**
+
+## Blocks and fragmentation
+
+$$
+\text{utilisation} = \frac{\sum \text{blocks held} \times 16}{\text{blocks allocated} \times 16}
+$$
+
+Contiguous allocation of `T` tokens: `T + 15` wasted at worst per request, and worse under growth. Blocks of 16 waste **at most 15 tokens per request, and only in the last block**.
+
+Llama-3.1-8B, 16 slots, sequences of 1,050 tokens: contiguous `16 × 1050 = 16,800` needed → only 15 fit. Paged: `ceil(1050/16) = 66` blocks each → **16 fit in the same memory**.
+
+## Prefix caching
+
+$$
+\text{hash}_i = H(\text{token}_i, \text{hash}_{i-1}) \quad \Rightarrow \quad
+\text{block}_i = (\text{tokens}_i,\ \text{hash}_i)
+$$
+
+Two requests with a common prefix of `P` tokens produce identical hashes for the first `floor(P/16)` blocks. Sharing is then a dict lookup, with no explicit prefix search.
+
+- hit rate on a 1k-token shared system prompt ≈ `1000/16 = 62` blocks reused
+- reuse is **block-aligned**, so 1,005 shared tokens reuses 62 blocks, not 63
+
+## The scheduler, per iteration
+
+1. **Free** the blocks of any finished or preempted sequence (O(1), via the page table).
+2. **Admit** from the waiting queue while tokens `≤ budget` and seqs `≤ max_num_seqs`.
+3. **Chunk** any prefill longer than the remaining budget.
+4. **Preempt** if allocations failed: evict the newest running sequence (LIFO).
+5. **Run** one forward pass; append the new KV; sample.
+6. **Emit** each sequence’s token to its stream.
+7. **Record** stats.
+
+**Token budget** `max_num_batched_tokens`: bounds how long a prefill can stall decode. If decode is `B` tokens and the budget is 512, a full prompt chunk is 512 − B tokens — everything else keeps generating.
+
+$$
+\text{tokens per step} = B_{\text{running}} + \text{prefill chunk}
+$$
+
+## Latency accounting
+
+$$
+\text{TTFT} = \text{queue wait} + \text{prefill} + t_{\text{step}}, \qquad
+\text{TPOT} \approx t_{\text{step}}
+$$
+
+$$
+\text{t}_{\text{step}} = \max\left(\frac{\text{weights} + B \cdot T \cdot \text{KV/token}}{\text{BW}},\
+\frac{2 \cdot \text{params} \cdot \text{tokens}}{\text{FLOP/s}}\right) + t_{\text{overhead}}
+$$
+
+`weights/BW` is the floor and it does not improve with batch. **Every user-added sequence is close to free until the KV read exceeds the weight read.**
+
+## Prefix of free throughput
+
+At `B` sequences the step is memory-bound until the KV read overtakes the weights:
+
+$$
+B \cdot T \cdot \text{KV/token} = \text{weights}
+\quad\Rightarrow\quad
+B_{\text{knee}} = \frac{\text{weights}}{T \cdot \text{KV/token}}
+$$
+
+Llama-3.1-8B, `T = 4096`: `16.06e9 / (4096 × 131072) = 30`. Below ~30 sequences the step time is flat; above it, every added sequence slows everyone.
+
+## Flags that map to code
+
+| Flag | Code you write |
+|---|---|
+| `--max-model-len` | refuse prefill beyond this; sets worst-case blocks/request |
+| `--gpu-memory-utilization` | the pool formula above |
+| `--max-num-seqs` | scheduler admission cap |
+| `--max-num-batched-tokens` | scheduler token budget |
+| `--block-size` | block size in `kv_manager` |
+| `--enable-prefix-caching` | use the block hash dict |
+| `--swap-space` | CPU blocks for swap preemption |
+
+## Metrics worth exporting
+
+| Metric | Type | Why |
+|---|---|---|
+| `vllm:num_requests_running` | gauge | the live batch |
+| `vllm:num_requests_waiting` | gauge | queue depth = the TTFT you are about to cause |
+| `vllm:gpu_cache_usage_perc` | gauge | > 0.95 means preemption is starting |
+| `vllm:preemption_count` | counter | the number that tells you your pool is too small |
+| `vllm:iteration_tokens_total` | counter | divide by wall time for real throughput |
+| `ttft_seconds` / `tpot_seconds` | histogram | the user-visible pair |
+| `time_to_first_token` / `time_per_output_token_seconds` | histogram | vLLM's own names |
+
+**`num_requests_waiting` is the leading indicator.** Throughput looks fine while it climbs; then latency explodes.
+
+## Rules of thumb
+
+1. Read the weights once per step no matter the batch size — that is the floor on latency.
+2. A `B`-token batch costs barely more than a 1-token batch until `B ≈ weights / (T × KV/token)`.
+3. Block size 16 is the sweet spot: at most 15 wasted tokens per request, fine-grained prefix sharing.
+4. Prefix caching is nearly free and pays enormously on shared system prompts, RAG and multi-turn chat.
+5. Set `max_model_len` to your real p99 context, not the model's maximum. It is the concurrency knob.
+6. Preempt LIFO (newest first): it protects long-running conversations from being starved.
+7. Never let a prefill run unbounded. Chunk it, or one long prompt becomes everyone else's latency spike.
+8. Emit tokens as the engine produces them. A background queue decouples the network from the GPU loop.
+9. Profile before optimizing: at decode sizes, Python and launch overhead are often 30–50% of the step.
+10. If `preemption_count` climbs, the answer is more KV memory or shorter contexts — not a better scheduler.
+
+## Check your engine against these
+
+- [ ] `prefill + decode` output matches `transformers` `generate()` token for token at temperature 0.
+- [ ] Per-request `TTFT = queue + prefill + step` holds to within a few percent.
+- [ ] `Σ blocks_held × 16 ≤ poolBlocks` at all times, asserted in code.
+- [ ] Memory never exceeds the budget, including at a full-length prefill.
+- [ ] Streaming begins before generation finishes; no buffering until the end.
+- [ ] The whole sweep runs twice and the medians agree.
+
+## Where to look in a real engine
+
+- `vllm/v1/core/sched/scheduler.py` — batch membership, budget, preemption
+- `vllm/v1/core/kv_cache_manager.py` — blocks, block table, prefix sharing, eviction
+- `vllm/v1/worker/gpu_model_runner.py` — weights, KV tensors, the forward call
+- `vllm/v1/attention/backends/` — where FlashAttention is actually invoked
+- `vllm/entrypoints/openai/` — HTTP, chat template, SSE streaming
+- Block-table indirection is the same idea as an OS page table; *Operating Systems: Three Easy Pieces*, Arpaci-Dusseau and Arpaci-Dusseau
+
+## Module order
+
+- 27.1 read-vllm → 27.2 runner-and-kv → 27.3 continuous-batching-engine → 27.4 paged-prefix-engine → 27.5 api-metrics-engine → 27.P project-mini-engine
+- Previous: **Module 26 Specialized Workloads** — the workloads you generate real traffic with
+- Next: **Module 28 Research & Capstone** — read papers, reproduce results, defend a design

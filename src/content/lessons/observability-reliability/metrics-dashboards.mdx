@@ -1,0 +1,285 @@
+---
+title: 'Metrics & dashboards that matter'
+summary: 'Turn a working service into an instrumented one: the three metric types, the four panels an inference dashboard actually needs, and why cardinality — not resolution — is what your monitoring bill is made of.'
+objectives:
+  - Distinguish counters, gauges and histograms, and pick the right one per question
+  - 'Build a four-panel inference dashboard: rate, latency, pressure, engine'
+  - Read a quantile out of a cumulative histogram instead of storing a mean
+  - Compute the cardinality a metric label scheme will create, and cut it
+  - Turn an SLO into an error budget and a burn-rate alert
+---
+import MetricsDashboard from '@/components/viz/observability-reliability/MetricsDashboard.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+An inference service fails in a way that is unusually well suited to being measured. Every request has a start and an end, a token count, a first-token time and a stream of gaps between tokens. There is nothing vague about "how is it doing". You either have the numbers or you have a dashboard you drew from intuition.
+
+The hard part is not collecting. It is **deciding what to collect**. A service that emits one metric per request produces millions of events an hour; a service that emits one metric per *label combination* produces a number of stored series you did not plan for. Get that wrong and you either pay for a firehose nobody queries, or you keep a dashboard so coarse that it cannot tell you anything when you need it.
+
+This lesson is about the second problem.
+
+## The three kinds of metric, and what each one costs
+
+Everything in a modern metrics system is one of three things. Learn these three and the rest is bookkeeping.
+
+A **<Term t="counter">counter</Term>** only ever increases. Requests served, tokens generated, retries issued, preemptions. You never read a counter directly — you read a **rate** off it over a window, which makes it immune to restarts and resets:
+
+$$
+\text{rate} = \frac{\text{increase over the window}}{\text{window length}}
+$$
+
+A **<Term t="gauge">gauge</Term>** goes up and down: queue depth, running requests, GPU memory in use, KV blocks allocated. You read the value directly, and you read it as a range because the instantaneous value is noise.
+
+A **<Term t="histogram">histogram</Term>** accumulates counts into fixed buckets. It is the only one of the three that can answer "what fraction of requests were slower than 800 ms", and therefore the only one that can produce a quantile.
+
+<Callout type="math" title="Worked example: why a mean is not stored">
+  Ten thousand requests finish. Their latencies sum to 2,400,000 ms, so the mean is 240 ms. That number is computed from the histogram too — but it is the wrong one to store, because it is *not decomposable*.
+
+  If you store the mean per replica, you cannot recover the mean over the fleet: replica A's mean is over 9,000 requests and replica B's is over 1,000, and the fleet mean is not the average of the two. With a histogram, every replica stores counts per bucket, you **add the buckets across replicas**, and then you take the quantile. Percentiles are only meaningful over pooled raw samples — a rule Module 06 insisted on and that this is the operational reason for.
+</Callout>
+
+<Callout type="pitfall" title="Never store a latency mean, and never average percentiles">
+  Two traps that appear constantly in review:
+
+  - Storing `latency_avg`. It hides the tail completely, and the tail is what users complain about.
+  - Computing p95 per pod and then averaging the p95s across pods. This is arithmetically meaningless — the value depends on which slice of the population you pool.
+
+  Store buckets. Pool buckets. Then take the quantile.
+</Callout>
+
+<Scrolly>
+  <MetricsDashboard client:visible slot="stage" />
+
+  <Step title="1. One request, a handful of numbers">
+    This is the entire raw material. Prompt tokens, output tokens, TTFT, TPOT and whether the SLO was met.
+
+    Everything above this line is instrumentation decisions. There is no way to recover a number you never emitted.
+  </Step>
+
+  <Step title="2. Counters, gauges, histograms">
+    The three types again, with their costs. A counter is cheap to store but only readable as a rate. A gauge is one number per label set. A histogram is **a number of numbers per label set**, and it is the one that multiplies your bill.
+  </Step>
+
+  <Step title="3. Panel 1 — rate and goodput">
+    Output tokens per second next to goodput. Throughput alone is a vanity number: it keeps climbing after your SLO has already broken.
+
+    Pair them. The gap between them is the story.
+  </Step>
+
+  <Step title="4. Panel 2 — latency as a histogram">
+    Buckets, not a mean. The query `histogram_quantile(0.95, …)` interpolates inside the bucket that contains the quantile, which is why a histogram answer is approximate and bucket boundaries matter.
+  </Step>
+
+  <Step title="5. Panel 3 — pressure, the leading indicator">
+    Requests running and requests **waiting**. These move minutes before latency does.
+
+    By the time p95 TTFT is up, your queue has been growing for a while. Watch the queue and you get a warning; watch only latency and you get a post-mortem.
+  </Step>
+
+  <Step title="6. Panel 4 — is the engine healthy">
+    Decode step time, KV blocks in use, preemptions. The engine can be quietly degrading while every user-facing number still looks acceptable, because the scheduler is absorbing it by slowing admission.
+  </Step>
+
+  <Step title="7. The bill: cardinality">
+    Here is the number nobody plans for: buckets times every label value.
+
+    Eleven buckets across two models, eight replicas, ten tenants and two outcomes is 3,520 stored series for **one** metric. Move the tenant slider and watch it.
+  </Step>
+
+  <Step title="8. Burn rate is what should page you">
+    An SLO at 99.5% over 30 days gives you an error budget of 0.5% of requests. Burn rate is how fast you are spending it.
+
+    Burn rate 1 means exactly on budget. Burn rate 2.4 means you will exhaust a month of failures in thirteen days, and that is the only thing that should wake someone up.
+  </Step>
+</Scrolly>
+
+## Cardinality: the number that ruins monitoring bills
+
+**<Term t="cardinality">Cardinality</Term>** is the number of distinct time series a metric will store. It is the product of the label values:
+
+$$
+\text{cardinality} = \prod_{\text{labels}} |\text{values of that label}|
+$$
+
+Take the histogram from above, with labels `model`, `replica`, `tenant` and `outcome`:
+
+| Label | Values |
+|---|---|
+| `model` | 2 |
+| `replica` | 8 |
+| `tenant` | 200 |
+| `outcome` | 2 |
+
+Multiplying them out gives **6,400 series**, and the histogram multiplies each by its bucket count. At eleven buckets that is **70,400 stored series for one metric**. Add TTFT, TPOT, end-to-end, time-to-first-token-for-cached-prompts and you are in the hundreds of thousands.
+
+<Callout type="math" title="The growth rule, so you can predict it before you ship">
+  Double the tenants and you double the series. There is no sublinear trick — cardinality is multiplicative, and every new label you add is a multiplication, not an addition.
+
+  The practical consequence: **the label set is a design decision with a price tag**. Before adding `endpoint` or `region` or `user_id`, ask which question it answers that the existing labels cannot.
+</Callout>
+
+<Callout type="pitfall" title="The labels that will end you">
+  Three classics, all of them plausible:
+
+  - `request_id` or `user_id` as a label. Every request is a new series. The series count equals your request rate, and after twenty minutes your monitoring system is the slowest thing in your stack.
+  - `error_message` or any free-text label. Unbounded by construction.
+  - `pod_name` on a long-running service. It churns; every restart creates new series that are never written to again, and they sit there costing money forever.
+
+  The safe substitute for all three: put the identifier in **logs and traces**, where it belongs, and keep it out of the metric label set.
+</Callout>
+
+## Choosing buckets, and why the SLO threshold must be one
+
+Histogram buckets are the resolution of your latency data, and they are a real design choice:
+
+- Too few buckets and the quantile you quote is meaningless interpolation between two far-apart edges.
+- Too many and you pay for series nobody will query.
+- A **bucket boundary exactly at your SLO threshold** is worth more than any other choice, because then "requests slower than the SLO" is a single bucket edge you can count, alert on, and put in an error budget without interpolation error.
+
+So the buckets should look like this for an SLO of 600 ms on TTFT:
+
+```
+0.05, 0.1, 0.2, 0.3, 0.5, 0.6, 0.8, 1.2, 2, 3, 5, 10
+                                ^^^ the SLO threshold is a bucket edge
+```
+
+Everything faster than 600 ms is "passing"; everything slower is on the wrong side of the line, exactly, with no interpolation.
+
+<Callout type="real" title="What vLLM gives you out of the box">
+  At the time of writing, vLLM exposes a Prometheus endpoint at `/metrics` on the server, with the standard names most of this course's terminology already matches: request counters broken down by outcome and finish reason, gauges for running and waiting sequences, and a histogram for time-to-first-token. That is enough to build all four panels without writing a line of instrumentation code.
+
+  What you must still build yourself: the **join to your own SLO**, the **tenant label policy**, and the **alert rules**. The engine knows what happened; only you know what was promised.
+</Callout>
+
+## The four panels, and only four
+
+An inference dashboard should answer four questions, in this order, because they are ordered by how early they warn you:
+
+1. **Are we serving, and is the work useful?** Output tokens/s, requests/s, and goodput next to throughput. If these two diverge, you are past the operating point from *SLOs & goodput* and you are burning GPU time on work that misses your promise.
+2. **How long are people waiting?** p50, p95, p99 of TTFT and of TPOT, as time series. Not numbers on a board — a shape over time, because only a shape shows you a regression.
+3. **What is pressing on the system?** Running requests, waiting requests, queue depth, admission rejections. The leading indicators.
+4. **Is the engine healthy?** Decode step time, KV blocks used out of total, preemptions, cache hit rate. This is where you see a model change, a quantization, or a prefix-cache eviction problem before users do.
+
+Anything that is not answering one of those four questions does not belong on the wall. Everything else goes in a drill-down nobody looks at during an incident, which is the correct place for it.
+
+<Callout type="intuition" title="Why the order is not arbitrary">
+  Panels 3 and 4 **lead**; panels 1 and 2 **lag**. Queue depth rises seconds before latency does, and preemptions rise before error rates do. A dashboard ordered user-facing-first is a dashboard you read after the damage.
+
+  On the other hand, panel 1 is first because it is the one you check when something looks *fine* — the "throughput is up, are we better?" question. Optimizing in the wrong order means either being paged too late or being paged too often.
+</Callout>
+
+## From SLO to alert: the error budget
+
+The bridge between the dashboards and the pager is the **<Term t="error-budget">error budget</Term>**. If your SLO is p95 TTFT under 600 ms, then — by definition — you are allowed 5% of requests to miss it. Over a 30-day window that is your budget.
+
+$$
+\text{burn rate} = \frac{\text{actual fraction missing}}{\text{allowed fraction}}
+$$
+
+This ratio is the <Term t="burn-rate">burn rate</Term>.
+
+- Burn rate **1** — spending exactly the budget. Normal operation.
+- Burn rate **2.4** — a month's allowance gone in 13 days. This is what should page you.
+- Burn rate **14.4** — the two-hour window would consume the entire 30-day budget in two hours. This is the emergency page.
+
+The standard multi-window alert fires on the intersection of two conditions, which is what makes it hard to fool:
+
+| Short window | Long window | Action |
+|---|---|---|
+| 5-minute burn rate | 1-hour burn rate | page |
+| 1-hour burn rate | 6-hour burn rate | ticket |
+| 6-hour burn rate | 3-day burn rate | ticket, no page |
+
+<Callout type="mentor" title="The discipline this buys you">
+  A percentile alert ("p95 TTFT above 600 ms") is a **symptom**, and it is the one that makes engineers stop trusting alerts, because it fires on a normal Tuesday. A burn-rate alert on an SLO is a **cause-budgeted** statement: you are out of road, and here is how fast.
+
+  The two together are the professional answer: burn rate to wake a human, and the percentile dashboard to tell them where to look.
+</Callout>
+
+## Putting it together in about ten lines
+
+The whole thing is small enough to write yourself, and writing it yourself means you know what it does not measure.
+
+```python
+# the shape of an inference metrics exporter
+import time, threading
+
+LATENCY_BUCKETS = [0.05, 0.1, 0.2, 0.3, 0.5, 0.6, 0.8, 1.2, 2, 3, 5, 10]  # 0.6 = the SLO edge
+
+class Metrics:
+    """Counters, gauges and one histogram. Cardinality is 1 because there are no labels."""
+
+    def __init__(self):
+        self.t0 = time.monotonic()
+        self.requests = 0            # counter
+        self.output_tokens = 0       # counter
+        self.slo_met = 0             # counter
+        self.running = 0             # gauge
+        self.waiting = 0             # gauge
+        self.ttft_hist = [0] * len(LATENCY_BUCKETS)   # cumulative histogram
+        self._lock = threading.Lock()
+
+    def observe(self, ttft_s: float, tokens: int, met_slo: bool) -> None:
+        with self._lock:
+            self.requests += 1
+            self.output_tokens += tokens
+            self.slo_met += 1 if met_slo else 0
+            for i, edge in enumerate(LATENCY_BUCKETS):
+                if ttft_s <= edge:
+                    self.ttft_hist[i] += 1
+                    break
+
+    def rate(self, counter_name: str, window_s: float = 60.0) -> float:
+        # a counter read as a rate: an increase over the window, never the raw value
+        return getattr(self, counter_name) / window_s
+
+    def quantile(self, q: float) -> float:
+        """Estimate the quantile from cumulative buckets by interpolating inside the bucket."""
+        total = self.ttft_hist[-1] if self.ttft_hist[-1] else sum(self.ttft_hist)
+        if not total:
+            return 0.0
+        target, prev_count, prev_edge = q * total, 0, 0.0
+        for count, edge in zip(self.ttft_hist, LATENCY_BUCKETS):
+            if count >= target:
+                bucket = count - prev_count or 1
+                return prev_edge + (target - prev_count) / bucket * (edge - prev_edge)
+            prev_count, prev_edge = count, edge
+        return LATENCY_BUCKETS[-1]
+```
+
+The exporter format is a formality on top of this: you render the counters and gauges as plain text and the histogram as bucket lines, and any Prometheus-compatible scraper reads it.
+
+<Callout type="try" title="Try it yourself, in ten minutes, with no infrastructure">
+  You do not need a monitoring stack to learn this. Wrap your serving function in a `Metrics` object exactly as above, run your Module 06 benchmark harness against it, and print the four panels as text at the end of the sweep.
+
+  You will discover two things immediately: which of your four panels moved when you raised concurrency (usually panel 3, waiting requests), and that computing the p95 from buckets gives you a number within a few percent of computing it from raw samples — which is all a histogram ever promises you.
+</Callout>
+
+<Callout type="recap" title="The dashboard, in one list">
+  1. **Counter** for everything you accumulate, read as a **rate**.
+  2. **Gauge** for everything that is a level right now.
+  3. **Histogram** for latency, with a bucket edge **at your SLO threshold**.
+  4. Pool buckets across replicas before taking a quantile. Never average percentiles.
+  5. Four panels: rate+goodput, latency, pressure, engine health.
+  6. Cardinality = buckets × product of label values. It is the bill, and it is multiplicative.
+  7. Alert on **burn rate** over two windows, not on a percentile.
+</Callout>
+
+<KeyNotes>
+  1. There are only three metric types. Counters are read as rates, gauges are read directly, histograms accumulate buckets and are the only source of quantiles.
+  2. Never store a latency mean and never average percentiles across replicas. Store buckets, pool the buckets, then take the quantile.
+  3. Put a bucket edge **exactly at your SLO threshold**, so "requests that missed the SLO" is a count you can alert on with no interpolation error.
+  4. A useful inference dashboard has exactly four panels — rate and goodput, latency shape, queue pressure, engine health — ordered so the leading indicators come first.
+  5. Watch **waiting requests and preemptions** before you watch latency. They lead it by seconds; latency tells you what already happened.
+  6. Cardinality is `buckets × ∏ label values` and it is **multiplicative**: in the worked example, eleven buckets and 200 tenants produces 70,400 series for one metric.
+  7. Never label a metric with `request_id`, `user_id`, free text, or `pod_name`. Put identifiers in logs and traces, where they belong.
+  8. Turn the SLO into an error budget and alert on **burn rate over two windows** — that is a cause-budgeted statement about your remaining road, and it is far harder to alarm-fatigue than a percentile alarm.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A TTFT histogram has 12 buckets and the metric carries labels model (2 values), replica (8) and tenant (250). How many stored time series does that one metric create?', numeric: true, answer: 48000, tolerance: 2000, unit: 'series', why: 'Cardinality is multiplicative: 12 buckets × 2 × 8 × 250 = 48,000 series. This is why label sets on high-cardinality metrics are a design decision with a price tag.' },
+  { q: 'Three replicas each expose their own p95 TTFT of 500, 520 and 900 ms. What is the fleet p95?', options: ['The average of the three: 640 ms', 'Impossible to compute — you must pool raw samples or histogram buckets across replicas and take the quantile', 'The maximum: 900 ms', 'The minimum: 500 ms'], answer: 1, why: 'Percentiles are not decomposable. A fleet p95 is not any function of the per-replica p95s, because each replica summarized a different number of requests. Pool the buckets (or the raw samples) first, then take the quantile.' },
+  { q: 'Your SLO is p95 TTFT under 600 ms, window 30 days. The dashboard shows 1.2% of requests missing it. What is the burn rate, to one decimal place?', numeric: true, answer: 2.4, tolerance: 0.1, unit: '×', why: 'A p95 SLO allows 5% of requests to miss. Burn rate = actual ÷ allowed = 1.2% ÷ 5% = 2.4. At that rate a month of allowance is gone in 30 ÷ 2.4 ≈ 13 days.' },
+  { q: 'Why should you avoid a `user_id` label on a latency histogram?', options: ['It makes the histogram quantiles less accurate', 'It is one new series per user, so your request rate becomes your series count and your storage cost grows without bound', 'Prometheus forbids it syntactically', 'It prevents load balancing'], answer: 1, why: 'Cardinality is the product of label values. A per-user label makes the series count equal the user count, and after a churn of new users each one creates a series that is then never written to again but is still billed.' },
+  { q: 'Which signal tells you a service is degrading earliest?', options: ['p99 latency', 'Error rate', 'Queue depth / requests waiting', 'Output tokens per second'], answer: 2, why: 'Queue depth rises seconds before latency and error rate. Latency and error rate are lagging indicators: by the time they move, users have already been waiting. This is why the pressure panel is the one you stare at.' },
+  { q: 'A histogram’s buckets are (0.1, 0.2, 0.5, 1.0, 2.0) and the counts are cumulative: (500, 900, 1000, 1000, 1000). Which bucket contains the median, and roughly what is the estimate?', options: ['The first bucket, so the median is about 0.1 s', 'The third bucket (0.5–1.0 s), estimated near 0.7 s', 'The last bucket, 2.0 s', 'There is not enough data'], answer: 0, why: 'The median needs 500 of 1,000 samples. The first bucket already holds 500, so the median sits at the top of the 0–0.1 s bucket and interpolates to ≈0.1 s. Note that the answer depends entirely on your bucket edges — which is exactly why you place an edge at your SLO threshold instead of asking for a quantile across a wide bucket.' },
+] } />

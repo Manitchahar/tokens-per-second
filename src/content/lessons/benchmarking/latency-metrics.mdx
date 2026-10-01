@@ -1,0 +1,227 @@
+---
+title: 'TTFT, TPOT, ITL & end-to-end latency'
+summary: 'Latency is not one number. Every response has a queue wait, a prefill and a stream of decode steps, and each one needs its own metric. Learn to name all four, compute them from first principles, and know which one your users actually feel.'
+objectives:
+  - Name the four latency numbers of an LLM response and say which user complaint each explains
+  - Decompose TTFT into queueing, prefill and one decode step, and compute each term
+  - Compute TPOT from decode step time and connect it to per-user tokens per second
+  - Explain why ITL is measured per gap and why its average can hide a stutter
+  - Compute end-to-end time and decide which term dominates for a given workload
+---
+
+import LatencyTrace from '@/components/viz/benchmarking/LatencyTrace.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have watched a model stream an answer before. Something about the *shape* of the wait tells you what the bottleneck is.
+
+If the screen sits blank for two seconds and then the whole answer appears at once, you were waiting on something that had nothing to do with token generation. If text appears word by word at a steady pace, the words are the bottleneck. If it starts fast, then stutters, then races, then stalls, something is periodically getting in the way.
+
+"Inference is slow" is not a diagnosis. It is four different bugs wearing one coat.
+
+## Latency is not one number
+
+A single LLM request goes through four phases, and each phase has a different cost driver:
+
+1. **Queueing.** The request waits while other requests finish.
+2. **Prefill.** The whole prompt is processed at once (Module 05).
+3. **The first decode step.** Produces the first token.
+4. **The rest of the decode.** One step per remaining token.
+
+That gives us the standard decomposition:
+
+$$
+\text{end-to-end} = \underbrace{\text{queue} + \text{prefill} + \text{first step}}_{\text{TTFT}} + (n - 1)\times \text{TPOT}
+$$
+
+where $n$ is the number of tokens the model will generate. Three named metrics fall out of this, and they are the three numbers you will see on every real serving system's dashboard.
+
+<Scrolly>
+  <LatencyTrace client:visible slot="stage" />
+
+  <Step title="1. The request arrives at t = 0">
+    One request, one timeline. Everything that happens to it happens on this single horizontal axis, and every latency number you will ever report is a **distance measured along it**.
+
+    Keep your eye on the axis labels. The whole picture rescales as you drag the sliders, because a long response is a different shape from a short one.
+  </Step>
+
+  <Step title="2. Queueing: the wait nobody profiles">
+    A real GPU is serving other requests. Yours joins a queue and waits. That wait is the hatched grey span.
+
+    Here it is **240 ms**, which is longer than the entire prefill that follows. This is the single most common surprise in serving: **the kernel is not the bottleneck, the queue is**. It is also invisible in a profiler, because nothing is running on the GPU while your request waits.
+  </Step>
+
+  <Step title="3. Prefill: the whole prompt in one pass">
+    The prefill span is amber because prefill is **compute-bound** (Module 05). It processes every prompt token at once, so its cost grows with prompt length — and it gets *worse* superlinearly at long context, because attention cost grows with the square of the length.
+
+    Drag the prompt slider from 20 to 4,096 tokens and watch this one span eat the entire budget.
+  </Step>
+
+  <Step title="4. TTFT is the wait for the first token">
+    The bracket at the top is **TTFT**: from sending the request to seeing the first word. It is queueing plus prefill plus one decode step, because prefill does not emit a token — a decode step has to run first.
+
+    This is the number users complain about when they say "the model is thinking". If your TTFT is bad and prefill is tiny, the problem is the queue, and the queue is a scheduling problem, not a kernel problem.
+  </Step>
+
+  <Step title="5. Decode: one token per step">
+    Every remaining token costs one decode step, and each step must read all 16 GB of weights. That is the blue span, repeated $n - 1$ times.
+
+    At 7.5 ms per step that is about **133 tokens per second** for this user — the <Term t="tpot">TPOT</Term> in seconds, upside down.
+  </Step>
+
+  <Step title="6. ITL: measure every gap, not the average">
+    The tick marks are the individual **inter-token gaps**. Each one is a separate measurement, and each one can be different.
+
+    TPOT is the *average* of these gaps. If one gap is 400 ms because a batch filled up behind it, and the rest are 7 ms, the average is fine and the user still saw a stutter. **Averages are not what people feel** — we return to this properly in *Percentiles*.
+  </Step>
+
+  <Step title="7. End to end, and where it goes">
+    The full bracket is the whole response. The bar underneath breaks it into its three shares.
+
+    Read that bar as a diagnostic. Queue-dominated means you need more capacity or better scheduling. Prefill-dominated means long prompts. Decode-dominated means the answer is long, and only batching or a faster GPU helps.
+  </Step>
+
+  <Step title="8. Two inputs, and you control both">
+    Prompt length moves TTFT. Output length $n$ moves the tail. That is the entire input space of latency, and the rest of this module is about measuring it properly.
+
+    Set queueing to 0 and prompt length to 8, and TTFT becomes essentially one decode step. That is the floor, and no amount of kernel work goes below it.
+  </Step>
+</Scrolly>
+
+## The four metrics, defined precisely
+
+Let me write the definitions with timestamps. Let $t_0$ be when the client sends the request, $t_i$ the arrival time of the $i$-th output token, and $t_n$ the arrival of the last one.
+
+| Metric | Definition | What it answers |
+|---|---|---|
+| **TTFT** | $t_1 - t_0$ | "How long before I see anything?" |
+| **ITL** | $t_i - t_{i-1}$, for each $i \ge 2$ | "Did the words come smoothly?" |
+| **TPOT** | $\frac{t_n - t_1}{n - 1}$ | "How fast does it read?" |
+| **E2E** | $t_n - t_0$ | "When am I done?" |
+
+Notice TPOT is a mean of the ITLs, and TTFT plus $(n-1)$ times TPOT is exactly E2E. Three independent measurements, one identity. Every serving system that reports a metric board is showing you these four numbers per request.
+
+<Callout type="math" title="Check the identity on a real response">
+  Suppose a request queues for 200 ms, prefills a 500-token prompt in 60 ms, and then streams 100 tokens at 8 ms each.
+
+  - TTFT $= 200 + 60 + 8 = 268$ ms
+  - TPOT $= 8$ ms, so $(n - 1) \times$ TPOT $= 99 \times 8 = 792$ ms
+  - E2E $= 268 + 792 = 1060$ ms
+</Callout>
+
+## Computing each term yourself
+
+You should never need a dashboard to estimate a latency budget. You have all the pieces.
+
+**Prefill.** Module 05 gave you this: prefill is compute-bound, so it is FLOPs over peak FLOP/s, and for a dense transformer it is about 2P FLOPs per token, where $P$ is the parameter count. On an H100 at roughly 55% of peak:
+
+$$
+t_{\text{prefill}} \approx \frac{2 \cdot 8\times 10^9 \cdot n_{\text{prompt}}}{989\times 10^{12} \times 0.55} = n_{\text{prompt}} \times 29\ \mu\text{s}
+$$
+
+So 500 prompt tokens is about 15 ms of pure math, but a real prefill of 500 tokens takes closer to 60 ms — the difference is attention, sampling, memory writes and launch overhead.
+
+**One decode step.** Memory-bound, so it is bytes over bandwidth. Llama-3.1-8B in BF16 is 16 GB of weights:
+
+$$
+t_{\text{step}} = \frac{16\ \text{GB}}{3.35\ \text{TB/s} \times 0.8} = 6.0\ \text{ms}
+$$
+
+plus about 1.5 ms of fixed overhead per step (kernel launches, sampling, Python), which gives the **7.5 ms** the visual uses. This is the same arithmetic as Module 00's *four numbers*.
+
+<Callout type="intuition" title="Why the overhead term is not optional">
+  A decode step launches hundreds of kernels. At roughly 5–10 µs each, 300 launches is 1.5–3 ms of pure launch cost. If you count it separately, small models and short contexts look *worse* than the bandwidth estimate — which is exactly what you observe on a small GPU running a small model.
+
+  This is also why Module 15's CUDA graphs exist: they replay an entire step with one launch. If your measured TPOT is far above the bandwidth floor, overhead is where the time is going.
+</Callout>
+
+## Which metric does the user feel?
+
+This matters because you fix different things.
+
+| Complaint | Metric | Usual cause |
+|---|---|---|
+| "It's not responding" | TTFT | Queueing, or a very long prompt |
+| "It feels sluggish" | TPOT / ITL | A large batch: everyone shares one step |
+| "It stutters" | ITL distribution | Preemption, prefix eviction, or a competing prefill |
+| "How long until it's done?" | E2E | The sum, and its $n$ term grows linearly |
+
+The stutter row is the subtle one. A mean TPOT of 30 ms can coexist with 95% of gaps at 7 ms and 5% at 560 ms. The average says the stream is fine; the user says otherwise. **Always report the distribution of ITLs, not just their mean.**
+
+<Callout type="real" title="What a good interactive product targets">
+  For a chat assistant people tolerate roughly: TTFT under about a second before it feels broken, and a steady stream at 20–40 tokens per second, which is roughly a comfortable reading rate. Going much above 40 tok/s per user is invisible to the user and pure waste of capacity you could have given to someone else.
+
+  The interesting consequence: **per-user speed above a threshold is a cost problem, not a quality problem.** This is the seed of *SLOs & goodput*.
+</Callout>
+
+## Measuring them
+
+The measurement is trivial to write and easy to get wrong. The three mistakes are all the same mistake: forgetting where the clock starts and stops.
+
+```python
+import time
+
+t0 = time.perf_counter()          # before we SEND, not before we parse
+stream = client.send(prompt, stream=True)
+first = None
+stamps = []
+for chunk in stream:
+    now = time.perf_counter()     # the moment a token is USABLE by the user
+    stamps.append(now)
+    if first is None:
+        first = now
+
+ttft = stamps[0] - t0
+itls = [stamps[i] - stamps[i-1] for i in range(1, len(stamps))]
+tpot = sum(itls) / len(itls) if itls else None
+e2e  = stamps[-1] - t0
+```
+
+<Callout type="pitfall" title="Four ways to report a wrong number">
+  1. **Starting the clock after the client has already begun parsing.** You measured your HTTP client, not your server.
+  2. **Timing a non-streaming request and calling it TTFT.** Without streaming there is no TTFT; there is only E2E. A request that returns all 1,000 tokens in one response hides the entire streaming experience.
+  3. **Timing the batch, not the request.** With $B$ requests in flight, a per-request measurement taken from outside sees $B \times$ the step time. Only a per-request clock is meaningful.
+  4. **Timing on the server instead of the client.** If your client is 50 ms away, you have just reported a latency 50 ms better than any user's experience. Include the network.
+</Callout>
+
+And one thing to always do: **count tokens with the model's own tokenizer**, never by splitting on spaces. A character-based estimate of "tokens per second" can be off by 40%, because one token is about four characters on average but a code-heavy prompt is far denser.
+
+## A worked example, end to end
+
+A support assistant: 800-token prompt, 250-token answer, on one H100 with Llama-3.1-8B, with 400 requests per second arriving.
+
+$$
+\begin{aligned}
+t_{\text{prefill}} &\approx 800 \times 29\ \mu\text{s} = 23\ \text{ms} \quad \text{(call it 45 ms with overhead)} \\
+t_{\text{step}} &\approx 6.0 + 1.5 = 7.5\ \text{ms} \\
+\text{TTFT} &= \text{queue} + 45 + 7.5 \\
+\text{TPOT} &= 7.5\ \text{ms} = 133\ \text{tok/s} \\
+\text{E2E} &= \text{TTFT} + 249 \times 7.5\ \text{ms} = \text{TTFT} + 1.87\ \text{s}
+\end{aligned}
+$$
+
+Two readings of this:
+
+- **If queueing is 0**, TTFT is 52 ms and E2E is 1.92 s. Great service.
+- **If queueing is 600 ms**, TTFT is 652 ms — 12× worse — while TPOT and prefill are *identical*. The GPU did exactly the same work per token.
+
+That is the lesson. A user whose answer is slow and a user whose answer is stuttering have the same GPU but need opposite fixes.
+
+<KeyNotes>
+  1. Latency decomposes as **E2E = queue + prefill + first step + (n−1) × step time**, and each term has a different owner: the scheduler, the GPU's compute, or the GPU's memory.
+  2. **TTFT = t₁ − t₀** includes queueing. It is the number that measures whether your service feels responsive, and it is dominated by things a profiler cannot see.
+  3. **TPOT = (tₙ − t₁)/(n − 1)** is the mean inter-token gap, so per-user speed is simply $\tfrac{1}{\text{TPOT}}$ tokens per second.
+  4. **ITL is every individual gap**, not the mean. A service can have an excellent mean TPOT and a visibly stuttering stream.
+  5. Prefill is compute-bound: about 2P FLOPs per prompt token, so roughly 29 µs per token for Llama-3.1-8B on an H100 at 55% of peak.
+  6. One decode step for that model is $\text{16 GB} \div (3.35\ \text{TB/s} \times 0.8) \approx 6$ ms of memory time, plus about 1.5 ms of launch overhead. That overhead is why a measured TPOT can beat the bandwidth estimate.
+  7. Clock the **client**, stream the response, and count tokens with the model's tokenizer. Starting the clock late or estimating tokens from characters invalidates the measurement.
+  8. Above roughly 40 tokens per second for a single user, extra speed buys nothing the user can perceive — it only consumes capacity.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A request prefill is 30 ms, then streams 80 tokens with a mean TPOT of 12 ms. Queueing was 150 ms. What is the end-to-end time, in milliseconds?', numeric: true, answer: 1127, tolerance: 12, unit: 'ms', why: 'TTFT = 150 + 30 + 12 = 192 ms. E2E = 192 + (80 − 1) × 12 = 192 + 948 = 1,140 ms. If you got 1,104 you forgot that the first token also costs one decode step.' },
+  { q: 'Your p50 TPOT is 8 ms but some users report visible stuttering. What is the most likely explanation?', options: ['TPOT is only an average and the individual ITLs are uneven', 'The GPU is thermally throttling', 'The tokenizer is slow', 'The batch size is too small'], answer: 0, why: 'TPOT is defined as the mean of the inter-token gaps. A few gaps of hundreds of milliseconds barely move the mean but are exactly what a user perceives as a stutter. Report the ITL distribution.' },
+  { q: 'Llama-3.1-8B in BF16 on an H100 at 80% of peak bandwidth. What is the memory floor on one decode step, in milliseconds?', numeric: true, answer: 5.97, tolerance: 0.6, unit: 'ms', why: '16 GB ÷ (3.35 TB/s × 0.8) = 16/2.68 ≈ 5.97 ms. Real steps land near 7.5 ms because ~1.5 ms of kernel launches sits on top of the floor.' },
+  { q: 'TTFT is 800 ms while prefill takes only 40 ms and one decode step takes 7 ms. Where must the rest of the time be going?', options: ['In the weight file read from disk each step', 'In the queue, waiting for the GPU', 'In the tokenizer', 'In the softmax'], answer: 1, why: 'TTFT = queue + prefill + one step. 40 + 7 = 47 ms accounted for, leaving ~750 ms of queueing. Queue delay is a capacity and scheduling problem, and it is invisible to a kernel profiler.' },
+  { q: 'You double the number of tokens the model generates. What happens to E2E and TPOT?', options: ['E2E roughly doubles, TPOT is unchanged', 'Both double', 'E2E doubles and TPOT halves', 'Neither changes'], answer: 0, why: 'E2E = TTFT + (n − 1) × TPOT, so the output-length term is linear in n. TPOT is set by the decode step time, which does not depend on how many tokens you end up generating.' },
+  { q: 'At 8 ms per output token, roughly how many tokens per second does one user perceive?', numeric: true, answer: 125, tolerance: 8, unit: 'tok/s', why: 'Per-user speed is 1 / TPOT: one token per 8 ms is 125 tokens per second — far above a comfortable reading rate, so the extra capacity is wasted rather than felt.' },
+]} />

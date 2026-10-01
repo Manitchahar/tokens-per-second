@@ -1,0 +1,25 @@
+{
+  "name": "tokens-per-second",
+  "type": "module",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tokens per Second: a zero-to-hero, first-principles course in LLM inference engineering.",
+  "scripts": {
+    "dev": "node scripts/build-notebooks.mjs && astro dev",
+    "build": "node scripts/build-notebooks.mjs && astro build",
+    "preview": "astro preview",
+    "check": "astro check",
+    "notebooks": "node scripts/build-notebooks.mjs"
+  },
+  "dependencies": {
+    "@astrojs/markdown-remark": "^7.3.1",
+    "@astrojs/mdx": "^8.0.2",
+    "@astrojs/react": "^7.0.0",
+    "astro": "^7.3.5",
+    "katex": "^0.18.9",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "rehype-katex": "^7.0.1",
+    "remark-math": "^6.0.0"
+  }
+}

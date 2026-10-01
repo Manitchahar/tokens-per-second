@@ -1,0 +1,155 @@
+---
+title: What happens when you press Enter
+summary: Follow one chat message from your keyboard to a GPU and back, and meet every idea this course will teach along the way.
+objectives:
+  - Describe, step by step, what happens between pressing Enter and seeing the answer stream in
+  - Explain the difference between training a model and running it (inference)
+  - Name the two phases of generation, prefill and decode, and say which part of the GPU each one stresses
+  - Read a simple profiler-style trace
+---
+import RequestJourney from '@/components/viz/trace/RequestJourney.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have used ChatGPT, Claude or Gemini. You type a question, press Enter, wait a moment, and then the answer *streams* onto the screen a few words at a time.
+
+That moment of waiting and that streaming are what this whole course is about. Somewhere, a very expensive chip is doing an enormous amount of arithmetic to produce those words, and a team of engineers has spent months making it faster and cheaper. Those engineers are **inference engineers**. By the end of this course, you will be one.
+
+We start by slowing time down and watching one message make the round trip.
+
+## One request, in slow motion
+
+The picture on the right is drawn like a **profiler trace**: the tool engineers use to see where time goes inside a computer. Read it like a music score.
+
+- **Time runs left to right**, in milliseconds (ms). 1 ms is a thousandth of a second.
+- **Each row is a place where work happens**: your laptop (client), the network, the server's CPU, the GPU, and so on.
+- **Colored blocks are work**, and the color always tells you *what kind* of work it is. You will see the same colors in every lesson.
+
+Scroll slowly. The trace advances as you read. You can also use the buttons under it to step or play.
+
+<Scrolly>
+  <RequestJourney client:visible slot="stage" />
+
+  <Step title="1. You press Enter">
+    You type *"Explain the KV cache in one sentence."* and press Enter. Your browser packages the text into a small web request. The clock starts at **0 ms**.
+  </Step>
+
+  <Step title="2. Across the network">
+    The request travels over the internet to the AI provider's servers. That takes a few tens of milliseconds. It is <span class="ink k-comm">communication</span>: data moving from one place to another. No thinking happens yet.
+  </Step>
+
+  <Step title="3. Words become numbers">
+    A model cannot read letters. The server runs a <Term t="tokenizer">tokenizer</Term> that chops your text into **tokens** (words or pieces of words) and replaces each with an integer ID from a fixed list. *"Explain the KV cache in one sentence."* becomes 8 numbers.
+
+    From here on, the model only ever sees and produces numbers.
+  </Step>
+
+  <Step title="4. Wait your turn">
+    The GPU is shared by many users. At this instant it is busy with someone else's request, so yours waits in a **queue** for a few milliseconds. The hatched grey block means <span class="ink k-idle">waiting</span>: time passes and nothing useful happens for you.
+
+    Queueing is invisible in demos and enormous in production. A good chunk of this course is about keeping it short.
+  </Step>
+
+  <Step title="5. Prefill: read the whole prompt at once">
+    Your request reaches the GPU. First, the model reads **all 8 prompt tokens in one go**, in parallel. This phase is called **prefill**.
+
+    Prefill is heavy arithmetic, so it is drawn in <span class="ink k-compute">compute</span> amber. While doing it, the model saves a summary of every token in the <span class="ink k-memory">KV cache</span> (bottom row) so it never has to reread the prompt. Prefill ends by producing the **first output token**.
+  </Step>
+
+  <Step title="6. The first token appears">
+    The first token, *"It"*, travels back over the network and shows up on your screen. The total delay from pressing Enter until now is called **time to first token (TTFT)**. Here it is about 245 ms.
+
+    TTFT is what makes a chatbot feel *snappy* or *laggy*.
+  </Step>
+
+  <Step title="7. Decode: one token at a time">
+    Now the model writes the answer **one token per step**. Each step produces exactly one token, adds it to the KV cache, and feeds it back in to produce the next. This phase is called **decode**.
+
+    Notice the decode blocks are <span class="ink k-memory">blue, memory</span>. To produce each single token the GPU must read *the entire model* (billions of numbers) out of its memory. Reading is the bottleneck, not math. Hold on to that sentence: it explains half of inference engineering.
+  </Step>
+
+  <Step title="8. Done, and the two numbers that describe it">
+    After 16 tokens the model emits a special *end* token and stops. The request took about 620 ms.
+
+    Users feel two numbers: **TTFT** (how long until it started) and **TPOT**, time per output token (how fast it streamed). Here TPOT is 25 ms, which is 40 tokens per second: faster than anyone reads.
+  </Step>
+</Scrolly>
+
+<Callout type="recap">
+  A chat request is: **network → tokenize → queue → prefill (compute-heavy, whole prompt at once) → decode (memory-heavy, one token at a time) → stream back**. Every lesson in this course zooms into one of those blocks.
+</Callout>
+
+## Training vs inference
+
+A language model has a life in two very different parts.
+
+**Training** is how the model is made. Engineers show it trillions of words and slowly adjust billions of internal numbers, called <Term t="weights">weights</Term>, until it gets good at predicting the next word. Training a frontier model takes thousands of GPUs for months. It happens once per model version.
+
+**Inference** is *using* the finished model: feeding it a prompt and getting an answer. The weights are frozen; nothing is learned. It happens every time anyone, anywhere, sends a message: billions of times a day.
+
+<Callout type="intuition">
+  Training is writing the cookbook. Inference is cooking from it, for every customer, all day, as fast and cheaply as possible, without burning anything. Training is a project. Inference is a restaurant.
+</Callout>
+
+Because inference runs constantly, **most of the money spent on AI hardware goes to inference**, not training. Every millisecond and every byte saved is multiplied by billions of requests. That is why inference engineering is its own job.
+
+## Why the answer streams word by word
+
+It is not a user-interface trick. The model genuinely *cannot* produce the second word until it has produced the first, because the second word depends on the first.
+
+A language model is a function that answers exactly one question: *"Given all the text so far, what is the most likely next token?"* To write a sentence, you call it again and again:
+
+1. Prompt → model → *"It"*
+2. Prompt + *"It"* → model → *"stores"*
+3. Prompt + *"It stores"* → model → *"each"*
+4. …and so on until it outputs an *end* token.
+
+This loop is called <Term t="autoregressive">autoregressive</Term> generation. Its sequential, one-step-at-a-time nature is the single biggest constraint in the field. A huge amount of clever engineering (batching, KV caching, speculative decoding) exists to work around it.
+
+## Why prefill and decode feel so different
+
+Look back at the trace. Prefill handled **8 tokens in 120 ms**. Decode needed **25 ms for each single token**. Per token, prefill was almost twice as fast. Why?
+
+Here is the short version. We will derive it properly in Module 2 and Module 5.
+
+- A GPU has two speed limits: how fast it can do **math**, and how fast it can **read numbers from its memory**.
+- Every step, prefill or decode, has to read the model's billions of weights from memory.
+- **Prefill** uses each weight it reads for *all 8 tokens at once*. Lots of math per byte read. It is limited by math speed: <span class="ink k-compute">compute-bound</span>.
+- **Decode** reads all those weights to process *one* token. Very little math per byte read. It is limited by memory speed: <span class="ink k-memory">memory-bound</span>.
+
+<Callout type="mentor">
+  If you remember one thing from this lesson, make it this. **Decode is memory-bound: it spends its time reading weights, not doing math.** The obvious fix, doing more useful work per byte read by serving many users in the same step, is called *batching*. It is the foundation of every serving engine you will study.
+</Callout>
+
+## A map of what you will learn
+
+Each part of the trace you just watched becomes a part of the course:
+
+| In the trace | What you will learn | Where |
+|---|---|---|
+| Tokens, weights, "what comes next" | How a transformer turns numbers into a next-token guess | Module 3 |
+| The GPU row | What is inside a GPU, and its two speed limits | Module 2 |
+| Prefill and decode, the KV cache | Why they differ, and all the memory math | Module 5 |
+| TTFT, TPOT | How to measure a system honestly | Module 6 |
+| The queue, other users | Batching and scheduling many requests at once | Modules 7 to 9 |
+| The whole thing, sped up | Quantization, kernels, FlashAttention, speculative decoding | Modules 10 to 17 |
+| More GPUs, more users | Multi-GPU, production, cost | Modules 18 to 25 |
+
+You do not need to understand any of it yet. You just need the map in your head, so that every new idea has a place to land.
+
+<KeyNotes>
+  1. **Inference** means running an already-trained model. The weights are fixed. It runs billions of times a day, so it is where most AI compute and money goes.
+  2. A chat request goes: network → tokenize → queue → **prefill** → **decode** loop → stream back.
+  3. Models read and write **tokens** (word pieces) as integer IDs, never raw text.
+  4. Generation is **autoregressive**: one token at a time, each depending on all previous ones. That is why answers stream.
+  5. **Prefill** processes the whole prompt at once and is compute-bound. **Decode** produces one token per step and is memory-bound: each step reads the whole model to make one token.
+  6. The **KV cache** stores a summary of every token seen so far so it is never recomputed. It grows by one entry per token.
+  7. Users feel **TTFT** (time to first token) and **TPOT** (time per output token).
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Which of these is inference, not training?', options: ['Adjusting a model’s weights using a large dataset', 'A chatbot answering your question', 'Fine-tuning a model on your company’s documents', 'Computing gradients to reduce the loss'], answer: 1, why: 'Inference is running a trained model with frozen weights. Everything else on the list changes the weights, which is training.' },
+  { q: 'Why does a chatbot’s answer appear word by word?', options: ['To make it feel more human', 'The network is slow', 'Each token depends on the previous ones, so tokens are generated one after another', 'The GPU can only store one word at a time'], answer: 2, why: 'Generation is autoregressive: the model predicts one next token, appends it, and runs again. The UI simply shows each token as soon as it exists.' },
+  { q: 'In the trace, prefill was drawn amber (compute) and decode blue (memory). What does that tell you?', options: ['Prefill runs on the CPU and decode on the GPU', 'Prefill is limited by math speed; decode is limited by how fast weights can be read from memory', 'Decode uses less memory than prefill', 'Prefill is slower per token than decode'], answer: 1, why: 'Prefill reuses each weight for many prompt tokens (lots of math per byte), while decode reads every weight to produce one token (little math per byte), so memory bandwidth is its bottleneck.' },
+  { q: 'A request’s first token arrives 230 ms after pressing Enter, then tokens arrive every 25 ms. How many tokens per second does the user see while it streams?', numeric: true, answer: 40, tolerance: 0.5, unit: 'tokens/s', why: '1 token every 25 ms means 1000 / 25 = 40 tokens per second. That is TPOT expressed as a rate.' },
+  { q: 'What does the KV cache do?', options: ['Caches whole answers so repeated questions are instant', 'Stores a summary (keys and values) of every token processed so far, so the model never recomputes them', 'Stores the model weights on disk', 'Compresses the prompt'], answer: 1, why: 'It remembers per-token keys and values from attention. Without it, every decode step would reprocess the whole text from scratch. Module 5 builds one.' },
+]} />

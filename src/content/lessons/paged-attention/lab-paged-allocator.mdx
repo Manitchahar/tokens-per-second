@@ -1,0 +1,172 @@
+---
+title: 'Visual lab: Build a paged KV allocator'
+summary: 'Write the allocator yourself. The in-browser simulator runs a real paged allocator beside a contiguous one on the same workload, and the Colab notebook has you implement both, measure the fragmentation, share prefixes with a real prefix tree, and run a working paged attention kernel on the GPU.'
+objectives:
+  - Implement a paged KV cache with a free list and per-request block tables
+  - Measure external fragmentation of a contiguous allocator and tail waste of a paged one
+  - Build a prefix tree and measure the memory a shared system prompt saves
+  - Count the exact bytes copy-on-write copies, and show why it is worth it
+  - Verify a paged attention kernel matches the naive one, and price the gather
+colab: 08-paged-allocator.ipynb
+---
+import PagedAllocatorLab from '@/components/viz/paged-attention/PagedAllocatorLab.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Everything so far has been argument and arithmetic. This lab is where you make the allocator with your own hands — first as a live simulator you can poke at, then as real Python in a notebook that measures the difference on a real GPU.
+
+Two halves, do both. The simulator takes ten minutes and builds the intuition. The notebook takes an hour and gives you the numbers.
+
+<Colab nb="08-paged-allocator.ipynb" />
+
+## Half one: the simulator
+
+Eight requests are decoding. Below, two allocators serve the identical workload side by side: the **contiguous** one reserves `max_len` tokens per request up front (the red bar), and the **paged** one holds only whole blocks that are actually in use (the blue bar).
+
+The "Decode steps run" slider is the clock. Slide it and watch the two bars separate. Then change `max_len` and see the red bar shrink — that is the entire benefit of the setting, and also the reason it is a trade rather than a free win.
+
+<Scrolly>
+  <PagedAllocatorLab client:visible slot="stage" />
+
+  <Step title="1. Start: eight requests, one pool">
+    64 blocks of 16 tokens each. Every request has prefilled 32 tokens and now holds two whole blocks. The pool is shared, and no request knows where any other one's data lives.
+  </Step>
+
+  <Step title="2. Grow them one token at a time">
+    Each decode step adds one token to one request. When a request crosses a block boundary, it pops exactly one new block id from the free list. **Nothing is copied.**
+  </Step>
+
+  <Step title="3. Watch the two allocators diverge">
+    The red bar grows in 2048-token steps: every live request is paying for its whole ceiling. The blue bar creeps. Early on they look similar; by step 400 the gap is enormous.
+  </Step>
+
+  <Step title="4. Try a smaller max_len">
+    Halve `max_len` and the red bar halves with it. Notice also that the **blue bar does not move at all** — paged memory is indifferent to `max_len`, because it never reserves.
+  </Step>
+
+  <Step title="5. Try a bigger block">
+    Raise the block size and the blue bar thickens slightly. That is tail waste: every request holds an empty stretch at the end of its last block.
+  </Step>
+
+  <Step title="6. Your turn">
+    Find the block size where tail waste starts to matter, then find the `max_len` a contiguous allocator would need to hold the same live set. The gap between them is what paging bought.
+  </Step>
+</Scrolly>
+
+**Check yourself before the notebook.** Answer these without the page:
+
+1. At step 0, why are the two bars the same height even though the allocators are completely different?
+2. Which bar grows in steps? Why is one of them a step function?
+3. If you set `max_len` to its maximum, roughly how many times more memory does the contiguous allocator reserve than the paged one needs?
+4. Why does the paged bar not move when you change `max_len`?
+
+## Half two: the notebook
+
+<Callout type="try" title="Setup (3 minutes)">
+  Open the notebook above in Colab, choose **Runtime → Change runtime type → T4 GPU**, and run the cells top to bottom with <kbd>Shift</kbd>+<kbd>Enter</kbd>. It downloads Qwen2.5-0.5B-Instruct (about 1 GB) in section 8, so the first eight sections run offline.
+</Callout>
+
+### 1. The number the whole module is about
+
+Section 1 prints KV bytes per token for a small Llama-shaped model and, next to it, the Llama-3.1-8B figure you derived by hand: **131,072 bytes per token**. Everything else in the notebook is arithmetic on that constant.
+
+If you get only one number out of this lab, get that one. It is the constant behind every capacity decision you will ever make, and it takes three lines to compute from a model config.
+
+### 2. Watch a contiguous cache fragment
+
+Section 2 runs 300 requests through a naive contiguous allocator and reports the free memory at the end. The line to read is the **largest single free run** versus the **total free**. The gap between them is external fragmentation, measured on your own code rather than quoted.
+
+Predict the numbers before you run it. If you cannot predict them, that is the most valuable thing the section will teach you.
+
+### 3. Build the paged allocator, and sweep the block size
+
+Section 3 is the allocator: a free list, a block table per request, and a `grow()` that appends one id. Then it sweeps block sizes 8, 16, 32 and 64 and prints tail waste as a percentage of the pool.
+
+**What to expect.** Tail waste well under 1% at block size 16, and — the important one — **zero external fragmentation at every block size**, because the free-block count is exactly `num_blocks − sum(len(table))`.
+
+### 4. Prove growth is free
+
+Section 4 times 1,000 one-token growth steps for both designs. The paged version is a list pop; the contiguous version occasionally reallocates and copies. Compare the two numbers and note the ratio.
+
+### 5. Build a real prefix tree
+
+Section 5 implements `PrefixTree`, the radix tree SGLang uses: an edge means "this block continues that block", so walking down while token blocks match gives the longest shared prefix for free.
+
+It then sends three requests sharing a 160-token system prompt and prints how many blocks each one reused. The saving is roughly 60% at three requests — and it rises with concurrency, because the shared prefix is a constant.
+
+### 6. Count the bytes copy-on-write copies
+
+Section 6 instruments the copy-on-write path and reports bytes copied versus bytes that separate storage would have needed. Expect the ratio to be large: 24 requests sharing a prefix copy 24 blocks total, versus 24 × 160 tokens stored separately.
+
+### 7. A paged attention kernel that is correct
+
+Section 7 is the one to slow down for. It scatters a real KV tensor into scattered blocks, then computes attention two ways — once contiguously, once through the block table — and checks they match.
+
+**Expected output:** a maximum absolute difference around 1e-2 or below (BF16 has three decimal digits; this is rounding, not error), and `identical: True`.
+
+Then it times both. The paged version pays one gather per call. The `overhead` line is the honest price of PagedAttention, measured rather than asserted, and you should sanity-check it against the theory: at 256 tokens of context the KV is only 512 KB, so the gather is latency-bound, not bandwidth-bound, and the ratio looks worse than it will at realistic context lengths.
+
+### 8. The real model
+
+Section 8 loads **Qwen2.5-0.5B-Instruct** and reads the actual KV cache out of the model after a generation. It prints the predicted bytes per token and the actual tensor size, and tells you the percentage difference.
+
+**Expected:** under 1% difference. If you see more than a few percent, check `num_key_value_heads` — it is the field people forget, and it is why GQA models have such small KV caches.
+
+### 9. Capacity, projected
+
+Section 9 uses your measured free memory to answer the question from the first lesson: how many concurrent requests fit? Then it repeats the projection for a contiguous allocator at `max_model_len = 32768` and prints the ratio.
+
+This is the number that decides how much a GPU costs per token, and you now have a way to derive it yourself for any model on any card.
+
+### 10. When it goes wrong
+
+The allocator works until something subtle breaks it. Four failure modes worth being able to recognise, all of which you can now reason about from the lessons:
+
+**Shared block written without a copy.** The classic. Symptom: outputs from different requests bleed into each other, and it only appears under concurrent load, never in a single-request test. Cause: missing refcount check on the write path.
+
+**Block table reused after free.** A block goes back on the free list and is handed to a new request while an old block table still points at it. Symptom: correct answers for a few requests, then corrupted output. Cause: forgetting that `free()` must clear every table that referenced it, not just the owner's.
+
+**Block size mismatch between layers.** Every layer must use the same block table. If one layer's cache is allocated with a different block size, that layer reads the wrong tokens. Symptom: output that is nearly right but subtly wrong, which is much worse than an outright crash because it passes casual checks.
+
+**Pool sized from the wrong constant.** The failure here is silent and expensive: the engine starts fine and collapses under load. Symptom: preemption or OOM at a concurrency far below what you predicted. Cause: KV bytes per token computed from query heads instead of KV heads.
+
+<Callout type="mentor" title="The testing lesson underneath this lab">
+  Every one of those four bugs passes a single-request test and fails under concurrency. That is not bad luck — it is the general shape of distributed-systems bugs, and it is why Module 06 insisted on reproducible workloads and percentiles.
+
+  When you test a serving system, the two things that matter are: **make it fail on purpose**, and **assert on the output, not just on the absence of a crash**. Section 7's `allclose` check is the model for the second.
+</Callout>
+
+## Check yourself
+
+Answer these in your notes, with the arithmetic shown.
+
+1. Why does tail waste grow as block size grows, and why does it cap out at a small fraction of the pool rather than becoming a problem?
+2. In section 6, why is the copy-on-write byte count independent of how many requests share the prefix?
+3. Section 7 reports an overhead percentage. Predict what it does at 8,192 tokens of context instead of 256, and say why.
+4. From section 9, what is the one number you would change to double the concurrent request count?
+
+**Answers, once you have done the work:**
+
+1. Tail waste is `block_size − (tokens mod block_size)`, so it is bounded by `block_size − 1` per request. It stays a small fraction of the pool because it applies *per request*, and the pool holds many requests. At $B = 64$ and 400 requests it is under 1% of the whole pool.
+2. Because only the *divergence* block is ever copied, and there is exactly one divergence block per shared prefix. Adding requests adds a reference count, not a copy.
+3. The overhead percentage **falls**. At 256 tokens the gather is latency-bound, not bandwidth-bound; at 8,192 tokens the same fixed kernel-launch cost is amortised over 32× more bytes, so it approaches the bandwidth-bound figure of roughly 1%.
+4. Reduce **average context length per request** — in practice by shortening system prompts, using prefix caching (Module 10), or lowering `max_model_len`. Concurrency is pool tokens divided by tokens per request, so halving the denominator doubles it.
+
+<KeyNotes>
+  1. A paged KV cache is three operations: `pop` to grow, `append` to free, `copy` to write into a shared block. There is no `realloc`.
+  2. Internal fragmentation is bounded by `block_size − 1` tokens per request. External fragmentation is **zero** by construction.
+  3. The block table costs a few hundred bytes to a couple of kilobytes per request against megabytes of KV, so block size is chosen to limit tail waste, not to shorten the table.
+  4. Prefix sharing is where the largest win is: a constant 900-token system prompt costs about 118 MB once regardless of concurrency, versus 3.77 GB for 32 separate copies.
+  5. Copy-on-write copies only at divergence. Sharing and reading never copy.
+  6. A paged attention kernel must produce **bit-comparable output** to the contiguous one. If `torch.allclose` fails in section 7, you have a block-table bug, not a precision issue.
+  7. The gather is the price of paging and it is real, but it is small: about 1% of HBM bandwidth at realistic context lengths.
+  8. From one real measurement — KV bytes per token for a real model, and your free GPU memory — you can predict the concurrency of any configuration. That is the number that decides cost per token.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A pool has 64 blocks of 16 tokens. Eight requests are each holding 32 tokens. How many tokens of the pool are committed?', numeric: true, answer: 128, tolerance: 0, unit: 'tokens', why: '32 tokens is exactly two blocks, so eight requests commit 16 blocks = 128 tokens of the 1,024-token pool.' },
+  { q: 'In a paged allocator, growing a request past its last block costs how many bytes of copying?', numeric: true, answer: 0, tolerance: 0, unit: 'bytes', why: 'The engine pops a free block id and appends it to the block table. Blocks were never individually allocated, so nothing has to move.' },
+  { q: 'A contiguous allocator reserves max_len = 4096 per request and the average request ends at 800 tokens. What fraction of the reservation is wasted?', numeric: true, answer: 80, tolerance: 5, unit: '%', why: 'Waste = 1 − 800/4096 = 1 − 0.195 ≈ 80.5%. This is what the red bar in the simulator is showing.' },
+  { q: 'Two requests share a 320-token prefix with a block size of 16. How many blocks must the second request copy under copy-on-write?', numeric: true, answer: 0, tolerance: 0, unit: 'blocks', why: 'Sharing itself copies nothing. A copy happens only when the second request needs to WRITE past a shared block; if its own tokens continue the prefix, no copy is needed at all.' },
+  { q: 'Why does a paged attention kernel still hit a fast path after its KV cache is scattered?', options: ['The GPU caches scattered reads automatically', 'Every block has the same fixed shape, so one gather makes it a normal tensor', 'The block table is copied into the weights', 'Attention is compute-bound anyway'], answer: 1, why: 'Uniform block shape is the whole point. The gather produces a contiguous SRAM tensor and the inner loop is unchanged, so paging costs one copy rather than a slow kernel.' },
+  { q: 'Your pool holds 305,000 tokens. At 8,192 tokens of context per request, roughly how many concurrent requests fit?', numeric: true, answer: 37, tolerance: 3, unit: 'requests', why: '305,000 ÷ 8,192 ≈ 37. This is the number that decides cost per token: it is capacity, and capacity is money.' },
+]} />

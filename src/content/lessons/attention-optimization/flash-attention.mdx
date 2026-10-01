@@ -1,0 +1,247 @@
+---
+title: 'FlashAttention, step by step'
+summary: 'Turn the online softmax into an actual GPU kernel: tile the query and key matrices, keep every intermediate in on-chip SRAM, and get an exact attention that reads memory O(T) times instead of O(T²).'
+objectives:
+  - Describe what one FlashAttention program instance owns and keeps in SRAM for its whole lifetime
+  - Write the forward pass as a loop over key tiles with the online update inside
+  - Compute the memory saving and arithmetic saving of fusion for a real model and context length
+  - Explain why the causal mask is a pure win and how much it saves at your context length
+  - State what the backward pass costs and why it is harder than the forward
+collab: 14-attention-backends.ipynb
+---
+import FlashAttention from '@/components/viz/attention-optimization/FlashAttention.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson gave you a streaming softmax. This one gives you a kernel: the loop, the tile sizes, the mask, and the reason the whole thing turned out to be *exact* rather than approximate.
+
+FlashAttention is the technique every production inference stack uses for prefill. Its name is not decoration — it is the name of the paper, and the "flash" is about memory access, not speed.
+
+## The one-sentence idea
+
+> Split Q and K into tiles, and for each pair of tiles compute the scores **on chip**, combine them into a running softmax, and throw the tile away.
+
+Everything else in this lesson is detail on that sentence.
+
+## The shape of the kernel
+
+A CUDA block (or a Triton program) takes responsibility for **one tile of query rows** — typically $B_r = 64$ or 128 — and it keeps those rows for the entire kernel. Here is the loop, in pseudocode, before any hardware:
+
+```python
+# FlashAttention forward, for ONE (program, head) pair.
+# Q: [Br, d] this program's query tile.  K, V: [T, d] the full keys and values.
+m = full((Br,), -inf)        # running max
+l = zeros((Br,))            # running sum
+O = zeros((Br, d))          # running output
+
+load Q_tile into SRAM       # Br x d: 16 KB for Br=64, d=128. Stays forever.
+
+for j in range(0, T, Bc):   # loop over key tiles
+    K_tile = load K[j:j+Bc, :]        # Bc x d: 16 KB
+    V_tile = load V[j:j+Bc, :]        # Bc x d: 16 KB
+    S      = Q_tile @ K_tile.T / √d   # Br x Bc: computed in SRAM, never stored
+    S      = causal_mask(S, rows=j)   # mask the part that looks into the future
+    m, l, O = online_update(m, l, O, S, V_tile)   # the previous lesson's merge
+
+O = O / l[:, None]           # one division, at the very end
+store O                      # Br x d back to HBM
+```
+
+Notice how little is in there. There is no `torch.empty` for the scores. There is no call to `softmax`. The tile `S` exists only in the expression that consumes it.
+
+<Scrolly>
+  <FlashAttention client:visible slot="stage" />
+
+  <Step title="1. One query tile, start to finish">
+    The program owns 64 query rows and keeps them for its whole life. This ownership is what makes fusion possible: the same data is in SRAM at the start and still there at the end, so nothing has to be re-read.
+  </Step>
+
+  <Step title="2. Load Q into SRAM">
+    The query tile is 64 × 128 numbers — **16 KB**. It sits in on-chip shared memory (or registers) for the whole loop. This is the only data that lives across iterations, and it is the reason the kernel is fast rather than merely correct.
+  </Step>
+
+  <Step title="3. Load a K tile, compute S">
+    A 64 × 64 key tile arrives and one matmul produces a 64 × 64 score tile, 8 KB, **entirely in SRAM**. This is the tensor eager attention wrote to HBM four times. Here it is computed and consumed without ever leaving the chip.
+  </Step>
+
+  <Step title="4. Online softmax updates m, ℓ, O">
+    The merge from the last lesson folds this tile in: rescale the old state by $e^{m - m_{\text{new}}}$, add the tile's contribution, rebase to the new maximum. Three vectors, updated in place.
+  </Step>
+
+  <Step title="5. Repeat for all key tiles">
+    The loop runs once per key tile — four times for 256 tokens, sixteen for 1,024. The final $O$ is **exactly** what a two-pass softmax gives, because the merge is associative. Nothing was approximated.
+  </Step>
+
+  <Step title="6. Divide once at the end">
+    After the last tile, $O \gets O/\ell$. One division, on a 64 × 128 tensor. Eager attention applied the same normalisation to a whole $T \times T$ matrix.
+  </Step>
+
+  <Step title="7. The causal mask skips tiles">
+    Because a token cannot see the future, query tile $i$ never needs key tile $j > i$. Those tiles are not loaded and not multiplied. Raise the key-tile count in the control and watch the skipped fraction grow — the mask is free speed.
+  </Step>
+
+  <Step title="8. Never write the intermediate">
+    At the end, the whole program's footprint is about **45 KB** — Q tile, one K/V tile, three state vectors. Set the control to 16 tiles and compare with the eager equivalent in the readout: gigabytes, for the same answer.
+  </Step>
+</Scrolly>
+
+## Why it is exact
+
+This deserves a paragraph because it is the part people doubt.
+
+A softmax over a full row is a function of all the scores. FlashAttention computes the same function but in a streaming order. Two facts make it identical:
+
+1. **The merge is associative.** We proved $\ell = \ell_1 e^{m_1-m} + \ell_2 e^{m_2-m}$ last lesson. Reassociate the tiles into any order and the answer is the same, because rescaling is the same operation throughout.
+2. **The final division is applied once.** The accumulator $O$ is a weighted sum of value rows with weights $e^{s_j - m}$, all relative to one consistent maximum. Dividing by $\ell = \sum_j e^{s_j-m}$ at the end produces exactly $\sum_j \operatorname{softmax}(s)_j v_j$.
+
+The only difference from eager attention is the **order of floating-point operations**, which is why FlashAttention output matches the naive version to within rounding — not bit-for-bit, but to within BF16 noise. The lab asserts that this difference is tiny.
+
+<Callout type="intuition" title="It is not an approximation; it is a reassociation">
+  Compare with the techniques that *do* approximate attention — sparse attention (dropping some connections), low-rank attention (replacing $S$ with a smaller matrix), and sliding-window attention (only looking nearby). All three change the model's output and can cost quality. FlashAttention changes nothing about which pairs of tokens interact. **Every token still attends to every earlier token.** It only changes the order in which the arithmetic happens. That distinction is the whole reason FlashAttention is uncontroversial and the others are research bets.
+</Callout>
+
+## The savings, in real numbers
+
+Two separate wins, and they grow at different rates.
+
+**Memory.** Peak extra memory per program is $O(B_r d + B_c d)$, independent of $T$:
+
+$$
+B_r d \cdot 2 + 2 B_c d \cdot 2 + 3 B_r d \cdot 4 \approx 45\ \text{KB} \text{ at } B_r = B_c = 64,\ d = 128
+$$
+
+The eager version needed $n_q \times 2 \times T^2 \times 2 = 2 \times 32 \times T^2 \times 2$ bytes for all heads. At $T = 4{,}096$ that is 2.15 GB. The fused version needs 45 KB. **The memory win is independent of context length** — it is a constant that never grows. That is why a 100,000-token prefill does not OOM.
+
+**Bandwidth (IO).** Eager moves $B_{\text{eager}} = 4 T^2 n_q b$ bytes; fused moves only $O, K, V$, which is $B_{\text{fused}} = 3 T n_q d b$. At $T = 4{,}096$, fused is faster because it does far less work per output number.
+
+<Callout type="math" title="Arithmetic intensity of fused attention, honestly">
+  Fused attention still touches all of K and V, so its bytes are $O(T)$ per head but its FLOPs are $O(T^2)$. So the *achieved* intensity of a fused kernel actually **improves** with $T$ — the opposite of the eager kernel, whose extra $O(T^2)$ traffic drags its intensity down.
+
+  This is the cleanest illustration in the course of the roofline's central lesson: **you do not make a memory-bound kernel faster by doing less math; you make it faster by moving fewer bytes per unit of math.** Fusion changes the second number without touching the first.
+</Callout>
+
+## The causal mask is a second, free win
+
+The mask says $s_{ij}$ is only needed for $i \ge j$. With square tiles of size $B$, query tile $i$ skips roughly half the key tiles on average. At $T = B \cdot n$:
+
+$$
+\text{tiles computed} = \frac{n(n+1)}{2}, \qquad \text{tiles in the full square} = n^2
+$$
+
+$$
+\text{fraction saved} = 1 - \frac{n(n+1)/2}{n^2} \approx \frac{1}{2} \quad \text{as } n \to \infty
+$$
+
+So a causal kernel does about **half** the FLOPs of a non-causal one, for free, simply by not loading and not multiplying the masked tiles. It is the single largest arithmetic saving in attention, and it is a correctness constraint you get paid for.
+
+<Callout type="real" title="What flash attention does not do">
+  The masked tiles are skipped, but they are still *allocated* conceptually as "no work" — attention remains $O(T^2)$ in the worst case. FlashAttention does not reduce the quadratic term in FLOPs; it reduces the **memory traffic** term and gives you the mask's constant-factor FLOP saving for free. Anyone claiming a kernel "makes attention linear" is describing sparse or sliding-window attention, a different technique with a different quality trade-off.
+</Callout>
+
+## The backward pass is the hard part
+
+Forward is one online softmax. Training (and any use that needs gradients, like speculative decoding's verification or RL rollouts) also needs the **backward pass** — and it is genuinely harder, for a structural reason.
+
+The forward pass computes $O$ from $S$ and $V$. The backward needs, for every input, how much $O$ would change:
+
+- Given $\delta O$ (the upstream gradient), recover $\delta V = P^\top \delta O$.
+- Recover $\delta P = \delta O\, V^\top$.
+- Then $\delta S$ from $\delta P$ through the softmax — and the softmax Jacobian depends on the full row.
+- And $\delta Q = \delta S\, K$, $\delta K = \delta S^\top Q$.
+
+The catch: $\delta S$ requires the *whole row* of scores, because softmax couples every entry. FlashAttention solves this by **recomputing** $S$ on the fly in the backward pass from the saved $Q$, $K$, $V$ and the two small state vectors $(m, \ell)$ — recomputation instead of storage. That is exactly the tradeoff Module 05's KV cache lesson made for the forward pass, and it is the same idea: *store the sufficient statistics, recompute the rest*.
+
+The two state vectors $m$ and $\ell$ are all that need to be kept between forward and backward: $B_r = 64$ numbers each per program. That is the whole memory cost of not storing $S$.
+
+<Callout type="pitfall" title="Why inference gets the easy half">
+  Pure inference — prefill and decode — never runs the backward pass. So **for a serving engine you only need the forward algorithm**, and the extra complexity of FlashAttention's backward is irrelevant to you. This is why you can understand and even reimplement forward FlashAttention without ever touching gradients. It is also why inference-focused attention kernels (FlashDecoding, paged attention, the ones vLLM ships) are much simpler than their training counterparts.
+</Callout>
+
+## Reading the numbers from your own GPU
+
+The lab makes you measure this, but here is what to expect so you can read your results. On a T4, eager vs fused, one layer, 32 heads, $d=128$:
+
+| $T$ | Eager (ms) | Fused (ms) | Speedup | Why |
+|---|---|---|---|---|
+| 512 | 4–6 | 2–3 | ~2× | both fit in cache; fusion saves launches |
+| 2,048 | 60–90 | 20–30 | ~3× | eager intermediate now exceeds cache |
+| 4,096 | 250–350 | 60–90 | ~3–4× | memory-bound; traffic is the wall |
+
+Two things to notice. The **absolute** win grows with $T$ (the quadratic intermediate is what hurts), but the **ratio** saturates around 3–4× because both versions still read all of $K$ and $V$ — fusion removes the intermediate, not the operands. And on a T4 the absolute times are large because its bandwidth is 320 GB/s versus an H100's 3.35 TB/s; the *ratio* is what transfers across hardware, not the milliseconds.
+
+## Write it yourself in Triton
+
+You already have the tools from Module 13. This is the forward kernel, close to what the real ones look like:
+
+```python
+import triton, torch, math
+
+@triton.jit
+def flash_fwd(Q, K, V, O, L,          # L will hold the final logsumexp, for the backward
+              stride_qm, stride_kn, stride_vn, stride_om,
+              T, BR: tl.constexpr, BC: tl.constexpr, D: tl.constexpr,
+              SCALE: tl.constexpr):
+    start_m = tl.program_id(0)
+    offs_m = start_m * BR + tl.arange(0, BR)
+    offs_d = tl.arange(0, D)
+
+    q = tl.load(Q + offs_m[:, None] * stride_qm + offs_d[None, :])   # [BR, D] stays in regs
+
+    m_i = tl.full([BR], -float("inf"), tl.float32)
+    l_i = tl.zeros([BR], tl.float32)
+    acc = tl.zeros([BR, D], tl.float32)
+
+    for start_n in range(0, T, BC):
+        offs_n = start_n + tl.arange(0, BC)
+        k = tl.load(K + offs_n[:, None] * stride_kn + offs_d[None, :])   # [BC, D]
+        v = tl.load(V + offs_n[:, None] * stride_vn + offs_d[None, :])
+
+        qk = tl.dot(q, tl.trans(k)) * SCALE                            # [BR, BC] in regs
+        qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, -float("inf"))  # causal mask
+
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        alpha = tl.exp(m_i - m_new)                                     # rescale old
+        p = tl.exp(qk - m_new[:, None])                                # tile, in regs
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)          # acc += P V
+        m_i = m_new
+
+    acc = acc / l_i[:, None]                                           # one division
+    tl.store(O + offs_m[:, None] * stride_om + offs_d[None, :], acc)
+    tl.store(L + offs_m, m_i + tl.log(l_i))                           # for the backward
+```
+
+The structure is exactly the pseudocode from earlier in the lesson. The magic is in what is **absent**: there is no `tl.store` of `qk` anywhere. `qk` lives in registers, dies at the end of the loop iteration, and is replaced. The online softmax lines are the merge from last lesson, unchanged.
+
+<Callout type="try" title="Make it yours">
+  Three experiments, in increasing order of difficulty: (1) remove the causal mask line and check that prefill still runs — you should see it compute future tokens it should not, which is why the mask matters. (2) change `BR` from 64 to 128 and time it; larger tiles mean fewer iterations and better tensor-core use, but more registers, and past a point the occupancy collapse makes it slower. (3) implement the backward inner loop that recomputes `qk` from the saved `L`. The lab does (1) and (2) for you and tells you what to look for.
+</Callout>
+
+## Where this leaves you
+
+You now have the most important optimization in LLM inference, derived from one observation and about thirty lines of code. It is exact, it never writes the quadratic tensor, and it makes long-context prefill memory-safe by construction.
+
+What it does **not** solve is decode. Decode is a completely different shape — one query row against a very long key sequence — and the tile loop above is the wrong shape for it: with a single query row you cannot fill a tensor core, so you get almost none of the compute benefit and the whole thing collapses to a memory-bandwidth problem. Decode attention is a different craft, with different kernels and different backends.
+
+That is the next lesson.
+
+<KeyNotes>
+  1. A FlashAttention program owns one tile of query rows ($B_r \approx 64$) and keeps it in SRAM for its entire life. That residency is what makes fusion possible.
+  2. The forward pass is a loop over key tiles: load $K_j$, compute $S_j = Q_j K_j^\top$ in SRAM, merge into $(m, \ell, O)$ with the online softmax, discard the tile.
+  3. It is **exact**, not approximate. The merge is associative and the division by $\ell$ happens once, so reassociating the arithmetic does not change the result — only the floating-point order.
+  4. Peak extra memory is $O(B_r d + B_c d) \approx 45$ KB per program, **independent of context length**. A 100,000-token prefill does not OOM because of it.
+  5. Bytes drop from $B_{\text{eager}} = 4T^2 n_q b$ to $B_{\text{fused}} = O(T n_q d b)$, while FLOPs stay $O(T^2)$. So fused attention's arithmetic intensity *improves* with context length — the roofline lesson made concrete.
+  6. The causal mask saves about half the FLOPs for free (triangular tiles), and is a correctness constraint you get paid for.
+  7. The backward pass needs $\delta S$, which requires the full score row, so it **recomputes** $S$ from $Q, K, V$ and the saved $(m, \ell)$ instead of storing it — the same store-the-statistics / recompute-the-rest trade as the KV cache.
+  8. Serving only needs the forward pass, which is why inference attention kernels are far simpler than training ones. Measured speedup over eager is ~2–4×, and the ratio saturates because fusion removes the intermediate, not the $K$/$V$ reads.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'In the FlashAttention forward pass, what is stored between loop iterations?', options: ['The full T x T score matrix', 'The query tile Q and the three state vectors m, ℓ, O', 'Only the current key tile', 'Nothing — the kernel is stateless'], answer: 1, why: 'The query tile and the running state persist. The score tile and the K/V tiles are recomputed or evicted each iteration and never written to HBM.' },
+  { q: 'With BR = BC = 64 and D = 128, how many key tiles does the causal loop iterate for a context of 1024 tokens, counting only the non-skipped tiles of query tile 0?', numeric: true, answer: 16, tolerance: 1, unit: 'tiles', why: 'A full context of 1024 tokens is 1024/64 = 16 key tiles. Query tile 0 can see all of them (it is the first block), so it runs 16 iterations.' },
+  { q: 'For a causal attention with square tiles over T tokens, what fraction of the full square FLOPs is actually computed (as the context gets large)?', options: ['About 25%', 'About 50%', 'About 75%', 'All of them'], answer: 1, why: 'Tiles computed = n(n+1)/2 of n² tiles, which tends to 1/2. The mask is a free constant-factor saving, and it grows with context.' },
+  { q: 'Why is FlashAttention exact while sparse attention is not?', options: ['FlashAttention uses lower precision', 'FlashAttention only reassociates the arithmetic; sparse attention drops connections the model was trained to use', 'FlashAttention runs in FP32', 'They are both exact'], answer: 1, why: 'Every token still attends to every earlier token. Fusion changes only the order of floating-point operations, which the associative merge makes equivalent. Sparse attention genuinely removes interactions, which is a model change.' },
+  { q: 'The backward pass cannot simply use the forward algorithm. Why does it need to recompute S from Q, K, V?', options: ['Because S was never saved, and recovering the softmax gradient needs the full score row', 'Because the forward pass lost the query tile', 'Because gradients must be computed in FP32 and S was BF16', 'Because K and V are freed after the forward pass'], answer: 0, why: 'The softmax Jacobian couples every entry in a row, so δS cannot be produced from the output and the three state vectors alone. FlashAttention recomputes S rather than store it, keeping only (m, ℓ) between passes.' },
+  { q: 'A fused kernel uses BR = 64 and BC = 64 with head dimension 128 in BF16. Its score tile is how many bytes?', numeric: true, answer: 8192, tolerance: 100, unit: 'bytes', why: 'BR × BC × 2 bytes = 64 × 64 × 2 = 8,192 bytes. That is the entire size of a score tile — and it never leaves SRAM, which is why the peak does not grow with context length.' },
+  { q: 'A fused attention kernel reads K and V (order T) and writes O (order T), but does order T² FLOPs. What happens to its arithmetic intensity as T grows?', options: ['It falls, like eager attention', 'It rises, because bytes are order T but FLOPs are order T²', 'It stays constant', 'It becomes zero'], answer: 1, why: 'Intensity = FLOPs/bytes = T²/T = T. Fused attention gets *more* compute-dense as context grows, which is why fusion is a pure win at long context and why the eager kernel\'s O(T²) traffic is what made it look memory-bound.' },
+]} />

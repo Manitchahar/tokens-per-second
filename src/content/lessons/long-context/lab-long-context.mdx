@@ -1,0 +1,161 @@
+---
+title: 'Lab: Push context beyond GPU memory'
+summary: 'Take one card and one model, and find out how much context you can actually serve. You will measure real KV bytes on real hardware, confirm the three walls, build a CPU-offloaded cache by hand, and end with a number you can defend: the maximum context at your concurrency target, per tier.'
+objectives:
+  - Measure real KV bytes per token on your own GPU and reconcile them with the formula
+  - Reproduce all three walls of long context with measured rather than assumed constants
+  - Measure the host-DRAM copy bandwidth your machine actually achieves
+  - Build a working CPU-offloaded KV cache and verify it against a resident one
+  - 'Produce the deliverable: a maximum-context table per tier at a stated concurrency'
+colab: 20-long-context.ipynb
+---
+import TierBudgetLab from '@/components/viz/long-context/TierBudgetLab.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+This is the lab for the module, and it has a slightly different shape from the others. The earlier labs asked you to measure a thing. This one asks you to **produce a number someone will make a purchasing decision on**: how much context can this service actually serve, on this hardware, at this concurrency, for this price.
+
+You get a real GPU, a small model, and a set of claims from the last two lessons that were all computed on paper. The job is to check every claim against hardware, then extend the system past the point where the paper said it had to fail.
+
+Use the notebook below. It runs top to bottom on a free Colab **T4 (16 GB)**, and every section prints the number you should expect to see.
+
+<Colab nb="20-long-context.ipynb" />
+
+## Before you start
+
+The notebook uses **Qwen2.5-0.5B-Instruct**: 0.49 B parameters, 24 layers, 2 key/value heads, head dimension 64. Its KV cache is **12,288 bytes per token** — a tenth of Llama-3.1-8B's — which is exactly why it fits a T4 and lets you sweep context lengths that would be impossible with an 8B model.
+
+One honest caveat before you start, because it will otherwise confuse you: **the T4 is small in every direction.** 16 GB of memory and 320 GB/s of bandwidth. The context lengths that break an H200 will sail past it. So measure the *shapes* and the *ratios*, and carry those to the real hardware rather than the absolute numbers. Where a claim cannot be tested at all on a T4, the notebook says so and gives you the arithmetic to do it by hand instead.
+
+<Wide>
+  <TierBudgetLab client:visible />
+</Wide>
+
+The simulator above is the planning tool: drag the context and the resident window, pick a tier, and read the three panels. The top is how the card's KV budget splits between what stays resident and what is streamed. The middle is what streaming costs you in per-user speed. The bottom is the frontier — how many conversations of this length actually fit. **Fill in the lab below, then check your reasoning against it.**
+
+## Task 1 · Measure the KV cache, do not trust the formula
+
+Walk the returned cache object and add up its tensors. Compare against $b_{kv} = 2 L H_{kv} D b$.
+
+**Expected:** exactly 12,288 bytes per token. The formula from Module 05 is not approximate — it is a count of numbers — so any disagreement means a layout surprise, usually an extra dimension or a non-contiguous view.
+
+**Also measure** the memory manager's report with and without a cache, and record the delta. That delta is the number your capacity plan needs, and it includes things the formula does not: alignment padding, and any scratch the attention kernel allocates.
+
+## Task 2 · Confirm wall one: the memory cliff
+
+Compute $N_{\max}$ from your measured budget, then prove it: allocate that many cache slots, then one more.
+
+**Expected:** the prediction and the allocation agree to within a few percent. The gap is the workspace reserve you did not model, which is exactly why you keep headroom.
+
+**Then push it:** raise the context until the prediction reaches zero and find where the allocation actually fails. That gap is the honest cost of the workspace on your machine.
+
+## Task 3 · Confirm wall three: the decode tax
+
+Build a cache of increasing length and time one decode step against it. Print the bytes next to the time.
+
+**Expected:** roughly linear in cache size, with a slope implying a fraction of the T4's 320 GB/s. Flat when the cache is small — then the 1 GB of weights dominates and the cache is invisible — and climbing once the cache is bigger than that.
+
+**How to read it:** fit a line. The slope is bytes per second and the intercept is the weight read. On a small model the intercept dominates for a long time, which is the honest answer to "does long context matter for a 0.5B model": in bandwidth terms, barely; in memory terms, sooner than you would think.
+
+## Task 4 · Time prefill, and find your own wall two
+
+Time prefill at 512, 2,048, 8,192 and 16,384 tokens. Plot time against tokens.
+
+**Expected:** close to linear at these lengths, because $n^* = P/(2dL) \approx 11{,}400$ tokens puts the quadratic term behind you for most of the sweep. Sweep to 32K if memory allows and you will see the curve start to bend.
+
+**How to read it:** fit time against $n$ and against $n^2$ separately. Whichever fits better tells you which side of your model's wall you are on. This is wall two, measured rather than quoted.
+
+## Task 5 · Measure your host tier
+
+The lesson's claim is that PCIe beats recomputation. Measure it.
+
+The notebook times a pinned H2D copy at several sizes, and the same copy with `pin_memory=False`.
+
+**Expected:** pinned sustained bandwidth in the low single-digit GB/s range over Colab's path, and **unpinned dramatically worse** — often by 3–10×. The pinned path can saturate; the pageable path goes through a driver staging buffer.
+
+**This is the single most important measurement in the lab**, because it decides whether a CPU tier is viable at all. If your machine's measured bandwidth is below the recompute crossover — $b_{kv} / t_{\text{recompute}}$, which you compute from your model — then offloading to the CPU loses to recomputing, and you have learned something worth a lot.
+
+## Task 6 · Build the offloaded cache by hand
+
+Now build the thing. A small class that keeps the most recent `R` tokens' KV in GPU memory and holds the rest in pinned host memory, fetching the tail on each step.
+
+**Expected:** it works, and it works on the first try less often than you would hope. The bugs that bite:
+
+- a pageable host tensor, silently capping your bandwidth;
+- forgetting `torch.cuda.synchronize()` before timing, so you measure the launch and not the copy;
+- a stale pointer: reusing the pinned buffer while the previous step is still reading it.
+
+**Verify correctness, not just speed.** Run the same prompt through (a) fully resident and (b) offloaded with `R = T`, so nothing is actually streamed. The logits should agree to floating-point noise. Then try `R < T` and expect *approximate* agreement at best — attention genuinely sees less of the cache, so the answers differ, and knowing by how much is part of the exercise.
+
+## Task 7 · Find the resident window
+
+Sweep `R` and measure per-token latency for a fixed long context.
+
+**Expected:** latency is flat and good until the streamed tail exceeds the per-step budget, then it rises roughly in proportion to bytes fetched. There is a knee, and where it sits is a direct consequence of Task 5's bandwidth and the step time from Task 3.
+
+**How to read it:** convert the knee into a maximum streamable byte count and then into a maximum context. That is the number the deliverable needs.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. From Task 5, what is your machine's achieved host bandwidth, and what does the recompute crossover predict for your model? Is CPU offloading worth it here?
+  2. From Task 3, at what context length does your cache read exceed your weight read? Compare that with $P b / b_{kv}$ from the lesson — why are they close but not identical?
+  3. Your KV budget is 12 GB. At 32K tokens and a 12 KB per-token cache, how many conversations fit? Now at 8K?
+  4. Task 6 gave you approximate rather than exact answers at `R < T`. Whose fault is that — the transfer, or the model? What would you have to do to get exact answers anyway?
+  5. If you halve the cache to FP8, which of your numbers from Tasks 2 through 7 change, and by how much?
+</Callout>
+
+## Task 8 · Produce the deliverable
+
+A one-page **capacity report** for a service you will actually defend. It must contain:
+
+- the model, GPU and measured constants you are using — bytes per token, achieved host bandwidth, weight read time, crossover bandwidth;
+- a **maximum-context table**: for each of resident-only, host-DRAM offload, and NVMe, the maximum context per conversation that supports your concurrency target (pick 32 and state it);
+- the resident window `R` you would set for each, with the arithmetic that produced it;
+- the per-user token rate at that configuration, and the latency it costs;
+- one sentence on what you would do if the answer is "none of these", which is a legitimate result;
+- the number you would alert on in production, and its threshold.
+
+<Callout type="mentor" title="What a strong report concludes">
+  The table is the easy part. The sentence that matters is the last one, and it should look like: *at 32 concurrent conversations on one T4 with Qwen2.5-0.5B, the maximum context is N tokens with a resident window of R; past that the streamed tail exceeds the per-step budget and per-user rate falls below 10 tokens per second; we alert on streamed bytes per step at 80% of budget.*
+
+  Anyone can quote a context length. An engineer says what it costs, what breaks first, and what number pages them.
+</Callout>
+
+## If you have a bigger GPU
+
+On an 80 GB card with Llama-3.1-8B, repeat Task 5 and Task 7 and check three predictions from the lesson:
+
+1. The streaming budget is **330 MB per step** (55 GB/s × 6.0 ms of weight read).
+2. PCIe at 55 GB/s is **far** above the 4.4 GB/s recompute crossover, so offload wins.
+3. A 32,768-token cache at batch 8 is 34 GB, which **blows the budget by 100×** — so a resident window is mandatory, not an optimization.
+
+And with vLLM:
+
+```bash
+# CPU-offloaded KV cache on a real engine
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --max-model-len 32768 \
+  --cpu-offload-gb 8 \
+  --swap-space 16 \
+  --disable-log-requests
+```
+
+Sweep `--max-model-len` and watch the startup log report how many KV blocks it could allocate. That log line *is* $N_{\max}$ from Task 2, computed the same way you computed it by hand. Compare them.
+
+<KeyNotes>
+  1. Measure bytes per token before trusting any formula. The formula is a count of numbers, so a disagreement is a layout bug, not an approximation error.
+  2. On a small model, the weight read dominates the decode step for a long time. Long context is a memory problem long before it is a bandwidth problem.
+  3. Your model's prefill wall is $P/(2dL)$. Small models hit it early — about 11,400 tokens for Qwen2.5-0.5B — so long prompts are more quadratic than you would expect.
+  4. **Pinned versus pageable host memory is the measurement that decides everything.** Pageable copies go through a staging buffer and lose 3–10×. This one flag is the difference between a working CPU tier and a useless one.
+  5. Compute the recompute crossover for your own model and your own measured bandwidth. If the host tier loses, recompute instead — and that is a good outcome to have discovered.
+  6. An offloaded cache with `R < T` gives *approximate* answers, not slow exact ones. Truncating attention is a quality decision; say so explicitly.
+  7. Verify offloading for correctness before speed: with `R = T` the logits must match the resident path to floating-point noise.
+  8. Convert your latency knee into a **byte budget**, then into a maximum context. That conversion is the actual skill.
+  9. Deliver the number with its cost attached. "32K context at 32 concurrency" is half a sentence; the resident window, the token rate and the alert threshold are the rest.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'On your machine, an unpinned host-to-device copy measures 1.2 GB/s and a pinned one measures 4.8 GB/s. What does the pinned number tell you about whether CPU offload is viable?', options: ['Nothing — offloading is decided by capacity, not bandwidth', 'Pinned at 4.8 GB/s it is just above the recompute crossover for a 0.5B model, so offloading wins but only narrowly, while unpinned at 1.2 GB/s loses', 'Pinned copies are always twice as fast, so use 9.6 GB/s in planning', 'The GPU can compute the cache faster than either copy can deliver it, so offloading is pointless'], answer: 1, why: 'Compare the achieved bandwidth against b_kv / t_recompute, not against the spec sheet. For Qwen2.5-0.5B the crossover is a few GB/s, so 4.8 GB/s is a win and 1.2 GB/s is a loss — and the difference is entirely the pinning, not the hardware.' },
+  { q: 'Qwen2.5-0.5B uses 12,288 bytes of KV per token. Your card has 12 GB of KV budget after weights, workspace and headroom. How many 32,768-token conversations fit?', numeric: true, answer: 30, tolerance: 4, unit: 'conversations', why: 'Budget = 12e9 ÷ 12,288 = about 977,000 context tokens. Each 32,768-token conversation needs 402 MB, so 12e9 ÷ 402e6 = 30 conversations. Note how different this is from an 8B model: the cache is 10× smaller, so the same card serves 10× more of them.' },
+  { q: 'Your offloaded cache holds the last 4,096 tokens in GPU memory and streams the rest from the host each step. At a measured 4.8 GB/s and a 6 ms weight read, how many bytes can you stream per step for free?', numeric: true, answer: 28.8, tolerance: 3, unit: 'MB', why: 'Bandwidth × the time the step was already spending on weights = 4.8 GB/s × 0.006 s = 0.0288 GB = 28.8 MB. Anything beyond that shows up as latency. Convert to a context by dividing by bytes per token.' },
+  { q: 'An offloaded KV cache with a resident window smaller than the context produces different — not merely slower — answers. Why?', options: ['The host copy introduces floating-point error on the way over PCIe', 'Attention genuinely attends only to the blocks it reads, so removing some is a model change, not a transfer detail', 'Pinned memory silently truncates tensors to fit', 'The tokenizer re-encodes the dropped tokens'], answer: 1, why: 'A transfer is supposed to be exact. If you drop blocks, the softmax normalises over fewer keys and the result is genuinely different — a quality decision about how much context the model sees. With R = T nothing is dropped and the logits must match the resident path to floating-point noise; that is the correct correctness test.' },
+  { q: 'You sweep context on Qwen2.5-0.5B and find prefill time grows linearly all the way to 32K tokens. Is that a bug in your measurement?', options: ['Yes — prefill is always quadratic, so a linear curve must be wrong', 'No — the model’s quadratic wall is at P/(2dL) ≈ 11,400 tokens, so it should bend before 32K; if it does not, your prompt is not really reaching the model at that length', 'No — linear is correct, because attention is linear in decode and prefill uses the same kernel', 'Yes — unless you used FP16, prefill cannot be linear'], answer: 1, why: 'For this model the crossover is around 11,400 tokens, so a clearly linear curve to 32K means the prompt is being truncated, cached, or padded away somewhere. Sweep with growing lengths and verify the actual token count reaching the model — that check catches more real bugs than any benchmark.' },
+]} />

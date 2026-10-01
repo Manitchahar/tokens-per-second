@@ -1,0 +1,172 @@
+---
+title: 'Load balancing & queue-aware routing'
+summary: 'One GPU cannot hold a fleet. You will learn why round robin is the wrong default for inference, what signal a replica should be scored on, and how to compute how many replicas a given arrival rate actually needs.'
+objectives:
+  - Explain why request count is the wrong unit of load for an LLM replica
+  - Compare round robin, least-queued, least-KV and power-of-two on measured behaviour
+  - Derive the number of replicas an offered rate needs, from KV capacity and time in system
+  - Recognise when cache affinity and load balancing genuinely conflict
+  - Choose a routing policy and defend it against a workload
+---
+import LoadBalance from '@/components/viz/routing-autoscaling/LoadBalance.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You finished Module 09 and started one server. It handled your traffic beautifully. Then somebody else's traffic arrived, and you bought more GPUs, because one GPU has 80 GB of memory and a certain number of users it can hold, and no negotiation with that number is possible.
+
+Now you have four GPUs. And immediately the question that never existed with one GPU appears: **which one gets this request?**
+
+This sounds like a plumbing question. It is not. It is the question that decides your p99, because a replica is not a web server — it is a fixed pool of KV cache that fills up, and requests differ enormously in how much of it they need. The component that answers it is the <Term t="load-balancer">load balancer</Term>, and choosing how it scores replicas is the first real design decision of this module.
+
+## The unit of load is not the request
+
+Start with the wrong assumption and see what it costs. A request is an 8,000-token RAG prompt generating 250 tokens. Another is a 40-token greeting. <Term t="round-robin">Round robin</Term> sends one to each replica, alternately, forever. It is the fairest possible policy by count, and it is **blind** to the only thing that matters.
+
+Here is why. From Module 05, the KV cache of Llama-3.1-8B in BF16 costs 2 × 32 × 8 × 128 × 2 = 131,072 bytes per token. So the two requests hold:
+
+$$
+\text{KV} = \text{tokens} \times 128 \text{ KiB}
+$$
+
+| Request | Context | KV held | Share of an H100's pool |
+|---|---|---|---|
+| Greeting | 40 + 250 = 290 | 36 MiB | 0.1% |
+| Short chat | 900 + 250 = 1,150 | 144 MiB | 0.4% |
+| Long RAG | 8,000 + 250 = 8,250 | 1.0 GiB | 3.0% |
+
+One H100 has 80 GB. After the weights (16 GB) and the CUDA context and workspace, roughly **56 GB is KV pool** — about 400,000 tokens. Round robin does not distinguish a request that uses 36 MiB from one that uses 1.0 GiB. It is spreading *counts*, not *load*.
+
+The alternative signals each try to get closer to the real thing. <Term t="least-connections">Least connections</Term> reacts to load but still counts requests. <Term t="power-of-two-choices">Power of two choices</Term> samples two replicas and picks the better, balancing nearly as well as a full scan at constant cost. And <Term t="least-kv">least-KV-tokens</Term> scores on the resource that actually runs out — which is why it produces the tightest spread of any stateless policy.
+
+<Callout type="pitfall" title="Counting connections is the default in every web load balancer you have ever used">
+  NGINX, HAProxy and cloud L7 balancers all implement least-connections. For a web server that is an excellent signal, because a request costs roughly the same whatever it is. For an LLM replica a request's cost varies by **more than two orders of magnitude** with its prompt length, so a signal that cannot see that variation is measuring the wrong thing.
+</Callout>
+
+## The four signals, in order of usefulness
+
+<Scrolly>
+  <LoadBalance client:visible slot="stage" />
+
+  <Step title="1. One replica">
+    Everything to one GPU. p99 time-to-first-token blows past twenty seconds and goodput collapses to 3%. This is not a broken configuration; it is the honest picture of what one GPU does when you point a queue of fourteen requests per second at it.
+  </Step>
+
+  <Step title="2. Round robin">
+    Four replicas, requests dealt out in turn. The KV spread drops to about 1.06× and goodput returns to 100%. But watch what it is *not* doing: it never looks at a replica, so it cannot know one is nearly full.
+  </Step>
+
+  <Step title="3. Least queued">
+    Send to whichever replica has the fewest waiting requests. Now the router reacts to load, and the spread improves. But it counts *requests*, so a replica holding twelve 8,000-token prompts looks identical to one holding twelve greetings.
+  </Step>
+
+  <Step title="4. Least KV tokens">
+    Score each replica on the KV tokens it actually holds. This is the signal that matches the physical constraint, and it produces the tightest spread of any stateless policy — about 1.02×.
+  </Step>
+
+  <Step title="5. Power of two">
+    Sample two replicas at random and send to the better one. With many replicas this balances nearly as well as scoring every one, but costs two comparisons instead of *N*. That is why it is the modern default.
+  </Step>
+
+  <Step title="6. Session affinity">
+    Pin each conversation to one replica. Watch the prefix hit rate jump to about 35% and the mean TPOT fall to under 11 ms — and watch the spread get *worse*, because a popular conversation now always goes to the same place.
+  </Step>
+
+  <Step title="7. Cache-aware routing">
+    Score on how much of *this specific request's* prefix the replica already holds. Same hit rate as affinity but with a load penalty in the score, so it spreads better. This is the subject of the next lesson.
+  </Step>
+
+  <Step title="8. There is no free winner">
+    Stateless balance and cache affinity pull in opposite directions. Round robin is free and fair; least-KV is the robust default; affinity buys a hit rate and pays in balance. The right choice depends on how much of your traffic repeats.
+  </Step>
+</Scrolly>
+
+Let the visual's own numbers make one point sharply. <Term t="session-affinity">Session affinity</Term> and <Term t="cache-aware-routing">cache-aware routing</Term> both get a **35% prefix hit rate**. That is a large saving — from Lesson 10, a 35% hit rate means you pay 65% of the cold prefill bill. But they also push the <Term t="kv-spread">KV spread</Term> from 1.02× to 1.12×, and that is *paying* for it. A 10% spread sounds small until one replica is 12% fuller than its sibling and the balancer is routing by count anyway.
+
+## Little's law turns back into a replica count
+
+Module 06 gave you Little's law: the number of requests in a system equals the arrival rate times the time each one spends there. It is usually taught for measurement. Run it backwards and it becomes a capacity formula, which is how you answer "how many GPUs do I need?" without deploying anything.
+
+Start from the memory constraint. A replica's KV pool holds
+
+$$
+\text{users per replica} = \frac{\text{KV pool tokens}}{\text{context length per user}}
+$$
+
+For our H100 running Llama-3.1-8B with a 56 GB pool, that is about 402,000 tokens. At an average context of 1,150 tokens (the short chat above) a replica holds roughly **350 concurrent users**.
+
+Now the timing. Each request occupies a KV slot for its entire life: it waits, prefills, and then generates. Generation alone takes
+
+$$
+t_{\text{gen}} = \text{output tokens} \times \text{TPOT} = 250 \times 0.05\ \text{s} = 12.5\ \text{s}
+$$
+
+Add a TTFT budget of 1 s and a request holds its slot for about **13.5 seconds** — that is its <Term t="time-in-system">time in system</Term>. So one replica retires
+
+$$
+\text{requests per second per replica} = \frac{350}{13.5} \approx 26\ \text{req/s}
+$$
+
+And that is the number the autoscaler needs. For fourteen requests per second you need one replica; for forty you need two. Notice what the formula is made of: **memory** (users per replica) divided by **time** (seconds per request). Both terms are ones you can measure before you deploy.
+
+<Callout type="math" title="Why context length, not request count, is the capacity unit">
+  Re-run the same arithmetic at a 8,250-token context — a long RAG request:
+
+  $$
+  \frac{402{,}374}{8{,}250} = 48\ \text{users per replica}
+  $$
+
+  Seven times fewer users than the short-chat case, from the same GPU. A capacity plan built on average context length is wrong by however much your context varies, and context varies enormously between a chatbot and a document-Q&A product. **Size for the context you actually serve.**
+</Callout>
+
+<Callout type="intuition" title="The two limits, and why you take the larger">
+  A replica is bounded by memory *and* by the memory bus. Memory says how many sequences fit in the KV pool; bandwidth says how fast they can all advance at once, because decode is memory-bound (Module 05). If you batch until the pool is full and the resulting step time is 200 ms, every user sees a 200 ms token gap — technically inside your SLO by luck, but with no headroom left for the next traffic spike. Both limits exist; capacity is whichever binds first.
+</Callout>
+
+## Queue-aware routing, precisely
+
+"Queue-aware" means the router's score uses the state of the queue rather than a counter of arrivals. There are two subtleties worth knowing, because both are ways real deployments go wrong.
+
+**The signal must be fresh and cheap.** Scoring a replica on its queue length is one integer comparison. Scoring it on cache contents means walking a radix tree (Module 10) on every request — still cheap, but no longer free, and it moves the router from "a switch" to "a program." That is a real operational decision, not a detail.
+
+**Aggregation loses the worst case.** Averages hide bimodality. If you publish one `queue_depth` gauge per replica and the router reads the fleet average, a single saturated replica is invisible. Route on **per-replica** state, and alert on per-replica percentiles. This is the same lesson as Module 06's percentiles, applied one level up: the fleet's average latency is not any user's latency.
+
+<Callout type="mentor" title="What to say in a design review">
+  "We route on least-KV-tokens, not least-connections, because request cost varies by two orders of magnitude with prompt length. We cap the batch by the KV pool at 85%, we scale on queue depth plus a look-ahead on arrival rate, and we hold one replica of headroom so a scale-up has somewhere to land the traffic." The common thread: every clause is about *state*, and about the gap between an average and a tail.
+</Callout>
+
+## What to actually run
+
+| Workload | Recommended policy | Why |
+|---|---|---|
+| Mostly unique prompts (batch, one-shot) | Least-KV-tokens | Nothing to reuse; balance is the only lever |
+| Chat with strong multi-turn reuse | Cache-aware | The conversation *is* the prefix — this is the highest-value case |
+| Agent loops re-sending history | Cache-aware | Each step re-sends the whole transcript |
+| Mixed traffic you don't control | Least-KV-tokens with power-of-two | Robust; affinity would let one hot replica drag |
+| Very few replicas (2–3) | Least-KV-tokens | With so few options, sample-two is noisier than scanning |
+
+One operational note that belongs in this lesson rather than the next: if you turn on affinity, **pin by conversation, not by user**. A single user with six tabs open creates six contexts and would otherwise hold six KV slots on one replica — a small but real way to unbalance a fleet.
+
+<Callout type="recap" title="The three sentences of this lesson">
+  1. A request's cost is its KV footprint, which varies by orders of magnitude, so route on KV tokens rather than on request count.
+  2. Users per replica = KV pool ÷ context length; requests per second per replica = users ÷ seconds in system. Divide and you have your capacity.
+  3. Affinity buys a hit rate and pays in balance. Take whichever side your workload's repetition rate justifies, and measure the spread.
+</Callout>
+
+<KeyNotes>
+  1. KV cache for Llama-3.1-8B in BF16 is 131,072 bytes per token, so an 8,250-token request holds about 1 GiB while a 290-token request holds 36 MiB.
+  2. Round robin balances *counts* and is blind to that difference; least-connections improves but still counts requests rather than memory.
+  3. Least-KV-tokens scores the replica on the resource that actually runs out, and is the robust default for stateless routing.
+  4. Power of two choices balances nearly as well as a full scan at constant cost, which is why modern L7 balancers default to it.
+  5. Users per replica = KV pool tokens ÷ context length. On an 80 GB H100 with Llama-8B that is about 402,000 tokens of pool.
+  6. Requests per second per replica = users per replica ÷ time in system. At 350 users and 13.5 s per request that is about 26 req/s.
+  7. Context length, not request count, is the capacity unit — an 8,250-token context fits 48 users on a GPU that holds 350 short chats.
+  8. Aggregate fleet metrics hide a single saturated replica. Route and alert on per-replica state.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'An 80 GB H100 running Llama-3.1-8B has about a 402,000-token KV pool. How many concurrent users fit at an average context of 8,250 tokens?', numeric: true, answer: 49, tolerance: 3, unit: 'users', why: '402,374 ÷ 8,250 ≈ 48.7, so about 49 users. The same GPU holds roughly 350 at a 1,150-token context, which is why context length — not request count — is the unit of capacity.' },
+  { q: 'A replica holds 350 users, each request occupies its slot for 13.5 s (12.5 s of generation at a 50 ms TPOT plus a 1 s TTFT budget). How many requests per second can it retire?', numeric: true, answer: 26, tolerance: 2, unit: 'req/s', why: 'Little\'s law run backwards: 350 ÷ 13.5 = 25.9, so about 26 req/s per replica. Divide your offered rate by this to get the replica count.' },
+  { q: 'Why is least-connections, the default in almost every web load balancer, a poor signal for an LLM replica?', options: ['It is too slow to compute for large fleets', 'Because it counts requests, and an LLM request\'s KV footprint varies by orders of magnitude with prompt length', 'Because it cannot handle streaming responses', 'Because HTTP/2 multiplexing makes connection counts meaningless'], answer: 1, why: 'Cost per request is nearly constant for a web server, so counting is a good proxy. For LLM inference an 8,000-token prompt holds ~1 GiB of KV and a 40-token greeting holds 36 MiB — the same count, wildly different load.' },
+  { q: 'Your fleet\'s average p99 TTFT is fine, but users report one very slow replica. Route and alert on which quantity instead?', options: ['The fleet mean queue depth', 'The total request rate across the cluster', 'Per-replica queue depth and per-replica latency percentiles', 'The GPU memory bandwidth of the fleet'], answer: 2, why: 'Averaging hides a single saturated replica — the same reason Module 06 insists on percentiles rather than means. Score each replica on its own state, and alert per replica.' },
+  { q: 'Which statement about cache-aware (prefix-affinity) routing is correct?', options: ['It improves the prefix hit rate but typically worsens the KV load spread, because a hot conversation keeps returning to one replica', 'It always improves both the hit rate and load balance', 'It is equivalent to round robin when the prefix cache is empty', 'It requires every replica to share one KV cache'], answer: 0, why: 'In the simulator, affinity and cache-aware both reach a ~35% hit rate while pushing the KV spread from 1.02× to 1.12×. Reuse and balance are the two sides of one trade-off.' },
+  { q: 'You route on KV tokens held. Two replicas hold 5% and 55% of their pools. Which replica gets the next 8,000-token request?', numeric: true, answer: 5, tolerance: 0, unit: '% replica', why: 'The 5%-full one. Least-KV-tokens compares the quantity that maps to the real constraint, and the 55% replica has only 45% of its pool left for an 8,000-token request that needs 1 GiB. Counting requests could not tell these two apart.' },
+] } />

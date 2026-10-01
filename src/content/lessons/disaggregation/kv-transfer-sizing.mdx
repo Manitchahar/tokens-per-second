@@ -1,0 +1,235 @@
+---
+title: 'KV transfer, pool sizing & routing'
+summary: 'Disaggregation is only as good as the handoff between the pools. You will compute the transfer, size both pools from first principles, and see why routing a disaggregated system is a bin-packing problem rather than a load-balancing one.'
+objectives:
+  - Compute KV payload bytes for any model and context, and the transfer time on a given link'
+  - Decide whether a link is fast enough, using the decode step as the yardstick'
+  - Size a prefill pool from arrival rate, prompt length and per-token prefill cost'
+  - Size a decode pool from both throughput and KV memory, and take the binding constraint'
+  - Explain why routing must be bin-packing rather than least-loaded'
+---
+import KVTransfer from '@/components/viz/disaggregation/KVTransfer.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson ended with a promise: put prefill where the FLOPs are, decode where the bandwidth is, and pay for the KV copy in between. This lesson is the invoice. Three quantities decide whether the deal closes — the **size** of the copy, the **speed** of the link it crosses, and the **size of each pool** you need to run the thing at all.
+
+Get these three right and disaggregation is close to free. Get them wrong and it is slower, more expensive, and more fragile than the single fleet it replaced.
+
+## The payload
+
+You already have this formula from Module 05. For each token of context, an engine stores one key and one value per layer, per KV head:
+
+$$
+\text{KV per token} = 2 \times \text{layers} \times \text{KV heads} \times \text{head dim} \times \text{bytes}
+$$
+
+For Llama-3.1-8B in BF16 — 32 layers, 8 KV heads, head dim 128 — that is $\;2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\;$ bytes per token. Payload for a whole request is just that times the context:
+
+$$
+\text{payload} = \text{KV per token} \times C
+$$
+
+| Context | Payload (8B, BF16) | Payload (70B, BF16) |
+|---|---|---|
+| 1,024 tokens | 128 MiB | 320 MiB |
+| 4,096 tokens | 512 MiB | 1.25 GiB |
+| 16,384 tokens | 2.0 GiB | 5.0 GiB |
+| 32,768 tokens | 4.0 GiB | 10.0 GiB |
+
+Notice the two multipliers you already control from earlier modules. **GQA** shrinks the payload — Llama-3.1's 8 KV heads against 64 query heads is an 8× reduction versus MHA, and it applies to every byte on this wire. **KV quantisation** shrinks it again, at some quality cost. And context length scales it linearly, with no offset.
+
+<Scrolly>
+  <KVTransfer client:visible slot="stage" />
+
+  <Step title="1. The payload is just KV bytes">
+    Everything prefill computed must reach the decode instance. That is the KV cache: two bytes per layer, per KV head, per head dimension, per token. For this model at 4K context it is 512 MiB — and it is the only thing that has to move.
+  </Step>
+
+  <Step title="2. Cost on the wire">
+    Moving bytes is arithmetic you already own from Module 03: bytes divided by bandwidth. On a fast interconnect 512 MiB costs about a millisecond, a rounding error against a 20 ms decode step. On 25 GbE the same 512 MiB costs **21 ms** — more than a whole step.
+  </Step>
+
+  <Step title="3. It grows linearly with context">
+    Double the context, double the payload, double the transfer. This is why disaggregation is comfortable for short-context chat and tense for long-context agents, and why KV quantisation and GQA are disproportionately valuable in a disaggregated design.
+  </Step>
+
+  <Step title="4. Sizing the prefill pool">
+    Prefill is bound by FLOPs, so size it by FLOPs. Multiply arrivals per second by prompt tokens by seconds per token and you get GPU-seconds needed per second. Round up, then check p99, not mean.
+  </Step>
+
+  <Step title="5. Sizing the decode pool">
+    Decode is bound by bandwidth and by KV memory, so it has **two** constraints. Compute the instances you need for throughput, compute the instances you need for the KV cache to fit, and take whichever is larger.
+  </Step>
+
+  <Step title="6. Why splitting wins">
+    Here is the payoff. If the same GPUs ran both phases, prefill would take a large share of every GPU's time and inflate the decode step for everyone streaming. Split the pools and TPOT returns to its floor, and each GPU does only the thing it is good at.
+  </Step>
+
+  <Step title="7. Routing is bin-packing">
+    Choosing a decode instance is not least-loaded. A 4K request needs an instance with 4K of room; the emptiest instance may still be too small. You are placing variable-size items into bins that are already partly full.
+  </Step>
+
+  <Step title="8. The rule">
+    Two rules cover it. The transfer must be small next to the decode step it feeds. And each pool must be sized by the bottleneck its phase is actually bound by — FLOPs on one side, bandwidth and memory on the other.
+  </Step>
+</Scrolly>
+
+## Is your link fast enough?
+
+You need one comparison, and the denominator is not the network's round-trip time — it is **one decode step**. The transfer happens once per request; the decode step happens once per generated token. So the transfer only needs to be a small fraction of a step, and the budget gets looser the longer the answer is.
+
+$$
+\text{transfer share} = \frac{\text{KV bytes} / \text{link bandwidth}}{t_{\text{decode}}}
+$$
+
+For Llama-3.1-8B at 4,096 context on an H100 with a 20.3 ms decode step at batch 64:
+
+| Link | Effective bandwidth | 512 MiB transfer | Share of a decode step |
+|---|---|---|---|
+| NVLink 4 | 900 GB/s | 0.60 ms | 3% |
+| 8×400 GbE | 400 GB/s | 1.34 ms | 7% |
+| 100 GbE | 100 GB/s | 5.37 ms | 26% |
+| 25 GbE | 25 GB/s | 21.5 ms | 106% |
+
+Read the last row again. At 25 GbE the transfer is **longer than the decode step it is feeding** — the pipeline spends more time shipping the cache than using it. Disaggregation there is strictly worse than not disaggregating.
+
+<Callout type="math" title="The 10% rule, and why it exists">
+  Keep the transfer under about **10% of a decode step** and it is invisible in steady state, because you pay it once per request while decode pays its step thousands of times.
+
+  Setting the bound explicitly:
+
+  $$
+  \frac{C \cdot b_{\text{kv}}}{B_{\text{link}}} \le 0.1 \, t_{\text{decode}}
+  \qquad\Longrightarrow\qquad
+  C \le \frac{0.1 \, B_{\text{link}} \, t_{\text{decode}}}{b_{\text{kv}}}
+  $$
+
+  Plug in 400 GB/s, a 20.3 ms step and 128 KiB per token: $C \le 0.1 \times 400\times 10^9 \times 0.0203 / 131072 \approx 62{,}000$ tokens. So on a 400 GbE fabric, 8B at 32K context passes comfortably. On 25 GbE the same formula gives about 3,900 tokens — below one realistic RAG chunk set. **The formula, not the gut, is what tells you the design is viable.**
+</Callout>
+
+## Sizing both pools
+
+Both pools come from the same three inputs: your arrival rate $\lambda$, your prompt length $n$, and your answer length $m$.
+
+**The prefill pool** is sized by arithmetic, because prefill is compute-bound:
+
+$$
+N_{\text{prefill}} = \left\lceil \lambda \cdot n \cdot t_{\text{tok}} \right\rceil,
+\qquad t_{\text{tok}} = \frac{2P}{\text{peak FLOP/s} \times \text{MFU}}
+$$
+
+At 20 requests per second with 4,096-token prompts on H100s, $t_{\text{tok}} = 29.5\ \mu\text{s}$:
+
+$$
+N_{\text{prefill}} = \left\lceil 20 \times 4096 \times 29.5\times 10^{-6} \right\rceil = \left\lceil 2.42 \right\rceil = 3
+$$
+
+**The decode pool** has two constraints. The throughput constraint is what it can deliver at full batch; the memory constraint is how many KV caches fit in HBM at all.
+
+$$
+N_{\text{throughput}} = \left\lceil \frac{\lambda \cdot m}{\text{tokens/s per instance}} \right\rceil,
+\qquad
+N_{\text{memory}} = \left\lceil \frac{C_{\text{concurrency}}}{\text{sequences per instance}} \right\rceil
+$$
+
+For the same workload — 20 req/s, 256-token answers, 512 concurrent users at 4,096 context — an H100 holds 113 sequences (16.1 GB of weights plus workspace leaves about 63.8 GB of KV, and $63.8\text{ GB} \div 537\text{ MB}$ is 113), and each delivers about 3,751 tok/s:
+
+$$
+N_{\text{throughput}} = \left\lceil \frac{20 \times 256}{3751} \right\rceil = 2,
+\qquad
+N_{\text{memory}} = \left\lceil \frac{512}{113} \right\rceil = 5
+$$
+
+$$
+N_{\text{decode}} = \max(2,\ 5) = 5
+$$
+
+**Note which constraint bound.** Throughput wanted two GPUs; KV memory wanted five. If you had sized this fleet by tokens per second alone — the obvious mistake — you would have shipped a service that OOMs within seconds of launch.
+
+<Callout type="intuition" title="Why the two pools want opposite things">
+  Prefill GPUs are sized for a **bursty, compute-saturated** job that holds almost no state: it reads the prompt, writes KV, ships it, forgets it. Decode GPUs are sized for a **smooth, memory-resident** job that holds hundreds of KV caches for minutes at a time.
+
+  This is why the pools scale differently under load. If traffic doubles, prefill needs roughly twice the FLOPs but barely more memory, while decode needs twice the KV residency. A fleet that scales as one number will always be wrong at one end.
+</Callout>
+
+## What splitting actually buys
+
+Let the two pools be honest about the comparison. On a **monolithic** fleet sized only for decode — 5 GPUs — the prefill work still has to happen, and it lands on those same five GPUs:
+
+$$
+\text{prefill duty} = \frac{\lambda \cdot n \cdot t_{\text{tok}}}{N_{\text{decode}}} = \frac{2.42}{5} = 48\%
+$$
+
+Prefill takes 48% of every GPU's time. Since decode steps are scheduled behind it, the effective step time for every streaming user inflates:
+
+$$
+\text{TPOT}_{\text{shared}} = \frac{t_{\text{decode}}}{1 - \text{duty}} = \frac{20.3\text{ ms}}{0.52} \approx 39\text{ ms}
+$$
+
+Now the disaggregated fleet — 5 decode GPUs plus 3 prefill GPUs:
+
+| | Monolithic (5 GPUs) | Disaggregated (8 GPUs) |
+|---|---|---|
+| TPOT for a streaming user | ~39 ms | **20.3 ms** |
+| Decode capacity | ~9,700 tok/s | **18,800 tok/s** |
+| Prefill capacity | 5,203 tok/s | 101,600 tok/s |
+| Prefill GPU utilisation | 48% | 81% |
+| Decode GPU utilisation | 48% | 27% |
+| A p99 burst of 128 requests | 48% of five GPUs | a separate pool absorbs it |
+
+You spent three more GPUs and got roughly **2× the decode latency improvement and 2× the decode capacity**, plus burst absorption that a shared fleet fundamentally cannot provide. Whether that trade is worth it is a cost decision, not a technical one — but the technical claim is now checkable, because every row came from the two formulas above.
+
+<Callout type="pitfall" title="The utilisation numbers are not a mistake">
+  Look at decode GPU utilisation: 27%. That looks wasteful and is in fact the entire point.
+
+  A GPU is only useful if it is doing the thing it is good at. On the shared fleet, "48% utilised" meant **48% of the time those GPUs were busy doing work that wasted 91% of their math capacity** — the prefill of a stranger's prompt. On the split fleet, the decode GPUs are 27% used *doing decode*, which is the highest-value use of a GPU that exists.
+
+  The question is never "is the GPU busy". It is "is the GPU busy doing the work this chip is good at". Module 03's roofline is the instrument for asking that, and it is the instrument you should reach for whenever someone shows you a utilisation number.
+</Callout>
+
+## Routing: bin-packing, not load balancing
+
+The router's job is to pick a decode instance for a finished prefill. The instinct is "send it to the emptiest instance". That instinct is wrong, and here is why.
+
+A decode instance is not a bucket of free capacity. It is a fixed number of sequence slots, each reserved for a specific maximum context. A request with 4,096 tokens of KV needs a slot with at least 4,096 tokens of room. An instance reporting "0% CPU, 40% GPU utilisation, 9 of 11 slots used" might have every remaining slot reserved for short requests, and a 4K request placed there gets **rejected or preempted**.
+
+So the correct router:
+
+1. **Filters by fit.** Only instances that can hold this request's context at all.
+2. **Ranks by fragmentation.** Prefer the instance whose remaining slots fit the request *best* — packing tight, rather than scattering.
+3. **Falls back by least-loaded** only among instances that pass the fit test.
+
+<Callout type="mentor" title="Prefill routing is the easier half, and that asymmetry is useful">
+  A prefill instance is almost **stateless**: it takes a prompt, computes, ships the KV away, and is immediately free. Anything with 16 GB of spare HBM can serve any prefill. So prefill routing is genuinely load balancing — round-robin or least-loaded both work fine.
+
+  The asymmetry is worth noticing: you can use a trivial router for half the problem and still need a careful one for the other half. If you are building this for the first time, get prefill routing working end to end with round-robin, and leave decode routing for when you have measurements.
+</Callout>
+
+## The rule
+
+Two sentences, and they are enough to size a whole system:
+
+1. **The transfer must be small next to the decode step it feeds** — target under 10%, and check it against your real link bandwidth and your real context length before you buy anything.
+2. **Size each pool by its own bottleneck** — FLOPs and p99 for prefill; throughput *and* KV residency for decode, taking the binding constraint of the two.
+
+And one consequence worth stating plainly: **both pools must be sized for p99, not mean.** Prefill is bursty in a way decode is not, because it is driven by prompt length rather than by streaming rate. A fleet sized on mean prefill length will look comfortable in your dashboard and fall over on the day someone pastes in a 30-page document.
+
+<KeyNotes>
+  1. The payload is exactly the KV cache: $2 \times \text{layers} \times \text{KV heads} \times \text{head dim} \times \text{bytes}$ per token, times context length. Nothing else crosses the wire — not the weights, which each instance loads itself.
+  2. Divide by real link bandwidth and compare against one decode step, not against a round-trip time. Transfer happens once per request; decode happens once per token.
+  3. Keep the transfer under **~10% of a decode step**. That gives $C \le 0.1 \, B_{\text{link}} \, t_{\text{decode}} / b_{\text{kv}}$ — about 62K tokens on 400 GbE for 8B, but only ~3.9K on 25 GbE.
+  4. Size the prefill pool from arrivals times prompt tokens times per-token prefill time: $\lceil \lambda n t_{\text{tok}} \rceil$. Size it from **p99** prompt length, not the mean.
+  5. Size the decode pool twice — by throughput **and** by KV residency — and take the larger. In the worked example throughput wanted 2 GPUs and KV memory wanted 5; sizing by throughput alone ships an OOM.
+  6. The split buys roughly **2× TPOT and 2× decode capacity** for three extra GPUs here, plus burst absorption a shared fleet cannot provide. It is a cost decision with a checkable technical claim.
+  7. Low GPU utilisation on a specialised pool is not waste. 27% decode utilisation at 93% memory-bound is more valuable than 48% utilisation spent on someone else's prefill.
+  8. Decode routing is **bin-packing**, not load balancing: filter by fit, rank by fragmentation, and only then use least-loaded. Prefill routing is stateless and can stay trivial.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-70B has 80 layers, 8 KV heads, head dim 128, BF16. How many bytes of KV cache does 16,384 tokens of context occupy?', numeric: true, answer: 5368709120, tolerance: 300000000, unit: 'bytes', why: 'Per token: 2 × 80 × 8 × 128 × 2 = 327,680 bytes (320 KiB). Times 16,384 tokens = 5,368,709,120 bytes ≈ 5.0 GiB.' },
+  { q: 'Llama-3.1-70B hands off a 16K-context request (5.0 GiB of KV) across a single 100 GbE link. How long does the transfer take, and is that acceptable against a 30 ms decode step?', options: ['About 5 ms — fine', 'About 54 ms — most of two decode steps, probably too slow', 'About 430 ms — unusable', 'About 1.4 s — completely unviable'], answer: 1, why: '5.37e9 bytes ÷ 100e9 B/s ≈ 54 ms per link, which is about 1.8× a 30 ms decode step. That already fails a 10% budget badly. On 25 GbE it would be 215 ms. The fix is a faster fabric or a smaller payload (GQA, KV quantisation), not a better router.' },
+  { q: 'Your decode instances can each hold 113 sequences at 4K context, and you need 512 concurrent users. Throughput sizing says 2 instances, memory sizing says 5. How many decode GPUs do you provision?', numeric: true, answer: 5, tolerance: 0, unit: 'GPUs', why: 'Take the max of the two constraints. KV memory binds at 5. Provisioning by throughput alone (2) would OOM the moment real concurrency arrived — the constraint that binds is the one you must honour.' },
+  { q: 'Which statement about the decode router is correct?', options: ['Least-loaded routing is always sufficient, since a GPU with free memory can take any request', 'Routing is bin-packing: filter by whether the instance can hold this context, then rank by fragmentation', 'Decode routing matters only when there is more than one decode instance', 'The router should send requests to whichever instance finished its prefill fastest'], answer: 1, why: 'Slots are reserved per request size. An instance can be "least loaded" and still have no slot that fits a 32K request. Filter by fit first, pack tightly second, and use least-loaded only as the tiebreak.' },
+  { q: 'You move to a 25 GbE fabric. Which workload below makes disaggregation clearly unviable?', options: ['Llama-3.1-8B, 2K context, 200-token answers', 'Llama-3.1-8B, 8K context, 200-token answers', 'Llama-3.1-70B, 16K context, 300-token answers', 'Llama-3.1-8B, 32K context, 50-token answers'], answer: 2, why: 'A 70B at 16K ships 5.0 GiB. On 25 GbE that is 1.7 s per request — far more than the decode steps it will ever feed. The others are 0.1–1.2 GiB, which stay tolerable. Payload, not model size alone, is what kills it.' },
+  { q: 'Prefill and decode share 5 GPUs. Prefill work works out to 2.42 GPU-seconds per second. By roughly what factor does the streaming users TPOT inflate versus a decode-only step?', options: ['About 1.2×', 'About 1.9×', 'About 5×', 'No change: prefill and decode use different parts of the GPU'], answer: 1, why: 'Prefill duty = 2.42/5 = 48%. Decode steps queue behind it, so the effective step inflates by 1/(1−0.48) ≈ 1.9×. Separating the pools removes that factor entirely — that inflation is the thing you are buying.' },
+]}/>

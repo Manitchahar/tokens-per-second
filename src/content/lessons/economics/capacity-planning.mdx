@@ -1,0 +1,235 @@
+---
+title: 'Capacity planning & headroom'
+summary: 'How many GPUs do you need? The answer is a division, not a dashboard: machine seconds per request, times the arrival rate, divided by the utilization you are willing to run at. This lesson derives that, and explains why the headroom you leave is the difference between a plan and a hope.'
+objectives:
+  - Derive fleet size from machine seconds per request and arrival rate
+  - Explain why peak is the wrong number to size a fleet for
+  - Compute the price of a fleet at a stated average utilization
+  - Justify a target utilization below 100% and say what it buys
+  - Size a fleet that absorbs a burst without an outage
+---
+
+import CapacityPlanning from '@/components/viz/economics/CapacityPlanning.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You can price a token and rank a GPU. The question that comes next is the one a manager actually asks: **how many of them do we need?**
+
+The instinct is to look at peak traffic, look at how many requests one GPU can handle, and divide. That is roughly right, and it is wrong in three specific ways that each cost real money. This lesson gets the arithmetic right and then deals with the thing arithmetic cannot tell you, which is that traffic is uneven and hardware is not infinitely divisible.
+
+## Why peak is the wrong number
+
+Sizing for peak has two failure modes and they pull in opposite directions.
+
+If you size for the **daily peak**, your fleet is fully committed at 3pm on a weekday to serve the busiest minute of the busiest day, and idle for the other 23 hours. Most serving traffic is heavily skewed — typically low overnight, with a spike on top of a working day — so a fleet sized to that instant is mostly idle.
+
+If you size for the **average**, you are short exactly when it matters. The average hides the spike, and the spike is what takes the service down.
+
+<Callout type="intuition" title="The number you actually want">
+  Not "requests per second at peak". You want **the number of GPUs that must be busy simultaneously to retire your traffic, at the arrival rate your users actually produce** — and then a margin, so that a spike is absorbed by headroom rather than by a queue that grows without bound.
+
+  That quantity is arithmetic. Peak-versus-average is a judgement about your traffic; this is a measurement of your machine.
+</Callout>
+
+## The arithmetic
+
+From the first lesson, one request consumes a known, computable amount of machine time:
+
+$$
+\text{machine seconds per request} = t_{pre} + \frac{n_{out}\, t_{step}}{B}
+$$
+
+Call it $m$, in seconds. Now the second input is the **arrival rate** $\lambda$, in requests per second. Multiply:
+
+$$
+\text{GPUs that must be busy} = \lambda \times m
+$$
+
+That product is a **floor**, not a fleet size. It says: this is how much machine you need, simultaneously, to keep up. It is the <Term t="busy-gpus">busy GPUs</Term> figure — the number you would need if arrivals were perfectly smooth and the scheduler never wasted a millisecond — which is to say, it is the number you cannot actually run at.
+
+<Callout type="math" title="Worked: a 12 req/s chat service on Llama-3.1-8B">
+  From the first lesson: a 512-token prompt and a 256-token answer at batch 64 on an H100 consumes about **73 ms** of machine time per request. So $m = 0.073$ s.
+
+  At $\lambda = 12$ requests/second:
+
+  $$
+  \text{busy GPUs} = 12 \times 0.073 = 0.87 \text{ GPUs}
+  $$
+
+  Less than one card. At \$2.50/hour, one card is \$1,825/month — and it would be right there at 87% utilization, which from Module 06 is well past the point where the tail starts to hurt.
+</Callout>
+
+## Divide by your target, not by one
+
+The floor assumes 100% utilization: every second of every card spent retiring requests, with no queue, no idle gaps between batches, no admission-control slack. Real serving runs at 50–70%, and that is not waste — it is the queue having somewhere to go.
+
+$$
+\text{fleet size} = \frac{\lambda \times m}{\rho}
+$$
+
+where $\rho$ is your target utilization.
+
+<Callout type="math" title="The cost of headroom, priced">
+  For the 12 req/s service above, whose floor is 0.87 GPUs:
+
+  | Target $\rho$ | GPUs required | Monthly bill |
+  |---|---|---|
+  | 100% | 1 | \$1,825 |
+  | 70% | 2 | \$3,650 |
+  | 60% | 2 | \$3,650 |
+  | 50% | 2 | \$3,650 |
+
+  Going from 100% to 60% utilization costs one whole card, because 0.87 pushes you over the single-card ceiling. **You pay \$3,650/month and you get a fleet that absorbs a deploy and a spike** — instead of one card with nothing spare.
+
+  The bill is a <Term t="step-function-bill">step function of the fleet size</Term>, not a smooth function of utilization. Utilization moves *within* a step; it does not move you between steps. That is why the interesting question is not "what utilization should we run at" but "how many cards do we commit to, and what happens on the last one".
+</Callout>
+
+## The headroom argument
+
+Headroom is the gap between your committed fleet and your sustained load — <Term t="committed-headroom">committed headroom</Term>, meaning capacity that already exists before the spike does. It exists for three reasons, and all three are real:
+
+1. **Traffic is uneven within the hour.** Arrivals are bursty at every scale — seconds, minutes, hours. A fleet sized to the mean of a bursty process will queue during the burst.
+2. **Traffic is uneven across the day and week.** Overnight idle time is what you are buying when you commit to a fleet sized for the working day.
+3. **Things break.** A deploy, a node drain, a thermal excursion, a bad release. From Module 24: a fleet with no spare capacity turns every incident into an outage.
+
+<Callout type="pitfall" title="The utilization target is not the headroom">
+  A common confusion: people set an autoscaler to target 60% utilization and believe they have headroom. They do not. **Autoscaling on utilization gives you a floor, not a ceiling** — it will spin up more cards as load rises, but it cannot spin up cards faster than the scaling policy allows, and during a spike the new cards arrive after the queue has already formed.
+
+  Headroom means **committed capacity that exists before the spike arrives**. That is a capacity decision, made in advance, and it is what autoscaling sits on top of.
+</Callout>
+
+## A worked capacity plan
+
+Let us size a service properly. **Chat assistant, Llama-3.1-8B, 512-token prompts, 256-token answers, 64 concurrent streams, one H100 per replica, interactive SLO.**
+
+| Arrival rate | Machine s/req | Busy GPUs | Fleet at 60% | Monthly | Note |
+|---|---|---|---|---|---|
+| 2 req/s | 0.073 | 0.15 | 1 | \$1,825 | one card, mostly idle |
+| 6 req/s | 0.073 | 0.44 | 1 | \$1,825 | comfortable |
+| 12 req/s | 0.073 | 0.87 | 2 | \$3,650 | the design point |
+| 30 req/s | 0.073 | 2.18 | 4 | \$7,300 | autoscaling territory |
+
+<Callout type="math" title="Read the table as a capacity decision">
+  At 12 req/s the *floor* is 0.87 GPUs. You could serve that on one card at 87% utilization — technically above your 60% target, and it works right up until it does not.
+
+  **Two cards is the decision.** One for throughput, one because a single card has no spare capacity for a deploy, a spike, or the 3pm peak.
+
+  At 30 req/s you need four cards to stay under 60%, and the question becomes how fast new replicas appear — which is Module 23's scaling-policy problem, and a reason this fleet has a committed floor even though three would be the steady-state requirement.
+
+  Notice what the table does *not* say: it says nothing about what happens if your output length doubles, or someone ships a 4× longer system prompt. **The whole table moves** — and that is why you re-run this whenever the model, the engine, the context, or the traffic mix changes.
+</Callout>
+
+<Scrolly>
+  <CapacityPlanning client:visible slot="stage" />
+
+  <Step title="1. Size the machine, not the peak">
+    The first thing to get right is *what you are dividing by*. Peak is a symptom; the quantity you control is how much machine one request consumes.
+
+    Everything else in this calculation is exact arithmetic once you have that number, and it does not depend on your traffic graph.
+  </Step>
+
+  <Step title="2. Machine time per request">
+    Prefill belongs to the request alone; the decode steps are shared with the batch. Add them and you have the machine seconds this request consumed.
+
+    Here it is about 73 ms for a 512-token prompt and a 256-token answer at 64 streams. The amber share is prefill, the blue is the request's slice of decode.
+  </Step>
+
+  <Step title="3. Multiply by the arrival rate">
+    Arrival rate is requests per second. Multiply by machine seconds per request and you get **GPU-seconds demanded per second** — which is just the number of cards that must be busy at once.
+
+    This is a floor. It assumes perfect smoothness and zero waste, which is a fleet you cannot actually run.
+  </Step>
+
+  <Step title="4. Divide by your target">
+    Now divide by the utilization you are willing to run at — typically 60% for interactive work, because the queue needs somewhere to go.
+
+    This is the step people skip, and skipping it is how you get a service that is fine at 3pm and unusable at 4pm.
+  </Step>
+
+  <Step title="5. Round up, then hold the extra">
+    Round up to a whole card, then **hold the extra**. The card after the last one that retires your load is the one that absorbs the spike.
+
+    The bill is a step function of fleet size, so the question is never "how much slack" — it is "how many cards have I committed to".
+  </Step>
+
+  <Step title="6. Headroom, priced">
+    The arithmetic cost of headroom is real: running at 60% instead of 100% costs 1.67× the arithmetic. But the alternative is a fleet with no spare capacity.
+
+    Every deploy, every node drain, every traffic spike becomes an outage. That is the trade, and it is worth writing down explicitly.
+  </Step>
+
+  <Step title="7. The same fleet at four rates">
+    Here is the whole calculation across four arrival rates. The fleet size is a **step function** of load, not a smooth one.
+
+    Between two and twelve requests per second you pay for one card; at thirty you pay for four. Utilization moves within a step, not between steps.
+  </Step>
+
+  <Step title="8. What you actually run">
+    **Floor plus headroom, with autoscaling closing the gap.** A minimum committed to survive a burst and a deploy; autoscaling on queue depth or p95 latency — never on GPU utilization — to handle what you did not plan for.
+
+    And re-run this whenever the model, engine, context length, or traffic mix changes. Every one of those moves the machine-seconds number that everything else is built on.
+  </Step>
+</Scrolly>
+
+## What moves the number
+
+The calculation is only as good as its inputs, and the inputs move more often than people assume. In rough order of how much they matter:
+
+| Change | Effect on machine s/request | Note |
+|---|---|---|
+| Output length doubles | Decode term doubles | Usually the biggest single lever |
+| Longer prompts | Prefill term grows | Matters most when prefill-dominated |
+| Lower precision | Step time and bytes drop | Module 11; often 10–30% on the decode term |
+| Prefix caching | Prefill term shrinks on hits | Module 10; large for shared system prompts |
+| Higher concurrency | Decode share per request drops | Costs memory; the operating-envelope limit |
+| Better engine / kernels | Step time drops | Module 17; a few percent each, they compound |
+| Speculative decoding | Fewer steps per token | Module 16; workload-dependent |
+
+<Callout type="real" title="The re-run cadence">
+  Treat the capacity plan as a living document with a review trigger, not a one-time calculation. Re-run it when:
+
+  - The model changes (a new checkpoint, or a swap to a different size).
+  - Precision changes (a quantization rollout).
+  - The prompt or output length distribution shifts (a product change, a new feature).
+  - The engine version changes materially (Module 17's warning about defaults moving).
+  - **Traffic grows past the last planned step.**
+
+  That last one is the most common and the most expensive, because it is the one where the bill and the incident arrive together.
+</Callout>
+
+<Callout type="try" title="Do this with your own numbers">
+  Take your actual traffic. You need three numbers, all of which you should be able to produce:
+
+  1. **Machine seconds per request** at your current operating point — use the identity from the first lesson with your real model, GPU, precision, and concurrency.
+  2. **Arrival rate** at peak sustained (not instantaneous spike — the level that lasts more than a minute or two).
+  3. **Your target utilization**, chosen from your SLO.
+
+  Then compute the floor, divide, round up, and ask yourself one question: *if a third of this fleet disappeared right now, what breaks?* The answer is your headroom requirement.
+</Callout>
+
+<Callout type="recap" title="The capacity plan in three lines">
+  **Fleet = (arrival rate × machine seconds per request) ÷ target utilization.** Machine seconds per request is $t_{pre} + n_{out}\,t_{step}/B$.
+
+  **Peak is not the input.** The arrival rate that lasts is. Everything else about peak traffic is a reason to hold headroom.
+
+  **Headroom is committed capacity, not a utilization target.** Autoscaling on utilization gives you a floor; it cannot give you a ceiling in time.
+</Callout>
+
+<KeyNotes>
+  1. **Fleet size = arrival rate × machine seconds per request ÷ target utilization.** Machine seconds per request is $t_{pre} + n_{out}\, t_{step}/B$ from the first lesson — the whole module rests on that one identity.
+  2. **Peak is the wrong input.** Size for the arrival rate that *lasts*, and hold headroom for the rate that does not.
+  3. The product $\lambda \times m$ is a **floor, not a fleet size**. It assumes 100% utilization, which is a service that has already failed.
+  4. Run at **50–70% utilization**. The 30–50% you are not using is the queue having somewhere to go — it is what keeps the tail flat under burst.
+  5. The bill is a **step function** of fleet size, not a smooth function of utilization. Utilization moves you *within* a step; only card count moves you between steps.
+  6. **Headroom means committed capacity that exists before the spike**, not a utilization target. Autoscaling on utilization gives a floor, never a ceiling in time.
+  7. The plan moves with output length, prompt length, precision, prefix-cache hit rate, concurrency and engine version. Re-run it when any of them change — especially when traffic crosses the last step you planned.
+  8. Report a capacity plan as **a floor, a committed fleet, and a named scaling trigger**. A number with no utilization assumption and no re-run trigger is not a plan; it is a guess with a unit attached.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'One request consumes 73 ms of machine time. Your service sees 12 requests per second at peak sustained. Ignoring utilization, how many GPUs must be busy simultaneously to retire that traffic?', numeric: true, answer: 0.88, tolerance: 0.08, unit: 'GPUs', why: 'λ × m = 12 × 0.073 = 0.88 GPUs busy. This is a floor — it assumes 100% utilization, which is a service that has already broken. At a 60% target you need 0.88 ÷ 0.6 = 1.46 GPUs, so two committed cards.' },
+  { q: 'You serve 20 requests/s and each consumes 0.1 GPU-seconds. At a 60% target utilization, how many GPUs should you commit to?', numeric: true, answer: 4, tolerance: 0, unit: 'GPUs', why: '20 × 0.1 = 2 GPUs busy. Divide by 0.6 = 3.33, round up to 4. The rounding is not a rounding error — the fourth card is the headroom that absorbs a spike or a deploy.' },
+  { q: 'Why is sizing a fleet for the daily peak usually wrong?', options: ['Peak is too high a number to measure', 'The fleet is idle most of the day and has no spare capacity for bursts within the peak period', 'Peak traffic never happens', 'Peak requires a different model'], answer: 1, why: 'Serving traffic is heavily skewed — low overnight, spiking on a working day. A fleet sized to the single busiest instant is idle for the other 23 hours and still has no slack when traffic surges *within* the peak period, which is when it actually breaks.' },
+  { q: 'A service targets 60% utilization and autoscales on GPU utilization. During a spike, what is the problem?', options: ['Autoscales fine, no problem', 'Utilization gives a floor, not a ceiling in time — new cards arrive after the queue has already formed', 'It will overscale and cost too much', 'Utilization is the best signal for scaling'], answer: 1, why: 'Utilization leads latency, and scaling on it means you wait for cards to boot while the queue grows. Headroom has to be *committed in advance*; autoscaling on queue depth or p95 latency closes the gap for what you did not plan for.' },
+  { q: 'Your fleet is 4 cards at an average utilization of 40% over the month. At \$2.50/hour per card, what is the utilization tax — how much you pay per unit of useful work versus a fully-utilized fleet?', numeric: true, answer: 2.5, tolerance: 0.3, unit: '×', why: 'A card is billed for every second it exists. At 40% average utilization, each unit of useful work costs 1 ÷ 0.40 = 2.5× what it would on a fully-utilized fleet. The utilization tax is the multiplier on every cost number in this module — which is why the right response is to consolidate onto fewer cards, not to buy more.' },
+  { q: 'Which change moves machine seconds per request the MOST, for a chat product with 256-token answers?', options: ['Upgrading from a previous GPU generation to a newer one', 'Doubling the output length', 'Raising concurrency from 32 to 64', 'Switching to a better engine version'], answer: 1, why: 'The decode term is n_out × t_step / B, so doubling output length doubles it directly. Concurrency actually *reduces* machine time per request. A GPU generation or engine change moves t_step by tens of percent; output length moves the whole term by 2×.' },
+]} />

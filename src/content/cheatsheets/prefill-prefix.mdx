@@ -1,0 +1,161 @@
+---
+title: 'Module 10 · Prefill & Prefix Optimization'
+module: prefill-prefix
+---
+
+## The two phases, one more time
+
+| | Prefill | Decode |
+|---|---|---|
+| Tokens per step | all at once | one |
+| Bound | compute | memory |
+| Intensity (Llama-8B) | ~410 FLOP/byte at 512 rows | ~1 FLOP/byte |
+| Scales with | prompt length $n$ | batch $\times$ context |
+
+An engine step is **one** thing. `step = max(prefill_chunk, decode_batch)`.
+
+## Prefill: the cost per token
+
+$$
+t_{\text{prefill}}(n) \approx \frac{2 P n}{\text{peak FLOP/s} \times \text{MFU}}
+$$
+
+| Model | per token (H100, MFU 0.55) | 2k prompt | 8k prompt | 32k prompt |
+|---|---|---|---|---|
+| Llama-3.1-8B | 29.5 µs | 59 ms | 236 ms | 945 ms |
+| Llama-3.1-70B | 260 µs | 519 ms | 2,077 ms | 8,307 ms |
+
+Prefill time is **linear in prompt length**. That is why a long prompt is a cliff.
+
+## Head-of-line blocking
+
+One prefill step blocks every decoder. For innocent users:
+
+$$
+\text{TPOT}_{\text{others}} = t_{\text{decode}} + \max(0,\ t_{\text{prefill}} - t_{\text{decode}})
+$$
+
+Speedup factor $= t_{\text{decode}} / \text{TPOT}_{\text{others}}$. An 8k prompt on a 20 ms decode step is a **12× slowdown** for everyone else.
+
+## The chunk rule
+
+Chunk prefill so one chunk takes one decode step:
+
+$$
+c^{*} = t_{\text{decode}} \times \frac{\text{peak FLOP/s} \times \text{MFU}}{2P}
+$$
+
+- ~**678 tokens** for Llama-3.1-8B on an H100 at a 20 ms decode step.
+- Grows with batch and context; shrinks with model size.
+- vLLM: `--max-num-batched-tokens` (V1 default 2048). SGLang: `--chunked-prefill-size`.
+
+Cost of chunking: one extra forward-pass overhead (1–3 ms) per chunk + smaller GEMMs.
+Result is **bitwise identical** — chunking changes *when* FLOPs run, never how many.
+
+## Prefix caching
+
+A token's hidden state depends only on the tokens before it ⇒ reuse is **exact**.
+
+$$
+t_{\text{cached}} = t_{\text{cold}} \times (1 - \text{hit rate}), \qquad
+\text{hit rate} = \frac{c_{\text{cached}}}{n}
+$$
+
+**Cache key must include:** token IDs, positions, model identity, adapter identity.
+An incomplete key serves wrong answers silently.
+
+### KV memory per token (BF16)
+
+$$
+\text{KV/token} = 2 \times \text{layers} \times \text{kv heads} \times \text{head dim} \times 2\ \text{bytes}
+$$
+
+| Model | KV/token | 8k ctx | 32k ctx |
+|---|---|---|---|
+| Llama-3.1-8B | 128 KiB | 1.0 GiB | 4.0 GiB |
+| Llama-3.1-70B | 320 KiB | 2.5 GiB | 10.0 GiB |
+
+Prefix caching is mostly a **memory** optimization: 4k shared prefix × 100 users = 51 GB of duplicates.
+
+### Block granularity
+
+Only whole blocks are reusable: reusable $= B\lfloor c/B \rfloor$.
+Memory waste is the average unused tail of a partially filled block.
+
+| Block | Waste vs exact | Hit rate |
+|---|---|---|
+| 16 | ~0.2% | highest (vLLM default) |
+| 256 | ~3% | good |
+| 1024 | ~12% | loses short prefixes |
+
+### Hit rates by workload
+
+| Workload | Hit rate | Why |
+|---|---|---|
+| Multi-turn chat | 60–90% | conversation is the prefix |
+| Agent loops | 50–80% | full history re-sent |
+| RAG (sorted, deterministic) | 30–60% | same chunks, same order |
+| One-shot queries | ~0% | nothing shared |
+
+## RadixAttention
+
+Tree of KV blocks, one tree per model per GPU. Block identity includes history:
+
+$$
+\text{hash}_i = \text{hash}(\text{block}_i \,\|\, \text{hash}_{i-1})
+$$
+
+Lookup: walk down while hashes match, prefill the remainder.
+
+**Eviction rule:** evict only nodes whose **whole subtree is cold**, LRU first.
+A node with surviving children is never a candidate ⇒ **you can only evict leaves**,
+and shared prefixes are the last to go.
+
+Health metrics: prefix hit rate, full-hit rate, eviction pressure.
+Budget the prefix pool **below 100%** of GPU memory.
+
+## Cache-friendly application design
+
+1. **Stable prefix first, variable tail last.**
+2. **Byte-identical or nothing** — no timestamps, no UUIDs, no unstable sorts in front.
+3. **Sort RAG documents by document ID.**
+4. Keep agent transcripts intact; do not summarize or reorder between steps.
+5. Keep few-shot blocks and tool schemas identical across releases.
+
+## Engine knobs
+
+| Engine | Knob | Effect |
+|---|---|---|
+| vLLM | `--max-num-batched-tokens` | chunk size (V1 default 2048) |
+| vLLM | `--enable-prefix-caching` | prefix reuse on by default in V1 |
+| vLLM | `--num-gpu-blocks` / `--gpu-memory-utilization` | KV pool size |
+| SGLang | `--chunked-prefill-size` | chunk size |
+| SGLang | `--max-total-tokens` | global token budget |
+| SGLang | `--enable-prompt-cache` | radix prefix tree |
+
+## The engine loop, in pseudocode
+
+```python
+step = max(prefill_time(chunk), decode_time(batch))
+apply(chunk)                 # write chunk KV, or recycle finished requests
+for seq in decoders:
+    decode_one_token(seq)    # one token per active sequence
+```
+
+## Reference numbers (Llama-3.1-8B, BF16, H100)
+
+| Quantity | Value |
+|---|---|
+| KV bytes / token | 131,072 (128 KiB) |
+| Prefill, per token | 29.5 µs |
+| Decode step, batch 32 @ 8k ctx | ~20 ms |
+| Crossover chunk $c^{*}$ | ~500–700 tokens |
+| Users at 8k ctx (H100 80 GB) | ~56 |
+| Users at 32k ctx | ~14 |
+| KV at 128k ctx | 16 GiB per request |
+
+## The three sentences
+
+1. Long prompts block everyone because a step is prefill **or** decode — chunk it to about one decode step.
+2. Shared prefixes are free to reuse because hidden states depend only on earlier tokens — hash them, and keep the cache key honest.
+3. Evict only cold leaves; put the stable part of the prompt first so there is something worth keeping.

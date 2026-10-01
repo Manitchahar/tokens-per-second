@@ -1,0 +1,116 @@
+---
+title: What an inference engineer actually does
+summary: Zoom through the six layers of the inference stack, from the chat box to the GPU's memory chips, and see which problems live at each level.
+objectives:
+  - Name the six layers of the inference stack and what happens in each
+  - Explain why one slow request can be caused at any layer
+  - Describe the four levels of inference engineering work, from calling APIs to writing kernels
+  - Know which modules of this course cover each layer
+---
+import StackZoom from '@/components/viz/trace/StackZoom.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In the last lesson you watched one request take 620 ms. Now we zoom in: *where exactly* do those milliseconds go, and who is responsible for each one?
+
+The answer is a **stack**: layers of software and hardware, each built on the one below. When something is slow or expensive, the cause can hide at any layer. An inference engineer is the person who can travel up and down the stack and find it.
+
+## Six zoom levels of one request
+
+A profiler lets you zoom: select a slice of time and blow it up to fill the screen. Scroll to zoom from the chat box all the way down to the memory chips. Each dashed funnel shows which slice gets magnified into the row below.
+
+<Scrolly>
+  <StackZoom client:visible slot="stage" />
+
+  <Step title="1. The product">
+    From the outside, a request is one block of time: 620 ms from pressing Enter to the last word. The product team cares about exactly two things here: *does it feel fast?* and *what does it cost us?*
+  </Step>
+
+  <Step title="2. The fleet">
+    A real service does not run on one GPU. It runs on many identical GPU servers called **replicas**, each handling many requests at once. A **router** (load balancer) decides which replica gets your request.
+
+    Pick badly and your request waits behind a long queue while another replica sits half-empty. Routing, autoscaling and reliability live here: Part 7 of the course.
+  </Step>
+
+  <Step title="3. The serving engine">
+    Inside one replica runs a **serving engine** such as vLLM, SGLang or TensorRT-LLM. It is the brain of inference: it queues requests, decides which ones run together in each step (**scheduling** and **batching**), and manages the KV cache memory.
+
+    Most of the day-to-day tuning an inference engineer does happens at this layer: Parts 2 to 4.
+  </Step>
+
+  <Step title="4. The model runtime">
+    Zoom into a single 25 ms decode step. The runtime executes the model itself: 32 **layers** in a row for this model, each an attention block then an MLP block, then an output head that scores every possible next token, then sampling.
+
+    Tricks like CUDA graphs, `torch.compile` and quantization live here.
+  </Step>
+
+  <Step title="5. The kernels">
+    Zoom into one layer. It is a sequence of **kernels**: small programs launched on the GPU. Each is one operation: a normalization, a matrix multiply, attention.
+
+    Nearly all the time goes to the big matrix multiplies (`qkv`, `gate+up`, `down`) and attention. Writing faster kernels (FlashAttention, fused ops, Triton) is Part 5.
+  </Step>
+
+  <Step title="6. The hardware">
+    Zoom into one matrix multiply. The GPU's memory (**HBM**) streams the weights in continuously, while the math units (**tensor cores**) do a short burst of work and then wait for the next chunk.
+
+    This is the physical reason decode is *memory-bound*. Every layer above is, in the end, a strategy for keeping these tensor cores busy.
+  </Step>
+</Scrolly>
+
+<Callout type="intuition">
+  Think of a restaurant. The **product** is the diner's experience. The **fleet** is the chain of restaurants and the host who seats people. The **engine** is the head chef deciding which orders to cook together. The **runtime** is the recipe being followed. The **kernels** are the individual techniques: chop, sear, plate. The **hardware** is the stove and the fridge. A slow dinner can be caused by any of them, and a great operator knows all six.
+</Callout>
+
+## What does the job look like day to day?
+
+"Inference engineer" covers a range of work. It is useful to think of four levels. Each level builds on the one before, and this course takes you through all four.
+
+| Level | You work on | Typical questions |
+|---|---|---|
+| **1. Consumer** | Calling model APIs | Which model and provider? How do I stream? Why is my bill so high? |
+| **2. Operator** | Deploying an engine (vLLM, SGLang) on GPUs | Which GPU fits my model? What batch size and context length? How do I hit my latency target? |
+| **3. Optimizer** | Squeezing more from the hardware | Should I quantize to FP8? Turn on prefix caching? Use speculative decoding? Tensor parallelism across 2 GPUs or 2 replicas? |
+| **4. Builder** | The engine and kernels themselves | Why is this attention kernel slow at long context? How should the scheduler handle preemption? Can we disaggregate prefill and decode? |
+
+Most job postings for "inference engineer" want levels 2 and 3 on day one, and level 4 for senior roles. By the end of Part 4 you will be a solid level 3. Parts 5 to 8 take you to level 4.
+
+## The recurring loop
+
+Across all levels, the work follows the same loop. You will do it in almost every lab:
+
+1. **Define the goal.** For example: *"serve Llama-3.1-8B to 200 concurrent users with p95 time-to-first-token under 500 ms, as cheaply as possible."*
+2. **Measure a baseline.** Honestly, with realistic traffic (Module 6).
+3. **Find the bottleneck.** Which layer? Memory, compute, queueing or network? (Module 12)
+4. **Change one thing.** A config flag, a quantization scheme, a kernel, a routing policy.
+5. **Measure again.** Did it help? Did quality or anything else get worse?
+
+<Callout type="mentor">
+  Beginners optimize what they *guess* is slow. Engineers measure first. The trace view you are learning to read is the habit that separates the two. Whenever you feel lost in a later lesson, ask: *where on the trace does this time go?*
+</Callout>
+
+## Where the course covers each layer
+
+| Layer | Modules |
+|---|---|
+| Hardware | 01 Numbers & math, 02 The GPU, 12 Profiling |
+| Kernels | 13 Triton, 14 Attention optimization |
+| Model runtime | 03 Transformers, 04 First LLM, 11 Quantization, 15 Compilation, 16 Speculative decoding |
+| Serving engine | 05 KV cache, 07 Batching, 08 PagedAttention, 09 vLLM, 10 Prefix caching, 17 Engines |
+| Fleet | 18 to 21 Multi-GPU, MoE, long context, disaggregation; 23 Routing & autoscaling |
+| Product | 06 Benchmarking, 22 Production, 24 Reliability, 25 Economics |
+
+<KeyNotes>
+  1. The inference stack has six layers: **product → fleet → serving engine → model runtime → kernels → hardware**.
+  2. A slow or expensive request can be caused at any layer. The job is finding *which one*.
+  3. The **serving engine** (vLLM, SGLang, TensorRT-LLM) schedules and batches requests and manages KV cache memory. It is where most tuning happens.
+  4. A forward pass is layers → kernels. Most time goes to **matrix multiplies and attention**.
+  5. At the bottom, decode is **memory-bound**: memory streams weights while the tensor cores wait.
+  6. The four levels of the job: consumer, operator, optimizer, builder.
+  7. The core loop: define the goal → measure → find the bottleneck → change one thing → measure again.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Your chatbot is slow only at peak hours, and some GPU servers are overloaded while others are nearly idle. Which layer is the most likely culprit?', options: ['Kernels', 'Hardware', 'The fleet: routing across replicas', 'The tokenizer'], answer: 2, why: 'Uneven load across replicas is a routing and load-balancing problem at the fleet level. Kernels and hardware would be slow all the time, not just at peak.' },
+  { q: 'Which layer decides which requests are processed together in each GPU step?', options: ['The router', 'The serving engine’s scheduler', 'The tensor cores', 'The product team'], answer: 1, why: 'The serving engine (vLLM, SGLang, ...) schedules and batches requests every step. That is the heart of Part 3.' },
+  { q: 'Inside one transformer layer during decode, what takes most of the time?', options: ['Normalization', 'Big matrix multiplies and attention', 'Sampling the next token', 'Tokenization'], answer: 1, why: 'The matmuls (qkv, output projection, gate/up, down) and attention move the most bytes. Norms and activations are tiny by comparison.' },
+  { q: 'What is the first step when a system is too slow?', options: ['Rewrite the attention kernel', 'Buy bigger GPUs', 'Measure a baseline and find where the time goes', 'Quantize to 4 bits'], answer: 2, why: 'Always measure first. Each of the other fixes targets one specific bottleneck, and might target the wrong one.' },
+]} />

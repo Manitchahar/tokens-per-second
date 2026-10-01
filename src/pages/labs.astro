@@ -1,0 +1,70 @@
+---
+import { getCollection } from 'astro:content';
+import Base from '../layouts/Base.astro';
+import Icon from '../components/Icon.astro';
+import { flatLessons, parts } from '../data/course';
+import { url, colabUrl } from '../site';
+
+const all = await getCollection('lessons');
+const byId = new Map(all.map((e) => [e.id, e]));
+const labs = flatLessons.filter((l) => l.kind !== 'lesson');
+---
+<Base title="Labs & projects" description="Every hands-on lab and project: Colab notebooks on a real GPU and in-browser simulators.">
+  <div class="page">
+    <h1>Labs & projects</h1>
+    <p class="lead">
+      Reading is not knowing. Every module ends with something you build or measure. Notebooks run free on Google Colab's T4 GPU, so you need no GPU of your own; simulators run right in the page.
+    </p>
+    <div class="setup">
+      <p><strong>First time?</strong> Do <a href={url('learn/big-picture/lab-hello-gpu/')}>Lab 00: Say hello to a real GPU</a>. It shows you how to open a notebook in Colab, switch on the free GPU, and run your first cell.</p>
+    </div>
+    {parts.map((p) => {
+      const ls = labs.filter((l) => l.module.part === p.num);
+      return (
+        <section>
+          <h2><span class="pn">Part {p.num}</span> {p.title}</h2>
+          <ol class="list">
+            {ls.map((l) => {
+              const e = byId.get(`${l.module.slug}/${l.slug}`);
+              return (
+                <li class="row" data-lesson-key={`${l.module.slug}/${l.slug}`}>
+                  <span class="code">{l.code}</span>
+                  <div>
+                    {e ? <a class="title" href={url(l.href)}>{l.title}</a> : <span class="title muted">{l.title}</span>}
+                    <p class="sum">{e ? e.data.summary : 'Being written.'}</p>
+                  </div>
+                  <div class="acts">
+                    <span class="mins">{l.minutes} min</span>
+                    {e?.data.colab && <a class="colab" href={colabUrl(e.data.colab)} target="_blank" rel="noopener">Colab <Icon name="external" size={13} /></a>}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </section>
+      );
+    })}
+  </div>
+</Base>
+<style>
+  .page { max-width: 960px; margin: 0 auto; padding: 3rem 24px 0; }
+  h1 { font-size: clamp(2.3rem, 5vw, 3.4rem); margin-bottom: 0.8rem; }
+  .lead { color: var(--text-2); max-width: 64ch; }
+  .setup { margin: 1.6rem 0 1rem; padding: 1rem 1.1rem; border: 1px solid var(--rule-2); border-radius: 4px; background: var(--ground-2); font-size: 0.93rem; }
+  .setup p { margin: 0; }
+  section { margin-top: 3rem; }
+  h2 { font-size: 1.6rem; margin-bottom: 0.8rem; }
+  .pn { color: var(--text-3); }
+  .list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule-2); }
+  .row { display: grid; grid-template-columns: 3.4rem 1fr auto; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid var(--rule); align-items: baseline; }
+  .code { font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-3); }
+  .row:global(.is-done) .code { color: var(--token); }
+  .title { font-weight: 700; text-decoration: none; }
+  a.title:hover { text-decoration: underline; }
+  .muted { color: var(--text-3); font-weight: 400; }
+  .sum { margin: 0.25rem 0 0; font-size: 0.88rem; color: var(--text-2); }
+  .acts { display: flex; gap: 0.8rem; align-items: baseline; font-size: 0.78rem; }
+  .mins { font-family: var(--font-mono); color: var(--text-3); }
+  .colab { display: inline-flex; gap: 0.25rem; align-items: center; color: var(--compute); text-decoration: none; font-weight: 700; }
+  @media (max-width: 640px) { .row { grid-template-columns: 2.6rem 1fr; } .acts { grid-column: 2; } .page { padding: 2rem 16px 0; } }
+</style>

@@ -1,0 +1,199 @@
+---
+title: 'Long-prompt interference & chunked prefill'
+summary: 'One long prompt can freeze everyone else on the GPU. You will see exactly how, measure the stall in milliseconds, and learn the one scheduler idea that fixes it without giving up any arithmetic.'
+objectives:
+  - Compute how long a prefill of any length takes on a given GPU
+  - Explain head-of-line blocking from first principles
+  - Measure the TPOT penalty a long prompt inflicts on other users
+  - Derive the chunk size at which prefill hides inside one decode step
+  - Name the overheads chunking adds, and when not to chunk at all
+---
+import ChunkedPrefill from '@/components/viz/prefill-prefix/ChunkedPrefill.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Thirty-two people are talking to your model. Each one is mid-sentence, and every 20 milliseconds each of them gets another token. Then someone pastes a 30-page contract into the chat box.
+
+For a quarter of a second, nobody gets anything. Not slow — *nothing*. All thirty-two streams freeze, because the engine gave the whole GPU to one person. Then everything resumes as if nothing happened. The user with the contract had a great time. The other thirty-two have a bug report.
+
+This is the problem. It is called **long-prompt interference**, and it is not a bug in anyone's code — it falls straight out of Module 05's picture of prefill versus decode. Today you get the exact numbers, and then you get the fix, which is about four lines of scheduler logic and the most useful knob in the engine.
+
+## Two workloads that want opposite things
+
+Recall the shape of the two phases, from *Prefill vs decode* in Module 05:
+
+| | Prefill | Decode |
+|---|---|---|
+| Tokens processed | all at once | one per step |
+| Arithmetic intensity | high, compute-bound | ~1 FLOP/byte, memory-bound |
+| Duration | milliseconds to seconds | ~20 ms |
+| Reads | weights, once | weights **and** the whole KV cache |
+| Wants | the whole GPU | a slice of a GPU |
+
+Prefill is compute-bound: it has thousands of rows of work per weight, so the math units are the limit and the bandwidth sits mostly idle. Decode is memory-bound: one row, so every byte of weight fetched feeds exactly one multiply-add, and the math units sit idle instead.
+
+Now the problem. **The engine runs one step at a time, and a step is one thing.** If a step is a prefill, no decode happens in it. If a step is a decode, no prefill happens in it. There is no way to be half-prefill and half-decode in the same step, because the tensor shapes differ: prefill is `[512 × 4096] · [4096 × 4096]`, decode is `[1 × 4096] · [4096 × 4096]`.
+
+So the engine must choose. And when it chooses prefill, the choice is expensive.
+
+## The stall, in milliseconds
+
+Prefill time follows straight from the compute ceiling. Recall from *Matrix multiply, step by step* that each token costs about twice the parameter count in FLOP:
+
+$$
+t_{\text{prefill}} \approx \frac{2 \cdot P \cdot n}{\text{peak FLOP/s} \times \text{MFU}}
+$$
+
+For Llama-3.1-8B ($P = 8.03\times 10^9$) on an H100 (989 TFLOP/s dense BF16, Module 02's table), at an MFU of about 0.55:
+
+$$
+t_{\text{prefill}}(n) \approx \frac{2 \times 8.03\times 10^9 \times n}{989\times 10^{12} \times 0.55} = 29.5\ \mu\text{s} \times n
+$$
+
+Read that as: **29.5 microseconds per prompt token.**
+
+| Prompt length | Prefill time on H100 | On A100 | On T4 |
+|---|---|---|---|
+| 128 tokens | 3.8 ms | 6.5 ms | 31 ms |
+| 512 tokens | 15 ms | 26 ms | 124 ms |
+| 2,000 tokens | 59 ms | 103 ms | 485 ms |
+| 8,000 tokens | 236 ms | 412 ms | 1,940 ms |
+| 32,000 tokens | 945 ms | 1,650 ms | 7,750 ms |
+
+A 32K prompt — a book, a huge code file, an agent with a long history — takes **almost a second of the entire GPU**. The 31 ms number in the last row is on the T4 you get free in Colab, which is why interactive coding assistants feel unusable on small GPUs.
+
+<Callout type="math" title="Where the 29.5 µs comes from">
+  You already built this. The prefill of $n$ tokens is one matrix multiply with $n$ rows, so it costs $2 \cdot n \cdot d^2$ FLOPs per projection, and $2Pn$ FLOPs for the whole model. Divide by the achieved FLOP/s and you have the time. There is no new physics here — only Module 01's arithmetic and Module 02's ceiling.
+</Callout>
+
+Now put the two phases next to each other. Thirty-two users decoding at 8K context need one decode step every **20 ms** to feel instant. A single 2,000-token prompt needs **59 ms** of GPU — three whole decode steps' worth. Every one of those three steps, the thirty-two users get nothing.
+
+<Callout type="pitfall" title="This is head-of-line blocking, and it is worse than it looks">
+  The stall is not just TTFT for the unlucky user. It is a **TPOT regression for everyone else**: their token rate drops by the factor `stall / step`. With a 236 ms prefill and a 20 ms decode step, thirty-one innocent users see their generation speed fall to about 8% of normal. From Module 06's *ITL*, their inter-token gaps are now 236 ms apart — a stream that visibly stutters.
+
+  This is why a service that looks fine at 5 requests per second falls apart at 6.
+</Callout>
+
+## The fix: stop asking for the whole GPU at once
+
+The insight is almost embarrassingly simple. **Prefill does not have to be atomic.** A transformer processes tokens independently within a layer — token 5's output does not depend on token 300's output at that layer, only on earlier tokens through attention. So you can prefill the first 512 tokens, write their KV to the cache, and come back for the rest later. The result is bitwise identical to prefilling all at once. No approximation, no quality loss, just bookkeeping.
+
+This is <Term t="chunked-prefill">chunked prefill</Term>. The engine's step becomes:
+
+1. Take at most one **chunk** of prefill tokens (say 512).
+2. Take one decode token from every active sequence.
+3. Run both. The step takes as long as the slower of the two.
+4. Repeat.
+
+The critical property is in step 3. `max` is the whole trick. A 512-token chunk takes 15 ms of compute. A 32-user decode step takes 20 ms. The step is therefore **20 ms — exactly what the decoders were getting anyway.** The prefill was free. It hid inside work the engine was already doing.
+
+<Scrolly>
+  <ChunkedPrefill client:visible slot="stage" />
+
+  <Step title="1. A healthy engine">
+    Thirty-two users are decoding at 8K context. Every engine step takes about 20 ms and hands each of them one more token. Nothing else is competing. This is what the service feels like when it works.
+  </Step>
+
+  <Step title="2. A long prompt arrives">
+    An 8,000-token prompt joins the queue. Prefill is compute-bound and wants to run on the whole GPU, so the scheduler has to decide when to give it what it wants.
+  </Step>
+
+  <Step title="3. One shot: the stall">
+    If the engine takes the entire prefill in one step, that step is 236 ms long. No token reaches any decoder while it runs. The hatched red band is the interference, and it belongs to strangers.
+  </Step>
+
+  <Step title="4. Cut the prompt into chunks">
+    Split the prompt into pieces small enough to fit in a single step. Each chunk is its own step, so between chunks the decoders get a token again. The stall is now bounded, not eliminated.
+  </Step>
+
+  <Step title="5. Chunks sized to the decode step">
+    Pick the chunk so its prefill time equals one decode step — about 500 tokens here. Every chunk then hides inside a step the decoders were taking anyway, so their token rate barely moves at all.
+  </Step>
+
+  <Step title="6. The crossover rule">
+    The curve is the whole lesson. Below the green line, chunks take less time than a decode step and interference is zero. Above it, the decoders wait. The knee is the chunk size worth tuning to.
+  </Step>
+
+  <Step title="7. What chunking costs">
+    Chunking does not make the arithmetic cheaper — the same FLOPs run either way. It pays a small fixed cost per chunk to bound the worst wait. You are buying fairness with a sliver of throughput.
+  </Step>
+</Scrolly>
+
+## The rule, as an equation
+
+The chunk size is not a guess. Set the two terms equal:
+
+$$
+\frac{2 P c}{\text{peak FLOP/s} \times \text{MFU}} = t_{\text{decode}}
+\qquad\Longrightarrow\qquad
+c^{*} = t_{\text{decode}} \cdot \frac{\text{peak FLOP/s} \times \text{MFU}}{2P}
+$$
+
+Plug in our numbers: $t_{\text{decode}} = 20$ ms, and $\frac{989\times 10^{12} \times 0.55}{2 \times 8.03\times 10^9} = 33.9$ tokens per millisecond.
+
+$$
+c^{*} = 20 \times 33.9 \approx 678 \ \text{tokens}
+$$
+
+Sweeping it properly (accounting for the step being a `max`, so the crossover is where the two curves actually meet) puts the knee at **500–700 tokens** for 8B on an H100 at this batch size. That is the whole calculation. vLLM's default `max_num_batched_tokens` of 2,048 sits above it, because vLLM trades a little fairness for better large-batch efficiency — and because it also batches *several* requests' chunks per step, which moves the effective budget.
+
+<Callout type="intuition" title="Why the chunk is measured in tokens and not in bytes">
+  A chunk of $c$ tokens needs $c \times$ (one token's KV bytes) of fresh memory, and its prefill cost is linear in $c$. But its *value* to you is bounding the wait. So the only thing that matters is the product of the two per-step durations — which is why a single number, token count, controls it. When you move to a bigger model or a slower GPU, recompute $c^{*}$; the 512 that was right for one hardware combination is wrong for another.
+</Callout>
+
+## What it costs, honestly
+
+Chunking is not free, and you should be able to defend the trade:
+
+- **Per-chunk overhead.** Each chunk runs its own forward pass: kernel launches, the sampler's logits projection over a 128K vocabulary, and Python-level scheduling. Call it 1–3 ms. Over a 8,000-token prompt in 512-token chunks that is 16 chunks, so tens of milliseconds — a few percent of the 236 ms of real work.
+- **Smaller GEMMs.** A 512-row multiply is less efficient than an 8,000-row one. You lose some MFU.
+- **No effect on the math.** Total FLOPs are identical. Chunking reorganizes *when* they run, never how many.
+
+And there are cases where you should not chunk at all:
+
+<Callout type="mentor" title="When chunking is the wrong tool">
+  - **Latency-sensitive, single user.** One user, one prompt, nobody to block. Take the whole prefill at once — you get the best MFU and the lowest TTFT.
+  - **A prompt so long it must be chunked anyway.** At 128K tokens, memory forces chunking whether or not you want it.
+  - **Batched chunks.** Real engines amortize this well: vLLM packs several requests' chunks into one step, so the per-chunk overhead is paid once per step, not once per request.
+
+  Chunked prefill is a **fairness** mechanism. Turn it on when your users share a GPU; leave it off when they do not.
+</Callout>
+
+## Seeing it yourself
+
+You do not need a vLLM cluster to reproduce this. The simulator in the next lab runs the loop you just read about — `max(prefill_chunk, decode_batch)` per step — and lets you change one knob at a time. But there is a cheaper experiment you can run tonight, with nothing but the KV math:
+
+```python
+# The interference, computed rather than measured.
+P, FLOP, MFU = 8.03e9, 989e12, 0.55
+t_decode = 0.020            # 20 ms: 32 users at 8K context on an H100
+
+for n in [512, 2000, 8000, 32000]:
+    prefill = 2 * P * n / (FLOP * MFU)
+    steps = 1 if n <= 512 else (prefill // t_decode)
+    print(f"{n:>6} tok: prefill {prefill*1000:7.0f} ms -> "
+          f"{steps:4.1f} decode steps of stall for everyone else")
+```
+
+<Callout type="real" title="What engines actually do at the time of writing">
+  vLLM made chunked prefill the default in its V1 engine (2024), driven by `--max-num-batched-tokens`; it mixes prefill and decode tokens into the same batched step rather than treating them as separate phases. SGLang calls the same knob `--chunked-prefill-size` and additionally overlaps chunked prefill with decode on the same device, which is the same idea taken one step further. TensorRT-LLM caps prefill with `--max_seq_len` and its own context-length heuristics. The names and defaults move; the rule — bound the prefill chunk to roughly one step of work — does not.
+</Callout>
+
+<KeyNotes>
+  1. Prefill costs $2Pn$ FLOP, so its time is **linear in prompt length**: 29.5 µs per token for Llama-3.1-8B on an H100 at 55% MFU. An 8K prompt is 236 ms of the entire GPU; a 32K prompt is nearly a second.
+  2. One engine step is one thing. A prefill step cannot also decode, so a long prefill is a **total** freeze for everyone else — head-of-line blocking.
+  3. The damage shows up as a TPOT regression, not just TTFT. A 236 ms prefill on a 20 ms decode step drops every other user's token rate to about 8%.
+  4. Prefill is not atomic. Chunking it changes **when** FLOPs run, never how many, so the result is bitwise identical.
+  5. The step is `max(chunk prefill, decode batch)`. Size the chunk so the two are equal and the prefill becomes free — $c^{*} = t_{\text{decode}} \times \text{tokens/ms}$, about 500–700 for 8B on an H100.
+  6. Chunking costs a few percent: per-chunk overhead and slightly smaller, less efficient matrix multiplies.
+  7. Chunked prefill buys **fairness**, not speed. For a single user with nobody to block, take the whole prefill at once.
+  8. The final version of this idea is to put prefill and decode in the same batched step, which is what vLLM's V1 engine and SGLang do at the time of writing.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B prefills a 8,000-token prompt on one H100 at about 55% MFU. Roughly how long does it take?', numeric: true, answer: 236, tolerance: 25, unit: 'ms', why: 'Time = 2 × 8.03e9 × 8,000 ÷ (989e12 × 0.55) = 0.236 s. Prefill time is linear in prompt length: 29.5 µs per token.' },
+  { q: 'Thirty-two users are decoding at 8K context, one token every 20 ms. An 8,000-token prefill runs in a single step. By roughly what factor do the other users’ token rate drop?', options: ['About 1.2× slower', 'About 3× slower', 'About 12× slower, since a step becomes 236 ms instead of 20 ms', 'No change: decode and prefill use different parts of the GPU'], answer: 2, why: 'One step lasts max(prefill, decode) = 236 ms. Token rate falls from 1/0.020 to 1/0.236, so about 12× slower — 8% of normal.' },
+  { q: 'Decode steps take 20 ms. How many prompt tokens of Llama-3.1-8B on an H100 take the same time to prefill?', numeric: true, answer: 678, tolerance: 60, unit: 'tokens', why: 'At 29.5 µs per token, 20 ms ÷ 0.0295 ms = 678 tokens. Set the two step times equal and the prefill chunk hides inside work the engine was already doing.' },
+  { q: 'Which is true of chunked prefill?', options: ['It approximates the result, trading a little quality for speed', 'It reduces total FLOPs by recomputing less', 'It changes only when the FLOPs run, never how many, so results are identical', 'It only works when the prompt fits in one KV block'], answer: 2, why: 'Tokens are independent within a layer except through attention over earlier positions, which is cached anyway. Chunking reorders *when* work runs; the arithmetic is identical and the output is bitwise the same.' },
+  { q: 'A 2,000-token prompt costs 59 ms of GPU. Split into chunks of about 600 tokens, roughly what fraction of the original time is overhead rather than useful math?', options: ['About 1%', 'About 10%', 'About 50%', 'None: the FLOPs are unchanged, so the time is unchanged apart from a few ms per chunk'], answer: 3, why: 'Total FLOPs do not change. You pay one extra forward-pass overhead (1–3 ms) per chunk, so a few milliseconds on ~59 ms — single-digit percent.' },
+  { q: 'Your service has exactly one user at a time and no queue. Which configuration is best?', options: ['Chunked prefill with a small chunk size, to protect other users', 'No chunking: take the whole prefill in one step for the best MFU and lowest TTFT', 'Prefix caching only, with chunking disabled', 'Neither: turn both on to be safe'], answer: 1, why: 'Chunked prefill is a fairness mechanism between users. With nobody to block, one big prefill has the best arithmetic intensity and the lowest TTFT.' },
+]} />

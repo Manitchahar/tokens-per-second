@@ -1,0 +1,75 @@
+---
+title: 'Lab: Tensors, dtypes & your first timing'
+summary: Build tensors and predict their shapes, measure bytes per dtype, time matrix multiplies in TFLOP/s, and measure yourself why decode is memory-bound.
+objectives:
+  - Predict tensor shapes after indexing and reshaping, then check in code
+  - Measure bytes per number for each dtype and see rounding error for real
+  - Write a correct GPU timing helper (warm-up, synchronize, average)
+  - Measure TFLOP/s and GB/s for matrix × vector vs matrix × matrix
+  - Implement a numerically safe softmax
+colab: 01-tensors.ipynb
+---
+
+Everything in Module 01 now becomes something you measure. The most important part is section 4: you will produce, with your own GPU and your own code, the table that explains why decode is slow. Do not skip it.
+
+<Colab nb="01-tensors.ipynb" />
+
+## What you will do
+
+### 1. Shapes: predict, then check
+
+Before running each line, say the shape out loud. `x[:, -1]` on a `[3, 5, 4096]` tensor? Reshape to heads? If a prediction is wrong, stop and figure out why. Shape bugs are the most common bug in model code.
+
+### 2. Bytes and precision
+
+You will print `element_size()` for each dtype, compute BF16/FP8/INT4 sizes for three real models, and watch 0.1 get rounded differently by FP32, FP16 and BF16. Then you will overflow FP16 on purpose with 70,000.
+
+### 3. A benchmark helper you will reuse
+
+```python
+def bench(fn, iters=50, warmup=5):
+    for _ in range(warmup):
+        fn()                          # pay one-time costs up front
+    torch.cuda.synchronize()          # start from an idle GPU
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()          # wait for the work to really finish
+    return (time.perf_counter() - t0) / iters
+```
+
+Warm-up, synchronize, average. You will copy this helper into many later labs.
+
+### 4. The key experiment: one weight, more and more tokens
+
+You keep one 4096 × 4096 FP16 weight fixed (33.5 MB, like one layer) and push m = 1, 2, 4 … 2048 tokens through it. Your table will look roughly like this on a T4 (your numbers will differ a bit):
+
+| m (tokens) | time | TFLOP/s | GB/s |
+|---|---|---|---|
+| 1 | ~0.12 ms | ~0.3 | ~280 |
+| 32 | ~0.13 ms | ~8 | ~270 |
+| 256 | ~0.35 ms | ~25 | ~110 |
+| 2048 | ~2.4 ms | ~29 | ~25 |
+
+<Callout type="intuition" title="How to read it">
+  From m = 1 to m = 32, the time **barely changes**: the GPU spends it loading the 33.5 MB weight, at close to its full memory bandwidth. Thirty-two times more math came almost free. Only at large m does the time start to grow with m, because math finally becomes the bottleneck. **Small m: memory-bound. Large m: compute-bound.** Decode is m = 1. Batching is how we raise m.
+</Callout>
+
+### 5. Softmax by hand
+
+You will write softmax with the subtract-the-max trick, check it against `torch.softmax`, and watch the naive version produce `nan` in FP16 on large scores.
+
+## Check yourself before moving on
+
+- Why does the m = 1 row achieve almost the full memory bandwidth but almost no FLOP/s?
+- Roughly at what m did your TFLOP/s stop climbing? Multiply that m by 2 bytes: that is roughly your GPU's *FLOPs per byte* balance point. Keep it; Module 02 names it.
+- What is the maximum value FP16 can hold, and what happens past it?
+
+<KeyNotes>
+  1. Predict shapes before printing them. Indexing removes dimensions; `view` reinterprets without copying.
+  2. `element_size()`: FP32 4, FP16/BF16 2, INT8 1. Model GB = billions of params × bytes.
+  3. GPU timing needs warm-up, `torch.cuda.synchronize()` on both sides, and averaging.
+  4. With a fixed weight, going from 1 token to ~32 tokens costs almost no extra time: small-m matmuls are **memory-bound**.
+  5. At large m the same matmul becomes **compute-bound** and approaches peak TFLOP/s.
+  6. Safe softmax subtracts the max; naive FP16 softmax overflows to `nan`.
+</KeyNotes>

@@ -1,0 +1,187 @@
+---
+title: 'Module 03 · Transformers'
+module: transformers
+---
+
+## The whole model in one line
+
+$$
+\mathbf{x}_0=\mathrm{Embed}[\text{id}],\quad
+\mathbf{x}_{l+1}=\mathbf{x}_l+\mathrm{Block}_l(\mathbf{x}_l),\quad
+\mathbf{y}_L=\mathrm{Head}(\mathrm{Norm}(\mathbf{x}_L))
+$$
+
+$$
+\text{Block}(\mathbf{x})=\mathbf{x}+\mathrm{MLP}\big(\mathrm{Norm}\big(\mathbf{x}+\mathrm{Attn}(\mathrm{Norm}(\mathbf{x}))\big)\big)
+$$
+
+## Neuron → layer
+
+$$
+y = f(Wx+b),\qquad f=\mathrm{ReLU},\ \mathrm{GELU},\ \mathrm{SiLU}
+$$
+
+**SiLU**(z) = z·σ(z), σ(z) = 1/(1+e^−z) · **GELU**(z) = 0.5z(1 + tanh(√(2/π)(z + 0.044715z³))) · **ReLU**(z) = max(0, z)
+
+A layer of n neurons is one matrix multiply. Without f, depth buys nothing: 32 linear layers collapse to one.
+
+## Tokens
+
+- **English ≈ 4 characters per token** (≈ 0.75 tokens per word). Code ≈ 2.5–3. CJK ≈ 1 token per character.
+- Vocabulary sizes: GPT-2 50,257 · Llama-2 32,000 · Llama-3.1 **128,256** · Qwen2.5 151,936.
+- Base is always 256 byte tokens. Llama-3.1: 128,256 = 256 × **501**. Qwen2.5: 256 × 593 + 288 special tokens.
+- Never assume `unk` exists: Llama-3 has none, because bytes always can.
+
+## Embeddings & positions
+
+$$
+\mathbf{e} = \mathrm{Embed}[\mathrm{id}] \in \mathbb{R}^{d},\qquad \mathrm{RoPE}:\ \mathbf{q}' = R(m\theta)\mathbf{q},\ \theta_i = \text{base}^{-2i/d_h}
+$$
+
+$$
+\mathbf{q}'\!\cdot\!\mathbf{k}' = \mathbf{q}^\top R((n-m)\theta)\,\mathbf{k}\quad\text{— only the gap } m-n \text{ survives}
+$$
+
+| Model | d | heads | d_h | layers | V | rope base |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 896 | 14 | 64 | 24 | 151,936 | 1e6 |
+| Llama-3.2-3B | 3,072 | 24 | 128 | 28 | 128,256 | 5e5 |
+| Llama-3.1-8B | 4,096 | 32 | 128 | 32 | 128,256 | 5e5 |
+| Qwen2.5-32B | 5,120 | 40 | 128 | 64 | 152,064 | 1e6 |
+| Llama-3.1-70B | 8,192 | 64 | 128 | 80 | 128,256 | 5e5 |
+
+- Embedding table = V × d. Llama-3.1-8B: 525.3 M params, 1.05 GB. Lookup reads **one row** = 8 KB.
+- Slowest RoPE pair's wavelength = 2π·base^(2i/d_h): base 10,000 → 54,400 tokens; base 500,000 → 2.51M.
+- RoPE costs **zero parameters**.
+
+## Attention
+
+$$
+\mathrm{Attn}=\mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_h}}+M\right)V,\qquad M_{ij}=0 \text{ if } j\le i \text{ else } -\infty
+$$
+
+**Six steps:** project → score → scale → mask → softmax → mix.
+
+- Divide by **√128 = 11.31**. Without it softmax goes one-hot and other keys get no gradient.
+- Mask with **−∞, not 0** (0 would give e⁰ = 1 and steal attention).
+- FLOPs: 4·T·d_model per layer per decode token; 2·T²·d_model per layer for a prompt of T.
+- Attention overtakes the weights at **T = P_layer/(d·L) ≈ 53,000** for Llama-3.1-8B.
+
+## Heads & the KV cache
+
+$$
+\text{KV bytes per token} = 2\,(K,V)\times L\times n_{kv}\times d_h\times b
+$$
+
+| Style | n_q | n_kv | group | Used by |
+|---|---|---|---|---|
+| MHA | 32 | 32 | 1 | GPT-2, GPT-3, Llama-2-7B |
+| MQA | 32 | 1 | 32 | Grok-1, some Llama-2-70B |
+| **GQA** | 32 | 8 | 4 | Llama-3.1, Qwen2, Mistral |
+
+| Model | L | n_kv | d_h | per token | @4K | @32K |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 2 | 64 | 12 KiB | 48 MiB | 375 MiB |
+| Llama-3.2-3B | 28 | 8 | 128 | 112 KiB | 448 MiB | 3.5 GiB |
+| Llama-3.1-8B | 32 | 8 | 128 | **128 KiB** | 512 MiB | 4.0 GiB |
+| Qwen2.5-32B | 64 | 8 | 128 | 256 KiB | 1.00 GiB | 8.0 GiB |
+| Llama-3.1-70B | 80 | 8 | 128 | 320 KiB | 1.25 GiB | 10.0 GiB |
+| Llama-2-7B (MHA) | 32 | 32 | 128 | 512 KiB | 2.00 GiB | 16.0 GiB |
+
+**GQA saves bytes, not FLOPs.** Read `num_key_value_heads` from the config, never assume it equals `num_attention_heads`.
+
+## The block, parameter by parameter (Llama-3.1-8B)
+
+| Matrix | Shape | Params | Bytes |
+|---|---|---|---|
+| q_proj | 4096 × 4096 | 16.78 M | 33.6 MB |
+| k_proj, v_proj | 4096 × **1024** | 4.19 M each | 8.4 MB each |
+| o_proj | 4096 × 4096 | 16.78 M | 33.6 MB |
+| **attention** | | **41.94 M** | 83.9 MB |
+| gate, up | 4096 × 14336 | 58.72 M each | 117.4 MB each |
+| down | 14336 × 4096 | 58.72 M | 117.4 MB |
+| **MLP** | | **176.16 M** | 352.3 MB |
+| 2 × RMSNorm | 4096 | 0.008 M | 0.03 MB |
+| **block total** | | **218.10 M** | **436.2 MB** |
+
+- **MLP is 80.8% of a block and 70.2% of the model.** Attention is 16.7% overall.
+- MLP intermediate = 3.5 × d. Break-even for three matrices is 8/3 ≈ 2.67.
+
+$$
+\mathrm{RMSNorm}(\mathbf{x}) = \mathbf{g}\odot\frac{\mathbf{x}}{\sqrt{\mathrm{mean}(\mathbf{x}^2)+\varepsilon}},\quad \varepsilon=10^{-5}
+$$
+
+No mean subtraction (that is LayerNorm), no bias. Output RMS = 1 always. **2L + 1 = 33 norms**, 135,168 params, 0.0017% of the model.
+
+**Residual stream:** one vector per token, written **1 + 2L = 65 times**. Adds cannot cancel. Magnitude grows with depth; RMSNorm divides it back to 1 before every sublayer.
+
+## Bytes and FLOPs
+
+$$
+\text{bytes} = 2P,\qquad \text{FLOPs} = 2P \text{ per token} \quad\Longrightarrow\quad \textbf{1 FLOP per byte}
+$$
+
+Llama-3.1-8B, one decode step at 4K context: **15.55 GB, 15.01 GFLOP**.
+On an H100: 5.80 ms of memory vs 27.6 µs of math — **memory-bound by 210×**.
+
+| Where the 15.55 GB goes | Share |
+|---|---|
+| 32 blocks × MLP matrices | 72.5% |
+| 32 blocks × attention matrices | 17.3% |
+| output head | 6.8% |
+| KV cache at 4K | 3.4% |
+| 33 norms + one embedding row | ~0% |
+
+| Phase | Bytes | FLOPs | Intensity | Bound |
+|---|---|---|---|---|
+| Decode, 1 token, 4K | 15.55 GB | 15.0 G | 0.97 | memory |
+| Prefill 512 | ~16.1 GB | 7.75 T | 481 | compute |
+
+**Prefill 512 ≈ 14 ms. Generating 512 ≈ 3.0 s. 208×.** Same weights, same arithmetic — the difference is rows per byte.
+
+Eager PyTorch: ~450 kernels per forward pass ≈ 3.2 ms of CPU time against 5.80 ms of GPU time. The GPU idles a third of the time waiting for launches.
+
+## Sampling
+
+| Stage | What it does | Cost |
+|---|---|---|
+| softmax(z) | scores → probabilities, sums to 1 | 2V FLOPs = 0.26 MFLOP |
+| temperature T | divide logits by T first; T < 1 sharpens | free |
+| top-k | keep the k best, zero the rest | one pass |
+| top-p | keep the smallest set reaching p | needs a sort |
+| min-p | keep p ≥ ε·p_max | no sort |
+| draw | walk the cumulative sum with one uniform u | one pass |
+
+| T | top token | entropy |
+|---|---|---|
+| 0.5 | 99.96% | 0.005 bits |
+| 1.0 | 96.67% | 0.29 bits |
+| 2.0 | 68.6% | 1.85 bits |
+
+- **Read entropy in bits, not temperature.** 0 = no choice; log₂V = no preference.
+- Use top_p **or** top_k, not both aggressively.
+- Gumbel-max: argmax(z + Gumbel) ≡ sample from softmax(z). One argmax, no softmax.
+- Shipped defaults: Llama-3.1 `T=0.6, top_p=0.9` · Qwen2.5 `T=0.7, top_p=0.8, top_k=20`.
+- Logits in BF16 = 128,256 × 2 = 256 KB — 0.016% of a decode step.
+
+## Formulas worth memorising
+
+```
+params       P = L·(2d² + 2·d·n_kv·d_h + 3·d·m) + (2L+1)·d + V·d·(1 + untied)
+weights      bytes = 2P   (BF16)     ·  P (FP8/INT8)   ·  0.5P (INT4)
+KV / token   2·L·n_kv·d_h·b
+FLOPs/token  2·(P − V·d)  +  4·T·d·L  +  2·V·d
+prefill FLOPs 2·m·P + 2·m²·d·L
+decode floor  (2P + T·kv_per_tok) / bandwidth
+mlp ratio     3.5·d for Llama; break-even 8/3·d
+head_dim      d / n_heads  →  128 for nearly everything
+ridge check   decode 1 FLOP/byte vs H100 295, A100 156, T4 203
+```
+
+## Real numbers to remember
+
+- 8.03 B params × 2 B = **16.06 GB** of BF16 weights for Llama-3.1-8B. Does not fit a 16 GB T4.
+- 70.2% MLP · 16.7% attention · 13.1% embed + head.
+- 90% of a decode step's bytes are the 32 blocks of weights; 72.5% of those are MLPs.
+- 128 KiB of KV per token per sequence. Llama-2-7B: 512 KiB.
+- KV cache equals all the weights at **122,500 tokens** of context (Llama-3.1-8B).

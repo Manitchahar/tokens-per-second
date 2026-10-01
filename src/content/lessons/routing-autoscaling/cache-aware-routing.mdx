@@ -1,0 +1,172 @@
+---
+title: 'Prefix- & cache-aware routing'
+summary: 'A cache that lives on one GPU is only useful if requests find their way to it. You will learn how routers score replicas on prefix match, why that conflicts with load balancing, and how to tune the dial between them.'
+objectives:
+  - Explain why a per-replica prefix cache changes the routing problem
+  - Compute the prefill saving implied by a given prefix hit rate
+  - Derive a cache-aware routing score from prefix affinity and load
+  - Predict the failure mode of pure session affinity
+  - Choose a load weight alpha and justify it from your traffic's repetition rate
+---
+import CacheAware from '@/components/viz/routing-autoscaling/CacheAware.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Module 10 gave you prefix caching: if a prompt's first $c$ tokens are already in the KV cache, you only compute the rest, and the saving is exact. Module 22 packaged the engine so it can be deployed many times over.
+
+Put those two together and you have created a new problem. **The cache is per-replica.** Four GPUs means four separate radix trees, each holding a different subset of conversations. A user whose transcript is warm on replica 2 pays full cold prefill if their next turn lands on replica 0.
+
+Routing used to be about load. Now it is about *where the data already is* — <Term t="prefix-affinity">prefix affinity</Term> — and those two pull in opposite directions. This lesson is the trade-off.
+
+## What reuse is worth
+
+Start with the size of the prize, because it sets how hard you should fight for it. From Lesson 10, with $c$ of $n$ prompt tokens already cached:
+
+$$
+t_{\text{prefill}} = t_{\text{cold}} \times \left(1 - \frac{c}{n}\right)
+$$
+
+Take the traffic shape from the previous lesson: 70% short chat, 30% long RAG, with strong multi-turn reuse. Measured on that workload, routing by prefix gives a **35% hit rate**. So:
+
+$$
+0.35 \text{ hit rate} \implies 0.65 \text{ of the prefill bill}
+$$
+
+You removed 35% of prefill GPU work outright. Since prefill is compute-bound and the most expensive phase per token (Module 10), that is a genuine **throughput** saving, not just a latency one: the fleet can serve more requests per second at the same fleet size.
+
+<Callout type="math" title="What a hit is worth in milliseconds, on real hardware">
+  Llama-3.1-8B on an H100 prefills at about 29.5 µs per token (Lesson 10). An 8,000-token RAG prompt costs about 236 ms cold. At a 35% hit rate it costs about **153 ms** — saving roughly **83 ms of TTFT** and 83 ms of GPU time per request. Across a fleet of four replicas at 14 req/s, that is about 0.5 GPU-seconds per second reclaimed, which is real capacity you did not buy.
+</Callout>
+
+## The conflict, stated precisely
+
+<Term t="session-affinity">Session affinity</Term> — pinning a conversation to a replica — gets you the hit rate. It has no load term in its score, so it produces exactly the failure you should expect: a <Term t="hot-replica">hot replica</Term>.
+
+A popular conversation always returns to whichever GPU owns it. That GPU accumulates KV cache while its siblings idle. In the simulator, pure affinity (α = 0) drives the KV spread to 4.00×: the busiest replica holds four times the mean. Goodput falls to 8%, and p99 TTFT goes past twenty seconds — far worse than a well-balanced fleet of the same size.
+
+<Callout type="pitfall" title="Affinity failures look fine until they don't">
+  The average user in a hot-spot fleet has an acceptable latency. The users in the popular conversation — often your heaviest, most engaged, most valuable users — have the worst latency in the system. And because you are measuring the fleet average, your dashboard is green while your best customers churn. This is Module 06's percentile lesson arriving with the bill.
+</Callout>
+
+## The score that resolves it
+
+<Term t="cache-aware-routing">Cache-aware routing</Term> scores every replica on two terms and sends the request to the highest. The subtlety is that the two terms come from different universes and must be **normalised** before they can be added:
+
+$$
+\text{score}(r) = \underbrace{\frac{\text{prefix tokens } r \text{ holds}}{\text{prompt length}}}_{\text{affinity, } 0..1} - \alpha \cdot \underbrace{\frac{\text{KV tokens } r \text{ holds}}{\text{KV capacity}}}_{\text{load, } 0..1}
+$$
+
+Both terms are now in 0–1 and α is a pure unitless dial. That normalisation is not cosmetic. My first attempt scored raw token counts against raw token counts, and because one replica's KV holdings are orders of magnitude larger than any plausible prefix hit, the load term always won and the dial did nothing. **If your two terms are in different units, you do not have a dial, you have a constant.**
+
+What this <Term t="load-weight">load weight α</Term> does:
+
+| α | Behaviour | Hit rate | KV spread |
+|---|---|---|---|
+| 0 | Pure affinity | 71% | 4.00× — hot spot |
+| 8 | Cache-aware sweet spot | **67%** | 1.12× |
+| 32 | Balanced | 54% | 1.06× |
+| 128 | Load-dominated | 36% | 1.03× |
+| ∞ | Plain least-loaded | 35% | 1.02× |
+
+(Measured on the simulator's default workload with 90% traffic correlation.)
+
+<Scrolly>
+  <CacheAware client:visible slot="stage" />
+
+  <Step title="1. A conversation returns">
+    The user comes back. Their new request repeats the entire transcript, so a replica holding that prefix skips the prefill for all of it. The opportunity exists; the question is whether the router takes it.
+  </Step>
+
+  <Step title="2. Reuse is worth a lot">
+    At a 35% hit rate you pay 65% of the cold prefill bill — about 83 ms of GPU time saved per long request on this workload. That is capacity, not just latency.
+  </Step>
+
+  <Step title="3. Affinity pins it">
+    Session affinity sends the conversation back to its owner. Hit rate and mean TPOT both improve, because the prompt it must actually prefill is much shorter.
+  </Step>
+
+  <Step title="4. Affinity hot-spots">
+    With no load term, a popular conversation always returns to one GPU. Spread hits 4.00×, goodput collapses to 8%, and p99 passes twenty seconds.
+  </Step>
+
+  <Step title="5. Score both terms">
+    Cache-aware routing adds a load penalty, both terms normalised to 0–1 so α is meaningful. The score under each bar shows which replica a returning conversation would be sent to.
+  </Step>
+
+  <Step title="6. Turn the dial">
+    Sweep α. At α = 8 you keep a 67% hit rate with a 1.12× spread — most of the reuse, most of the balance. That is the whole tuning exercise.
+  </Step>
+
+  <Step title="7. Know when to skip it">
+    If your prompts share nothing, the affinity term is always zero and the router quietly becomes least-loaded — correct, but not worth the extra machinery. Turn it on where reuse is real.
+  </Step>
+</Scrolly>
+
+## Where the router gets the prefix information
+
+The score needs to know what each replica holds. Three sources, in increasing sophistication:
+
+**Ask the replica.** Each engine already has the radix tree from Module 10, and many expose its prefix cache in an HTTP endpoint. The router sends a hash of the first few dozen tokens to each replica and takes the longest match. This is what production routers based on SGLang's router and vLLM's production stack do, and at the time of writing it is the most common real design.
+
+**Derive it from routing history.** Keep a table yourself: conversation → replica. Cheaper, but only knows affinity you created, and it goes stale whenever a replica restarts and loses its cache.
+
+**Bloom-filter the fleet.** Each replica maintains a compact filter of the block hashes it holds; the router consults all of them. Cheap to query, no false negatives, occasional false positives that just cost you a miss.
+
+The important operational point: the router's view of the cache is a <Term t="prefix-hint">cache hint</Term> itself, and it goes stale. A replica restarting (Module 22), an eviction sweep running (Module 10), or a rolling deploy all invalidate it. Never let the router *require* a warm prefix to route — always fall back to least-loaded when the hint is missing. A stale hint that sends traffic to an empty GPU is worse than no hint at all.
+
+<Callout type="real" title="Disaggregated serving needs cache awareness more, not less">
+  In Module 21 you split prefill and decode onto separate GPUs. Now the KV cache for a request lives on a *prefill* instance while decode runs elsewhere. The router that sends a returning conversation to the same prefill instance is saving a full KV transfer over the interconnect — tens of gigabytes for an 8,000-token context. Cache awareness is the mechanism that makes disaggregation pay off on repetitive traffic.
+</Callout>
+
+## Making the hit rate real
+
+Routing is only half of it. You cannot route to a prefix that does not exist, and from Lesson 10, reuse needs byte-identical prompts:
+
+1. **Stable prefix first, variable tail last** in every prompt you assemble.
+2. **No timestamps, request IDs or UUIDs** before the cached region.
+3. **Sort retrieved documents deterministically** — by document ID, not by similarity score, whose tie order flips between runs.
+4. **Pin by conversation, not by user**, so six browser tabs do not hold six slots on one replica.
+5. **Keep the cache pool generous.** A prefix cache starved by the KV budget is a cache that misses for reasons that look random.
+
+<Callout type="mentor" title="How to choose α in one sentence">
+  Measure your traffic's repetition rate first. Below about 10% correlation, α barely matters and least-KV-tokens is the right call. Above 60%, start near α = 8 and only raise it if you see hot replicas in the KV-spread panel — and if you do, you have learned something about *which* conversations are hot, which is worth more than the tuning itself.
+</Callout>
+
+## The disaggregated case, in numbers
+
+It is worth being concrete about why cache awareness matters more in a disaggregated deployment (Module 21) than in a monolithic one, because the saving is not "some prefill" — it is an entire network transfer.
+
+Take an 8,000-token prompt on Llama-3.1-8B. Its KV cache is
+
+$$
+8{,}000 \times 131{,}072\ \text{bytes} \approx 1.0\ \text{GB}
+$$
+
+In a monolithic deployment, a warm prefix saves you the prefill compute on that replica: about 8,000 × 29.5 µs = 236 ms of GPU time. Real, but bounded by arithmetic.
+
+In a disaggregated deployment, the request's KV lives on a *prefill* instance. If the router sends this turn to a different prefill instance, that 1.0 GB must cross the interconnect to reach the decode instance before the first token can be produced. On NVLink at roughly 300 GB/s that is about 3.4 ms of transfer — fast in absolute terms, but it is pure overhead added to every turn of every conversation, and it scales with context length. Whether your contexts are 8,000 tokens or 128,000, the transfer is there and the warm instance is the one that avoids it.
+
+The saving from routing the turn back to the warm prefill instance is therefore twofold: less prefill compute *and* no transfer. This is why the two features reinforce each other rather than merely coexisting, and why a router that scores replicas on prefix match is the component that makes disaggregation worthwhile on repetitive traffic at all.
+
+<Callout type="real" title="On very long contexts the transfer dominates completely">
+  At a 128,000-token context, Llama-3.1-8B's KV cache is 128,000 × 131,072 ≈ 16 GB. No interconnect moves that quickly, and a router that misses the warm instance is asking the network to do arithmetic it cannot. At long context, cache-aware routing stops being an optimization and becomes a correctness-of-architecture requirement — which is why long-context deployments (Module 20) and disaggregated deployments (Module 21) both need it.
+</Callout>
+
+<KeyNotes>
+  1. Prefix caches are per-replica, so routing decides whether reuse is reachable at all. A warm cache on the wrong GPU is worth nothing.
+  2. A 35% hit rate means paying 65% of cold prefill — about 83 ms of GPU time per long request on Llama-8B/H100, which is throughput capacity.
+  3. Pure session affinity gets the hit rate but hot-spots the fleet: 4.00× KV spread, 8% goodput, p99 past twenty seconds.
+  4. A cache-aware score is affinity minus a load penalty, with **both terms normalised to 0–1** or α is meaningless.
+  5. α ≈ 8 captured a 67% hit rate at a 1.12× spread in measurement — most of the reuse with most of the balance.
+  6. Router cache hints go stale on restart, eviction and rolling deploys. Always fall back to least-loaded when the hint is missing.
+  7. In prefill/decode disaggregation, cache awareness saves the KV *transfer*, which is why the two features reinforce each other.
+  8. You cannot route to a prefix that does not exist: stable prefix first, no timestamps, deterministic ordering of retrieved documents.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B prefills at about 29.5 µs per token on an H100. An 8,000-token prompt costs 236 ms cold. What does a 35% prefix hit rate make it?', numeric: true, answer: 153, tolerance: 8, unit: 'ms', why: '236 × (1 − 0.35) = 153.4 ms. The saving is 83 ms of GPU time, which is throughput capacity as well as latency.' },
+  { q: 'Your four replicas hold KV loads of 4%, 5%, 92% and 6%. A returning conversation has an 80% warm prefix on replica 1. With α = 4, which replica gets it? Compute score = hit_frac − α × load_frac for each.', options: ['Replica 0, because it is the least loaded', 'Replica 1, because its score of 0.60 beats replica 2\'s −3.68', 'Replica 2, because affinity must yield to any load', 'Replica 3, as a tie-break'], answer: 1, why: 'r0: 0 − 4×0.04 = −0.16. r1: 0.8 − 4×0.05 = +0.60. r2: 0 − 4×0.92 = −3.68. r3: 0 − 4×0.06 = −0.24. Replica 1 wins: its warm prefix outweighs its modest load. Note how badly the overloaded replica scores.' },
+  { q: 'A disaggregated deployment must move an 8,000-token request\'s KV cache from a prefill instance to a decode instance when the prefill instance is not warm. At 131,072 bytes per token and about 300 GB/s, how much data crosses the interconnect, in GB?', numeric: true, answer: 1, tolerance: 0.1, unit: 'GB', why: '8,000 × 131,072 = 1.05 × 10⁹ bytes ≈ 1.0 GB, which is about 3.4 ms at 300 GB/s. Routing the turn back to the warm prefill instance avoids both this transfer and the prefill compute — which is why cache awareness pays off twice over in a disaggregated fleet.' },
+  { q: 'Why must the affinity and load terms in a cache-aware routing score be normalised to the same 0–1 range?', options: ['It is required by HTTP/2', 'Because raw token counts and memory fractions have different units, so an unnormalised load term always dominates and α has no effect', 'Because routing scores must be integers', 'Because the KV pool size is unknown at request time'], answer: 1, why: 'One replica\'s KV holdings can be orders of magnitude larger than any prefix hit. Added raw, the load term always wins and the dial is inert. Normalising makes α a genuine unitless trade-off.' },
+  { q: 'What happens if you enable cache-aware routing on a workload of entirely unique prompts?', options: ['Hit rates stay at zero and the router behaves like least-loaded routing', 'The fleet develops hot replicas', 'Requests are rejected because no prefix matches', 'It halves the arrival rate automatically'], answer: 0, why: 'With nothing to reuse, the affinity term is always zero and the score reduces to the load term. Correct behaviour, just no benefit — which is why you check your repetition rate before adding the machinery.' },
+  { q: 'A replica restarts during a rolling deploy. What is the risk if the router trusts its cached prefix-hint table?', options: ['Nothing, the router will recompute the hint', 'Requests keep being routed to the empty replica, which now pays full cold prefill', 'The KV pool doubles', 'The hit rate will rise because the cache is empty'], answer: 1, why: 'The hint table says "warm prefix here" while the replica has lost its cache, so requests are sent to a GPU with nothing to reuse. Hints must expire, and the router must fall back to least-loaded when a hint is missing.' },
+] } />

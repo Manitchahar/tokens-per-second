@@ -1,0 +1,21 @@
+---
+// Inline glossary term. Hover or focus shows the definition, so nothing is used before it is taught.
+import { glossary } from '../../data/glossary';
+interface Props { t: string }
+const { t } = Astro.props;
+const entry = glossary[t];
+if (!entry) console.warn(`[glossary] missing term: ${t} (add it to src/data/glossary/<module-slug>.ts)`);
+---
+{entry ? <span class="term" tabindex="0"><slot /><span class="term-tip" role="tooltip"><strong>{entry.term}</strong> {entry.def}</span></span> : <slot />}
+
+<style>
+  .term { position: relative; text-decoration: underline dotted var(--text-3); text-underline-offset: 0.25em; cursor: help; }
+  .term-tip {
+    position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%) translateY(4px);
+    width: min(320px, 80vw); padding: 0.65rem 0.8rem; font-size: 0.82rem; line-height: 1.5; color: var(--text-2);
+    background: var(--ground-3); border: 1px solid var(--rule-2); border-radius: 4px; box-shadow: 0 10px 28px rgb(0 0 0 / 0.5);
+    opacity: 0; pointer-events: none; transition: opacity 0.2s, transform 0.25s var(--ease-out); z-index: 30; font-style: normal; font-weight: 400; text-align: left;
+  }
+  .term-tip strong { color: var(--text); display: block; margin-bottom: 0.2rem; }
+  .term:hover .term-tip, .term:focus .term-tip { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>

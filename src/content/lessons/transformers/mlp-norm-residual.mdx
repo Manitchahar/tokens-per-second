@@ -1,0 +1,229 @@
+﻿---
+title: 'The MLP, RMSNorm & the residual stream'
+summary: 'The other half of a transformer block. Three matrices hold 70% of the model, a normalisation keeps 32 layers numerically sane, and a single running vector is what ties the whole thing together.'
+objectives:
+  - Write the SwiGLU MLP and explain why it needs three matrices
+  - Compute the parameter split of a block and compare it with attention
+  - Compute RMSNorm by hand and explain what the RMS scaling protects against
+  - Explain pre-norm versus post-norm and why every current model uses pre-norm
+  - Describe the residual stream and count how many times a token is written to
+---
+import BlockViz from '@/components/viz/transformers/BlockViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Attention is the part everyone pictures. But in Llama-3.1-8B, attention holds **16.7%** of the weights. The other 70.2% sit in the <Term t="mlp">MLP</Term> — three matrices and a nonlinearity, the part of a transformer block that looks like 03.1 and runs on almost all the bytes.
+
+This lesson is about that half, and about the two small pieces of glue that make 32 of them stackable: <Term t="rmsnorm">RMSNorm</Term> and the <Term t="residual-stream">residual stream</Term>.
+
+## The block, whole
+
+One transformer block, pre-norm, in four lines:
+
+$$
+\begin{aligned}
+\mathbf{u} &= \mathbf{x} + \mathrm{Attn}(\mathrm{RMSNorm}(\mathbf{x})) \\
+\mathbf{y} &= \mathbf{u} + \mathrm{MLP}(\mathrm{RMSNorm}(\mathbf{u}))
+\end{aligned}
+$$
+
+Every symbol is now something you can compute. Attention was 03.4 and 03.5. The MLP is below. The norm and the two adds are the rest of this lesson.
+
+Note the shape discipline: $\mathbf{x}$, $\mathbf{u}$ and $\mathbf{y}$ are all 4,096 numbers. **A block takes a 4,096-vector and returns a 4,096-vector.** Whatever it learned is written into the vector it was given.
+
+## RMSNorm, exactly
+
+<Callout type="math" title="The formula, and what was left out">
+  $$\mathrm{RMSNorm}(\mathbf{x}) = \mathbf{g} \odot \frac{\mathbf{x}}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2 + \epsilon}}$$
+
+  Three deliberate omissions compared with LayerNorm:
+  - **no mean subtraction** — that is the "RMS" in RMSNorm; it makes the norm cheaper and works just as well
+  - **no bias** — the learned gain $\mathbf{g}$ (4,096 numbers per norm) does that job
+  - $\epsilon = 10^{-5}$, purely so an all-zero vector does not divide by zero
+
+  FLOPs: $F = 2d$ per vector — one sum of squares, one rescale. Bytes: read 4,096 numbers, write 4,096 numbers.
+</Callout>
+
+What does dividing by the RMS actually buy? It makes every sublayer receive an input with a **fixed scale**, no matter how large the stream has grown. Drag the slider in the visual: the incoming vector's RMS changes by a factor of 60, and the output is *bit-identical* every time. RMSNorm discards the magnitude entirely and keeps only the shape.
+
+<Callout type="intuition" title="Why the stream grows, and why that is fine">
+  Each sublayer's output is **added** to the stream, and nothing in the architecture ever rescales the sum. So after 32 blocks the stream's magnitude is roughly 30 times what it was at layer 1. That would overflow any fixed-precision format within a few layers if the numbers fed into a sublayer kept growing — a single dot product over 128 numbers that each grew 30× would produce a score 900× too large, and the softmax from 03.4 would be dead.
+
+  RMSNorm's division by the RMS puts the scale back to exactly 1 before every single sublayer. **The growth is harmless precisely because the norm removes it first.** This is the load-bearing reason a 32-layer model is numerically stable in BF16.
+</Callout>
+
+### Pre-norm vs post-norm
+
+The original 2017 Transformer normalised *after* the residual add. Every modern model normalises *before* the sublayer. The reason is the gradient path:
+
+- **Post-norm:** the stream is normalised after every add, so information written by layer 1 passes through 32 normalisation operations before it reaches the output. Deep post-norm models needed careful initialisation and warm-up.
+- **Pre-norm:** the path from the embedding to the output is a straight line of identity operations with additions along it. Gradients flow back through that line unchanged.
+
+**Counting the norms.** Pre-norm with $L$ blocks uses **$N = 2L + 1$** RMSNorms: two per block plus one final norm before the output head. Llama-3.1-8B: $N = 2 \times 32 + 1 = 33$, and at 4,096 gains each that is $N_{\text{norm}} = 135{,}168$ parameters — **0.0017%** of the model's 8.03 B. The cheapest part of the model, and the part that keeps the rest of it working.
+
+<Scrolly>
+  <BlockViz client:visible slot="stage" />
+
+  <Step title="1. The residual stream">
+    Give each token one vector of 4,096 numbers and keep adding to it. For Llama-3.1-8B that is **1 + 2 × 32 = 65 separate contributions** summed into a single running vector. Adds never cancel, so what layer 3 learned is still in there when layer 31 runs.
+  </Step>
+
+  <Step title="2. Pre-norm: read a normalised copy">
+    Each sublayer reads a *normalised copy* of the stream, computes something, and adds the result back. The stream itself is never overwritten. That leaves an unbroken identity path from input to output — which is why 32 layers train at all.
+  </Step>
+
+  <Step title="3. RMSNorm, exactly">
+    Divide by the root-mean-square, then multiply by a learned gain. **33 norms in Llama-3.1-8B, 135,168 parameters, 0.0017% of the model.** Drag the slider: change the incoming RMS by 60× and the output does not move at all.
+  </Step>
+
+  <Step title="4. Attention writes its result back">
+    `x = x + Attn(Norm(x))`. No scaling, no gate — 4,096 elementwise additions. The sublayer can only *add* information, never remove it, which is the whole reason residual connections are so cheap and so effective.
+  </Step>
+
+  <Step title="5. Then the MLP writes back">
+    The same pattern again: `y = u + MLP(Norm(u))`. Two sublayers, two writes, and the block returns a vector the same size as the one it was given.
+  </Step>
+
+  <Step title="6. The MLP: where the weights are">
+    Expand 4,096 → 14,336 twice, multiply element by element, project back to 4,096. **176.16 M parameters, 80.8% of a block** — and 70.2% of the whole model. Three matrices, not two, because SwiGLU needs two branches.
+  </Step>
+
+  <Step title="7. Why the stream keeps growing">
+    Nothing rescales the sum, so the magnitude climbs with depth — roughly 1.4 at layer 1 to about 15 at layer 32 in an illustrative profile. RMSNorm divides it back to 1 before every sublayer, which is exactly why that growth is survivable.
+  </Step>
+</Scrolly>
+
+## The MLP: three matrices and a nonlinearity
+
+$$
+\mathbf{y} = W_{\text{down}} \left( \mathrm{SiLU}(W_{\text{gate}}\mathbf{x}) \odot (W_{\text{up}}\mathbf{x}) \right)
+$$
+
+Three steps, all visible in the visual:
+
+1. **gate**: 4,096 → 14,336, then SiLU applied elementwise
+2. **up**: 4,096 → 14,336, left alone
+3. **multiply the two element by element**, then **down**: 14,336 → 4,096
+
+The multiplication in the middle is the whole point. One branch has a nonlinearity on it and one does not, and their product is a **learned gate**: the model decides, per intermediate unit, how much of the "up" value to let through. This is called <Term t="swiglu">SwiGLU</Term>, and it is why Llama-style models have three matrices in their MLP instead of two.
+
+<Callout type="math" title="Three matrices, and the 8/3 rule">
+  The original Transformer used two matrices of width $r = 4$ times $d$, giving 8d² parameters in total.
+
+  SwiGLU uses three. To spend the same budget you would need $P_{\text{MLP}} = 3rd^2$ to equal that same budget, so $r = 8/3 \approx 2.67$.
+
+  **Llama-3.1-8B uses $r = 14{,}336/4{,}096 = 3.5$** — deliberately fatter than break-even. Check the budget: $P_{\text{MLP}} = 3 \times 4096 \times 14336 = 176.16$ M against attention's $P_{\text{attn}} = 41.94$ M. The "extra" width is where the model's capacity actually went.
+</Callout>
+
+### The parameter split of a block
+
+| Matrix | Shape | Parameters | Share of block |
+|---|---|---|---|
+| `q_proj` | 4096 × 4096 | 16.78 M | 7.7% |
+| `k_proj` | 4096 × 1024 | 4.19 M | 1.9% |
+| `v_proj` | 4096 × 1024 | 4.19 M | 1.9% |
+| `o_proj` | 4096 × 4096 | 16.78 M | 7.7% |
+| `gate_proj` | 4096 × 14336 | 58.72 M | 26.9% |
+| `up_proj` | 4096 × 14336 | 58.72 M | 26.9% |
+| `down_proj` | 14336 × 4096 | 58.72 M | 26.9% |
+| 2 × RMSNorm | 4096 each | 0.008 M | ~0% |
+| **Total** | | **218.10 M** | 100% |
+
+<Callout type="pitfall" title="If you profile an 8B model, you will not be looking at attention">
+  `gate_proj`, `up_proj` and `down_proj` are **80.8% of every block**, 70.2% of the model, and 352 MFLOP of the 436 MFLOP a layer spends per token. Three matrices, all `[tokens × 4096] · [4096 × 14336]`-shaped GEMMs, all of them on the memory-bandwidth floor during decode.
+
+  This is why: quantizing a model means mostly quantizing MLPs; a faster attention kernel moves maybe a fifth of the bytes; and a "slow model" report almost always turns out to be dominated by `gate_proj`.
+</Callout>
+
+## The residual stream
+
+The <Term t="residual-stream">residual stream</Term> is the running vector, and thinking about it as a shared workspace explains several things at once.
+
+**It is one vector, written 65 times.** The embedding writes first; then every block's attention and MLP write once. The final vector is a plain sum of 65 terms.
+
+**Adds cannot cancel.** A sublayer can only add coordinates to the stream. Nothing it wrote can be removed by a later layer — only overwritten in the sense of being diluted by other additions. This is why a model can learn many features and keep them.
+
+**Its magnitude grows with depth, and nobody cares.** Every RMSNorm divides it back to 1 before the next sublayer, so no sublayer ever sees an out-of-range vector even though the stream itself has grown an order of magnitude.
+
+### Traffic accounting, one token, per block
+
+| What | Read | Write |
+|---|---|---|
+| RMSNorm 1 | 8 KB (stream) + 8 KB (gain) | 8 KB |
+| Attention | 83.9 MB of weights | 8 KB |
+| ⊕ add | 16 KB | 8 KB |
+| RMSNorm 2 | 16 KB | 8 KB |
+| MLP | 352.3 MB of weights | 56 KB |
+| ⊕ add | 16 KB | 8 KB |
+
+Two numbers matter. **The MLP's 352.3 MB is 83.8% of the block's weight traffic.** And the elementwise glue — two norms, two adds — is about 96 KB, which is 0.02% of the block. The norms are free; the MLP is the whole cost.
+
+## In code
+
+SwiGLU and RMSNorm, complete:
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.g = nn.Parameter(torch.ones(d))     # the only learned numbers here
+        self.eps = eps
+    def forward(self, x):                        # x: [..., d]
+        return self.g * x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps).type_as(x)
+
+class SwiGLU(nn.Module):
+    def __init__(self, d=4096, inter=14336):
+        super().__init__()
+        self.gate = nn.Linear(d, inter, bias=False)   # 4096 -> 14336
+        self.up   = nn.Linear(d, inter, bias=False)   # 4096 -> 14336
+        self.down = nn.Linear(inter, d, bias=False)   # 14336 -> 4096
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+class Block(nn.Module):
+    def __init__(self, d=4096, heads=32, kv_heads=8, d_head=128, inter=14336):
+        super().__init__()
+        self.n1, self.n2 = RMSNorm(d), RMSNorm(d)
+        self.q = nn.Linear(d, heads * d_head, bias=False)
+        self.k = nn.Linear(d, kv_heads * d_head, bias=False)
+        self.v = nn.Linear(d, kv_heads * d_head, bias=False)
+        self.o = nn.Linear(heads * d_head, d, bias=False)
+        self.mlp = SwiGLU(d, inter)
+
+    def forward(self, x):
+        h = self.n1(x)
+        a = self.o(F.scaled_dot_product_attention(
+            self.q(h).view(*h.shape[:-1], -1, 1, 128).squeeze(-3),
+            self.k(h), self.v(h), is_causal=True))          # shapes simplified
+        x = x + a
+        return x + self.mlp(self.n2(x))
+```
+
+Two details worth noticing. Every `nn.Linear` has `bias=False` — the residual stream is where Llama puts that capacity, so the projections have no bias at all. And `RMSNorm.forward` casts to FP32 for the sum of squares before casting back, because squaring 4,096 BF16 numbers and averaging them in BF16 loses real precision.
+
+**Why fusion exists, in one sentence.** The norms, the adds and the SwiGLU multiply are all elementwise: low arithmetic intensity, pure memory traffic. At inference nobody runs them as separate kernels — vLLM and TensorRT-LLM fuse the norm, the residual add and the activation into the neighbouring GEMM's epilogue, and write custom Triton kernels for the rest. Module 13 is that work, and the reason it is worth doing is exactly the table above: the glue is only 0.02% of the bytes but it costs several kernel launches, and a launch is about 5 microseconds.
+
+<Callout type="try" title="See the stream grow and be tamed">
+  In the module notebook, hook every `RMSNorm` module in a real model and record the RMS of its input at each of the 33 calls, for one forward pass. You will see the value rise through the layers and drop back to 1 at every norm. Then replace each norm's `forward` with the identity and watch the output turn to garbage — the norm is not optional, it is load-bearing.
+</Callout>
+
+<KeyNotes>
+  1. A block is `x = x + Attn(Norm(x))` then `y = x + MLP(Norm(x))`. Shape in equals shape out: 4,096 in, 4,096 out.
+  2. **SwiGLU**: `down(SiLU(gate(x)) ⊙ up(x))`, three matrices, 4,096 → 14,336 → 14,336 → 4,096. The `⊙` is a learned gate.
+  3. The break-even MLP width for three matrices is $r = 8/3 \approx 2.67\times$ hidden; Llama-3.1-8B chose **3.5×**, deliberately fatter.
+  4. **The MLP is 176.16 M of a 218.10 M block — 80.8%** — and 70.2% of the whole model. Attention is the minority of the weights and a minority of the bytes.
+  5. `RMSNorm(x) = g ⊙ x / √(mean(x²) + ε)`: no mean subtraction, no bias, ε = 1e-5, plus 4,096 learned gains. It discards the vector's scale completely.
+  6. Pre-norm leaves an unbroken identity path from input to output. Every model in this course is pre-norm, with **$N = 2L + 1 = 33$** norms totalling 135,168 parameters — 0.0017%.
+  7. The **residual stream** is one vector per token, written $N_w = 1 + 2L = 65$ times for Llama-3.1-8B. Adds cannot cancel, so early layers' contributions survive.
+  8. Per token per block: MLP reads 352.3 MB of weights, attention 83.9 MB, and all the glue together about 96 KB. The norms are free; the MLP is the cost.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B’s MLP has three matrices: gate, up and down. How many parameters is that per layer?', numeric: true, answer: 176160768, tolerance: 3000000, why: '3 × 4096 × 14336 = 176,160,768. That is 80.8% of the block’s 218.10 M and 70.2% of the whole model.' },
+  { q: 'A vector is [0.9, −2.1, 1.4, 0.3, −0.8, 2.2, 0.6, −1.1]. What is its RMS? (mean of squares, then square root.)', numeric: true, answer: 1.338, tolerance: 0.01, why: 'Squares sum to 14.32, mean is 1.79, √1.79 = 1.338. RMSNorm divides by exactly this, so the output always has RMS 1.' },
+  { q: 'A 32-layer pre-norm transformer uses how many RMSNorms?', numeric: true, answer: 33, tolerance: 0, why: 'Two per block (one before attention, one before the MLP) plus one final norm before the output head: 2 × 32 + 1 = 33. At 4,096 gains each that is 135,168 parameters, 0.0017% of Llama-3.1-8B.' },
+  { q: 'For Llama-3.1-8B, the MLP intermediate width is 14,336 and hidden size is 4,096. What is the ratio, and why is it above the break-even of 8/3?', numeric: true, answer: 3.5, tolerance: 0.05, why: '14,336 / 4,096 = 3.5. SwiGLU needs three matrices where the original used two, so matching budgets would need 8/3 ≈ 2.67. Llama chose a fatter MLP on purpose — that is where the extra capacity went.' },
+  { q: 'What fraction of a Llama-3.1-8B block’s parameters sit in attention (q, k, v, o)?', options: ['About 20%', 'About 35%', 'About 50%', 'About 81%'], answer: 0, why: '41.94 M of 218.10 M = 19.2%. The MLP holds the other 80.8%. This is the number that decides which matrices a quantizer or a kernel author should attack first.' },
+  { q: 'Llama-3.1-8B: how many bytes of weights does one token’s MLP read during one decode step, per layer?', numeric: true, answer: 352321536, tolerance: 8000000, unit: 'bytes', why: '176,160,768 weights × 2 bytes = 352.3 MB. Compare attention’s 83.9 MB per layer: the MLP moves 4.2× as many bytes, which is exactly why decode is memory-bound and why the MLP dominates.' },
+] } />

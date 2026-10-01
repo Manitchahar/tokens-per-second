@@ -1,0 +1,247 @@
+---
+title: 'torch.compile, fusion & graph breaks'
+summary: 'What torch.compile actually does: trace your Python into a graph, guard it, then generate fused Triton kernels called from C++. Learn why the byte savings are modest, why the launch savings are large, and what a graph break quietly costs you.'
+objectives:
+  - 'Name the four stages inside torch.compile and say which one produces the fused kernels'
+  - 'Count the HBM traffic of an elementwise chain before and after fusion, and say honestly how much that is worth'
+  - 'Explain why the launch saving is usually the bigger one, in terms of the previous lesson'
+  - 'List the common causes of a graph break and find them with fullgraph=True and torch._dynamo.explain'
+  - 'Predict when compilation will not help a configuration, and check it before you deploy it'
+---
+import FusionGraph from '@/components/viz/compilation/FusionGraph.tsx';
+import ModeMatrix from '@/components/viz/compilation/ModeMatrix.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson ended with a bill you could finally see: **3.3 ms of Python** to launch 556 kernels, against **6.0 ms of GPU** to do the work. This lesson is about the tool that attacks that bill, and — just as importantly — about the gap between what people expect it to do and what it actually does.
+
+Here is the honest version, up front, so the rest of the lesson makes sense: <Term t="torch-compile">`torch.compile`</Term> is **a fix for the launch tax**. Its effect on the GPU's byte bill is real but usually small on a dense model. If your configuration is not paying the launch tax, compiling it will buy you a few percent and no more — and the people who quote you 3× numbers are, almost always, quoting you a small model or a low-batch case.
+
+## What is actually inside `torch.compile`
+
+It is four stages, and you need all four to reason about a failure.
+
+```python
+compiled = torch.compile(model)          # or torch.compile(model, mode="reduce-overhead")
+compiled(input_ids, past_key_values=cache, use_cache=True)
+```
+
+1. **Dynamo — trace.** <Term t="dynamo">Dynamo</Term> runs your Python with the real tensors replaced by *proxies*. Every operation on a proxy is recorded instead of executed, and the proxy for the result flows on. When the trace reaches a function it cannot follow, it stops: that is a <Term t="graph-break">graph break</Term>.
+2. **Guards — check.** Before reusing a graph compiled last time, Dynamo checks a <Term t="guard">guard</Term> set: dtypes, shapes, device index, layout, `requires_grad`, and any `id()`-like Python identity it depends on. All pass and the compiled artifact is reused. One fails and you pay a <Term t="recompilation">recompilation</Term>.
+3. **Inductor — generate.** <Term t="inductor">Inductor</Term> takes the operator graph and emits code: mostly <Term t="triton">Triton</Term> kernels (Module 13's language), plus calls into cuBLAS for matrix multiplies unless you ask for autotuning. It decides which pointwise chains to fuse, picks tile sizes, and emits C++ glue.
+4. **The C++ launcher — call.** The generated code is a compiled object. Calling it does not go through the Python interpreter per operator, which is where most of the CPU saving comes from: a launch drops from about **6 µs to about 2 µs**.
+
+<Callout type="intuition" title="Why step 4 is the one people miss">
+  The fused kernels are the visible half of `torch.compile` and the small half of its benefit. The invisible half is that **the Python interpreter is no longer in the loop**. `silu(gate) * up` is still two Triton kernels with two driver calls — it is just that a C++ loop now issues them instead of a Python loop.
+</Callout>
+
+## Fusion, defined precisely
+
+<Term t="operator-fusion">**Operator fusion**</Term> means: take a chain of elementwise operations and emit **one** kernel that reads the inputs, does all the arithmetic in registers or SRAM, and writes only the final result.
+
+The saving is not the arithmetic. It is that each intermediate tensor never travels to HBM and back. One chain of $n$ elementwise ops over a tensor of $b$ bytes moves about $b \cdot 2n$ bytes in eager mode, and only $b \cdot 2$ bytes once fused. That is a 32× reduction in traffic for the chain — *if* the fusion is complete.
+
+The word doing the work is **complete**. Two rules decide what is possible:
+
+- A fusion group must be a **chain of pointwise (and reduction) ops on the same data**, with no other consumer in between. If op 3's output is needed by something else, it must be written out, and the chain splits.
+- The <Term t="epilogue-fusion">**epilogue of a GEMM**</Term> (bias add, activation, residual add) can be fused into the matrix multiply's own kernel, so the result of the GEMM never hits memory. This is the biggest single byte saving available, and it is why inductor is willing to generate its own matmul kernels at all.
+
+## The arithmetic, honestly
+
+Take one decoder layer of Llama-3.1-8B and a 512-token chunk. Count in **units**, where one unit is one hidden row: 4,096 BF16 numbers = 8,192 bytes.
+
+| Eager kernel | reads | writes | units |
+|---|---|---|---|
+| RMSNorm | x | normalised | 2.00 |
+| split into heads (contiguous) | Q,K,V | contiguous copy | 3.75 |
+| RoPE on Q | Q | Q | 2.00 |
+| RoPE on K | K | K | 0.50 |
+| residual add | x, attn | h | 3.00 |
+| RMSNorm | h | normalised | 2.00 |
+| SiLU(gate) | gate | activated | 7.00 |
+| × up | activated, up | product | 10.50 |
+| residual add | h, mlp | h | 3.00 |
+| **total** | | | **33.75** |
+
+Those numbers are just the shapes: Q is 4,096 numbers, K and V are 1,024 each, and the FFN rows are 14,336 numbers = 3.5 hidden rows. Now do the same three lines for what inductor leaves behind, and then the arithmetic that matters:
+
+$$
+\text{bytes} = 33.75 \times 8{,}192 \times 512 \times 32 = 4.53\ \text{GB}
+\qquad
+t = \frac{4.53\ \text{GB}}{2.68\ \text{TB/s}} = \textbf{1.69 ms}
+$$
+
+$$
+\text{bytes}_{\text{fused}} = 22 \times 8{,}192 \times 512 \times 32 = 2.95\ \text{GB}
+\qquad
+t = \textbf{1.10 ms}
+$$
+
+Now put that next to the prefill it belongs to, on an H100 at 55% of peak:
+
+$$
+t_{\text{prefill}} = \frac{2 \times 8.03\times 10^9 \times 512}{989\times 10^{12} \times 0.55} = 15.1\ \text{ms}
+$$
+
+$$
+\frac{1.69 - 1.10}{15.1} = \textbf{3.9\%}
+$$
+
+<Callout type="mentor" title="So is fusion not worth it?">
+  On a **dense** 8B model, for a **prefill** of a few hundred tokens: no, the byte saving is a few percent, and any honest write-up says so. Three things change the answer, and you should check all three on your own workload before you conclude anything:
+  1. **The elementwise share of your model.** Qwen-style models and models with large MoE routers or big vocab projections have proportionally more pointwise work than Llama's 33.75 units.
+  2. **Small chunks.** The chain's cost is linear in tokens, but the *launch* cost is not — see below.
+  3. **FP8 or other narrow dtypes.** Halving the bytes per number halves the chain's traffic too, so the same percentage saving is worth more in absolute terms.
+</Callout>
+
+The **launch** saving is the other half, and it is the bigger one:
+
+$$
+556 \times 6\ \mu\text{s} = 3.34\ \text{ms}
+\quad\longrightarrow\quad
+420 \times 2\ \mu\text{s} = \textbf{0.84 ms}
+$$
+
+Launches per step fall from 556 to about 420: the elementwise chain goes from 9 kernels per layer to 5, and the head and sampling chain from 12 kernels to about 4. And each of the survivors is three times cheaper because a C++ loop issues it.
+
+<Scrolly>
+  <FusionGraph client:visible slot="stage" />
+
+  <Step title="1. Nine kernels around seven GEMMs">
+    One decoder layer, eager mode. The matrix multiplies do essentially all the arithmetic; these nine just move numbers. Each is a launch **and** a round trip to GPU memory.
+  </Step>
+
+  <Step title="2. The byte bill">
+    Add up what each kernel reads and writes and the chain costs **33.75 units** per token per layer: 4.53 GB for a 512-token chunk through 32 layers, or **1.69 ms**. Not one byte of it reaches a tensor core.
+  </Step>
+
+  <Step title="3. The launch bill">
+    The same nine kernels, 32 times over, are 288 launches — **1.7 ms of Python to launch 1.7 ms of GPU work**. The chain of pure bookkeeping is launch-bound on its own.
+  </Step>
+
+  <Step title="4. Dynamo records a tape">
+    Dynamo does not read your code. It runs it with a proxy tensor that logs every call. What comes out is a graph of **operators with shapes** — the same thing a JIT gets in any other language.
+  </Step>
+
+  <Step title="5. Guards decide reuse">
+    Before reusing last time's graph, Dynamo checks dtypes, shapes, device and flags. All pass, and the compiled artifact is free. A new batch size can fail a shape guard, and a failure is a recompile measured in seconds.
+  </Step>
+
+  <Step title="6. Inductor fuses">
+    Five kernels instead of nine, 22 units instead of 33.75 — and every launch now costs 2 µs instead of 6, because a C++ loop is issuing them. **0.84 ms of CPU per step instead of 3.34.**
+  </Step>
+
+  <Step title="7. A graph break">
+    `.item()`, `print(t)`, a branch on a tensor value, an op with no symbolic form: Dynamo stops there, that op runs eagerly, and a new graph starts after it. **It does not crash.**
+  </Step>
+
+  <Step title="8. What a break costs">
+    Not the compile — the **fusion**. Everything after the break is back to one launch per operator *and* one round trip per intermediate, and you now own several graphs and several guard sets.
+  </Step>
+</Scrolly>
+
+## So when is it a big win?
+
+Only when the CPU term was the longer one. The instrument below is that question, answered for a configuration you choose.
+
+<ModeMatrix client:visible />
+
+Worked, with the constants from the last lesson (8 µs of sync added to every row, 6 µs per launch, H100 at 80% of peak bandwidth, 1,024 tokens of context):
+
+| Configuration | CPU term | GPU term | Step, eager | Step, compiled | Step, graphed |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B, batch 1 | 2.52 ms | 0.37 ms | 2.72 ms | **0.83 ms** | 0.57 ms |
+| Qwen2.5-0.5B, batch 128 | 2.52 ms | 0.97 ms | 2.72 ms | **1.17 ms** | 1.17 ms |
+| Qwen2.5-0.5B, batch 512 | 2.52 ms | 2.77 ms | 2.97 ms | 2.97 ms | 2.97 ms |
+| Llama-3.1-8B, batch 1 | 3.34 ms | 6.0 ms | 6.2 ms | 6.2 ms | 6.2 ms |
+| Llama-3.1-8B, batch 64, 4k ctx | 3.34 ms | 18.8 ms | 19.0 ms | 19.0 ms | 19.0 ms |
+
+Read the Qwen rows from the top: compiling is **3.3×** at batch 1, **2.3×** at 128, and by batch 512 the GPU has caught up and all three modes are identical. Read the two 8B rows: compiling is worth **nothing at all**, at any batch, because the GPU was always the longer pipeline.
+
+<Callout type="real" title="What real engines do, at the time of writing">
+  vLLM compiles the model runner with torch.compile by default and exposes flags to disable it and to change the compilation mode; the same region is then wrapped in a CUDA graph, which is the next lesson. TensorRT-LLM does not use torch.compile at all: it builds a full engine graph ahead of time with its own kernel library, which is more work to set up and harder to debug but gives more control. SGLang leans on torch.compile plus its own fused attention and MLP kernels. The lesson to take away is not which one is fastest — you will measure that in Module 17 — but that **all four of them decided the launch tax was worth attacking.**
+</Callout>
+
+## Graph breaks: the failure mode you will actually hit
+
+This is where most people's first `torch.compile` experience goes wrong, so it gets its own section. The rule to remember: **a graph break is not an error, it is a silent downgrade.**
+
+What breaks a graph:
+
+| Cause | Example | Fix |
+|---|---|---|
+| Reading a value to the CPU | `if t.item() > 0:` | keep the branch on-device, or `torch._dynamo.graph_break()` deliberately |
+| Printing or formatting a tensor | `print(t.shape, t.dtype)` | delete it; use logging outside the compiled region |
+| Data-dependent control flow | `while cache.get_seq_length() < n:` | drive the loop with a Python integer you own |
+| An op with no symbolic form | a custom CUDA extension, some quantised ops | accept the break, or exclude the op with `torch._dynamo.allow_in_graph` |
+| Mutating a Python object | appending to a list of tensors | pass tensors in and out; return a new object |
+| Mixing dtypes or devices | a `.float()` on one branch only | normalise before the compiled region |
+
+In a HuggingFace `generate()` loop the usual culprits are the stopping criteria (which call `.item()`), the logits processors (which branch on tensor values), and the cache object itself (which is mutated in place). That is why production code compiles the **forward step**, not `generate()`.
+
+Two tools make this concrete instead of mysterious:
+
+```python
+# 1. Make every break an error. Do this first, always.
+compiled = torch.compile(model, fullgraph=True)
+
+# 2. Ask where the breaks are, and what the compiler decided.
+from torch._dynamo.explain import explain
+report = explain(model)(input_ids, past_key_values=cache, use_cache=True)
+print(report.break_reasons)     # the ops it could not follow
+print(report.graph_count)       # how many graphs you ended up with
+print(report.graph_break_count)
+```
+
+`fullgraph=True` is the single most useful line in this lesson. Turn it on, fix everything it complains about, *then* turn it off. A model with `fullgraph=True` passing is a model whose performance you can reason about.
+
+<Callout type="pitfall" title="Recompilation storms">
+  A <Term t="recompilation">recompile</Term> is not free: Dynamo re-traces, Inductor re-generates, and the generated Triton is compiled to machine code. It takes seconds. Normal: two or three (one per shape family, plus warm-up shapes you did not ask for). Broken: hundreds, which means a shape, dtype or device is varying in a way you did not anticipate.
+
+  Three settings fix most of it. `dynamic=True` at the top level tells Dynamo to expect varying shapes and generate a kernel that covers a range. <Term t="mark-dynamic">`torch._dynamo.mark_dynamic(t, 0)`</Term> marks one specific dimension. And `torch._dynamo.config.cache_size_limit` (default 8) is the guard against the worst case: when more than that many graphs are live, Dynamo gives up and falls back to eager, which is the honest failure mode rather than an OOM. If you see eager in a profile, check that counter first.
+</Callout>
+
+<Callout type="try" title="Three experiments worth an hour">
+  1. `fullgraph=True` on your model's forward step. Count the errors. Most people find at least one, and it is nearly always a `.item()` they wrote for logging.
+  2. `torch._dynamo.explain(...)` before and after `mode="max-autotune"`. Compare `graph_count` and the op counts. This is how you see whether autotuning changed your fusion plan.
+  3. Compile with `dynamic=False` while feeding three different batch sizes, and watch the recompile count. Then compile with `dynamic=True` and watch it drop to one. This is the whole shape-dynamics lesson in ten minutes.
+</Callout>
+
+## The modes, and what each one really turns on
+
+- **`torch.compile(model)`** — the default. Fuses pointwise chains, keeps cuBLAS for matrix multiplies, and calls the generated code from C++. Usually a **1.05–1.5×** on a GPU-bound dense decode step, and much more on a launch-bound one.
+- **`mode="reduce-overhead"`** — wraps the compiled region in <Term t="cuda-graph">CUDA graphs</Term> and replays them, so the CPU issues one launch per step instead of hundreds. This is the flag that crosses into the next lesson, and it is also the flag most likely to confuse you, because it silently imposes the static-address rules we are about to meet.
+- **`mode="max-autotune"`** — benchmarks candidate Triton matmul configurations for your exact shapes and keeps the winner. Much slower to compile, and the win shows up on **prefill and large batches** where the GEMMs dominate. At the time of writing it also turns on CUDA graphs; `mode="max-autotune-no-cudagraphs"` gives you the autotuning without them.
+
+<Callout type="pitfall" title="When compiling makes things worse">
+  **Rebuild thrash.** A model whose shape changes on every call will compile continuously and never finish. Fix the shapes, not the compiler.
+
+  **A fusion that reads more than it saves.** If a fused kernel's working set stops fitting in SRAM, it spills to HBM and can be *slower* than the eager version it replaced. This is rare in inference and common in training; if you see it, it shows up as a longer kernel in the profile.
+
+  **Compile time you cannot amortise.** On a T4, the first compile of a 1.5B model takes tens of seconds. In a notebook that is annoying; in a serverless cold start it is a p99 TTFT catastrophe (Module 22's lesson). Either warm up, or cache the compiled artifacts.
+
+  **The wrong thing compiled.** Wrapping `generate()` rather than the forward step drags the sampling loop, the stopping criteria and the Python bookkeeping inside the guard set. Compile the step.
+</Callout>
+
+## The habit to keep
+
+`torch.compile` is not a speedup you switch on. It is a **claim you test**: *this configuration is paying a launch tax, and this change removes most of it.* The test is three lines long — count the launches, time the CPU, compare against the GPU term — and the last lesson's table tells you in advance which of the three outcomes you are buying.
+
+<KeyNotes>
+  1. `torch.compile` is four stages: Dynamo traces, guards check, Inductor generates Triton, and a C++ launcher calls it. Inductor is the stage that fuses.
+  2. Fusion saves **HBM round trips**, not arithmetic. The chain around Llama-8B's GEMMs costs 33.75 units per token per layer, and 22 after fusion — a **3.9%** prefill saving at 512 tokens, and honest work says so.
+  3. The **launch** saving is usually the bigger one: 556 launches at 6 µs (3.34 ms) becomes about 420 at 2 µs (**0.84 ms**), because the Python interpreter leaves the loop.
+  4. So the payoff is entirely about the crossover. Qwen2.5-0.5B on an H100: **3.2×** at batch 1, 1.24× at 128, and Llama-3.1-8B: **exactly nothing**, because the GPU was always the longer pipeline.
+  5. A **graph break** (`.item()`, `print`, data-dependent branching, an untraceable op) silently downgrades you to eager from that point on. Turn on `fullgraph=True` to make it an error, and `torch._dynamo.explain` to find them.
+  6. **Guards** on dtype, shape, device and flags decide whether a graph is reused. A failure is a recompile measured in seconds; use `dynamic=True` or `mark_dynamic` when shapes vary, and watch `cache_size_limit`.
+  7. `mode="reduce-overhead"` adds CUDA graphs on top, and `mode="max-autotune"` autotunes the matmuls. Compile the forward step, not `generate()`.
+  8. Compiling cannot help a configuration that was never launch-bound, and a recompilation storm, a spilling fusion, or an unamortised compile time can make it actively worse.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A decode step issues 556 launches at 6 µs each. After torch.compile there are about 420 launches at about 2 µs each. How much CPU time is left?', numeric: true, answer: 0.84, tolerance: 0.06, unit: 'ms', why: '420 × 2 µs = 840 µs = 0.84 ms, against 556 × 6 µs = 3.34 ms before. The count falls a little and the per-launch cost falls three times, because a C++ loop issues the kernels instead of the Python interpreter.' },
+  { q: 'You compile a Llama-3.1-8B forward step on an H100 at batch 1. The step was 6.0 ms of GPU work and 3.3 ms of CPU work. Roughly what speed-up do you get?', options: ['About 1.0× — the GPU term is the longer pipeline, so removing CPU time changes nothing', 'About 1.5×, because the two terms overlap', 'About 3×, because compilation removes the memory traffic too', 'About 2×, because the sync disappears'], answer: 0, why: 'The step is max(CPU, GPU) + sync. Compilation only moves the CPU term, from 3.3 ms to 0.84 ms, and the GPU term of 6.0 ms never moved. A configuration that was not launch-bound gets almost nothing from compiling.' },
+  { q: 'Llama-3.1-8B, 32 layers, one elementwise chain of 33.75 units per token per layer, 512-token chunk, 8,192 bytes per unit. How many bytes does the chain move through HBM?', numeric: true, answer: 4.53, tolerance: 0.15, unit: 'GB', why: '33.75 × 8,192 = 276,480 bytes per token per layer, × 512 tokens = 141.6 MB per layer, × 32 layers = 4.53 GB. At 2.68 TB/s that is 1.69 ms of GPU time for arithmetic that never touches a tensor core.' },
+  { q: 'What does a graph break cost you?', options: ['A crash, which is why fullgraph=True exists', 'A recompile of everything after it', 'The fusion: everything after the break runs one launch per operator again, and you own several graphs and guard sets', 'Nothing, Dynamo reconnects the two graphs'], answer: 2, why: 'A break is a silent downgrade, not an error. The eager region keeps its full kernel count and its full HBM traffic, and each graph has its own guards — so a new shape now costs a recompile per graph instead of one.' },
+  { q: 'Which of these is NOT a cause of a graph break?', options: ['Calling .item() on a tensor inside the compiled region', 'Printing a tensor shape for debugging', 'Iterating a Python list of tensors that you built inside the region', 'A 4096 × 4096 BF16 matrix multiply'], answer: 3, why: 'A plain matmul is exactly what inductor expects: it is a well-formed operator with a symbolic shape, and inductor either calls cuBLAS for it or generates a Triton template. Breaks come from the host reading tensor values, Python control flow on them, and mutation of Python objects.' },
+  { q: 'You compile a model and the profile shows eager kernels again after a few minutes. What is the most likely cause?', options: ['The GPU is too small', 'A recompilation storm: too many distinct shapes have filled the dynamo graph cache, so it fell back to eager', 'CUDA graphs were enabled by mistake', 'The model was loaded in FP32'], answer: 1, why: 'Dynamo keeps a bounded number of live graphs (torch._dynamo.config.cache_size_limit, 8 by default). Pass the cache and it gives up on compiling rather than running out of memory. Fix it by fixing the shapes — mark_dynamic, padding, or bucketing — not by raising the limit.' },
+]}/>

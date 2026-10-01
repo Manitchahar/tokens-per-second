@@ -1,0 +1,241 @@
+---
+title: 'Logits to tokens: sampling'
+summary: 'The last 200 microseconds of a forward pass, and the only part a user directly controls. Temperature, top-k and top-p, a renormalisation, and one uniform draw — with the arithmetic behind each knob.'
+objectives:
+  - Turn a vector of logits into a distribution and explain the shift-invariance of softmax
+  - Compute the effect of temperature on the top probability and on entropy
+  - Explain top-k, top-p and min-p, and say when each is the right knob
+  - 'Describe the actual sampling algorithm: renormalise, then one cumulative-sum walk'
+  - Name the real default sampling parameters of current open models
+---
+import SamplingViz from '@/components/viz/transformers/SamplingViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The forward pass is finished. What comes out of the output head is **128,256 numbers** — one score for every token in the vocabulary — and the job of this lesson is to turn them into exactly one token. It is the smallest step in the whole pipeline and the only one where a user has a dial.
+
+It is also the step everyone hand-waves. "Set temperature to 0.7" is not an explanation. In twenty minutes you will be able to explain it, compute it, and predict what a change to any of the five knobs does to the output.
+
+## Stage 1: scores, not probabilities
+
+A **logit** is a raw score. It can be 7.2 or −3.6 and neither is a probability. Two things are true about them:
+
+- **Only differences matter.** Softmax is shift-invariant: adding 5 to every logit leaves the output identical. There is no absolute meaning to a logit, only a ranking and a spacing.
+- **They are unbounded.** Nothing stops a logit being 40. (And if one is, $e^{40}$ overflows BF16 — which is why you subtract the max before exponentiating, exactly as in Module 01.)
+
+For the visual's example — the model has just seen *"The capital of France is"* — here are the top of the distribution, plus eight more so the filtering has something to remove:
+
+| Token | Logit |
+|---|---|
+| `Paris` | 7.2 |
+| ` the` | 3.1 |
+| ` a` | 2.4 |
+| ` known` | 1.9 |
+| ` also` | 1.1 |
+| ` located` | 0.2 |
+| ` famous` | −0.4 |
+| ` home` | −0.9 |
+| ` one` | −1.4 |
+| ` city` | −1.8 |
+| ` in` | −2.2 |
+| ` beautiful` | −2.7 |
+| ` region` | −3.1 |
+| ` of` | −3.6 |
+
+## Stage 2: softmax
+
+$$
+p_i = \frac{e^{z_i}}{\sum_j e^{z_j}}
+$$
+
+$$
+e^{7.2} = 1339.4,\ e^{3.1} = 22.2,\ e^{2.4} = 11.0,\ e^{1.9} = 6.7,\ e^{1.1} = 3.0, \ldots \quad \sum = 1385.3
+$$
+
+| Token | Logit | $e^{z}$ | Probability |
+|---|---|---|---|
+| `Paris` | 7.2 | 1,339.4 | **96.67%** |
+| ` the` | 3.1 | 22.2 | 1.60% |
+| ` a` | 2.4 | 11.0 | 0.80% |
+| ` known` | 1.9 | 6.7 | 0.48% |
+| ` also` | 1.1 | 3.0 | 0.22% |
+| the other 128,251 tokens | ≤ 0.2 | ≤ 1.22 | **0.23% total** |
+
+The model is not *unsure* here. It is 96.7% confident, and that is what a well-trained model looks like on a factual question.
+
+<Callout type="math" title="What that costs, and why it does not matter">
+  Softmax over 128,256 logits is about $F = 2 \times 128{,}256 = 0.26$ MFLOP, plus reading the 256 KB the output head just wrote. On an H100 that is a couple of microseconds — **0.03% of a 5.8 ms decode step**. Sampling is free.
+
+  It matters for correctness, not for speed. Getting it wrong produces bad text, not slow text.
+</Callout>
+
+## Stage 3: temperature
+
+Divide the logits by $T$ before the softmax:
+
+$$
+p_i(T) = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}
+$$
+
+This is the *same operation* as the $d^{-1/2}$ divisor in attention (03.4) and for the same reason: it controls how peaked the distribution is. Compute it for the four temperatures that matter:
+
+| $T$ | `Paris` | ` the` | Entropy (bits) | Behaviour |
+|---|---|---|---|---|
+| 0.5 | **99.96%** | 0.03% | 0.005 | effectively greedy |
+| 1.0 | 96.67% | 1.60% | 0.29 | what the model actually believes |
+| 1.5 | 84.5% | 5.49% | 1.03 | noticeably more exploratory |
+| 2.0 | 68.6% | 8.83% | 1.85 | a different token is now plausible |
+
+<Callout type="intuition" title="Read the entropy column, not the temperature">
+  Temperature itself is meaningless out of context — 0.7 is not "70% creative". The number that means something is the **entropy of the resulting distribution**, in bits. 0 bits means the model has no choice left; $\log_2 V$ bits means it has no preference at all.
+
+  Llama-3.1's default of 0.6 on this prompt gives 0.29 bits. That is not "60% deterministic" — it is a specific, computable statement about how much room the sampler has.
+</Callout>
+
+## Stage 4: filtering
+
+Even at $T = 1$, 0.23% of the mass sits on 128,251 tokens. Over a 500-token answer that tail gets sampled ~1.2 times, and the tail is where garbage lives. So engines filter before they sample.
+
+### Top-k
+
+Keep the $k$ most probable tokens, zero the rest. $k = 1$ is greedy decoding; $k = V$ is no filtering at all. Qwen2.5 ships `top_k = 20`.
+
+At $T = 1$ on our distribution, top-3 keeps 99.07% of the mass and top-5 keeps 99.77%.
+
+### Top-p (nucleus sampling)
+
+Sort descending, walk until the cumulative probability reaches $p$, keep everything up to that point. The set size **adapts to the distribution**:
+
+| | $T = 1$ (peaked) | $T = 2$ (flat) |
+|---|---|---|
+| top-k 3 keeps | 3 tokens, 99.1% | 3 tokens, 81.5% |
+| top-p 0.90 keeps | **1 token**, 96.7% | **5 tokens**, 91.7% |
+| top-p 0.95 keeps | 2 tokens, 98.3% | **7 tokens**, 95.3% |
+
+Read that table twice. On the confident question top-p keeps *fewer* tokens than top-k — the model is sure, so let it be sure. On the flat question it keeps *more* — the model is unsure, so let it explore. One parameter, both behaviours.
+
+<Callout type="pitfall" title="Do not set both aggressively and then wonder why it is repetitive">
+  Llama-3.1 recommends **either** top_p **or** top_k, not both. Setting `top_p = 0.9` and `top_k = 5` together leaves you with the intersection of the two rules, which is usually just top-k — and you have thrown away the adaptivity that made top-p worth having. Pick one and tune it.
+</Callout>
+
+### Min-p
+
+A newer, cheaper alternative: keep every token whose probability is at least $\varepsilon \times p_{\max}$. At $\varepsilon = 0.05$:
+
+| | $T = 1$ | $T = 2$ |
+|---|---|---|
+| tokens kept | **1** | **4** |
+
+It needs one maximum and one threshold — **no sort at all**. Top-p needs a full descending sort of 128,256 values on every generated token. Over a 500-token answer that is 500 sorts where none were necessary, which is why min-p is gaining ground in serving engines.
+
+<Scrolly>
+  <SamplingViz client:visible slot="stage" />
+
+  <Step title="1. 128,256 raw scores">
+    The output head gives one score per vocabulary token. Any real number, negatives included. Only differences matter: adding 5 to every logit changes nothing, because softmax is shift-invariant.
+  </Step>
+
+  <Step title="2. Softmax: scores become probabilities">
+    Exponentiate, subtract the max for safety, divide by the total. **`Paris` takes 96.67%** and the other 128,251 tokens share 0.23% between them. Subtract the max first or $e^{40}$ will overflow FP16 — the same trick as Module 01.
+  </Step>
+
+  <Step title="3. Temperature: a knob on the softmax">
+    **T < 1 sharpens, T > 1 flattens** — the identical operation as attention's $d^{-1/2}$ divisor. At $T = 0.5$ the top token holds 99.96% and the entropy is 0.005 bits: no choice left at all.
+  </Step>
+
+  <Step title="4. Greedy is a special case">
+    Greedy takes the argmax every step. Deterministic and reproducible, but it loops and writes bland text. A seed makes sampling reproducible too — that is the entire purpose of a seed parameter.
+  </Step>
+
+  <Step title="5. Top-k: only the k best">
+    Zero everything below rank $k$. A fixed $k$ is a poor fit: too loose on an easy question, too tight on a hard one. Cost is a partial selection over 128,256 values.
+  </Step>
+
+  <Step title="6. Top-p: only the confident mass">
+    **Nucleus sampling.** Sort descending, walk until the cumulative probability reaches $p$. Raise the temperature and watch it keep *more* tokens than top-k did. Llama-3.1 ships 0.9.
+  </Step>
+
+  <Step title="7. Renormalise and draw">
+    Zero the filtered logits, softmax again so the survivors sum to 1, then walk the cumulative sum with a uniform random $u$ in $[0, 1)$. One pass, no sort, no extra kernel. Press **Draw again**.
+  </Step>
+
+  <Step title="8. What an engine actually receives">
+    `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed` — request parameters, not model constants. At the time of writing Llama-3.1 defaults to **0.6 / 0.9** and Qwen2.5 to **0.7 / 0.8 / 20**.
+  </Step>
+</Scrolly>
+
+## Stage 5: the draw
+
+The actual algorithm is one line of pseudocode, and it is worth knowing because it explains why sampling is so cheap:
+
+```python
+# inverse-transform sampling: one pass, no sort
+p = softmax(logits / temperature)
+p[p < top_k_threshold] = 0            # top-k and min-p: threshold
+p = top_p_filter(p, p_threshold)      # top-p: needs a descending sort
+p /= p.sum()                          # renormalise to 1
+u = torch.rand(())                    # one uniform number
+token = 0
+acc = 0.0
+while acc + p[token] <= u:            # walk the cumulative sum
+    acc += p[token]
+    token += 1
+```
+
+There is an elegant alternative worth knowing because **speculative decoding** (Module 16) depends on it. The **Gumbel-max trick** says:
+
+$$
+\arg\max_i \left( z_i + g_i \right) \;\sim\; \text{sample from } \mathrm{softmax}(z)
+$$
+
+where $g_i$ are independent Gumbel samples, $g_i = -\log(-\log u_i)$. Add Gumbel noise to the logits, take the argmax, and you have sampled exactly from the distribution — no softmax, no cumulative sum, one argmax. It is what makes it possible to verify a draft model's token with a single comparison.
+
+**And one more knob you will see in every API: `repetition_penalty`.** It divides the logits of tokens already present in the context by a factor (typically 1.05–1.15) before the softmax. It is a blunt instrument — it treats a repeated number and a repeated name identically — and it distorts the distribution into something that is no longer any model's actual beliefs. Use it only if you must, and prefer temperature and top-p first.
+
+## Choosing, in order
+
+The practical advice, in the order you should actually try things:
+
+1. **Greedy (T = 0)** for extraction, classification, code completion and anything parsed. Deterministic beats creative.
+2. **Temperature alone**, around 0.6, if you want the model's own distribution and nothing else.
+3. **Add top-p 0.9** if you see the tail leaking in — usually on factual or code tasks where a weird token is catastrophic.
+4. **Add a repetition penalty** last, and as small as you can get away with.
+5. **Use min-p instead of top-p** if you are running your own engine and care about the sort cost.
+
+| Task | Temperature | top_p | Why |
+|---|---|---|---|
+| Code / JSON / SQL | 0 or 0.2 | 0.9–1.0 | one wrong token ruins the answer |
+| Factual QA, tool calls | 0.3–0.6 | 0.9 | the model is usually confident; let it be |
+| Chat, assistants | 0.6–0.8 | 0.9 | the shipped defaults |
+| Creative writing | 0.9–1.2 | 0.95 | genuinely want to explore |
+| Batch generation for training data | 1.0 | 1.0 | you want the model, unmodified |
+
+<Callout type="real" title="Where this bites an inference engineer">
+  - **Batching changes results.** With batched sampling on a GPU, a row that finishes early keeps generating unless you freeze it. Different batch compositions therefore produce different text for the same seed. If you need bit-identical output you need greedy decoding, a fixed batch composition, or per-request RNG — a real operational constraint, not a detail.
+  - **`seed` is not free.** Per-request RNG states cost memory and a little time, which is why engines have historically used one shared generator per step.
+  - **Structured output** replaces sampling with a mask and an argmax over the legal tokens (Module 26). That is both faster and exactly correct, and it is the right answer for JSON schemas and grammar-constrained generation.
+  - **The logit filter is a common fast path.** If `top_k = 1`, you can skip the softmax entirely and just argmax the output head — one fewer kernel on a 128,256-wide tensor.
+</Callout>
+
+<Callout type="try" title="Read a real distribution">
+  In the module notebook, run a small instruct model on a factual prompt, print the top 20 logits and their softmax probabilities, then repeat with `temperature = 0.3`, `1.0` and `1.5`. Compute the entropy of each. Then compare `do_sample=True` against greedy over 20 generations and count how many distinct outputs you get. Those numbers are what you will be tuning in production.
+</Callout>
+
+<KeyNotes>
+  1. The output head produces **128,256 logits** — unbounded scores, meaningful only in their differences, since softmax is shift-invariant.
+  2. At softmax, a well-trained model on a factual prompt is usually **~97% confident** on one token. That is not overconfidence; it is what the distribution is.
+  3. **Temperature** divides logits before softmax. $T = 0.5$ → 99.96% top token, 0.005 bits of entropy. $T = 2$ → 68.6%, 1.85 bits. It is the same knob as attention's $d^{-1/2}$ divisor.
+  4. **Entropy in bits** is the number that means something, not the temperature. 0 = no choice; $\log_2 V$ = no preference.
+  5. **Top-k** keeps a fixed count; **top-p** keeps the smallest set reaching a probability mass. On a peaked distribution top-p keeps fewer than top-k; on a flat one it keeps more. That adaptivity is the point.
+  6. Use **top_p or top_k, not both aggressively** — the intersection is usually just top-k, throwing away top-p's adaptivity.
+  7. **Min-p** keeps tokens with $p \ge \varepsilon p_{\max}$: one threshold, **no sort**. Over a 500-token answer that is 500 sorts avoided.
+  8. Sampling costs **0.26 MFLOP and 256 KB** — about 0.03% of a decode step. Shipped defaults at the time of writing: Llama-3.1 `0.6 / 0.9`; Qwen2.5 `0.7 / 0.8 / 20`.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Logits [7.2, 3.1, 2.4, 1.9, 1.1] plus a small tail. What probability does the token with logit 7.2 get at temperature 1?', numeric: true, answer: 96.7, tolerance: 0.4, unit: '%', why: 'e^7.2 = 1339.4; the exponentials sum to 1385.3; 1339.4 / 1385.3 = 0.9667. Note the sum uses all 128,256 logits — the tail adds about 1.7 to it.' },
+  { q: 'At temperature 2.0, the top token holds what share of the probability mass?', numeric: true, answer: 68.6, tolerance: 0.8, unit: '%', why: 'Logits / 2 = [3.6, 1.55, 1.2, …]. e^3.6 = 36.6 and the exponentials sum to 53.4, so 36.6 / 53.4 = 0.686. Entropy rises from 0.29 to 1.85 bits.' },
+  { q: 'Top-p 0.90, temperature 2.0, on the 14-token distribution above: how many tokens survive?', numeric: true, answer: 5, tolerance: 0, why: 'Cumulative from the top: 68.6% → 77.4% → 83.6% → 88.5% → 91.7%, which is the first prefix to reach 90%. Five tokens. At temperature 1 the same p keeps only one.' },
+  { q: 'How many bytes does the logits vector occupy for Llama-3.1-8B in BF16?', numeric: true, answer: 256512, tolerance: 100, unit: 'bytes', why: '128,256 logits × 2 bytes = 256,512 bytes = 256 KB. Written by the output head, read once by the softmax. That is 0.016% of the 15.5 GB a decode step moves.' },
+  { q: 'Why does top-p need a sort that min-p does not?', options: ['Top-p is applied to the logits and min-p to the probabilities, so top-p has more precision to get wrong', 'Top-p must find the smallest prefix reaching p, which requires ranking all tokens by probability; min-p only needs the maximum and a threshold comparison', 'Top-p is only used in training', 'Min-p is an approximation of top-p'], answer: 1, why: 'Top-p needs the descending order to know where the cumulative sum crosses p. Min-p compares every probability against ε × p_max, so it is one max-reduction and one threshold — no ordering at all.' },
+  { q: 'Llama-3.1-8B: about how many FLOPs does softmaxing the logits cost, in MFLOP?', numeric: true, answer: 0.26, tolerance: 0.05, unit: 'MFLOP', why: 'One exponential and one division per logit is about 2 × 128,256 = 256,512 FLOPs ≈ 0.26 MFLOP. Two microseconds on an H100 — 0.03% of a 5.8 ms decode step. Sampling costs nothing; getting it wrong costs quality.' },
+] } />

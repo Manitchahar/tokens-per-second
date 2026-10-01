@@ -1,0 +1,206 @@
+---
+title: 'Measuring quality regression'
+summary: 'A quantized model is never obviously broken — it is subtly worse in specific ways. You will learn a three-stage evaluation ladder (perplexity, task benchmarks, length-swept KV checks), how to read a confidence interval instead of a point estimate, and how to write the regression report that decides whether a config ships.'
+objectives:
+  - Compute and interpret perplexity as a first-pass regression signal
+  - Choose task benchmarks that match the failures your users would notice
+  - Report a quality delta with a confidence interval, not a point estimate
+  - Design a length sweep that catches KV cache quantization damage
+  - Write a quantization regression report with acceptance criteria
+---
+import QualityDashboard from '@/components/viz/quantization/QualityDashboard.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have a 4-bit model. Someone asks whether it is "still good". That question has no useful answer, and the fact that it has no useful answer is the lesson.
+
+Quantization does not break a model the way a bug breaks it. It does not crash, it does not produce gibberish, and it passes every smoke test you are likely to write in an afternoon. It **shifts the error distribution**: it makes the model slightly more likely to mis-copy a long string, slightly more likely to loop, slightly more willing to guess rather than say it does not know. The damage is real and it is invisible to aggregate metrics.
+
+So the job is not "detect breakage". It is **build an instrument sensitive enough to see a 2-point regression, and then decide whether that 2 points matters to your product**.
+
+## Stage 1: perplexity, the fast smoke test
+
+<Term t="perplexity">Perplexity</Term> is how surprised the model is by real text it was not trained on. Formally, for a corpus of tokens $x_1, \dots, x_N$:
+
+$$
+\text{PPL} = \exp\!\left( -\frac{1}{N}\sum_{i=1}^{N} \log p(x_i \mid x_{<i}) \right)
+$$
+
+Read it as "the average number of equally likely choices the model is as surprised by as the real next token." A PPL of 6.72 means the model is about as uncertain as a 6.72-way guess.
+
+It is worth running first, for three reasons: it takes **minutes**, it needs no labels, and it moves **before** task accuracy does. A typical 8B model at 4-bit goes from ~6.72 to ~6.89 — a 2.5% jump that tells you something went wrong even though every accuracy number is unchanged.
+
+<Callout type="pitfall" title="Perplexity is a smoke test, not a decision">
+  PPL is an average over every token of every document. A model that is 0.5% better on 95% of tokens and 30% worse on the 5% that matter will show you a PPL change of about zero — and you have shipped a regression in exactly the place your users notice.
+
+  It is also **corpus-dependent**. A model tuned on code-heavy text will score worse on a news corpus than the same model in BF16, with nothing wrong anywhere. Run PPL on text that resembles your traffic, or it is measuring the wrong thing.
+</Callout>
+
+## Stage 2: task benchmarks, the actual gate
+
+This is where the decision gets made. The right benchmarks are not "the popular ones" — they are the ones that fail in the ways your users would describe as *the model got worse*.
+
+| If your product is… | Watch | Why it fails first under quantization |
+|---|---|---|
+| Coding assistant | HumanEval, MBPP, your own held-out PRs | Exact string reproduction and long dependency chains are the first casualty |
+| Math / reasoning | GSM8K, MATH | Multi-step arithmetic accumulates per-step error, and $\sqrt{L}$ is real here |
+| RAG / search | Long-context QA, retrieval accuracy | Reads the KV cache hardest; hurts if the cache is quantized |
+| Support / chat | Your own eval set, judged by a rubric | Conversation quality drifts in ways no public benchmark measures |
+| Summarisation | ROUGE / your own factuality check | Factuality degrades before fluency does — the summary stays smooth and becomes wrong |
+
+Run **at least three**, and always include one from your own traffic. A public benchmark tells you the community's experience; only your own eval tells you your users'.
+
+<Scrolly>
+  <QualityDashboard client:visible slot="stage" />
+
+  <Step title="1. Perplexity: the cheap first check">
+    Held-out perplexity for each configuration. W8A8 moves by 0.02; W4 moves by 0.17. You know in minutes that 4-bit changed something, before spending a GPU-hour on accuracy.
+  </Step>
+
+  <Step title="2. Perplexity is not enough">
+    The point of this step is the habit: PPL moved 2.5%, and the task numbers barely moved. If you had stopped here you would have shipped on a signal that provably cannot see the failures you care about.
+  </Step>
+
+  <Step title="3. The tasks users actually complain about">
+    Four benchmarks, each with a baseline tick and a confidence band. Read the arrows: the code and math columns take small hits everywhere, and the long-context column is where the configuration starts to fall apart.
+  </Step>
+
+  <Step title="4. Reading the numbers honestly">
+    Every delta carries a ± interval from the sample count. At 200 samples the noise is ±4 points, so a 2-point move is not a finding. Shrink the sample count and the dashboard tells you your eval is too small to decide anything.
+  </Step>
+
+  <Step title="5. Long context and the KV effect">
+    The same weights, with KV precision varied, evaluated at 1k, 8k and 32k. INT4 KV looks acceptable at short context and collapses at 32k. **If you only evaluate at 512 tokens, you will conclude INT4 KV is fine.**
+  </Step>
+
+  <Step title="6. The report you hand over">
+    The deliverable is not a number, it is a document: config, eval set and version, per-task deltas with intervals, performance deltas, and the failures you read by hand. That is what makes the decision reviewable.
+  </Step>
+</Scrolly>
+
+## Sample size is not a detail
+
+The single most common way quantization evals go wrong is not a bad benchmark. It is **too few samples**, which turns noise into a decision.
+
+A proportion measured on $n$ samples has a standard error of roughly:
+
+$$
+\text{SE} \approx \sqrt{\frac{p(1-p)}{n}}
+$$
+
+and a 95% interval is about $\pm 1.96 \times \text{SE}$. At $p \approx 0.6$:
+
+| Samples | 95% interval |
+|---|---|
+| 100 | ±9.5 points |
+| 200 | ±6.8 points |
+| 1,000 | ±3.0 points |
+| 5,000 | ±1.4 points |
+| 20,000 | ±0.7 points |
+
+**A 4-bit regression is usually 1–4 points.** So to see a 2-point regression you need on the order of 5,000 samples per task, not 200. If you cannot afford that, then the honest conclusion is "this configuration is within our measurement resolution", and you should say that in the report rather than declaring a 1.2-point improvement.
+
+<Callout type="math" title="A paired test is much more sensitive than the intervals suggest">
+  Those intervals assume each model is evaluated on independent samples, which overstates the uncertainty. In practice the same prompts go to both models, and the two scores are highly correlated. A **paired** test — the McNemar test on which items each model got right — typically needs 5–10× fewer samples to detect the same difference.
+
+  This is not a nicety. It is the difference between a 5,000-sample eval and a 50,000-sample one, i.e. between hours and a week of GPU time. If your harness can do paired analysis, use it.
+</Callout>
+
+## KV cache quantization needs its own sweep
+
+The previous lesson warned that KV cache error accumulates with sequence length. This is a measurement problem as much as a modelling one, and the fix is a specific experiment:
+
+> **Hold the weights fixed. Vary the KV precision. Sweep the context length. Plot accuracy against length.**
+
+That plot has a characteristic shape:
+
+| Context | INT8 KV | INT4 KV |
+|---|---|---|
+| 1k | ~no change | ~no change |
+| 8k | −0.5 pts | −3 to −6 pts |
+| 32k | −1 to −2 pts | −10 to −15 pts |
+| 128k | −2 to −4 pts | unusable |
+
+Two practical consequences:
+
+1. **Never evaluate KV precision at a short context.** You will get a false pass. Evaluate at or above your longest served context.
+2. **A config that passes at 8k may fail at 128k.** If your product grows context, treat KV precision as a config you will re-tune, not a decision you make once.
+
+<Callout type="mentor" title="Read the failures, not just the score">
+  Aggregate scores tell you *that* something regressed. Reading twenty actual outputs tells you *what*, and that is what changes your mind about a config.
+
+  The signatures to look for, in rough order of how often they are the real problem:
+  - **Repetition** — the model loops on a phrase instead of progressing. Almost always KV quantization at long context.
+  - **Lost needle** — it cannot retrieve a specific fact stated thousands of tokens back. KV cache error, again, and often worse than it looks.
+  - **Late hallucination** — correct and detailed until the final clause, which it invents. Weight quantization at 4 bits, amplified by greedy decoding.
+  - **Code that almost runs** — right structure, wrong identifier or off-by-one. Weight quantization, concentrated in the MLP.
+
+  Keep a small <Term t="golden-set">golden set</Term> — a hand-reviewed set of ~50 cases with known-correct behaviour — that no automated tuning touches. It is the last line of defence, and it is what you read when a score moves and you do not know why.
+</Callout>
+
+## Writing the report that gets accepted
+
+A quantization decision is a **behavioural change to your model**, and it should be reviewed like one. The report is short and it has a fixed shape:
+
+```
+## Quantization change: <model> BF16 → W4A16 (g128, GPTQ)
+
+Config     model revision <sha>, quantizer gptq, group 128, weights INT4,
+           activations BF16, KV cache BF16, calibration 128 sequences
+Eval       task suite <name+v>, 5,000 samples/task, paired McNemar,
+           greedy decoding, seed 1234, prompt format as served
+
+Quality    GSM8K    62.5 → 61.4   −1.1 ± 0.8   not significant
+           HumanEval 48.2 → 45.9  −2.3 ± 1.1   SIGNIFICANT, fails 2 of 12 accepted
+           MMLU     68.4 → 67.9   −0.5 ± 0.7   not significant
+           LongQA   71.0 → 68.2   −2.8 ± 1.2   SIGNIFICANT
+
+Perf       weights 16.06 → 4.27 GB;  step 12.4 → 8.0 ms
+           peak memory 34.1 → 22.4 GB;  concurrency +52%
+           TTFT 41 → 38 ms;  TPOT 11.9 → 7.7 ms
+
+Decision   ACCEPT with condition: exclude HumanEval-style tasks from the
+           routing policy, or ship W8A8 for the code-serving replica.
+Rollback   BF16 checkpoint retained; flag `--quantization w8a8` ready.
+```
+
+The things that make this reviewable rather than merely reported:
+
+- **Absolute and relative numbers**, so the reader can check the arithmetic.
+- **Intervals**, so "significant" is a claim with evidence.
+- **A named decision**, not "here are some numbers". Someone must choose.
+- **A rollback plan**, because this is a behavioural change and you will need it.
+
+<Callout type="recap" title="The whole measurement lesson in four lines">
+  Run **perplexity** first because it is cheap and moves early, but never decide on it.
+  Run **task benchmarks from your own traffic**, because public benchmarks measure the community's users, not yours.
+  Use **paired tests and enough samples** to resolve a 2-point regression, which means thousands, not hundreds.
+  **Sweep context length** whenever the KV cache is quantized, because that damage only appears at the long end.
+</Callout>
+
+<Callout type="try" title="Check yourself before continuing">
+  1. A configuration scores 1.2 points below baseline on an eval of 200 samples (±6.8). What do you write in the report, and what do you do next?
+  2. You quantize the KV cache to INT4. Your eval runs at 1,024 tokens and shows no regression. Your service supports 32k. What have you missed, and what is the smallest change that fixes it?
+  3. PPL rose from 6.72 to 6.89 and all task benchmarks are flat. Which do you trust, and why do both being true at once make sense?
+  4. You have 500 samples per task and need to resolve a 2-point regression. Paired McNemar versus independent intervals: which gets you there, and roughly how many samples do you save?
+  5. Name the failure signature you would expect from each of: (a) 4-bit weights, greedy decoding; (b) INT4 KV at 32k context.
+</Callout>
+
+<KeyNotes>
+  1. Perplexity is a minutes-long smoke test that moves before accuracy does. It is corpus-dependent and it averages away exactly the rare failures you care about.
+  2. The decision gate is task benchmarks, and at least one must come from your own traffic. Public benchmarks measure the community, not your users.
+  3. A 4-bit regression is typically 1–4 points, so you need thousands of samples per task. At 200 samples you cannot resolve it, and must say so.
+  4. Paired testing (McNemar on which items each model got right) is 5–10× more sample-efficient than independent intervals, because the two models see the same prompts.
+  5. Always report absolute and relative deltas with 95% intervals, and mark which moves are significant.
+  6. KV cache quantization must be swept across context length. It looks fine at 1k and collapses at 32k.
+  7. Read actual failures, not just scores: repetition (KV), lost needle (KV), late hallucination (4-bit weights, greedy), near-miss code (4-bit weights, MLP).
+  8. The deliverable is a report with a named decision and a rollback plan, because quantization is a behavioural change to your model.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'An eval of 200 samples shows a 1.2-point drop, with a 95% interval of ±6.8 points. What is the correct conclusion?', options: ['The quantized model is worse; ship the rollback', 'The drop is inside the noise band, so either gather more samples with a paired test or report “within measurement resolution”', 'Perplexity is the better metric; use that instead', 'Re-run with a different seed and take the better result'], answer: 1, why: 'A 1.2-point difference against a ±6.8 interval is indistinguishable from noise. The honest move is to increase the sample count and use a paired test, or to state in the report that the eval cannot resolve this difference. Calling it a regression invents a finding you do not have.' },
+  { q: 'What sample size gives roughly ±1.4 points of 95% confidence on a score near 0.6?', numeric: true, answer: 5000, tolerance: 600, unit: 'samples', why: 'SE = √(p(1−p)/n). Setting 1.96·√(0.24/n) = 0.014 gives n = 1.96²·0.24/0.014² ≈ 4,800, so about 5,000. At 200 samples the same formula gives ±6.8 points — far too coarse to see a 4-bit regression.' },
+  { q: 'Why does paired McNemar testing need far fewer samples than comparing independent accuracy intervals?', options: ['McNemar uses a more powerful distribution', 'Both models answer the same prompts, so only the items where they disagree carry information, and there are few of those', 'McNemar does not require sampling', 'It measures a different, easier quantity'], answer: 1, why: 'Independent intervals treat each score as a fresh binomial draw and pay for the near-total agreement. In a paired design you look only at items where one model is right and the other wrong — typically a small number — so the same effect size is detectable with 5–10× fewer samples.' },
+  { q: 'INT4 KV cache quantization shows no regression at 1,024 tokens. Your service supports 32k. What is the risk?', options: ['None — short-context accuracy generalises', 'KV error accumulates over sequence length, so the damage appears only at long context and your eval gave a false pass', 'The risk is only to speed, not quality', 'INT4 KV is always fine regardless of length'], answer: 1, why: 'Every cached key contributes a slightly shifted vector to the attention distribution, and at 32k there are 32,000 of them. The symptom is repetition and lost long-range recall. A short-context eval structurally cannot detect it.' },
+  { q: 'A 4-bit quantization costs 4.0 points on GSM8K. At p ≈ 0.6, how many samples per task do you need for a 95% interval half-width of about 2 points?', numeric: true, answer: 2300, tolerance: 500, unit: 'samples', why: 'Solve 1.96·√(p(1−p)/n) = 0.02 for n: n = 1.96²·0.6·0.4/0.02² = 3.84·0.24/0.0004 ≈ 2,300. Below a few thousand samples the interval is wider than the effect you are trying to detect, which is why small quantization evals routinely report changes that are pure noise.' },
+  { q: 'Perplexity rises from 6.72 to 6.89 while every task benchmark stays flat. What does that combination tell you?', options: ['Perplexity is broken and should be ignored', 'Something changed measurably but not on the tasks you tested — the average moved while the specific behaviours did not', 'The task benchmarks are wrong', 'The model is fine; perplexity noise is larger than the change'], answer: 1, why: 'PPL averages over every token of a corpus. A change that is uniform but small (2.5%) shows up there while leaving per-task accuracy inside its confidence interval. Both facts are consistent and both are useful: PPL said something moved, the tasks said it did not move what you measure.' },
+]} />

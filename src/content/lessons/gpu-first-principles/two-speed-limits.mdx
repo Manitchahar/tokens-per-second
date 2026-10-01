@@ -1,0 +1,161 @@
+---
+title: 'The two speed limits: compute and bandwidth'
+summary: 'The roofline. Every GPU has a compute ceiling and a memory floor, and which one you hit is decided by one number — FLOPs per byte. Derived from scratch, then applied to prefill, decode and attention.'
+objectives:
+  - Write the lower bound on a kernel's time from its FLOPs and its bytes
+  - Compute arithmetic intensity for a matrix multiply at any number of rows
+  - Find the ridge point for a given GPU and say what it means
+  - Classify a real LLM operation as compute-bound or memory-bound
+  - Explain why a faster GPU is often the wrong purchase
+---
+import Roofline from '@/components/viz/gpu/Roofline.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Open the roofline above and look at the shaded triangle. That picture is the answer to the question Module 01 left hanging, and it is the most useful diagram in this course. Everything after this module is an attempt to move a point in it.
+
+## Two numbers, and they are not comparable
+
+Every GPU has a **compute ceiling**: how many floating-point operations it can retire per second, if every arithmetic unit is busy every cycle. And it has a **bandwidth floor**: how many bytes it can read per second, if memory is the only thing running.
+
+On an H100:
+
+$$
+\text{compute ceiling} = 989\ \text{TFLOP/s}, \qquad \text{memory} = 3.35\ \text{TB/s}
+$$
+
+These are the two numbers people quote, and they are not the same kind of thing at all. One is a rate of arithmetic. The other is a rate of *supplying material* to the arithmetic. **No program can exceed either.**
+
+<Callout type="math" title="The lower bound on any kernel">
+  Do $F$ floating-point operations while moving $B$ bytes:
+
+  $$
+  t \ge \max\left(\frac{F}{\text{peak FLOP/s}},\ \frac{B}{\text{bandwidth}}\right)
+  $$
+
+  Both terms are hard floors. The larger one is the one that will actually decide your runtime, and it is not possible to be clever about it.
+</Callout>
+
+So take Module 01's decode token: $F \approx 16$ GFLOP of math, $B \approx 16$ GB of weights.
+
+$$
+\frac{16\times 10^9}{989\times 10^{12}} = 16\ \mu\text{s} \qquad \frac{16\times 10^9}{3.35\times 10^{12}} = 4.8\ \text{ms}
+$$
+
+Sixteen microseconds of math, 4.8 milliseconds of memory. Decode is **memory-bound**, and it is memory-bound by a factor of about 300. That is the 7 ms you measured, with the remaining time spent on overheads and on not quite reaching peak bandwidth.
+
+## One number decides which limit you hit
+
+Divide the first term by the second and the machine disappears:
+
+$$
+\text{arithmetic intensity} = \frac{F}{B} \quad [\text{FLOP per byte}]
+$$
+
+$$
+\frac{\text{compute ceiling}}{\text{bandwidth}} = \frac{989\times 10^{12}}{3.35\times 10^{12}} \approx 295\ \text{FLOP/byte}
+$$
+
+That ratio is the **ridge point**: the intensity at which the two limits are exactly balanced. Plot the achievable rate against intensity and you get a rising slope (bandwidth-limited) that flattens into a ceiling (compute-limited). A roofline.
+
+| GPU | Compute ceiling | Bandwidth | Ridge point |
+|---|---|---|---|
+| T4 (free Colab) | 65 TFLOP/s | 0.32 TB/s | ~203 FLOP/byte |
+| A100 80GB | 312 TFLOP/s | 2.0 TB/s | ~156 FLOP/byte |
+| H100 SXM | 989 TFLOP/s | 3.35 TB/s | ~295 FLOP/byte |
+| B200 | ~2,250 TFLOP/s | 8.0 TB/s | ~281 FLOP/byte |
+
+<Scrolly>
+  <Roofline client:visible slot="stage" />
+
+  <Step title="1. Two numbers, one graph">
+    Horizontal axis: arithmetic intensity, from a tenth of a FLOP per byte up to three thousand. Vertical axis: achieved TFLOP/s. Every job is a point.
+  </Step>
+
+  <Step title="2. The roof">
+    Draw a line of slope 1 from the origin: at intensity $I$ you can do at most $I \times$ bandwidth. It is the bandwidth floor. Above the line is impossible, so the area under it is shaded as unreachable.
+  </Step>
+
+  <Step title="3. The ceiling and the ridge">
+    Past the ridge point the slope would require more FLOP/s than the GPU has. The roof becomes flat at the compute ceiling. Everything on the left is memory-bound; everything on the right is compute-bound.
+  </Step>
+
+  <Step title="4. Prefill lands on the right">
+    A prefill step is one big matrix multiply with hundreds of rows. Each weight is reused for every row, so intensity runs into the hundreds and the point sits on the flat top: **compute-bound**. The arithmetic is worth doing.
+  </Step>
+
+  <Step title="5. Decode slides off the cliff">
+    The same weights, but one row at a time. Every byte fetched feeds exactly one multiply-add, so intensity is about **1 FLOP/byte** and the point is deep on the left, pinned to the bandwidth floor: **memory-bound**. All the compute in the world would not speed this up.
+  </Step>
+
+  <Step title="6. The wasted machine">
+    The vertical gap from a point up to the roof is throughput thrown away. Real kernels reach maybe 80% of peak bandwidth and 50–70% of peak FLOP/s. Closing that gap is what kernel engineering, fusion and quantization are for.
+  </Step>
+
+  <Step title="7. Only two moves exist">
+    Raise intensity, or lower bytes. Batching raises intensity. Quantization lowers bytes. Fusion lowers bytes. Better kernels raise intensity. There is no third move, and this diagram will organize every optimization in the rest of the course.
+  </Step>
+</Scrolly>
+
+## The intensity of each phase, computed
+
+<Callout type="math" title="Matrix multiply: intensity as a function of m">
+  $[m \times 4096] \cdot [4096 \times 4096]$ in BF16, counting the weights, the activations and the output:
+
+  $$
+  F = 2 \cdot m \cdot 4096 \cdot 4096, \qquad B = (m \cdot 4096 + 4096 \cdot 4096 + m \cdot 4096) \times 2
+  $$
+
+  | Rows $m$ | FLOPs | Bytes | Intensity | Bound on H100 |
+  |---|---|---|---|---|
+  | 1 (decode) | 33.5 M | 33.6 MB | **1.0** | memory |
+  | 8 (small batch) | 268 M | 33.7 MB | **8.0** | memory |
+  | 64 | 2.1 G | 34.2 MB | **63** | memory |
+  | 512 (prefill) | 17.2 G | 42 MB | **410** | compute |
+
+  The intensity grows almost exactly like $m$, because $B$ is dominated by the 33.5 MB weight matrix, which does not change, while $F$ grows in proportion to the number of rows. This one table explains an enormous amount about serving.
+</Callout>
+
+<Callout type="math" title="Attention: intensity grows with context">
+  For Llama-3.1-8B in BF16 at context length $T$:
+
+  $$
+  F \approx 4 T^2 \cdot 4096, \qquad B = T \times (2 \times 32 \times 8 \times 128 \times 2) = T \times 131{,}072
+  $$
+
+  $$
+  I = \frac{4 T^2 \cdot 4096}{131{,}072\, T} = \frac{T}{8}
+  $$
+
+  At 1,024 tokens the intensity is 128: still memory-bound. At 8,192 it is 1,024: compute-bound. A single formula tells you that **long contexts make attention expensive in a different way from the weights**, and Module 05 and Module 20 will both be about managing that.
+</Callout>
+
+## So why not just buy a faster GPU?
+
+<Callout type="pitfall" title="The most expensive mistake in inference engineering">
+  If a job is memory-bound, buying arithmetic is buying the wrong thing. An H100 has 989 TFLOP/s against an A100's 312, so 3.2× the compute. But its bandwidth is 3.35 TB/s against 2.0 TB/s, or 1.7×. A decode-heavy service on a memory-bound workload gets **1.7× more speed for 1.6× the price**, and it is still bottlenecked on the same wires.
+</Callout>
+
+The corollary is the one to remember: **for a memory-bound job, the number to shop on is bytes per second, not FLOP/s.** The industry noticed this, and HBM bandwidth is now the headline spec on accelerator data sheets for exactly this reason.
+
+And the fix that costs nothing is arithmetic, not hardware. Decode sits at 1 FLOP/byte because one token uses each weight once. If you process a batch of 64 tokens in the same matrix multiply, the weights are read once and used 64 times, and intensity becomes 64. Same GPU, 64× less memory traffic per token. That single observation is the whole of Module 07.
+
+<KeyNotes>
+  1. Two hard limits: a **compute ceiling** (FLOP/s) and a **bandwidth floor** (bytes/s). A kernel cannot beat either.
+  2. $t \ge \max(F \div \text{peak FLOP/s},\ B \div \text{bandwidth})$. The larger term is the one that decides your runtime.
+  3. **Arithmetic intensity** is FLOPs per byte. It alone decides which limit you hit.
+  4. The **ridge point** is compute ceiling ÷ bandwidth: 295 FLOP/byte on H100, 156 on A100, 203 on T4. Left of it, memory-bound; right of it, compute-bound.
+  5. Decode runs at ~1 FLOP/byte (memory-bound). Prefill at $m = 512$ runs at ~410 (compute-bound). Intensity grows almost exactly linearly in $m$, because the weight matrix dominates the bytes and does not change.
+  6. Attention intensity is $T/8$ for Llama-3.1-8B in BF16: memory-bound under ~2,400 tokens of context, compute-bound above.
+  7. If the job is memory-bound, buy **bandwidth**, not FLOP/s. If it is compute-bound, buy FLOP/s. Check the roofline first.
+  8. Real kernels reach ~80% of peak bandwidth and ~50–70% of peak FLOP/s. The gap between the roof and your point is the entire optimization budget.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'The ridge point of a GPU is compute ceiling divided by bandwidth. On an H100, about what is it, in FLOP per byte?', numeric: true, answer: 295, tolerance: 15, unit: 'FLOP/byte', why: '989 TFLOP/s ÷ 3.35 TB/s = 989/3.35 ≈ 295 FLOP per byte. Below that intensity you are memory-bound.' },
+  { q: 'A [1 × 4096] times [4096 × 4096] multiply in BF16. What is its arithmetic intensity, in FLOP per byte?', numeric: true, answer: 1, tolerance: 0.15, unit: 'FLOP/byte', why: 'FLOPs = 2·1·4096·4096 = 33.5M. Bytes = (4096 + 16.78M + 4096) × 2 ≈ 33.6MB. Intensity ≈ 1.0 — the definition of memory-bound.' },
+  { q: 'Which change raises arithmetic intensity most directly?', options: ['Loading weights in FP32 instead of BF16', 'Batching 64 tokens into one matrix multiply', 'Running at a lower clock speed', 'Using a smaller GPU'], answer: 1, why: 'The weight bytes stay fixed while FLOPs grow linearly with the number of rows, so intensity grows with batch size. Lower precision *lowers* bytes, which helps — but FP32 raises them.' },
+  { q: 'A decode step on a GPU with 1 TB/s of bandwidth must read 16 GB of weights. What is the fastest it could possibly finish, in milliseconds?', numeric: true, answer: 16, tolerance: 1, unit: 'ms', why: '16 × 10⁹ bytes ÷ 1 × 10¹² bytes/s = 16 ms. This is a hard floor; no amount of arithmetic capacity changes it.' },
+  { q: 'Your service is decode-heavy and memory-bound on an A100. You switch to an H100. Roughly how much faster does it get?', options: ['About 3.2×, matching the compute ratio', 'About 1.7×, matching the bandwidth ratio', 'About 10×', 'No change, since both are memory-bound'], answer: 1, why: 'A memory-bound job is limited by bytes per second: 3.35 ÷ 2.0 ≈ 1.7×. The 3.2× extra compute is unusable until you change the workload.' },
+  { q: 'For Llama-3.1-8B in BF16, attention arithmetic intensity is about T/8 FLOP per byte. At what context length does it cross the H100 ridge of ~295?', numeric: true, answer: 2360, tolerance: 180, unit: 'tokens', why: 'Set T/8 = 295, so T = 2,360 tokens. Below that attention is memory-bound; above it, compute-bound.' },
+  { q: 'A kernel achieves 250 TFLOP/s on a GPU with a 989 TFLOP/s ceiling. What is its MFU?', options: ['About 25%', 'About 40%', 'About 75%', 'It cannot be computed without the bandwidth'], answer: 0, why: 'MFU = achieved FLOP/s ÷ peak FLOP/s = 250/989 ≈ 25%. Well below the 50–70% a good GEMM reaches.' },
+]} />

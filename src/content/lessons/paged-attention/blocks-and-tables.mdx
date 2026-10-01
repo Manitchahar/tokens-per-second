@@ -1,0 +1,253 @@
+---
+title: 'Blocks, block tables & PagedAttention'
+summary: 'The fix for the previous lesson: allocate the KV cache as equal fixed-size blocks up front, and give each request a small table of block ids. Growth is one pop from a free list, and attention follows the table.'
+objectives:
+  - Define a KV block, a token slot and a block table in your own words
+  - Explain why a fixed block size bounds internal fragmentation at block_size − 1 tokens
+  - 'Walk through the lifecycle of a request: allocate, grow, free'
+  - Describe how a paged attention kernel turns a block table into a normal tensor read
+  - Compute pool size, waste and per-block bytes for a real model and GPU
+---
+import BlocksAndTables from '@/components/viz/paged-attention/BlocksAndTables.tsx';
+import PagedKernel from '@/components/viz/paged-attention/PagedKernel.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The previous lesson ended with a pool full of holes and a request that could not start. The fix is not a better hole-picker. It is to stop asking for holes at all.
+
+Store the KV cache as one big tensor, allocated **once at startup**, carved into equal fixed-size pieces. Give each request a **list of the piece ids** it has been given. When the request grows past the end of its last piece, hand it one more piece. Nothing is reserved in advance, nothing is contiguous, and nothing is ever copied.
+
+This is <Term t="paged-attention">PagedAttention</Term>, and the name is not a marketing choice: it is the operating system's virtual memory, transplanted onto GPU memory.
+
+## Where the idea came from
+
+You have used this idea your whole life without calling it that. A program on a 1960s machine cannot ask for 900 KB of contiguous memory unless 900 KB of contiguous memory happens to exist, even when 900 MB is free in total. So the operating system gives every process its own **virtual address space** — a private, contiguous, infinite-looking space — and backs it with a page table that says which physical page each virtual page lives in.
+
+The physical pages are scattered. The program never knows. It reads `p[i]` and the hardware reads whatever physical page that is.
+
+The KV cache has exactly this problem, with exactly this solution.
+
+<Callout type="real" title="PagedAttention in vLLM">
+  The technique comes from the vLLM team's 2023 paper on efficient memory management for large language model serving, where it is reported to cut wasted KV memory from roughly 20% under a naive allocator to under 4% with paging, allowing roughly 2–4× more concurrent sequences depending on workload. At the time of writing, PagedAttention is the default KV cache manager in vLLM and the model SGLang copied for its own RadixAttention. Numbers are the paper's and depend heavily on workload.
+</Callout>
+
+<Scrolly>
+  <BlocksAndTables client:visible slot="stage" />
+
+  <Step title="1. One pool, allocated once">
+    At startup, the engine carves GPU memory into **32 equal blocks** and never allocates from the OS again. This is why there is no allocator in the hot loop and no fragmentation between blocks: they were never individually allocated.
+  </Step>
+
+  <Step title="2. A block is 16 tokens">
+    Each block holds the K and V of **16 tokens**, across all 32 layers and all 8 KV heads. In bytes: 16 × 131,072 = **2 MB**. Fixed shape, always. That uniformity is what makes the kernel fast.
+  </Step>
+
+  <Step title="3. Requests own lists of blocks">
+    Request A owns blocks 19, 12, 27, 3, 30, 8, 21. Not a region — a **list**. Its block table on the left is that list, plus how many slots of the last block are valid.
+  </Step>
+
+  <Step title="4. Growing pops one block">
+    A crosses a 16-token boundary, so it needs one more slot. The engine pops a free id off the **free list** and appends it. **Zero bytes move.** Compare with the previous lesson, where growth meant reserving more of a giant buffer.
+  </Step>
+
+  <Step title="5. The block table is the index">
+    The table is one small vector of integers per request. It is the only thing that makes the memory non-contiguous, and it costs a few hundred bytes against megabytes of KV.
+  </Step>
+
+  <Step title="6. Attention follows the table">
+    The kernel walks the table. For each block id it loads that fixed-shape chunk and accumulates into the running softmax. Everything else in the model is untouched.
+  </Step>
+
+  <Step title="7. One gather, once per step">
+    Because attention wants a contiguous operand, the kernel gathers the blocks into on-chip SRAM **first**, then does ordinary fast attention on it. One gather per layer per step, paid once.
+  </Step>
+
+  <Step title="8. Waste is one block">
+    Everything else is gone. What remains is the empty tail of the last block of each request: at most 15 tokens, at most **6%** with 16-token blocks, and **zero external fragmentation**.
+  </Step>
+</Scrolly>
+
+## The pieces, precisely
+
+A <Term t="kv-block">**KV block**</Term> is a fixed-size slice of the pool. Inside it, the unit is the <Term t="token-slot">**token slot**</Term>: the K vector and V vector of one token, for one layer, for all KV heads:
+
+$$
+\text{slot bytes} = 2 \times n_{kv} \times d_{head} \times b = 2 \times 8 \times 128 \times 2 = 4{,}096\ \text{bytes} = 4\ \text{KiB}
+$$
+
+A block is just $B$ of those stacked:
+
+$$
+\text{block bytes} = B \times 4{,}096
+$$
+
+| Block size $B$ | Bytes per block | Worst waste per request | Blocks for 4,096 tokens |
+|---|---|---|---|
+| 8 | 32 KiB | 7 tokens (0.2%) | 512 |
+| 16 | 64 KiB | 15 tokens (0.4%) | 256 |
+| 32 | 128 KiB | 31 tokens (0.8%) | 128 |
+| 256 | 1 MiB | 255 tokens (6.2%) | 16 |
+
+Wait — those block bytes look too small. They are, **per layer**. The pool holds all 32 layers, so a block that covers all layers is 32 × the number above: 1 MiB, 2 MiB or 4 MiB for $B$ of 16, 32 or 64. Be careful about which one you are quoting.
+
+<Callout type="math" title="Sizing the pool, end to end">
+  Llama-3.1-8B, BF16, $B = 16$, H100 with 80 GB. Budget 40 GB for weights (the model is 16 GB, so 24 GB to spare for activations and fragmentation — you will set this properly with `--gpu-memory-utilization`, but 50% is a reasonable first guess).
+
+  $$
+  \text{pool} = 40\ \text{GB}, \quad \text{tokens} = \frac{40\times 10^9}{131{,}072} \approx 305{,}000\ \text{tokens}, \quad \text{blocks} = \frac{305{,}000}{16} \approx 19{,}000
+  $$
+
+  At an average of 2,000 tokens per request, that is **152 concurrent requests** — versus 78 with contiguous 8,192-token reservations. Same GPU, same model, **about 2× the users**.
+</Callout>
+
+## The three operations
+
+Everything an engine does to memory reduces to three calls. Learn them and you can read any KV allocator.
+
+```python
+# 1. Allocate the pool once. Never again.
+pool = torch.empty(num_blocks, block_size, layers, 2, kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+free_list = list(range(num_blocks))          # ids of blocks nobody owns
+
+# 2. A request needs more room: pop one block id. O(1), no copying.
+def grow(req, need_slots):
+    while len(req.blocks) * block_size - req.filled_slots < need_slots:
+        req.blocks.append(free_list.pop())    # RefillError if the pool is dry
+    req.filled_slots = req.blocks[-1]        # which slots of the last block are valid
+
+# 3. A request is done: push its block ids back. Also O(1), no copying.
+def free(req):
+    for b in req.blocks:
+        free_list.append(b)
+```
+
+That is the entire memory manager. No `realloc`, no `memcpy`, no free-list merging, no holes to coalesce — because blocks were never adjacent by contract.
+
+### Why the free list is a list and not a bitmap
+
+A detail worth a sentence, because it is the difference between O(1) and O(n) in the hottest loop in the engine. Allocation happens once per 16 generated tokens *per request*; at 400 concurrent requests decoding, that is thousands of pops and pushes per second.
+
+A bitmap or a sorted array means a search on every operation. A stack (or a queue, if you want FIFO fairness among blocks) means `pop()` and `append()` on the end, both constant time, no searching at all. The free list is the simplest possible data structure, and that is exactly why it is the right one here.
+
+<Callout type="intuition" title="The design is boring on purpose">
+  Compare this to the surrounding system: attention kernels, sampling, a continuous-batching scheduler, a distributed executor. Every one of those is subtle. The memory manager that sits underneath all of them is a stack of integers.
+
+  That is not an oversight — it is the point of the design. **The mechanism that runs most often should be the one you can hold in your head**, because the failures it prevents are the ones that take down the whole service.
+</Callout>
+
+## Choosing a block size
+
+The block size is the one real tuning decision in this lesson, and it trades two costs against each other.
+
+**Small blocks** ($B \le 8$): almost no tail waste, and fine-grained packing at the low end. But the block table grows. A 4,096-token request needs 512 entries at $B = 8$, and every decode step walks all of them — both in the kernel's block loop and in any host-side bookkeeping.
+
+**Large blocks** ($B \ge 128$): a short table, and a gather that copies in bigger chunks (better memory efficiency). But tail waste climbs toward $(B-1)/B$, and the low end suffers: a pool of big blocks cannot serve many tiny requests without stranding capacity.
+
+<Callout type="math" title="Quantifying both costs for Llama-3.1-8B">
+  At $B = 16$, one block holds about **2.1 MB** (16 tokens × 131,072 bytes), and a 4,096-token context is 256 blocks.
+
+  | $B$ | MB per block | Blocks for 4,096 tokens | Table bytes (int32) | Tail waste |
+  |---|---|---|---|---|
+  | 8 | 1.05 | 512 | 2 KB | 0.2% |
+  | **16** | **2.10** | **256** | **1 KB** | **0.4%** |
+  | 32 | 4.19 | 128 | 512 B | 0.8% |
+  | 128 | 16.8 | 32 | 128 B | 3.1% |
+  | 256 | 33.6 | 16 | 64 B | 6.2% |
+
+  The table is never the problem — a kilobyte against megabytes of KV. **Tail waste is.** That is why the default sits at 16: the cost of going smaller is negligible, and the cost of going larger grows.
+</Callout>
+
+<Callout type="pitfall" title="Block size is not free of consequences elsewhere">
+  Two things quietly depend on it. First, **prefill** writes into blocks; a block size that does not divide your typical prompt length wastes a whole block on every request. Second, **chunked prefill** (Module 10) processes the prompt in chunks, and chunk boundaries interact with block boundaries. If you tune the block size, re-measure prefill throughput — do not assume the decode-side optimum is the whole-system optimum.
+</Callout>
+
+<Callout type="pitfall" title="Do not tune the block size on a synthetic benchmark">
+  A benchmark that sends the same prompt length to every request will show you almost nothing about tail waste, because with a uniform length every request wastes the same amount. You need **variable-length** requests to see the effect at all. This is Module 06's lesson about reproducible workloads arriving at you in a new place.
+</Callout>
+
+## What PagedAttention actually changes
+
+The memory change is easy. The interesting part is the kernel, because a plain attention kernel assumes K and V are contiguous tensors. Make them scattered and you change what the kernel is.
+
+<Scrolly>
+  <PagedKernel client:visible slot="stage" />
+
+  <Step title="1. Naive attention sees a rectangle">
+    Without paging, K for one request is a tensor of shape `[context, kv_heads, head_dim]` at one address. The kernel indexes it as a dense matrix. Fast, simple, and it requires that one buffer.
+  </Step>
+
+  <Step title="2. Paged attention sees a list">
+    With paging the same data is a set of `[16, kv_heads, head_dim]` chunks at arbitrary addresses. The kernel cannot index it as a rectangle — but every chunk is **the same shape**, so it can loop.
+  </Step>
+
+  <Step title="3. One gather, then the same math">
+    Load each chunk by id into SRAM as a contiguous tensor, then run the identical fixed-shape attention. The gather is the entire price of paging, and it is paid once per block per step.
+  </Step>
+
+  <Step title="4. Two kernels, not one dynamic one">
+    Because the shapes are uniform, the fast path stays fast: a compile-time-specialized inner loop over 16-token blocks. SGLang later removed the gather entirely by making its kernels index the block table directly — same idea, one fewer copy.
+  </Step>
+</Scrolly>
+
+In code, the shape of it looks like this. Note how little has changed: the loop is over blocks, and the block index comes from the table.
+
+```python
+# One decode step's attention for ONE request, paged.
+# k_cache: [num_blocks, block_size, kv_heads, head_dim]  (one layer)
+out = torch.zeros(kv_heads, head_dim, dtype=torch.float32, device="cuda")
+m, l = torch.full((kv_heads,), -float("inf"), device="cuda"), torch.zeros(kv_heads, device="cuda")
+
+for blk in req.blocks:                     # from the block table
+    k = k_cache[blk, : req.valid_slots]    # the gather: one block, contiguous in SRAM
+    v = v_cache[blk, : req.valid_slots]
+    s = (q @ k.transpose(-1, -2)) / math.sqrt(head_dim)
+    # online softmax: fold this block into the running (max, sum, accumulator)
+    m_new = torch.maximum(m, s.max(-1).values)
+    l = l * torch.exp(m - m_new) + torch.exp(s - m_new[..., None]).sum(-1)
+    out = out * torch.exp(m - m_new)[..., None] + torch.exp(s - m_new[..., None]) @ v
+    m = m_new
+
+out = out / l[..., None]
+```
+
+<Callout type="math" title="What the gather costs">
+  Per layer per step, request with $T$ context, $B$ block size, $s$ bytes per slot:
+
+  $$
+  \text{bytes gathered} = T \times s = T \times 4{,}096
+  $$
+
+  On an H100 at 3.35 TB/s, a 4,096-token request moves 16.8 MB per layer per step; across 32 layers, 537 MB per step. At 76 steps/s that is 41 GB/s — about **1% of the machine's bandwidth**. Paging is essentially free in bandwidth terms, and it is why the technique was adopted without hesitation.
+</Callout>
+
+## The costs, honestly
+
+Paging is not free. Know all four.
+
+1. **The gather.** One extra copy of the KV cache per step, into SRAM. About 1% of bandwidth, but it is memory traffic, and decode is memory-bound.
+2. **The block table.** A few hundred bytes per request, plus one indirection on the critical path of every attention read.
+3. **Tail waste.** At most $B - 1$ tokens per request. Bounded and small, but not zero.
+4. **Attention kernels must be written for it.** FlashAttention (Module 14) assumes contiguity. Every backend in a paged engine needs a paged variant, which is why backend choice in vLLM is a real topic.
+
+<Callout type="pitfall" title="Paged memory does not mean you can oversubscribe">
+  A common misreading is that paging makes memory infinite. It does not. The pool is still a fixed tensor on the GPU. Paging removes *fragmentation*, not *demand*. If total demand exceeds the pool you still get out of memory — you just get it honestly, at 100% full instead of 60% full. Module's next lesson is about what to do then.
+</Callout>
+
+<KeyNotes>
+  1. A **KV block** is a fixed-size slice of a pool allocated once at startup. A **token slot** inside it holds one token's K and V for one layer (4 KiB for Llama-3.1-8B).
+  2. A request owns a **list of block ids**, not a region. Its **block table** is that list plus the valid slot count of the last block.
+  3. Growth is `free_list.pop()` — O(1), zero bytes copied. Freeing is `free_list.append()` per block. That is the whole memory manager.
+  4. Block size $B$ bounds internal fragmentation at $B-1$ tokens per request: 0.4% at $B=16$, 6.2% at $B=256$.
+  5. Paged attention gathers the blocks into SRAM once, then runs ordinary fixed-shape attention. The gather costs about **1%** of H100 bandwidth per step.
+  6. Sizing: `pool_bytes = pool_budget`, `tokens = pool_bytes / 131072`, `blocks = tokens / B`. 40 GB and $B=16$ gives ~19,000 blocks, ~152 requests at 2,000 tokens each.
+  7. The price of paging is four things: the gather, the block table, $B-1$ tail tokens, and attention kernels that must understand block tables.
+  8. Paging removes fragmentation, not demand. Full is still full.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B has 32 layers, 8 KV heads, head dim 128, BF16. How many bytes is one token slot (one token, one layer, K and V)?', numeric: true, answer: 4096, tolerance: 60, unit: 'bytes', why: '2 (K and V) × 8 KV heads × 128 head dim × 2 bytes = 4,096 bytes. That is 4 KiB per token per layer.' },
+  { q: 'With a block size of 16 tokens, what is the worst-case internal fragmentation for one request, in tokens?', numeric: true, answer: 15, tolerance: 1, unit: 'tokens', why: 'A request that stops one token into a block leaves 15 slots empty. Worst case is B − 1, so 15 tokens for B = 16.' },
+  { q: 'A 40 GB pool of Llama-3.1-8B KV cache, block size 16. How many blocks does it hold (approximately)?', numeric: true, answer: 19070, tolerance: 900, unit: 'blocks', why: '40e9 / 131,072 bytes per token ≈ 305,176 tokens, then 305,176 / 16 ≈ 19,073 blocks.' },
+  { q: 'What does growing a sequence by one token cost in a paged allocator?', options: ['A memcpy of the whole cache', 'A pop from the free list, O(1), no copying', 'A realloc of the request buffer', 'Nothing, it grows in place'], answer: 1, why: 'Blocks are fixed and equal, so a new block is always available as an unused id. Appending the id to the block table is the entire operation.' },
+  { q: 'Why can a paged attention kernel still use fast, fixed-shape attention math?', options: ['Because every block has identical shape, so the gather gives a uniform tensor', 'Because the KV cache is copied back to contiguous memory first', 'Because attention ignores the KV cache', 'Because GPUs cannot handle indirection'], answer: 0, why: 'The scatter is only in *where* the blocks live, not in their shape. Once gathered into SRAM they are one contiguous, uniform tensor, so the inner loop is unchanged.' },
+  { q: 'A request grows past its last block. The engine pops a block from the free list and there is none. What is the state?', options: ['The request silently continues with an out-of-bounds write', 'The pool is exhausted; the engine must admit, preempt, swap or recompute', 'The engine allocates a fresh contiguous buffer instead', 'The GPU clock throttles'], answer: 1, why: 'Paging removes fragmentation, so a failure means genuine exhaustion. That is the right moment for the policies in the next lesson: admission control, preemption, swap, recompute.' },
+]}/>

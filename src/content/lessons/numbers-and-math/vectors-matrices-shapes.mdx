@@ -1,0 +1,117 @@
+---
+title: Vectors, matrices & shapes
+summary: Everything inside an LLM is a grid of numbers with a shape. Learn to read shapes like [batch, tokens, hidden] fluently. It is the language every later lesson speaks.
+objectives:
+  - Explain scalars, vectors, matrices and higher-dimensional tensors
+  - Read and write shapes such as [3, 5, 4096] and say what each dimension means
+  - Index into a tensor and predict the resulting shape
+  - Explain reshape, and why [T, 4096] becomes [T, 32, 128] for attention heads
+---
+import ShapesViz from '@/components/viz/math/ShapesViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Open any LLM's code and you will see comments like `# x: [B, T, D]`. Engineers debug inference by tracking **shapes**. If you can read shapes, you can read the code. If you cannot, nothing will make sense. Luckily the idea is simple: a shape just says how many numbers there are along each direction of a grid.
+
+## From one number to a batch
+
+<Scrolly>
+  <ShapesViz client:visible slot="stage" />
+
+  <Step title="1. A scalar">
+    A single number, like 3.14, is a **scalar**. It has no directions, so its shape is empty: `[]`.
+  </Step>
+
+  <Step title="2. A vector">
+    A list of numbers is a **vector**. Inside an LLM, every token is represented by a vector. For Llama-3.1-8B that is **4,096** numbers per token, called the **hidden size**. Shape: `[4096]`.
+
+    We draw 12 cells, but imagine 4,096. Each number is one learned "feature" of the token, though almost none mean anything a human could name.
+  </Step>
+
+  <Step title="3. A matrix">
+    Stack the vectors of a 5-token sentence, one per row, and you get a **matrix** with shape `[5, 4096]`: 5 rows, 4,096 columns. The rule: **shapes list the sizes from the outside in**.
+  </Step>
+
+  <Step title="4. A batch: a 3-D tensor">
+    Serve 3 sentences at once (a **batch**) and you stack 3 matrices: shape `[3, 5, 4096]`. People write it `[B, T, D]`: **B**atch, **T**okens (sequence length), and hidden size **D** (for *dimension*).
+
+    Any grid with any number of dimensions is called a **tensor**. That is why the library is called *Tensor*Flow and PyTorch's core type is `torch.Tensor`.
+  </Step>
+
+  <Step title="5. Weights are matrices too">
+    The model's learned weights are also tensors, mostly big matrices. A `[4096, 4096]` weight holds 4,096 × 4,096 ≈ **16.8 million** numbers: 33.5 MB in BF16. An 8B model is a few hundred of these.
+
+    Running the model mostly means multiplying the activations `x` by these weight matrices. Next lesson shows exactly how.
+  </Step>
+
+  <Step title="6. Indexing">
+    Square brackets pick pieces out. `x[0]` is sequence 0, shape `[5, 4096]`. `x[0, 2]` is token 2 of sequence 0, shape `[4096]`. `x[:, -1]` is the **last token of every sequence**, shape `[3, 4096]`. That is exactly what you use to predict the next token.
+
+    Each index you fix removes one dimension from the shape.
+  </Step>
+
+  <Step title="7. Reshape into heads">
+    **Reshape** reinterprets the same numbers with a new shape, without moving any memory. Attention splits each 4,096-number vector into **32 heads** of 128: `[5, 4096]` → `[5, 32, 128]`. 32 × 128 = 4,096, so no number is lost or added.
+
+    You will see this exact reshape in every attention implementation (Module 03).
+  </Step>
+</Scrolly>
+
+## Shapes in code
+
+Here is the same story in PyTorch. Read the comments. They are what inference engineers actually write.
+
+```python
+import torch
+
+x = torch.randn(3, 5, 4096)        # [B, T, D] = 3 sequences, 5 tokens, 4096 hidden
+print(x.shape)                     # torch.Size([3, 5, 4096])
+print(x.numel())                   # 61,440 numbers = 3 * 5 * 4096
+
+x[0].shape                         # [5, 4096]    one sequence
+x[0, 2].shape                      # [4096]       one token
+x[:, -1].shape                     # [3, 4096]    last token of each sequence
+
+heads = x.view(3, 5, 32, 128)      # [B, T, H, Dh]: split hidden into 32 heads of 128
+heads = heads.transpose(1, 2)      # [B, H, T, Dh]: swap two dimensions (now per-head)
+print(heads.shape)                 # torch.Size([3, 32, 5, 128])
+```
+
+<Callout type="math" title="Counting numbers and bytes">
+  The number of elements is the product of the shape: 3 × 5 × 4,096 = 61,440. Multiply by bytes per element to get memory: in BF16, 61,440 × 2 = 122,880 bytes ≈ 123 KB. You will use exactly this to size the KV cache in Module 05.
+</Callout>
+
+## The dimension names you will see everywhere
+
+| Letter | Meaning | Typical values |
+|---|---|---|
+| **B** | batch size: sequences processed together | 1 to 512 |
+| **T** or **S** or **L** | sequence length: tokens | 1 (decode) to 128K (long prompts) |
+| **D** or $d_{\text{model}}$ | hidden size | 896 (0.5B) to 8,192 (70B) to 16,384 (405B) |
+| **H** | number of attention heads | 32, 64, 128 |
+| $D_h$ | head dimension = D ÷ H | usually 128 |
+| **V** | vocabulary size | 32K to 256K |
+
+<Callout type="intuition">
+  Think of a spreadsheet. A vector is one row. A matrix is a sheet. A 3-D tensor is a workbook of identical sheets. A 4-D tensor is a shelf of workbooks. The shape is the table of contents: how many workbooks, sheets per workbook, rows per sheet, cells per row.
+</Callout>
+
+<Callout type="pitfall">
+  `view`/`reshape` never moves data; it only changes how the same memory is read. `transpose` changes the *order* in which dimensions are read, so the tensor is no longer laid out row by row in memory ("non-contiguous"). Some operations then need `.contiguous()`, which *does* copy. Unexpected copies like this show up as mystery memory traffic in profiles (Module 12).
+</Callout>
+
+<KeyNotes>
+  1. Scalar `[]`, vector `[D]`, matrix `[T, D]`, 3-D tensor `[B, T, D]`. Any of these is a **tensor**.
+  2. Shapes list sizes from the outside in. The number of elements is the product of the shape.
+  3. Standard names: **B** batch, **T** tokens, **D** hidden size, **H** heads, **Dh** head dim, **V** vocabulary.
+  4. Each index you fix removes a dimension: `x[:, -1]` → `[B, D]`, the last token of each sequence.
+  5. **Reshape** reinterprets the same numbers: `[T, 4096]` → `[T, 32, 128]` splits each vector into 32 heads.
+  6. Memory = number of elements × bytes per element.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'x has shape [8, 1024, 4096]. What is the shape of x[:, -1]?', options: ['[8, 1024]', '[8, 4096]', '[1024, 4096]', '[4096]'], answer: 1, why: 'Fixing the token index to the last one removes the middle dimension, leaving [batch, hidden] = [8, 4096].' },
+  { q: 'How many numbers are in a tensor of shape [4, 128, 4096]?', numeric: true, answer: 2097152, tolerance: 1, why: '4 × 128 × 4096 = 2,097,152.' },
+  { q: 'How much memory does that tensor take in BF16, in MB?', numeric: true, answer: 4.19, tolerance: 0.1, unit: 'MB', why: '2,097,152 × 2 bytes = 4,194,304 bytes ≈ 4.19 MB.' },
+  { q: 'A model has hidden size 5120 and 40 attention heads. What is the head dimension?', numeric: true, answer: 128, tolerance: 0, why: '5120 ÷ 40 = 128. Most modern models use 128.' },
+  { q: 'What does reshaping [T, 4096] to [T, 32, 128] do to memory?', options: ['Copies the data into a new layout', 'Nothing: the same numbers are read with a different shape', 'Doubles the memory', 'Deletes half the numbers'], answer: 1, why: '32 × 128 = 4096, so the elements are identical and a view just reinterprets the same buffer.' },
+]} />

@@ -1,0 +1,52 @@
+---
+import { getCollection } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import Icon from '../../components/Icon.astro';
+import { modules } from '../../data/course';
+import { url } from '../../site';
+
+const sheets = await getCollection('cheatsheets');
+const bySlug = new Map(sheets.map((s) => [s.data.module, s]));
+const master = bySlug.get('formulas');
+---
+<Base title="Cheat sheets" description="Every formula, number and rule of thumb from the course, one printable page per module.">
+  <div class="page">
+    <h1>Cheat sheets</h1>
+    <p class="lead">One page per module with every formula, number and rule of thumb, written to be printed or kept open in a tab while you work. Print with <kbd>Ctrl</kbd>+<kbd>P</kbd>; the pages switch to black on white.</p>
+    {master && (
+      <a class="master" href={url('cheatsheets/formulas/')}>
+        <Icon name="sigma" size={22} />
+        <span><strong>{master.data.title}</strong><span>The formulas an inference engineer uses every week, on one page.</span></span>
+      </a>
+    )}
+    <ol class="list">
+      {modules.map((m) => {
+        const s = bySlug.get(m.slug);
+        return (
+          <li class="row">
+            <span class="code">{m.num}</span>
+            {s ? <a href={url(`cheatsheets/${m.slug}/`)}>{m.title}</a> : <span class="muted">{m.title}</span>}
+            <span class="state">{s ? '' : 'being written'}</span>
+          </li>
+        );
+      })}
+    </ol>
+  </div>
+</Base>
+<style>
+  .page { max-width: 820px; margin: 0 auto; padding: 3rem 24px 0; }
+  h1 { font-size: clamp(2.3rem, 5vw, 3.4rem); margin-bottom: 0.8rem; }
+  .lead { color: var(--text-2); }
+  .master { display: flex; gap: 1rem; align-items: center; margin: 2rem 0; padding: 1.2rem 1.3rem; border: 1px solid var(--rule-2); border-radius: 4px; background: var(--ground-2); text-decoration: none; }
+  .master:hover { border-color: var(--text-2); }
+  .master :global(.icon) { color: var(--compute); flex: none; }
+  .master strong { display: block; }
+  .master span span { font-size: 0.88rem; color: var(--text-2); }
+  .list { list-style: none; padding: 0; margin: 1rem 0 0; border-top: 1px solid var(--rule-2); }
+  .row { display: grid; grid-template-columns: 3rem 1fr auto; gap: 1rem; padding: 0.8rem 0; border-bottom: 1px solid var(--rule); align-items: baseline; }
+  .code { font-family: var(--font-mono); color: var(--text-3); font-size: 0.82rem; }
+  .row a { text-decoration: none; font-weight: 700; }
+  .row a:hover { text-decoration: underline; }
+  .muted { color: var(--text-3); }
+  .state { font-size: 0.75rem; color: var(--text-3); }
+</style>

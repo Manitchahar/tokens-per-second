@@ -1,0 +1,206 @@
+---
+title: 'Project: PyTorch vs vLLM, then optimize one GPU'
+summary: 'Build the artifact that proves you can do this job: a harness that measures the same workload on a plain PyTorch generate loop and on vLLM, a results matrix, then a documented tuning pass that improves one GPU and an honest report explaining why.'
+objectives:
+  - Build one harness that can measure a PyTorch generate loop and a vLLM engine identically
+  - Measure TTFT, TPOT and throughput at several concurrency levels and present them as a matrix
+  - Predict the numbers from the arithmetic before you measure them, then explain the gap
+  - Sweep three engine flags, pick an operating point against a latency target, and quantify the gain
+  - 'Write a report a staff engineer would sign off on: method, raw data, claims and limits'
+colab: 09-pytorch-vs-vllm.ipynb
+---
+
+Everything so far has been you learning to build and to measure. This is the deliverable. Not the notebook — the notebook is the raw material. The deliverable is a **claim you can defend**: "on this model, this GPU, this workload, here is what the engine bought me, here is where the gain came from, here is what it cost, and here is what I would do next."
+
+The two halves matter equally. Anyone can run vLLM and quote a big number. The skill this course is actually teaching is the second half: knowing which knob moved which number, and saying so in writing.
+
+<Callout type="pitfall" title="The sentence to never write in a report">
+  "vLLM is 24× faster than Hugging Face." It is almost always true, and it is worth nothing. Faster at what? For whom? On which GPU, with which context lengths, at which concurrency, and what did it cost in memory and in complexity? A comparison without a workload and a latency target is a vibe, and Module 06 · Measure Like a Pro spent a whole module on why.
+</Callout>
+
+## The deliverable
+
+A small repository — or a single well-organised notebook — containing:
+
+| Artifact | What it must contain |
+|---|---|
+| `bench.py` | One entry point that runs the **same workload** through either engine: same prompts, same `max_tokens`, same temperature, same warm-up discipline. |
+| `results/` | Raw JSON per run: config, per-request timings, aggregate percentiles. Never hand-typed numbers. |
+| `REPORT.md` | The comparison matrix, the tuning sweep, one plot, the startup log, and a limitations section. |
+| `NOTES.md` | Predictions **before** measurements, kept next to the results so your reasoning is auditable. |
+
+## The harness contract
+
+Before you write a line of engine code, decide what every engine must be given and what
+you will record. This is the part that decides whether your comparison means anything.
+
+**Identical for every run:**
+
+| Fixed | Why |
+|---|---|
+| The exact prompt list | Different prompts are different prefill work. Ship them in a JSON file next to the results. |
+| `max_tokens` | Otherwise a fast engine just finishes early. |
+| `temperature: 0` | Greedy decoding, so all engines do the same number of steps. |
+| A seed, if you sample at all | Non-determinism is not a measurement. |
+| Warm-up before timing | The first call pays for kernel compilation and allocator growth. |
+
+**Recorded for every run:** engine and version, all flags, per-request latency, output
+tokens, total wall clock, and peak GPU memory. Write it to JSON as it happens. A number
+you typed into a Markdown table by hand is not a result.
+
+**The four metrics**, defined once so every engine is measured the same way:
+
+```python
+def summarize(latencies, out_tokens, wall):
+    s = sorted(latencies)
+    return {
+        "p50_ms": 1000 * s[len(s) // 2],
+        "p95_ms": 1000 * s[min(len(s) - 1, int(0.95 * len(s)))],
+        "output_tok_s": out_tokens / wall,
+        "requests_per_s": len(latencies) / wall,
+    }
+```
+
+<Callout type="pitfall" title="The unfairness traps, in order of how often they happen">
+  1. **Different `max_tokens`.** The most common, and the most flattering mistake.
+  2. **No warm-up.** The first call includes compilation and is 10–50× slower.
+  3. **Different prompts.** A 2,000-token prompt against a 200-token prompt is not a comparison.
+  4. **Counting prompt tokens in "output tokens/s".** Keep the two columns apart; the course has used this distinction since Module 00.
+  5. **Streaming vs not.** A streaming client measures TTFT and ITL; a non-streaming one measures total latency. Never compare them in the same table without saying which is which.
+</Callout>
+
+## Setup
+
+Runs on a free Colab T4 (16 GB, FP16, no BF16 tensor cores).
+
+```bash
+!pip install -q vllm
+```
+
+After the install, restart the runtime so the new PyTorch is picked up. Use **`Qwen/Qwen2.5-0.5B-Instruct`**: about 0.5 B parameters, so 0.98 GB in FP16, and it leaves plenty of room for a KV cache. Add `--enforce-eager` (or `enforce_eager=True`) so the engine does not try to capture CUDA graphs on a card that will not benefit from them.
+
+<Colab nb="09-pytorch-vs-vllm.ipynb" />
+
+## Part A · Write the predictions first
+
+Before you run anything, write down what you expect, with the arithmetic. For Qwen2.5-0.5B-Instruct on a T4:
+
+**KV cache per token.** 24 layers, 2 KV heads, head dim 64, 2 bytes each for K and V:
+
+$$
+2 \times 24 \times 2 \times 64 \times 2 = 12{,}288\ \text{bytes} = 12\ \text{KB per token}
+$$
+
+**Decode speed at concurrency 1.** Read 0.98 GB of weights at roughly 80% of the T4's 320 GB/s:
+
+$$
+t \approx \frac{0.98\ \text{GB}}{256\ \text{GB/s}} + 1.5\ \text{ms} \approx 5.3\ \text{ms} \quad\Rightarrow\quad \approx 190\ \text{tokens/s}
+$$
+
+**Decode speed at concurrency 64**, with 2,048 tokens of context each. The KV read is now 64 × 2,048 × 12,288 B = 1.6 GB, so memory traffic per step has grown by 60%:
+
+$$
+t \approx \frac{0.98 + 1.6}{256} + 0.0015 \approx 11.6\ \text{ms} \quad\Rightarrow\quad 86\ \text{tokens/s each},\ \ 5{,}500\ \text{tokens/s total}
+$$
+
+**How many fit.** `0.9 × 16 GB = 14.4 GB` of budget, minus 0.98 GB of weights and about 0.64 GB of reserve leaves a 12.8 GB pool. Divide by 12 KB per token and you get about 1,040,000 tokens of context — roughly **500 sequences at 2,048 tokens**.
+
+Write those four numbers down in `NOTES.md`. Then measure. The point of the exercise is not that you will be right; it is that you will find out **which** of your mental numbers was wrong.
+
+## Part B · The comparison
+
+Three configurations, identical workload (64 prompts of ~200 tokens, 128 output tokens, temperature 0, fixed seed):
+
+1. **`transformers` `generate`**, one prompt at a time, no batching.
+2. **The same model with a hand-rolled batch** — put 16 prompts in a list and step them together yourself. This is the honest middle of the road: it proves how much of the win is "just batching" and how much is the engine.
+3. **`vllm.LLM`** (the offline class, in-process) at `max_num_seqs` = 1, 16, 64, 256.
+
+Report this matrix, with p50 and p95 for the two latency metrics:
+
+| Engine | Concurrency | p50 TTFT | p95 TTFT | TPOT | Output tok/s | GPU mem used |
+|---|---|---|---|---|---|---|
+| PyTorch, 1 at a time | 1 | | | | | |
+| PyTorch, manual batch 16 | 16 | | | | | |
+| vLLM | 1 | | | | | |
+| vLLM | 16 | | | | | |
+| vLLM | 64 | | | | | |
+| vLLM | 256 | | | | | |
+
+**How to read it.** You should see, and be able to explain:
+
+- The PyTorch rows at concurrency 1 are the floor. Each request waits for the previous one to finish 128 tokens, so throughput is one request's worth.
+- Your manual batch of 16 recovers most of the *throughput*, because the weights are read once for sixteen rows. **This is the key finding**: most of what people attribute to vLLM is just batching, and you proved it yourself.
+- vLLM's advantage over your manual batch shows up in **TTFT at high concurrency** and in **memory**, because it never lets a 128-token request block behind another one and its KV cache is paged rather than preallocated. It also removes per-step Python overhead, which on a small model is a large fraction of the step.
+- vLLM at concurrency 1 should be close to your manual loop. If it is not, something in your harness differs — check the dtype and the sampler.
+
+<Callout type="intuition" title="The sentence this earns you">
+  "At concurrency 1, vLLM matches a hand-written loop (as it should). The engine's value appears at concurrency 16 and above, where its continuous batching keeps every user moving and its paged KV cache fits 3× the requests in the same memory." That is a claim with a mechanism attached. It survives a code review.
+</Callout>
+
+## Part C · Optimize the one GPU
+
+Now do the work the module is really about. Sweep three flags, one at a time, at a fixed workload (64 concurrent users, 2,048-token context):
+
+| Sweep | Values | What you are testing |
+|---|---|---|
+| `gpu_memory_utilization` | 0.6, 0.8, 0.9 | Does the pool size change anything while KV usage stays low? |
+| `max_model_len` | 1,024, 2,048, 8,192 | Worst-case concurrency: 1,040,000 ÷ 8,192 = **127** vs ÷ 1,024 = **1,015**. |
+| `max_num_seqs` | 16, 64, 128, 256, 400 | Where does TPOT cross your latency target? Where does the pool run out? |
+
+Set a target before you look at the results. Something like: *p95 TTFT under 800 ms and TPOT under 25 ms*. Then find the setting that meets it with the most throughput, and **write down the operating point**: model, GPU, dtype, flags, p50/p95 TTFT, TPOT, output tok/s, KV usage, and the date.
+
+Expect the `max_num_seqs` sweep to be the interesting one, and expect it to be the same shape you saw in the visual in 09.3: per-user speed falling slowly, total throughput rising, memory ending the story around 500 sequences at 2k context on this card.
+
+<Callout type="real" title="Measure twice, report honestly">
+  Run every configuration three times and report the median. If a run crashed with `CUDA out of memory`, that is a **result**, not a discarded sample — write it in the table. "400 sequences: OOM at gpu_memory_utilization 0.9, fine at 0.8" is exactly the sentence that gets you hired.
+</Callout>
+
+## Part D · The report
+
+`REPORT.md`, at most four pages, in this order:
+
+1. **Claim.** One sentence, with the workload in it.
+2. **Setup.** GPU, model, dtype, software versions, and the exact commands.
+3. **Method.** What you warmed up, what you measured, how you measured it, and what you did *not* measure.
+4. **Results.** The matrix from Part B, the sweep from Part C, and one plot: your latency–throughput curve with the operating point marked.
+5. **Why.** Two or three paragraphs tying each change to a mechanism from this course — paged KV, continuous batching, the memory budget. Use the arithmetic.
+6. **Limits and next steps.** What would change on a bigger GPU, with a longer context, with quantization, with prefix caching. Name the module where you learned it.
+
+A rubric, so you know what "done" means:
+
+| Criterion | Weight | What full marks looks like |
+|---|---|---|
+| Method is reproducible | 20% | One command runs it. Seeded, warmed up, averaged, and someone else can repeat it. |
+| Numbers are honest | 20% | Raw data in the repo. Failures reported, not hidden. Predictions kept next to results. |
+| Explanation is mechanistic | 25% | Every claim in "Why" maps to arithmetic from the course, not to "it was faster". |
+| Latency and throughput reported together | 15% | Never one without the other, never without the workload. |
+| Operating point is defensible | 10% | A stated SLO, and settings that meet it. |
+| Limits acknowledged | 10% | Says what it does not cover and what would change the answer. |
+
+## Stretch goals
+
+If you have the time, add one column that changes *what the engine can do*, not just how fast:
+
+- **`--enable-prefix-caching`** with a multi-turn workload, and the prefix-cache hit rate over time. Module 10 · Prefill & Prefix Optimization.
+- **`--max-num-batched-tokens 1024`** with a 4,096-token-prompt workload, and p95 TTFT before and after. Module 10 again, from the other side.
+- **A quantized model** on the same harness, with the memory saved and the throughput gained. Module 11 · Quantization.
+- **A second concurrency axis**: sweep *offered load* as well as batch size, and plot goodput (requests that met their SLO) rather than throughput. This is the shape of Module 06's goodput argument, and it is the metric a capacity planner actually wants.
+
+## Check yourself before you move on
+
+- Your manual batch of 16 recovered a lot of the vLLM throughput. What exactly did it *not* recover, and which vLLM component is responsible?
+- vLLM at concurrency 1 matched your hand-written loop. Why would you expect that to be true, and what would it mean if it were not?
+- Your `max_model_len = 8,192` sweep showed 127 worst-case concurrent requests and your 2,048 setting showed over a thousand. Which of those numbers appeared in the throughput column, and why only one of them?
+- Where did your p95 TTFT come from: the queue, the prefill, or the first decode step? How did you tell?
+- Name one thing your harness did not measure that a reviewer would ask about.
+
+<KeyNotes>
+  1. The deliverable is a **defensible claim with a mechanism**, not a speedup number. "Faster" is only interesting when you say which phase, at what concurrency, and why.
+  2. Compare three points, not two: naive PyTorch, a hand-rolled batch, and vLLM. The middle one proves how much of the win is simply batching.
+  3. Predict every number from the arithmetic before you measure it, and keep the predictions next to the results. Being wrong in a documented way is the fastest way to learn.
+  4. Expect the engine's advantage at concurrency 1 to be small. That is the correct result, and it is the thing most comparisons hide.
+  5. The engine's real wins are TTFT under load and KV memory efficiency: continuous batching plus paged KV.
+  6. Tune one flag at a time against a fixed workload, with the SLO written down **before** you look at the results.
+  7. Report failures. An OOM at one setting is data; deleting it makes the report worthless.
+  8. Always report latency and throughput together, with the workload attached. Never one without the other.
+</KeyNotes>

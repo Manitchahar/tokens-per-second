@@ -1,0 +1,166 @@
+---
+title: 'Module 23 · Routing, Autoscaling & Orchestration'
+module: routing-autoscaling
+---
+
+## The one-line summary
+
+A replica is a fixed pool of KV cache, so **route on the resource that runs out, scale on pressure that leads it, and size for peak.**
+
+## KV is the unit of load
+
+$$
+\text{KV/token} = 2 \times \text{layers} \times \text{kv heads} \times \text{head dim} \times 2\ \text{bytes}
+$$
+
+| Model | KV/token | 1k ctx | 8k ctx |
+|---|---|---|---|
+| Llama-3.1-8B | 128 KiB | 125 MiB | 1.0 GiB |
+| Llama-3.1-70B | 320 KiB | 313 MiB | 2.5 GiB |
+
+Request cost varies by **orders of magnitude** with prompt length. Counting
+requests is counting the wrong thing.
+
+## Routing policies
+
+| Policy | Signal | Spread (measured) | When |
+|---|---|---|---|
+| Round robin | none | 1.06× | stateless fallback |
+| Least-queued | request count | 1.12× | better, still blind |
+| **Least-KV-tokens** | KV tokens held | **1.02×** | robust default |
+| Power of two | sample 2 | 1.17× | O(1) at large *N* |
+| Session affinity | conversation | 1.12×, hit 35% | pins, hot-spots |
+| Cache-aware | prefix − α·load | 1.12×, hit 34% | repetitive traffic |
+
+Power of two balances nearly as well as a full scan at constant cost — the modern default.
+
+## Cache-aware routing score
+
+$$
+\text{score}(r) = \frac{\text{prefix tokens } r \text{ holds}}{\text{prompt length}} - \alpha \cdot \frac{\text{KV held}}{\text{KV capacity}}
+$$
+
+**Both terms must be normalised to 0–1.** Raw token counts in different units
+make the load term always win, and α becomes a no-op.
+
+| α | Hit rate | KV spread |
+|---|---|---|
+| 0 | 71% | 4.00× (hot spot) |
+| **8** | **67%** | **1.12×** |
+| 32 | 54% | 1.06× |
+| 128 | 36% | 1.03× |
+
+Hit rate value: $t_{\text{cached}} = t_{\text{cold}} \times (1 - \text{hit rate})$.
+At 35%: an 8k prompt goes 236 ms → 153 ms on H100.
+
+## Capacity: Little's law backwards
+
+$$
+\text{users per replica} = \frac{\text{KV pool tokens}}{\text{context length}}
+\qquad
+\text{req/s per replica} = \frac{\text{users}}{\text{time in system}}
+$$
+
+$$
+\text{time in system} = \text{out tokens} \times \text{TPOT} + \text{TTFT budget}
+$$
+
+H100 + Llama-8B: **402,374** KV tokens of pool.
+
+| Context | Users per replica |
+|---|---|
+| 1,024 | ~392 |
+| 4,096 | ~98 |
+| 8,250 | ~49 |
+
+At 350 users and 13.5 s per request ⇒ **~26 req/s per replica**.
+Context length — not request rate — is the capacity unit.
+
+## The goodput cliff (measured, 4 replicas)
+
+| Rate | p50 TTFT | p99 TTFT | TPOT | Goodput |
+|---|---|---|---|---|
+| 8 | 27 ms | 530 ms | 9.7 ms | 100% |
+| 16 | 45 ms | 579 ms | 13.2 ms | 100% |
+| 20 | 66 ms | 1,081 ms | 17.2 ms | 98% |
+| 26 | 173 ms | 2,243 ms | 37.7 ms | 70% |
+| 34 | 2,306 ms | 38,016 ms | 50.2 ms | 6% |
+
+**Throughput measures the GPU; goodput measures the user.** They come apart
+exactly when overload begins.
+
+## Scaling signals
+
+| Signal | Leads? | Note |
+|---|---|---|
+| CPU | no | pinned at every concurrency |
+| **Queue depth** | yes | latency *is* queueing delay |
+| SLO-derived concurrency | yes | Little's law forward |
+| KV occupancy | guard rail | catches long-context pressure |
+
+**Never route and scale on the same metric** — the router masks the pressure
+the scaler must see.
+
+### Anti-oscillation
+
+1. Window ≫ replica start time (30–60 s minimum)
+2. Scale **out** fast, scale **in** slow
+3. Min replicas (never cold-start), max replicas (bound the blast radius)
+4. Size for peak with one spare
+
+## Orchestration
+
+| | KServe | Ray Serve | llm-d |
+|---|---|---|---|
+| Abstraction | `InferenceService` CRD | `@app.deployment` | gateway + placement |
+| You write | YAML | Python | YAML + components |
+| Owns | reconciliation, HPA wiring | placement, batching, routing | routing, topology |
+| Best when | already on k8s | serving logic custom | placement is the edge |
+
+Four pod assumptions an inference replica breaks: **small state, fast start,
+cheap replacement, one process per GPU**.
+
+```yaml
+# The shape of an inference pod. Illustrative.
+spec:
+  terminationGracePeriodSeconds: 600   # drain, do not kill
+  containers:
+    - name: engine
+      command: ["vllm", "serve", "meta-llama/Llama-3.1-8B"]
+      resources:
+        limits: { nvidia.com/gpu: 1, sharedmemory: 16Gi }
+      startupProbe:                      # NOT liveness — see below
+        httpGet: { path: /health, port: 8000 }
+        failureThreshold: 60
+        periodSeconds: 5
+      lifecycle:
+        preStop: { exec: { command: ["sh","-c","sleep 15"] } }
+```
+
+Use a **startupProbe**. A liveness probe during weight loading restarts the pod
+forever and never serves a request.
+
+## Sizing worked example
+
+Average 12 req/s, peak 36 req/s, 26 req/s per replica.
+Floor: $36/26 = 1.4 \Rightarrow 2$. Plus one spare ⇒ **3 replicas**.
+At 2 replicas each carries 18 req/s ⇒ ~70% goodput, multi-second p99.
+
+## Metrics worth a dashboard
+
+| Metric | Why |
+|---|---|
+| goodput per replica | the number you promised |
+| queue depth per replica | leading indicator |
+| KV occupancy per replica | the real constraint |
+| prefix hit rate | reuse is working |
+| KV spread (busiest ÷ mean) | imbalance, early warning |
+| prefix warm-up seconds | capacity that is paid for but idle |
+
+**Per-replica, never fleet-averaged.** A single hot replica is invisible in a mean.
+
+## The three sentences
+
+1. Route on KV tokens, not request counts — request cost varies by orders of magnitude with prompt length.
+2. Capacity = (KV pool ÷ context) ÷ time in system; size for peak with one spare, because a new replica is useless until it is warm.
+3. Scale on queue depth over a long window, scale out fast and in slow, and never route and scale on the same signal.

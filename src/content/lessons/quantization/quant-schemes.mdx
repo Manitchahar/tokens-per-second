@@ -1,0 +1,192 @@
+---
+title: 'W4A16, W8A8, FP8: choosing a scheme'
+summary: 'Quantization schemes are named by what they shrink — W for weights, A for activations — and they are not points on one quality-to-speed line. You will learn what each scheme actually changes on the hardware, where FP8 differs in kind rather than degree, and how to pick a scheme by your bottleneck.'
+objectives:
+  - 'Decode a scheme name: what W means, what A means, and why A16 is the default'
+  - Explain what W8A8 gains that W4A16 cannot, and what it costs to get
+  - Explain why FP8 is a different mechanism rather than a narrower INT8
+  - Compute memory, decode step and throughput for a scheme from the roofline terms
+  - Choose a scheme for a given bottleneck and defend it
+---
+import SchemeChooser from '@/components/viz/quantization/SchemeChooser.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+There is a Wikipedia-shaped factoid that runs through every blog post on this topic: 4-bit quantization is 4× faster than FP16. It is wrong in an interesting way, and understanding why is basically this lesson.
+
+The problem is that "4-bit" is not a format. It is a shorthand for **which tensor got narrower, in what way, and executed by which kernel** — and those three choices pull in different directions.
+
+## Reading the name
+
+Every scheme name has the same shape: **W**, the bits, **A**, the bits. Written compactly: W4A16, W8A8, FP8.
+
+- **W** is the bit width of the **weights**. This is what the previous two lessons have been about.
+- **A** is the bit width of the **activations** — the hidden states, the Q/K/V tensors, the attention output, the MLP intermediate. These are recomputed on every single step, so they are never stored, only streamed.
+
+And here is the first surprise: **almost every 4-bit model you will meet is W4A16.** The weights are 4-bit; the activations stay in BF16. Why?
+
+<Callout type="intuition" title="Activations are much harder to quantize than weights">
+  A weight is a fixed number, chosen offline, sitting in a matrix with a handful of outliers you can go and look at. An activation is a different number on every request, from a distribution you cannot fully inspect in advance, with **outlier channels that vary per token**.
+
+  GPTQ and AWQ exist to solve the *weight* problem well. The activation problem — getting a scale cheaply, per token, without stalling the pipeline — is why W4A16 is the default and W4A4 is not a thing anyone ships.
+</Callout>
+
+So the honest taxonomy is not "more bits = better". It is a set of four different machines:
+
+| Scheme | Weights | Activations | Tensor cores used | Needs a fused kernel? |
+|---|---|---|---|---|
+| **BF16** | 16-bit float | 16-bit float | BF16 | no (baseline) |
+| **FP8** | 8-bit float | 8-bit float | FP8 | yes (standardised) |
+| **W8A8** | 8-bit integer | 8-bit integer | INT8 | yes |
+| **W4A16** | 4-bit integer | 16-bit float | INT8 (after dequant) | yes |
+
+## W4A16: shrink what you store, not what you compute
+
+This is the scheme behind essentially every "GPTQ" or "AWQ" checkpoint. The mechanism:
+
+1. **Offline:** quantize each weight matrix to INT4 with group size 128. Store 4-bit codes plus FP16 scales. The model is now ~4.25 bits per weight.
+2. **Every forward pass:** the GEMM kernel loads 4-bit weights, **dequantizes them to BF16 inside the kernel's inner loop**, and runs a normal BF16 tensor-core matmul.
+
+So what does W4A16 buy?
+
+- **Memory: 4×.** 16.06 GB → about 4.27 GB.
+- **Decode step: close to 4× shorter**, because decode is memory-bound and you just cut the bytes it reads.
+- **Prefill: essentially unchanged.** Prefill is compute-bound at ~400 FLOP/byte; it reads the weights once and then does the math. Fewer bytes to read is irrelevant when the math dominates.
+- **Compute throughput: unchanged**, because the math still happens in BF16.
+
+<Callout type="pitfall" title="If you dequantize outside the kernel, W4A16 is a memory win and a speed loss">
+  Unpack the INT4 weights to a BF16 tensor, then call `torch.matmul`. You now hold 16 GB again. You paid the unpacking cost *and* the memory-bandwidth cost of writing and reading the BF16 copy. The speedup evaporates and you may go **slower** than BF16.
+
+  This is the single most common quantization bug in hand-rolled code, and it is why fused dequantize-and-matmul kernels (Marlin, and the kernels inside vLLM and TensorRT-LLM) exist at all. **Quantization is an engineering problem wearing a numerics costume.**
+</Callout>
+
+## W8A8: reach the integer tensor cores
+
+W8A8 quantizes both sides to INT8. The reason to do it is not memory — 8-bit weights only save 2×, and weights are not usually the bottleneck at high batch. The reason is that it is the scheme that **actually runs on the hardware's fastest path**.
+
+- On an A100, INT8 tensor cores do up to 624 TOPS against 312 TFLOPS for BF16 — a **2×** multiplier that no amount of weight-only 4-bit unlocks for prefill, because the activations are still BF16 and the matmul is still BF16.
+- On a T4 and on modern Ampere/Hopper parts, INT8 is the well-optimised integer path.
+
+The cost is on the activation side. Activations need a scale, and a scale that works for one token does not work for the next, so real implementations use a **per-token dynamic scale**: compute `max(|x|)` over the token's vector, derive the scale, quantize. That costs a reduction over the activation, which is why it is fused into the preceding kernel (usually RMSNorm or the previous GEMM's epilogue).
+
+| | W4A16 | W8A8 |
+|---|---|---|
+| Weight memory | 4.27 GB | 8.4 GB |
+| Decode step | ~4× faster | ~2× faster |
+| **Prefill** | **unchanged** | **up to ~2× faster** |
+| Quality risk | low (weights only) | moderate (activations too) |
+| Complexity | moderate | high (dynamic per-token scales) |
+
+<Callout type="math" title="Reading that table as an engineer, not a shopper">
+  If your bottleneck is **decode latency at low batch** — which is the interactive-chat case — W4A16 wins clearly, because decode reads weights and you cut them 4×.
+  If your bottleneck is **prefill throughput** — long prompts, RAG, summarisation, offline batch — W4A16 does nothing for you, and W8A8's 2× on the compute term is the entire game. That is why they coexist and why engines expose both.
+</Callout>
+
+## FP8: a different mechanism, not a narrower INT8
+
+FP8 looks like "8-bit" and gets filed next to INT8. It should not be. Its structure is completely different, and the difference is the reason it is the highest-quality scheme available:
+
+$$
+\text{INT8: } \quad q = \operatorname{round}\!\left( \frac{x - z}{s} \right), \quad s \text{ fixed per group}
+\qquad
+\text{FP8: } \quad q = \operatorname{round}\!\left( \frac{x}{2^{e_x - e_{\max}}} \right), \quad e_x \text{ kept per element}
+$$
+
+- **INT8 has one scale for many numbers.** A single outlier forces a coarse grid on everything.
+- **FP8 keeps its own exponent per element**, exactly like BF16 but shorter. Its format is 1 sign bit, 4 exponent bits, 3 mantissa bits (E4M3), giving it the same wide range as BF16.
+
+Consequences:
+
+| | INT8 | FP8 E4M3 |
+|---|---|---|
+| Range | set by the scale | built in, per element |
+| Needs group scales | yes | **no** |
+| Metadata overhead | $12/(gb)$ | **zero** |
+| Outlier tolerance | poor without fine groups | good, like BF16 |
+| Relative precision | $\approx 2^{-b}$ uniform | $\approx 2^{-3}$ near each value |
+
+FP8 E4M3 keeps **3 mantissa bits**. INT8 with a per-group scale keeps *at least* 7 bits of information within a group (as computed in the previous lesson). So FP8 is genuinely the **less precise** of the two in mantissa terms — it wins because it spends bits on range instead of on a shared scale, and because range is what real activations need.
+
+Where it runs: **NVIDIA Hopper (H100, H200) and Blackwell have dedicated FP8 tensor cores** at 2× the BF16 rate. That is where FP8 is the default for training and increasingly for inference. On an A100 or a T4 there is no FP8 tensor-core path at all, so FP8 buys you the memory saving and nothing else — which is a fine reason to use it, but not a speed one.
+
+## The KV cache gets its own decision
+
+Weights are half the story in a memory-bound service. The other half, as Lesson 11.1 computed, is the KV cache, and it is quantized **independently**:
+
+| KV scheme | Bytes/token (8B) | Notes |
+|---|---|---|
+| BF16 | 131,072 | default |
+| FP8 | 65,536 | per-tensor scale, works well; native on Hopper+ |
+| INT8 | 65,536 | per-token scale; slightly better than FP8 at 8 bits in practice |
+| INT4 (per-head or per-token) | 32,768 | bigger quality cost; group-wise scales are essential |
+
+Crucially, KV quantization and weight quantization are **orthogonal**. W4 + KV8 is a real and popular combination: it is the configuration most often chosen for long-context serving, because it halves *both* terms in the decode step's byte count.
+
+<Callout type="real" title="A caution on KV cache quantization you should know before shipping it">
+  Quantizing the KV cache does not introduce a small, uniform error. It degrades **attention**, and attention errors compound over sequence length: by token 8,000 you have accumulated error from 8,000 quantized keys. The practical consequences people see are a rising rate of repetition and a degradation in long-range recall, not gibberish.
+
+  The mitigation is grouping: **per-token** scales (each token's K and V get their own) rather than per-tensor, and for 4-bit KV, per-head groups. And it is why FP8 KV, which needs no scale management at all, is the safer first move.
+</Callout>
+
+<Scrolly>
+  <SchemeChooser client:visible slot="stage" />
+
+  <Step title="1. What the letters mean">
+    Six schemes for the same 8B model, drawn to one scale. Two bars each: weight memory on top, one decode step below. Every number comes from the roofline terms, so you can check my arithmetic.
+  </Step>
+
+  <Step title="2. W4A16: weights only">
+    4.27 GB instead of 16.06, and the decode step drops by nearly the same factor — because decode was spending almost all its time waiting for weight bytes, and you just removed three quarters of them.
+  </Step>
+
+  <Step title="3. W8A8: both sides">
+    Half the memory saving, but the activations are now 8-bit too, so the matmul actually runs on INT8 tensor cores. That is a **prefill** speedup, and prefill is where W4A16 could do nothing for you.
+  </Step>
+
+  <Step title="4. FP8: a float, not an integer">
+    A float, with its own exponent per element. No group scales, no metadata, and it handles outliers the way BF16 does. On Hopper and newer it also runs at 2× the BF16 tensor-core rate.
+  </Step>
+
+  <Step title="5. The KV cache has its own budget">
+    The bottom panel is the useful one: nearly every row is almost entirely blue. Decode waits on bytes in every scheme. That is why the winning move is always "read fewer bytes", and why the KV cache is worth attacking independently of the weights.
+  </Step>
+
+  <Step title="6. Choosing by workload">
+    Set what you are optimizing for and read the recommendation. Then change batch or context and watch it move — at batch 1, weight memory rules; at batch 256, the KV cache does; at 32k context, nothing else matters at all.
+  </Step>
+</Scrolly>
+
+## How to actually choose
+
+Ignore which scheme is fashionable. Work through these four questions in order:
+
+1. **What is my bottleneck?** Decode latency at low batch → weight memory → W4A16. Prefill throughput → activations → W8A8 or FP8. Both, and long context → W4 + KV8.
+2. **What hardware do I have?** FP8 needs Hopper or newer for the speed; on an A100 or T4 it is a memory-only win. INT8 needs a good integer GEMM path, which Ampere and later have.
+3. **How much quality budget do I have?** If the product is a coding assistant where a wrong token costs a debug session, buy FP8 W8. If it is summarising thousands of documents where occasional awkwardness is invisible, W4 is free money.
+4. **Do I have the kernel?** An unsupported scheme is a 1.3× win at best, because you will be dequantizing outside the fused GEMM. Check what your engine actually implements before choosing.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. Llama-3.1-8B, batch 32, 4k context, H100. Compute the decode step for BF16 and for W4A16 (assume group-128 scales, KV left at BF16). Why is the speedup less than 4×?
+  2. Your workload is 12,000-token RAG prompts with long generations. Prefill dominates your GPU time. Which of W4A16 and W8A8 helps you, and why?
+  3. You have an A100, not an H100. What do you lose by choosing FP8 over W8A8?
+  4. Halving the KV cache from 16 to 8 bits at batch 32 and 4k context: roughly how much does that shrink the per-step byte count, and why is it a smaller win than halving the weights?
+  5. Someone claims their "4-bit" model is exactly 4 bits per weight. What have they most likely forgotten, and by how much?
+</Callout>
+
+<KeyNotes>
+  1. A scheme name is W bits for weights, A bits for activations. The two are independent decisions, as is the KV cache.
+  2. W4A16 is the standard 4-bit recipe because activations are much harder to quantize than weights — they vary per token and have outliers that move.
+  3. W4A16 gives ~4× less weight memory and ~4× shorter decode steps, but leaves prefill unchanged, since prefill is compute-bound in BF16.
+  4. If you dequantize outside the GEMM, W4A16 is a memory win and a speed *loss*. Fused kernels are mandatory.
+  5. W8A8 is the scheme that reaches the INT8 tensor cores, so it is the prefill/throughput lever — 2× on the compute term where W4A16 gives nothing.
+  6. FP8 is a float with a per-element exponent: no group scales, no metadata, outlier-tolerant, and 2× tensor-core rate on Hopper and newer. On older GPUs it is a memory-only win.
+  7. KV quantization is orthogonal and independently worth it. W4 + KV8 halves both terms and is the standard long-context configuration.
+  8. Pick by bottleneck, then hardware, then quality budget, then kernel support — in that order. Never by fashion.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B on an H100, batch 32, 4,096 tokens of context. You move from BF16 to W4A16 with group-128 scales, KV still BF16. Decode bytes go from 33.2 GB to what?', numeric: true, answer: 21.5, tolerance: 1.2, unit: 'GB', why: 'Weights: 8.03e9 × (0.5 × 1.0625) = 4.27 GB. KV: 32 × 4096 × 131,072 = 17.18 GB, unchanged. Total = 21.45 GB. So the step is 1.55× faster, not 4× — because the KV cache was already half the bill and you did not touch it.' },
+  { q: 'Your workload is dominated by 12,000-token RAG prompts. Which scheme choice helps most, and why?', options: ['W4A16, because it cuts weight memory 4×', 'W8A8 or FP8, because prefill is compute-bound and only narrowing the activations reaches the fast tensor cores', 'Neither, because prefill cost is independent of precision', 'INT4 KV, because prefill is limited by cache writes'], answer: 1, why: 'Prefill at 12,000 tokens is firmly compute-bound (roughly 400 FLOP/byte), so reading fewer weight bytes changes nothing. You need the activations narrow too, which is what routes the matmul to INT8 or FP8 tensor cores for a 2× on the compute term.' },
+  { q: 'What is the structural difference between INT8 and FP8 E4M3 that makes FP8 need no group scales?', options: ['FP8 uses more bytes internally', 'INT8 stores a fixed exponent per group; FP8 stores an exponent per element, so its range travels with the value', 'FP8 is signed and INT8 is unsigned', 'FP8 rounds instead of truncating'], answer: 1, why: 'INT8 covers its range with one shared scale, so an outlier forces a coarse grid. FP8 has 4 exponent bits per element, so each number carries its own range — outliers cost nothing and no scale metadata is needed at all.' },
+  { q: 'A "4-bit" model with group size 128 and FP16 scales is storing how many bits per weight, really?', numeric: true, answer: 4.25, tolerance: 0.2, unit: 'bits', why: 'Data is 4 bits per weight. Each group of 128 weights adds 4 bytes (an FP16 scale plus an FP16 zero-point), which is 4/(128 × 0.5) = 6.25% overhead. 4 × 1.0625 = 4.25 bits per weight.' },
+  { q: 'You run FP8 on an A100 instead of an H100. What happens?', options: ['Everything is 2× faster; A100 supports FP8 tensor cores', 'You keep the memory saving but get no tensor-core speedup, because FP8 acceleration starts with Hopper', 'FP8 becomes INT8 automatically', 'It runs at half the speed of BF16'], answer: 1, why: 'Dedicated FP8 tensor cores arrived with Hopper (H100/H200) and Blackwell. On Ampere, FP8 is stored and unpacked but the matmul falls back to a slower path. It is still worth using for the memory saving — just do not expect the 2×.' },
+]} />

@@ -1,0 +1,154 @@
+---
+title: 'How to read an inference systems paper'
+summary: 'A systems paper is an argument with a benchmark at the end of it. Learn the reading order that finds the claim, the setup and the threats, so you can tell in twenty minutes whether a result is real, relevant to you, and worth reproducing.'
+objectives:
+  - Read a title and abstract as a specific, checkable claim rather than a summary
+  - Locate the roofline setup so you know which speed limit a method attacks
+  - Decide whether a paper''s hardware and workload are close enough to yours to matter
+  - 'Use the threats-to-validity section to find the authors own list of what would break the result'
+  - Judge a paper’s practical value from its artifacts, cost and mechanism, not its headline number
+---
+
+import PaperReader from '@/components/viz/research-capstone/PaperReader.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have spent this whole course building things: KV caches, schedulers, kernels, serving engines, a whole system in Module 27. Now the direction reverses. Other people build things, publish them, and you have to decide what is worth your time.
+
+An inference systems paper is **an argument with a benchmark at the end of it**. Somebody believed a bottleneck was real, built a mechanism to attack it, and measured a number that got better. Your job is not to admire the number. Your job is to find the argument, check it, and decide: *is this true, does it apply to me, and is it worth my week?*
+
+<Callout type="mentor" title="The whole lesson in one line">
+  Read the setup before the results. The setup tells you which of your two speed limits the paper attacks, on which hardware, with which workload — and that is where most of the relevance is decided. The results table is the easy part.
+</Callout>
+
+## The reading order
+
+Most people read papers backwards: abstract, results table, conclusion, done. That gets you the headline number and none of the context. Read in this order instead, and it is fast.
+
+<Scrolly>
+  <PaperReader client:visible slot="stage" />
+
+  <Step title="1. The title is a claim">
+    An inference title is almost always a claim about **which speed limit you are hitting**. "*Reducing memory overhead in LLM serving*" is memory. "*Breaking the compute-memory roofline for autoregressive decoding*" is compute. "*A kernel for X*" is usually neither — it is a specific implementation bet.
+
+    Read the title as a hypothesis, not a description. You now know what the paper claims before you read a word of it, which means every section that follows is either support or a hole you can go look for.
+  </Step>
+
+  <Step title="2. The abstract is a search query">
+    The abstract is written for two audiences: people skimming, and people deciding whether to reproduce. It should give you the setting, the mechanism in one sentence, and the headline number.
+
+    If you are **skimming**, read title → abstract → the results table → conclusion. About ten minutes. You are answering one question: *is this worth my week?*
+
+    If you are going to **read or reproduce it**, come back to the abstract last, and check the headline number against the threats-to-validity section. The abstract is the authors at their most optimistic, and they know it.
+  </Step>
+
+  <Step title="3. Find the roofline, not the throughput">
+    This is the step that separates engineers from readers. In the setup or method section, find which limit the work attacks.
+
+    In Module 2 you learned every GPU has **two speed limits**: memory bandwidth and math throughput, with a <Term t="roofline">roofline</Term> between them. Decode is memory-bound; prefill is compute-bound. A method that attacks the wrong limit for your workload is worthless to you even if its benchmark is beautiful.
+
+    Write down the mechanism in your own words: *what resource does this reduce, and by how much?* If you cannot, you do not understand it, and you should not reproduce it.
+  </Step>
+
+  <Step title="4. Check the setup is yours">
+    Before you fall in love with a result, check the setup: which GPU, which model, which batch size, which context length, which arrival pattern, which engine.
+
+    This is where relevance is decided, and most failed reproductions are decided right here, not by anything mysterious later. A method that shines on an A100 at batch 1 may do nothing on your T4 at batch 64, because the bottleneck it attacks is not the one *your* deployment is hitting.
+
+    Two numbers to extract: **the headline speedup** (so you know the ceiling) and **what it costs** (memory, an extra pass, a worse TTFT). Then check the arithmetic yourself.
+  </Step>
+
+  <Step title="5. Read the threats to validity">
+    Every serious paper has a **threats-to-validity** section, and it is a list, written by the authors, of the things that would break the result. It is the most honest part of the paper and the last part anyone reads.
+
+    Typical threats in inference work: small sample size, one model only, a workload that is not your workload, a hardware generation that is not yours, an accuracy drop that was measured on too few examples.
+
+    The right use of this section is to find the threat that applies **to you**, then decide whether to dismiss it or to worry about it. The authors list six threats; you care about the one that matches your deployment.
+  </Step>
+
+  <Step title="6. Trace the money: cost & code">
+    A method that makes decode 20% faster by using 40% more GPU memory might be a loss for you, because memory is what caps your batch size (Module 5, Module 8). Speed and capacity trade against each other, so a systems result without its memory cost is an incomplete result.
+
+    Then the practical questions. Is there **code**? Is there a **commit or version** pinned? Does it need a specific hardware feature you do not have? Can you still install it six months from now?
+
+    <Callout type="real">
+      A paper with no code is a wish. A paper with code, a pinned commit and a documented setup is an engineering task. You are reading because you might build on it, so "can I actually run this" is part of reading it.
+    </Callout>
+  </Step>
+
+  <Step title="7. The one-page verdict">
+    The artifact you keep is **one page**, not a PDF full of highlights. Five lines: the claim with its number, whether the setup matches yours, whether the evidence clears the noise, the threat that worries you, and the cost to adopt.
+
+    Write it **before** you do any work. The next lesson is about reproducing a result, and the first step there is exactly this verdict sheet. Reading and reproducing are the same skill at different depths.
+  </Step>
+</Scrolly>
+
+## The three lenses
+
+The same paper gets read three ways, and you should know which one you are doing.
+
+| Lens | Time | You read | You want |
+|---|---|---|---|
+| **Skim** | ~10 min | title, abstract, results, conclusion | Is this worth my week? |
+| **Deep** | ~1 hour | + method, setup, threats | Does the mechanism hold on my traffic? |
+| **Reproduce** | ~1 day+ | + all artifacts, every number | Can I regenerate their headline number? |
+
+Most papers you will ever see need only the skim. A few — the ones you might build on, or cite in a design doc — need the deep lens. The reproduce lens is for the one or two per year you actually run.
+
+<Callout type="pitfall" title="Reading order is a discipline, not a suggestion">
+  The temptation is to read the results first, get excited about a 2× number, and only then find the setup used a batch size of 1 on a GPU you do not have. Every one of those mistakes is a paper you believed for a week. Ten minutes of setup before results prevents all of them.
+</Callout>
+
+## Separating the claim from the number
+
+A paper's title makes a claim; its results table makes a number. Keep them apart, because they fail differently.
+
+The **number** fails if the effect is inside the run-to-run noise. From Module 17: with a rig noise $c$ of 5%, claiming a 4% effect needs roughly $k \approx (2c/\delta)^2 = (2\times 5/4)^2 \approx 6$ repeats to defend. A single-run 4% improvement is not an improvement.
+
+The **claim** fails if the mechanism does not generalize — one model, one hardware generation, one context length. This is why the threats section matters: it tells you the range of validity, and you decide whether your deployment is inside it.
+
+$$
+\text{a result you can trust} = \text{effect} > \text{noise} \quad\text{and}\quad \text{your workload} \in \text{its valid range}
+$$
+
+<Callout type="math" title="Check the headline number yourself">
+  Suppose a paper claims *"decode throughput improves 2.1× on Llama-3.1-8B at batch 64."* Before believing it, run the memory math from Module 5 on **your** setup. Llama-3.1-8B in BF16 is about 16 GB of weights, and each token of context costs 128 KB of KV cache. On an 80 GB A100 that leaves room for hundreds of concurrent sequences — but if the method needs extra memory to hold its working state, that capacity shrinks, and the "free" 2.1× may come out of your batch size instead.
+
+  The point is not to be cynical. It is that **a speedup number is only meaningful next to the resource it consumes and the workload it was measured on.** Both are in the setup. Neither is in the title.
+</Callout>
+
+## Reading a paper you will build on
+
+If you are going to use this in your system, the reading gets one level deeper. You are no longer asking "is it true", you are asking "does it compose with what I already run".
+
+- **Does it change my bottleneck?** If you are memory-bound and this attacks compute, no. If you are decode-bound and this shrinks KV reads, maybe.
+- **What does it cost me elsewhere?** Faster decode that doubles TTFT, or that halves my batch size, or that breaks prefix caching (Module 10), is a trade, not a win.
+- **Is it compatible with my stack?** Does it work inside vLLM, or does it need its own runtime? Can it be combined with the quantization scheme from Module 11?
+
+This is where Module 27 earns its keep: you built an engine, so you know which parts of it a given method would have to touch, and you can guess the integration cost faster than someone who has never seen the request path.
+
+<Callout type="try" title="Ten-minute practice">
+  Pick any inference paper you have skimmed before. Re-read it in this order — title, abstract, setup, method, threats, results — and write the five-line verdict. You will find one of two things: a number that does not clear the noise, or a setup that is not yours. Both are useful; neither takes long.
+</Callout>
+
+<KeyNotes>
+  1. A systems paper is **an argument with a benchmark at the end**. Your job is to find the argument, not to admire the number.
+  2. Read in this order: **title → abstract → setup → method → threats → results**. Reading results first is how you end up believing a number that does not apply to you.
+  3. Find the **speed limit** the method attacks. Decode is memory-bound and prefill is compute-bound; a method aimed at the wrong one is worthless on your workload.
+  4. Relevance is decided in the **setup**, not the abstract: GPU, model, batch size, context length, arrival pattern, engine. Most failed reproductions die here.
+  5. A speedup is incomplete without its **cost** — extra memory, extra passes, worse TTFT — because memory is what caps batch size.
+  6. The **threats-to-validity** section is the authors' own list of what breaks the result. Find the threat that matches your deployment.
+  7. Trust a number only if the effect **clears run-to-run noise** (Module 17) and your workload sits inside its stated valid range.
+  8. Keep a **one-page verdict** — claim, setup match, evidence, threat, cost. It is the artifact that makes reproducing and building possible later.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'You are reading an inference paper to decide whether it applies to you. What should you read first?', options: ['The results table, to see how big the win is', 'The experimental setup, to see whether the hardware and workload are yours', 'The conclusion, to see what the authors recommend', 'The references, to see who else worked on it'], answer: 1, why: 'Relevance is decided in the setup. If the GPU, model, batch size or workload is not yours, the results table is describing a system you will never run, no matter how large the win.' },
+  { q: 'A paper claims a 4% decode throughput improvement, and your rig’s run-to-run spread is 5%. Roughly how many repeats are needed to defend that effect?', numeric: true, answer: 6, tolerance: 1.5, unit: 'repeats', why: 'Using k ≈ (2c/δ)² from Module 17 with c = 5% and δ = 4%: (2×5/4)² = (2.5)² = 6.25, so about 6 repeats. A single-run 4% effect sits inside the noise.' },
+  { q: 'Which question does the threats-to-validity section answer?', options: ['How fast is the method?', 'What would break this result, according to the authors?', 'How much memory does it save?', 'Who funded the research?'], answer: 1, why: 'It is the authors’ own list of validity threats: small samples, one model, non-representative workloads, unsupported hardware. You use it to find the threat that applies to your deployment.' },
+  { q: 'A method speeds up decode by 2× but needs 2× the KV cache memory. Why is the 2× possibly a loss for you?', options: ['It always is a loss', 'Because KV cache memory caps how many sequences fit, so the speedup can come out of your batch size', 'Because KV cache is compute, not memory', 'Because 2× is never a real speedup'], answer: 1, why: 'Decode throughput depends on batch size, and batch size is capped by KV memory. Spending memory on a faster kernel can shrink concurrency so much that total throughput falls. This is why a speedup must always be read next to its memory cost.' },
+  { q: 'You want to reproduce a paper’s result. What is the correct first step?', options: ['Clone the repo and run the benchmark', 'Write the one-page verdict from the paper: claim, setup, evidence, threat, cost', 'Read the abstract again', 'Email the authors asking for their seed'], answer: 1, why: 'Write the verdict first. It forces you to state, before any compute, exactly which number you intend to regenerate, on which setup, and what would count as success. That plan is what you execute and what you compare against.' },
+]}/>
+
+## Where this goes next
+
+Reading is half of research; the other half is **doing**. The next lesson, *Reproducing a result*, takes the verdict sheet you just learned to write and turns it into a plan: how to pin a setup, measure against the noise, and honestly report what did and did not reproduce.

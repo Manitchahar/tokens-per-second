@@ -1,0 +1,192 @@
+---
+title: 'What precision buys you'
+summary: 'Before you remove a single bit, you need to know what each one is paying for. You will learn where the bits are in an LLM forward pass, which part of the workload each byte controls, and why quantization is a memory decision before it is a compute decision.'
+objectives:
+  - Identify every place a 16-bit number lives during a forward pass
+  - Compute bytes per weight, per KV token and per layer from the model shapes
+  - Derive the decode step time from bytes read and memory bandwidth
+  - Explain why decode is memory-bound and what that makes precision worth
+  - Distinguish a memory saving from a compute saving, and price both
+---
+import PrecisionPayoff from '@/components/viz/quantization/PrecisionPayoff.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You are deploying Llama-3.1-8B. Your GPU has 80 GB. The model in BF16 needs 16.1 GB of weights, which fits, so you ship it.
+
+Three months later the same model needs a new feature that triples the context length, you must double your concurrency to hit a throughput target, and your inference bill has doubled. You go looking for the lever everyone mentions, and the lever is: **there are two bits per weight you did not need**.
+
+Take those bits away and the weights take 8.4 GB instead of 16.1. That is not a 2% optimization. It is a different deployment.
+
+Before you remove them, though, you need a model of what a bit is *for*. Because the honest answer is not "precision buys quality". It is much more specific, and much more useful.
+
+## Every number in the forward pass is 16 bits
+
+From Module 01, you know what a number in memory looks like. Take one token's journey through a transformer block, from *The MLP, RMSNorm & the residual stream* in Module 03, and mark the format of everything it touches:
+
+| Number | Count | Format | Bytes |
+|---|---|---|---|
+| Weights, $W_Q, W_K, W_V, W_O, W_{gate}, W_{up}, W_{down}$ | $P$ | BF16 | $1P$ |
+| KV cache, per token | $1 \cdot L \cdot H_{kv} \cdot D$ | BF16 | $1 \cdot L \cdot H_{kv} \cdot D \cdot 2$ |
+| Hidden state $x$ | $d_{model}$ | BF16 | $1\,d_{model}$ |
+| Q, K, V for this token | $1\,d_{model}$ | BF16 | $1\,d_{model}$ |
+| RMSNorm gain | $d_{model}$ | FP32 | $1\,d_{model}$ |
+| Logits | $\vert V\vert$ | BF16 | $1\lvert V\rvert$ |
+
+Add it up for Llama-3.1-8B, which has $P = 8.03$ billion parameters, $L = 32$, $H_{kv} = 8$, $D = 128$, $d_{model} = 4096$, $\vert V\rvert = 128{,}256$:
+
+$$
+\text{weights} = 8.03\text{e}9 \times 2 = 16.06\ \text{GB} \qquad
+\text{KV/token} = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\ \text{bytes}
+$$
+
+Now the part that matters. The weights total 16 GB and are read **on every single decode step**. The activations total a few hundred kilobytes and are read once per step, to produce a few numbers, for one user. **Four orders of magnitude apart.**
+
+<Callout type="intuition" title="Only two numbers in that table are ever big">
+  Activations scale with batch size, and you can batch 256 users at once. So activations cost you 256 × a few hundred kilobytes ≈ tens of megabytes. They are rounding errors next to 16 GB of weights and gigabytes of KV.
+
+  If you are choosing which number to shrink, you are choosing between the weights and the KV cache. That is the whole menu. Everything in this module is a way of making one or both of those smaller.
+</Callout>
+
+## What each bit is paying for
+
+A bit in the weights buys **range and precision for a number that was learned once and never changes**. A bit in the KV cache buys the same thing, but for a number that is **recomputed differently on every request** and thrown away at the end. A bit in an activation buys the same thing for a number that lives for microseconds.
+
+That difference in lifetime is why the two big numbers behave so differently under quantization, and it is worth being blunt about it:
+
+| | Weights | KV cache |
+|---|---|---|
+| Written | once, offline | every step, every request |
+| Read | every decode step | every decode step |
+| Overhead of being approximate | **permanent** | **per-request** |
+| Can you detect the error? | Only by evaluating the model | Only by evaluating the model |
+| Compresses well by | clustering similar weights | clustering similar activations |
+
+Weights are the safer target for one specific reason: the error you introduce is **fixed**. Every request, forever, gets the same slightly-wrong matrix. You can measure it once, on an evaluation set, and know what you have. KV cache error is different — it is recomputed per request, so you must be confident about it statistically rather than by exhaustion.
+
+<Scrolly>
+  <PrecisionPayoff client:visible slot="stage" />
+
+  <Step title="1. Bytes decide what fits">
+    Six precision schemes for the same 8B model, drawn to one scale. BF16 weights take 16.1 GB. FP8 and INT8 take 8.4. INT4 takes 4.2. **Bytes per weight is bytes per model** — there is no second-order term you can negotiate with.
+  </Step>
+
+  <Step title="2. Bytes decide the decode step">
+    Decode reads the whole weight matrix every step, so step time is roughly *bytes divided by bandwidth*. On an H100 at 3.35 TB/s that is 4.8 ms for BF16 and 2.4 ms for INT4. **Fewer bits is a shorter step**, not just a smaller model.
+  </Step>
+
+  <Step title="3. The KV cache joins the bill">
+    Now add what 32 users at 4,096 tokens of context need: 16.8 GB of KV at BF16, which is *more than the weights*. So weight quantization alone leaves the biggest line item untouched — and that is the moment KV cache quantization starts to look obvious.
+  </Step>
+
+  <Step title="4. Precision is telling values apart">
+    Precision is not "bits". It is *how many distinct values the format can represent*. Four bits is sixteen of them. Here is a real row of weights, and what a 4-bit format does to it: the small weights collapse onto zero, and the error between the tick and the bar is the price.
+  </Step>
+
+  <Step title="5. Fewer bytes moves the roofline">
+    There is a second effect, and it is the one people forget. Decode does $1P$ FLOPs per token and moves $1P$ bytes per token. Halve the bytes and the arithmetic intensity doubles, so the step stays memory-bound to a much larger batch. More users per step, for free.
+  </Step>
+
+  <Step title="6. And there is a price">
+    Drop to 2 bits and the error is no longer a rounding detail — it is 30% of the signal, and the model starts to break. Somewhere between 16 and 4 bits there is a knee. **Locating that knee honestly is the skill this module teaches.**
+  </Step>
+</Scrolly>
+
+## Deriving the decode step, from the bits
+
+You already have this from Module 05's *Prefill vs decode* and Module 02's *The two speed limits*. Now put the bit width in. One decode step must move, at minimum:
+
+$$
+\text{bytes} = \underbrace{P \cdot \frac{b_w}{8}}_{\text{weights}} \;+\; \underbrace{B \cdot T \cdot 2 L H_{kv} D \cdot \frac{b_{kv}}{8}}_{\text{KV cache, }B \text{ users at } T \text{ tokens}}
+$$
+
+and it does $1PB$ FLOPs. So:
+
+$$
+t_{\text{step}} = \max\!\left( \frac{\text{bytes}}{\text{BW} \times \text{MBU}},\ \frac{2PB}{\text{peak FLOP/s} \times \text{MFU}} \right) + \text{overhead}
+$$
+
+Work the BF16 numbers for Llama-3.1-8B, $B = 32$, $T = 4096$, on an H100 (3.35 TB/s, 989 TFLOP/s BF16, MBU 0.8, MFU 0.55):
+
+$$
+\text{bytes} = 8.03\text{e}9 \times 2 + 32 \times 4096 \times 131072 = 16.06\text{e}9 + 17.18\text{e}9 = 33.2\ \text{GB}
+$$
+
+$$
+t_{\text{mem}} = \frac{33.2\text{e}9}{3.35\text{e}12 \times 0.8} = 12.4\ \text{ms} \qquad
+t_{\text{compute}} = \frac{2 \times 8.03\text{e}9 \times 32}{989\text{e}12 \times 0.55} = 0.94\ \text{ms}
+$$
+
+Thirteen to one. The decode step is **entirely** waiting for bytes, and the tensor cores are 92% idle. This is the single most important number in the module, because it tells you exactly what a bit is worth:
+
+$$
+\boxed{\ \text{halving the weight bits halves the memory term, and the decode step with it}\ }
+$$
+
+<Callout type="math" title="The same arithmetic for the 70B model, and why the picture changes">
+  Llama-3.1-70B has $P = 70.6$ billion parameters, $L = 80$, $H_{kv} = 8$, $D = 128$. BF16 weights are 141 GB — it does not fit on one 80 GB H100 at all, and cannot without tensor parallelism across at least two.
+
+  Its KV cache is *cheaper* per token (320 KiB vs 128 KiB, because it has 80 layers but the same 8 KV heads), but the weights dominate so heavily that weight quantization takes it from "needs 2+ GPUs" to "fits comfortably on one". **That is not a speed optimization. It is the difference between deploying and not deploying.**
+</Callout>
+
+## Memory, then speed: the order of the arguments
+
+It is easy to present quantization as "3× faster". It is not. Here is the honest causal chain, in the order the effects actually occur:
+
+1. **Memory.** Bytes per weight drop from 2 to 0.5. The model occupies a quarter of the memory. This is arithmetic on a spec sheet and it is exact.
+2. **Concurrency.** More memory for weights means less left for KV cache, so *more* users fit. On a memory-bound workload this converts directly into throughput.
+3. **Decode speed.** Fewer bytes per step means a shorter step — *but only while the step is memory-bound.* Once you cross into compute-bound, shrinking bytes buys nothing.
+4. **Compute speed.** Low-precision tensor cores are faster than BF16 ones, which matters for **prefill** (compute-bound) and only for the compute term of decode.
+
+Steps 1 and 2 are unconditional. Steps 3 and 4 are conditional on hardware and on where you sit on the roofline, and a good engineer says so out loud rather than quoting a single speedup number.
+
+<Callout type="pitfall" title="The 4-bit speedup is not 4×, and here is why">
+  It is tempting to divide the bytes: 16 bits to 4 bits, therefore 4× faster. Three things stop that from being true.
+
+  **The metadata.** Group-wise 4-bit quantization does not store 4 bits per weight; it stores 4 bits plus a scale and a zero-point per group. At group size 128 those cost 4 bytes per 128 weights, which is 6.25% overhead on top — so a 4-bit model is really 4.25 bits per weight, not 4.
+
+  **The dequantization.** If you unpack INT4 to BF16 and call a normal GEMM, you have saved memory and lost speed: you now pay the unpacking cost *and* the compute term stays the same. Speed comes from a fused kernel that dequantizes inside the GEMM, which is why the kernel support is the hard part.
+
+  **The roofline.** If decode was memory-bound at 33 GB/step, it still is at 8 GB/step. You get the speedup only while you stay memory-bound. At batch 256 you were already compute-bound, and there quantization buys almost nothing on latency.
+
+  What you can say honestly: **4-bit weights roughly halve the memory and the decode step, enable several times the concurrency, and leave prefill almost unchanged.**
+</Callout>
+
+## Why bits are not equally valuable
+
+One more idea, because it decides where you point the effort. In a BF16 weight, some of the 16 bits carry almost nothing. Look at what BF16 actually is, from Module 01: 1 sign bit, 8 exponent bits, 7 mantissa bits.
+
+That is **7 bits of precision**. Nine of the sixteen bits are spent on range — being able to represent both 1e-38 and 3e38. For the weights of a layer, almost none of that range is used. A well-behaved layer's weights live inside roughly $[-0.5, 0.5]$.
+
+This is why "the model was only using 7 bits of precision all along" is a true and useful observation, and why **BF16 to INT8 is nearly free** while **INT4 is a real trade**: at 8 bits you are using all 8 bits meaningfully; at 4 bits you are giving up half of the mantissa you were already using.
+
+<Callout type="recap" title="What precision buys, in one paragraph">
+  In BF16 the weights use 7 mantissa bits for precision and 8 for a range the weights never touch, so 8-bit quantization costs almost nothing in quality and halves both memory and decode step time. Below 8 bits you start spending real precision, and the error compounds through the layers — which is exactly what *How quantization works* measures, and what *AWQ, GPTQ & SmoothQuant* spends three techniques trying to control.
+</Callout>
+
+<Callout type="try" title="Check yourself before continuing">
+  1. Llama-3.1-8B in BF16 on an H100, batch 32, 4,096 tokens of context. Compute the memory term and the compute term of one decode step. Which dominates, and by what factor?
+  2. You quantize the weights to INT8 and leave the KV cache at BF16. By roughly what factor does the decode step get faster? Think about which term shrank.
+  3. You quantize to INT8 *and* the KV cache to INT8. By what factor now?
+  4. You quantize the weights to INT4 but forget to fuse the dequantization into the GEMM. What happens to memory, and what happens to speed? Which is the reason 4-bit inference is mostly an engineering problem?
+  5. Your service is compute-bound (batch 256, short context, big batch). Does weight quantization help your TPOT at all? Explain from the two terms.
+</Callout>
+
+<KeyNotes>
+  1. The forward pass is full of 16-bit numbers, but only two of them are ever large: the weights ($1P$ bytes) and the KV cache ($1LT H_{kv}D \cdot 2$ bytes per sequence). Activations are rounding errors next to them.
+  2. Decode reads every weight every step, so $t_{\text{step}} \approx \text{bytes}/\text{bandwidth}$. For Llama-8B at batch 32 that term is 12.4 ms against a 0.94 ms compute term — the step is 92% waiting.
+  3. Bytes per weight **is** bytes per model. Halving the bits halves memory, halves the memory term, and doubles concurrency. Those three are arithmetic, not estimates.
+  4. The decode speedup holds only while you stay memory-bound. Quantizing weights at batch 256 buys you capacity, not latency.
+  5. Lower precision is faster in hardware too (FP8 and INT8 tensor cores), which is what makes quantization help **prefill**, the compute-bound phase.
+  6. BF16 spends 8 of its 16 bits on range the weights never use. That is why INT8 is nearly free and INT4 is not.
+  7. Weight error is fixed and measurable once. KV cache error is recomputed per request, so it must be argued statistically.
+  8. "4× faster" is not a number you can defend. "Half the memory, half the decode step, several times the concurrency, prefill unchanged" is.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B has 8.03B parameters. At 4 bits per weight, ignoring group scales, how many GB do the weights occupy?', numeric: true, answer: 4.0, tolerance: 0.3, unit: 'GB', why: '8.03e9 × 4/8 = 4.015e9 bytes = 4.0 GB. Compare BF16 at 16.1 GB: exactly a quarter. With group-128 scales you would add 6.25%, landing near 4.27 GB.' },
+  { q: 'For Llama-3.1-8B, how many bytes of KV cache does one token of context occupy in BF16?', numeric: true, answer: 131072, tolerance: 4000, unit: 'bytes', why: '2 (K and V) × 32 layers × 8 KV heads × 128 head dim × 2 bytes = 131,072 bytes = 128 KiB per token. At 8-bit KV it becomes 64 KiB; at 4-bit, 32 KiB.' },
+  { q: 'Llama-3.1-8B, batch 32, 4,096 tokens of context, H100. Roughly how long is one decode step, and what dominates it?', options: ['About 0.9 ms, dominated by tensor-core compute', 'About 12 ms, dominated by reading weights and KV cache from memory', 'About 120 ms, dominated by kernel launch overhead', 'About 1 ms, dominated by the KV cache only'], answer: 1, why: 'Bytes = 16.1 GB weights + 17.2 GB KV = 33.2 GB. At 3.35 TB/s × 0.8 MBU that is 12.4 ms. The compute term is 2 × 8.03e9 × 32 / (989e12 × 0.55) = 0.94 ms. Memory wins by more than 13×, so the tensor cores sit idle 92% of the step.' },
+  { q: 'You quantize weights to INT8 and leave the KV cache in BF16, at batch 32 and 4k context. Roughly how much faster is the decode step?', options: ['1.0× — nothing changes', 'About 1.2×', 'About 2×', 'About 4×'], answer: 2, why: 'Only the weight term halves: 33.2 GB becomes 8.05 + 17.18 = 25.2 GB, so 12.4 ms → 9.4 ms, about 1.3×. To get the full 2× you must halve the KV cache too, because in this configuration KV is already the larger term.' },
+  { q: 'Why is 8-bit weight quantization so much cheaper in quality than 4-bit?', options: ['INT8 uses a floating-point format and 4-bit uses integers', 'BF16 spends 8 of its 16 bits on range the weights never use, so the 7 mantissa bits compress into 8 integer bits almost losslessly — while 4 bits gives up half of them', 'INT8 has a smaller group size and therefore more scales', 'INT8 quantization does not change the weights at all'], answer: 1, why: 'The useful precision in BF16 is its 7-bit mantissa. Eight integer bits with a per-group scale hold at least that much information, so INT8 is nearly lossless. Four bits hold half, and the error compounds through 32 layers.' },
+  { q: 'Your decode service runs at batch 256 with a 512-token context, and you already measured it to be compute-bound. What does quantizing the weights to 4 bits do for your TPOT?', options: ['Roughly halves it, because the weights are smaller', 'Roughly quarters it, because 16 bits became 4', 'Almost nothing — the step was waiting on math, not on bytes', 'It makes TPOT worse, because dequantization adds work'], answer: 2, why: 'Once the compute term dominates, shrinking bytes does not shorten the step. Quantization would still cut memory and let you run a bigger batch, but latency per step at this batch is set by FLOP/s, not bandwidth.' },
+]} />

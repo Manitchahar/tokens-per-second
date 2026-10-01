@@ -1,0 +1,220 @@
+---
+title: 'CUDA graphs: capture & replay'
+summary: 'Record the decode step once, then replay it once per token for the price of a single API call. Learn what a graph actually contains, the static-address rule that makes it fast and makes it brittle, and how to decide whether one will help your configuration at all.'
+objectives:
+  - 'Explain what a CUDA graph is on the device and why replaying one is a single API call'
+  - 'Predict the CPU time of a replayed step and say what it no longer depends on'
+  - 'Apply the static-address rule: name the buffers that must be allocated once and why'
+  - 'Explain graph padding and graph memory pools, and the cost of each'
+  - 'Decide whether a graph can help a given configuration, using the CPU-versus-GPU test'
+---
+
+import GraphReplay from '@/components/viz/compilation/GraphReplay.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+`torch.compile` made each launch cheaper: about 2 microseconds instead of 6. That is a good deal, but it is still a per-launch cost, and a decode step of Llama-3.1-8B is still around 420 of them. This lesson removes the multiplication altogether.
+
+A <Term t="cuda-graph">**CUDA graph**</Term> is a recorded list of kernel launches, with their arguments, stored on the device. You build it once and then replay it, and replaying re-issues every kernel in the recorded order **with no CPU in between**. A step of 556 launches becomes one API call costing about 8 microseconds.
+
+Here is the honest framing before anything else, because it decides whether you should care. A graph is a **CPU-side optimisation only**. It does not move fewer bytes, does not skip a kernel, and does not touch the GPU bill at all. If the GPU was already the longer pipeline in Lesson 15.1, a graph buys you approximately nothing. If the CPU was the longer pipeline, it buys you almost everything the CPU was costing you.
+
+## Capture, then replay
+
+The mechanism is a mode switch on the stream. Inside a <Term t="graph-capture">**capture region**</Term>, the driver does not execute the launches you make — it writes them down:
+
+```python
+import torch
+
+static_in  = torch.zeros(1, 4096, device="cuda", dtype=torch.bfloat16)
+static_out = torch.zeros(1, 128256, device="cuda", dtype=torch.bfloat16)
+
+# warm up on a side stream first: cuBLAS handles and autotuning must not
+# happen inside capture, or the recording picks up work it should not.
+s = torch.cuda.Stream()
+s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(3):
+        model(static_in, past_key_values=cache, use_cache=True)
+torch.cuda.current_stream().wait_stream(s)
+torch.cuda.synchronize()
+
+# capture: runs the step, executes nothing, builds the tape
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    model(static_in, past_key_values=cache, use_cache=True)
+
+# replay: one call, every kernel, correct order
+static_in.copy_(real_input)
+g.replay()
+torch.cuda.synchronize()
+result = static_out
+```
+
+Three things worth noticing, because each one is a rule you will meet again.
+
+<Callout type="intuition" title="Capture is a recording, not a run">
+  While capturing, the launches in your step do not execute. The CPU still walks your Python and the dispatcher still runs — it is just that each launch ends up as an entry in a tape instead of as a driver call. That is why capture is cheap, and also why capture does not warm anything up. **Warm up first, on a side stream, or your graph will contain whatever the first call did.**
+</Callout>
+
+<Callout type="pitfall" title="The warm-up step is not optional">
+  The most common capture bug is capturing on a cold model. The first eager call allocates cuBLAS workspaces, runs cuDNN autotuning, and lazily creates CUDA events — and under capture, any of those can either fail or bake a temporary address into the graph. PyTorch's own guidance is three warm-up iterations on a side stream before you capture. If your graph replays garbage, this is the first thing to check.
+</Callout>
+
+<Callout type="real" title="What an engine actually does">
+  At the time of writing, vLLM captures the decode step into CUDA graphs by default on supported models and has done so for several releases, with a flag to size the capture batch list. TensorRT-LLM builds a far larger engine graph ahead of time, including prefill. SGLang uses CUDA graphs on the decode path and relies on `torch.compile` for fusion. You will meet all of these in Module 17; the point here is that the reason is always this lesson's reason.
+</Callout>
+
+## The static-address rule
+
+Here is the one sentence that explains both the speed and the pain: **the graph has the addresses baked in.**
+
+At capture time each kernel argument — every tensor pointer, every scalar, every shape — is resolved to a concrete value and stored in the tape. So the graph knows not "read the input tensor" but "read the bytes at `0x7f3a...`". Replay therefore does no argument marshalling at all: there is nothing left to decide.
+
+The consequence is that every buffer the graph touches must be **allocated once and kept at that address**:
+
+- A <Term t="static-input">**static input buffer**</Term> holds the token ids and positions. You copy new data into it before each replay, because you cannot hand the graph a different tensor.
+- The <Term t="static-output">**static output buffer**</Term> is where results land. You read them from there.
+- Intermediate activations are allocated once during capture and reused on every replay. This is a real memory win, and it is the other half of why engines like this: the activation memory of the decode step is allocated exactly once for the process lifetime.
+
+<Scrolly>
+  <GraphReplay client:visible slot="stage" />
+
+  <Step title="1. Eager: 556 launches, one at a time">
+    Every operator in the step is a separate driver call. The CPU walks the list in Python, and the step costs 556 launches times about 6 microseconds. This is the bill from Lesson 15.1, unchanged.
+  </Step>
+
+  <Step title="2. Capture mode: record, do not execute">
+    Run the step once inside a capture region and the launches stop running and start being written down. Each becomes an entry in a tape on the device. No arithmetic happens, which is why capture is nearly free.
+  </Step>
+
+  <Step title="3. One graph, addresses resolved">
+    What you get is a chain of kernel nodes, in order, with every pointer already turned into a device address. That is exactly why replay is cheap — and exactly why the graph cannot later be pointed at your data.
+  </Step>
+
+  <Step title="4. Replay: hundreds of kernels, one call">
+    One API call hands the whole chain to the GPU. Every kernel runs in the recorded order, and the CPU is free again immediately. The work is not smaller; it is only described once.
+  </Step>
+
+  <Step title="5. What replay removes, and what it cannot touch">
+    The CPU term collapses from about 3.3 milliseconds to about 8 microseconds. The GPU term does not move at all — same kernels, same bytes. **A graph is a CPU optimisation only.**
+  </Step>
+
+  <Step title="6. Shapes are baked in, so graphs are per-batch-size">
+    A graph captured at batch 64 assumes 64 rows in every buffer. Run it at batch 33 and it reads past the end of what you allocated. Capture one graph per bucket, or replay the big graph on padding rows and discard the extras.
+  </Step>
+
+  <Step title="7. Graphs cannot use a movable KV pool">
+    The graph reads and writes fixed addresses, so it cannot use a pool that preemption is free to relocate. Graph-captured KV has to sit in a second pool nobody is allowed to move, which is memory you cannot reclaim under pressure.
+  </Step>
+</Scrolly>
+
+## Sample inside the graph
+
+The output buffer deserves its own section, because getting it wrong quietly wastes more than you expect.
+
+The obvious thing to capture is "model forward, ending in logits". For Llama-3.1-8B the vocabulary is 128,256, so the output buffer at batch 32 is:
+
+$$
+32 \times 128{,}256 \times 2\ \text{bytes} = 8.21\ \text{MB}
+$$
+
+That sounds alarming and in fact is not. Compare it with the weights the same step just read: 16.06 GB. The copy-out is 0.05% of the step's traffic, which at 2.68 TB/s is about **3 microseconds**. The bytes are a non-event.
+
+The real cost is not bytes, it is **where the graph ends**. If the graph stops at the logits, then something outside the graph has to read them — and reading a GPU tensor on the CPU is a <Term t="host-sync">host sync</Term>, the one point from Lesson 15.1 where the two pipelines are not overlapped. You have taken 3.3 milliseconds of CPU work out of the step and handed back a synchronisation point.
+
+So engines put the sampler inside the graph. The graph ends at <Term t="sampled-id">one sampled token id per sequence</Term>:
+
+$$
+32 \times 4\ \text{bytes} = \textbf{128 bytes}
+$$
+
+and the only thing outside the graph is a 128-byte copy. Sampling inside the graph also lets the whole thing stay on the device, which is what makes Module 22's lesson on device-side sequence state possible.
+
+<Callout type="math" title="The two costs, side by side">
+  Llama-3.1-8B, batch 32, on an H100 at 80% of peak bandwidth:
+
+  | Output of the graph | Size | Time to move | Plus |
+  |---|---|---|---|
+  | full logits | 8.21 MB | 3.06 µs | a host sync, ~200 µs |
+  | one sampled id per sequence | 128 B | negligible | still needs one sync |
+
+  The table is the argument: both options need a sync, so make the payload tiny and keep the sync off the critical path where you can. The lesson is not "never copy logits out" — it is that the payload is not the expensive part, the synchronisation is.
+</Callout>
+
+## Graph padding, and the cost of it
+
+The shape rule is the practical one. A graph is correct for exactly the shapes it was captured with, and a serving engine sees every batch size in between. Two options:
+
+**Capture one graph per bucket.** Round batch sizes to powers of two, or to a list you choose, and capture a graph for each. vLLM exposes this as its capture batch sizes. Cost: one graph per bucket, so memory grows with the number of buckets, and capture time at start-up grows too.
+
+**Pad up to the next bucket.** If you have 33 sequences and a graph for 64, run the 64-row graph and discard 31 rows. This is <Term t="cudagraph-padding">**graph padding**</Term>, and it is what most engines do. The cost is paid in GPU work:
+
+$$
+\text{wasted fraction} = 1 - \frac{33}{64} = 48\%
+$$
+
+Nearly half the work of that step is computing rows you throw away. It is worth it precisely when the CPU was the bottleneck — you traded GPU work you had to spare for CPU work you did not — and it is a terrible trade when the GPU is the bottleneck, because you have just made the bottleneck worse.
+
+<Callout type="intuition" title="Why padding is a good trade in exactly one case">
+  Padding adds GPU work and removes CPU work. So it pays when the CPU was the longer pipeline, and costs when the GPU was. For a 0.5B model at batch 1 with a 3.3 ms CPU bill and a 0.37 ms GPU bill, spending 3 microseconds of GPU time to save 2.5 milliseconds of CPU time is obviously right. For Llama-3.1-70B, where the GPU term is 52.7 ms and the CPU term is 8.2 ms, padding is just waste.
+</Callout>
+
+The batch-bucketing choice has a second-order consequence worth knowing: it makes the CPU cost of a step a **step function** rather than a smooth line. Each bucket boundary is a place where your effective batch, and therefore your wasted GPU work, jumps.
+
+## The graph memory pool
+
+The last rule is the one that bites in production, and it comes straight from the address rule.
+
+Your KV cache is normally a pool that the scheduler may **preempt**: when memory runs short, the engine frees blocks belonging to requests that have not been scheduled recently. Those blocks get handed to other requests, and their addresses change.
+
+A captured graph cannot tolerate that. Its writes are aimed at specific addresses, so a pool whose contents move is a pool the graph will eventually write into someone else's data. The fix is structural: engine-managed graph capture uses a **separate, non-preemptible memory pool** for the KV blocks those graphs touch.
+
+<Callout type="pitfall" title="Graph pool memory is memory you cannot reclaim">
+  The graph pool is held for the lifetime of the process and is excluded from preemption. Under memory pressure the scheduler has less to work with, so you can OOM while free memory technically exists in the graph pool. This is why "my batch size fits when it is idle but OOMs under load" is a graph-pool symptom and not a sizing bug.
+</Callout>
+
+## The whole menu, scored
+
+Now the honest table. Same H100, same 6 microsecond launch cost, 1,024 tokens of context, batch 1, plus the 0.2 ms host sync on every row:
+
+| Configuration | CPU, eager | CPU, compiled | CPU, graph | GPU (all modes) | Eager step | Best step |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B, batch 1 | 2.52 ms | 0.84 ms | 0.008 ms | 0.37 ms | 2.72 ms | **0.57 ms** (4.8×) |
+| Qwen2.5-0.5B, batch 128 | 2.52 ms | 0.84 ms | 0.008 ms | 0.97 ms | 2.72 ms | **1.17 ms** (2.3×) |
+| Qwen2.5-0.5B, batch 512 | 2.52 ms | 0.84 ms | 0.008 ms | 2.77 ms | 2.97 ms | 2.97 ms (1.0×) |
+| Llama-3.1-8B, batch 1 | 3.34 ms | 0.84 ms | 0.008 ms | 6.0 ms | 6.2 ms | 6.2 ms (1.0×) |
+| Llama-3.1-8B, batch 64, 4k ctx | 3.34 ms | 0.84 ms | 0.008 ms | 18.8 ms | 19.0 ms | 19.0 ms (1.0×) |
+
+Read the top three rows and the bottom two carefully, because they are the whole lesson.
+
+The 0.5B model at batch 1 goes from **2.72 ms to 0.57 ms**, and then the GPU is the only thing left, exactly as it should be. The 8B model gets **nothing**, at any batch, because its GPU term was always longer. A graph is not a speed-up button; it is the last and largest of the three levers from Lesson 15.1, and it only fires when the first two have already told you the CPU is your problem.
+
+<Callout type="recap" title="The whole module in three lines">
+  **Fewer kernels** — fuse the elementwise chains, so there is less to launch and less to round-trip. **Cheaper launches** — compile, so C++ issues them instead of Python. **One launch** — capture a graph, so there is nothing left to issue at all. All three attack the same bill, and the last one is the biggest.
+</Callout>
+
+<Callout type="try" title="Three things to try before the lab">
+  1. Capture a graph and time `g.replay()` against the eager step. Then set the batch to 32 and replay the **same** graph. The GPU time should roughly double while the CPU time does not move — that is the whole asymmetry in one experiment.
+  2. Capture at batch 8 and replay with only 3 rows of real data. It will not crash and it will not complain, which is the point: read the padding cost out of your own numbers rather than trusting the flag.
+  3. Add a `.item()` to the region and capture. It fails loudly at capture time, not silently at replay time. Worth seeing once, because the failure mode you are avoiding is a graph that quietly produces stale results.
+</Callout>
+
+<KeyNotes>
+  1. A <Term t="cuda-graph">CUDA graph</Term> is a recorded, ordered tape of kernel launches with their arguments resolved to device addresses. Replaying it costs **one API call** (about 8 µs) no matter how many kernels it holds.
+  2. **Capture executes nothing** — it records. Always warm up on a side stream first, or the graph captures cuBLAS workspace creation and autotuning.
+  3. The static-address rule is the source of both the speed and the pain: inputs, outputs and activations must be allocated once, and you copy data into the input buffer before each replay.
+  4. A graph is a **CPU-side optimisation only**. It never moves fewer bytes, so on Llama-3.1-8B (GPU 6.0 ms, CPU 3.3 ms) it buys exactly nothing at any batch size.
+  5. Put the **sampler inside the graph**. Llama-3.1-8B's logits at batch 32 are 8.21 MB, but the 128-byte sampled-id output is what avoids making a large tensor the centre of your host round-trip.
+  6. Graphs are captured per shape, so you need one per batch bucket, or you pad up to the next one — 33 sequences replayed as 64 wastes **48%** of the GPU work.
+  7. Padding trades GPU work for CPU work, so it pays exactly when the CPU was the bottleneck, and is waste when the GPU was.
+  8. Graph-captured KV must live in a **separate non-preemptible pool**, because the graph writes to fixed addresses. That pool is memory your scheduler cannot reclaim, and it is a real cause of OOM under load.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'You capture a decode step of 556 kernels into a CUDA graph. About how much CPU time does one replay take?', numeric: true, answer: 0.008, tolerance: 0.004, unit: 'ms', why: 'Replay is a single API call, about 8 µs. It does not scale with the kernel count at all — that is the entire point. Compare with 556 × 6 µs = 3.34 ms eagerly.' },
+  { q: 'Llama-3.1-8B on an H100 at batch 1: the GPU term is 6.0 ms and the CPU term is 3.3 ms. A CUDA graph removes the CPU term. What happens to the step?', options: ['It drops to about 0.2 ms, the sync', 'It becomes about 3.3 ms', 'It becomes about 6.2 ms — essentially unchanged', 'It becomes about 9.5 ms because of capture overhead'], answer: 2, why: 'The step is max(CPU, GPU) + sync. Removing the CPU term entirely leaves the GPU term of 6.0 ms plus the 0.2 ms sync = 6.2 ms, which is what the step already was. A graph is a CPU optimisation, and this configuration has no CPU problem to solve.' },
+  { q: 'You have 33 sequences decoding and a captured graph for batch 64. What fraction of the GPU work is thrown away?', numeric: true, answer: 48, tolerance: 2, unit: '%', why: '1 - 33/64 = 0.484, so 48%. Padding is a good trade only because you are removing CPU work you did not need and spending GPU work you had to spare.' },
+  { q: 'Llama-3.1-8B has a vocabulary of 128,256. At batch 32 in BF16, how large is the output buffer if the graph ends at the logits rather than at the sampled token ids?', numeric: true, answer: 8.21, tolerance: 0.2, unit: 'MB', why: '32 × 128,256 × 2 bytes = 8,208,384 B = 8.21 MB, against 16.06 GB of weights read in the same step — 0.05% of the traffic, or about 3 µs at 2.68 TB/s. The bytes are trivial; the host sync they force is not. Sampling inside the graph makes the output 128 bytes.' },
+  { q: 'Why does a captured graph need its own memory pool for the KV cache?', options: ['Graphs execute on a separate stream that cannot see the main allocator', 'A graph writes to fixed addresses, so it cannot use a pool that preemption is free to relocate', 'The graph pool is allocated in host memory for faster access', 'CUDA requires one pool per stream, and graphs get their own stream'], answer: 1, why: 'It follows directly from the static-address rule. The graph has the KV addresses baked in at capture time, so any pool whose blocks can move is a pool that will eventually hand those addresses to someone else. Engines keep a second, non-preemptible pool, which is memory the scheduler cannot reclaim under pressure.' },
+  { q: 'You set a batch of 33 into a graph captured for 64 and it runs without error. What is the risk?', options: ['None, CUDA clamps the shapes for you', 'The graph reads past the buffers sized for 33 and produces rows that are undefined, and the errors may only show up much later', 'The replay is rejected at launch time', 'It is safe but slower'], answer: 1, why: 'The shapes are baked in, so the graph will happily process 64 rows against whatever memory you allocated. If that memory was sized for 33, the extra rows read and write out of bounds — and because it is memory rather than an API error, it can surface as corrupt output or a crash far from the cause. Size the buffers for the captured shape, not the current one.' },
+]}/>

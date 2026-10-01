@@ -1,0 +1,183 @@
+---
+title: 'Module 21 · Prefill/Decode Disaggregation'
+module: disaggregation
+---
+
+## The one-sentence idea
+
+Prefill is **compute-bound**, decode is **memory-bound**, and the gap is about two orders of magnitude in arithmetic intensity. Do not ask one GPU to be good at both — put prefill where the FLOPs are, decode where the bandwidth is, and pay for one KV copy in between.
+
+## Arithmetic intensity, both phases
+
+$$
+I_{\text{prefill}}(n) = \frac{2Pn}{2P + n\,b_{\text{kv}}}
+\qquad
+I_{\text{decode}}(B,C) = \frac{2PB}{2P + B\,C\,b_{\text{kv}}}
+$$
+
+Ridge point = peak FLOP/s ÷ bandwidth. Above it compute-bound, below memory-bound.
+
+| Phase (8B, H100) | Intensity | vs ridge (295) | Bound by |
+|---|---|---|---|
+| Prefill, 512 rows | ~510 FLOP/B | 1.7× above | math units |
+| Decode, B=1, 4k ctx | ~0.6 FLOP/B | 490× below | bandwidth |
+| Decode, B=64, 4k ctx | ~20 FLOP/B | 15× below | bandwidth |
+| Decode, B=64, 32k ctx | ~2.6 FLOP/B | 110× below | bandwidth |
+
+Math utilisation in a decode step: $\dfrac{2PB}{\text{peak FLOP/s} \times t_{\text{decode}}}$ → **9.3%** at B=64.
+Prefill intensity **improves** with rows; decode intensity **asymptotes** and never crosses the ridge.
+
+## The handoff
+
+Prefill passes: the KV cache, the position offset, the sampling state.
+It does **not** pass the weights — each instance loads its own.
+
+$$
+\text{payload} = 2 \times \text{layers} \times \text{KV heads} \times \text{head dim} \times \text{bytes} \times C
+$$
+
+| Model | KV/token (BF16) | 4k ctx | 16k ctx | 32k ctx |
+|---|---|---|---|---|
+| Llama-3.1-8B | 128 KiB | 512 MiB | 2.0 GiB | 4.0 GiB |
+| Llama-3.1-70B | 320 KiB | 1.25 GiB | 5.0 GiB | 10.0 GiB |
+
+GQA shrinks the payload (8× vs MHA on Llama-3.1). KV quantisation shrinks it again. Context scales it linearly.
+
+## The transfer rule
+
+$$
+t_{\text{transfer}} = \frac{\text{payload}}{\text{link bandwidth}},
+\qquad
+\text{share} = \frac{t_{\text{transfer}}}{t_{\text{decode}}} \le 0.10
+$$
+
+Solve for the maximum context a link can carry:
+
+$$
+C \le \frac{0.1 \times B_{\text{link}} \times t_{\text{decode}}}{b_{\text{kv}}}
+$$
+
+| Link | Bandwidth | 512 MiB (8B @ 4k) | Share of a 20.3 ms step |
+|---|---|---|---|
+| NVLink 4 | 900 GB/s | 0.60 ms | 3% |
+| 8×400 GbE | 400 GB/s | 1.34 ms | 7% |
+| 100 GbE | 100 GB/s | 5.37 ms | 26% |
+| 25 GbE | 25 GB/s | 21.5 ms | **106% — unviable** |
+
+Max context at the 10% rule, 8B: ~62K tokens on 400 GbE, ~3.9K on 25 GbE.
+
+## Pool sizing
+
+**Prefill pool** — bound by FLOPs:
+
+$$
+N_{\text{prefill}} = \left\lceil \lambda \cdot n \cdot t_{\text{tok}} \right\rceil,
+\qquad
+t_{\text{tok}} = \frac{2P}{\text{peak FLOP/s} \times \text{MFU}}
+$$
+
+**Decode pool** — bound twice, take the larger:
+
+$$
+N_{\text{throughput}} = \left\lceil \frac{\lambda m}{\text{tokens/s per instance}} \right\rceil,
+\qquad
+N_{\text{memory}} = \left\lceil \frac{C_{\text{concurrency}}}{\text{seqs per instance}} \right\rceil
+$$
+
+$$
+N_{\text{decode}} = \max(N_{\text{throughput}},\ N_{\text{memory}})
+$$
+
+**Always report which one bound.**
+
+## Worked example: 20 req/s, 4,096-token prompts, 256-token answers, 512 concurrent, H100
+
+| Step | Number |
+|---|---|
+| Prefill time/token | 29.5 µs |
+| Prefill demand | 20 × 4096 × 29.5 µs = **2.42 GPU-s/s → 3 GPUs** |
+| KV per seq @ 4k | 537 MB |
+| Free HBM after weights + workspace | 63.8 GB → **113 seqs/GPU** |
+| Decode throughput | ~3,751 tok/s |
+| by throughput | 5120 ÷ 3751 = 2 |
+| by KV memory | 512 ÷ 113 = **5** ← binding |
+| **Decode pool** | **5 GPUs** |
+| **Total** | **8 GPUs** (vs 5 shared) |
+
+## Shared vs split, same fleet
+
+$$
+\text{prefill duty} = \frac{\lambda n t_{\text{tok}}}{N_{\text{decode}}}
+\qquad
+\text{TPOT}_{\text{shared}} = \frac{t_{\text{decode}}}{1 - \text{duty}}
+$$
+
+| | Shared (5 GPUs) | Disaggregated (8 GPUs) |
+|---|---|---|
+| TPOT | ~39 ms | **20.3 ms** |
+| Decode capacity | ~9,700 tok/s | **18,800 tok/s** |
+| Prefill capacity | 5,203 tok/s | 101,600 tok/s |
+| Prefill util | 48% | 81% |
+| Decode util | 48% | 27% |
+
+27% decode utilisation is **not waste** — it is 27% of a GPU doing the work it is good at. A shared fleet's 48% is spent on other people's prefill.
+
+## Routing
+
+Decode routing is **bin-packing**, not load balancing:
+
+1. Filter by fit — can the instance hold this context at all?
+2. Rank by fragmentation — pack tight, do not scatter.
+3. Least-loaded only as the tiebreak, among instances that pass (1).
+
+Prefill routing is stateless: round-robin is fine.
+
+## Rules of thumb
+
+- Keep the transfer **under 10% of a decode step**. It is paid once per request; decode pays its step per token.
+- Size **both pools from p99**, never the mean. Prefill cost is linear in prompt length.
+- The KV constraint binds when context is long. Throughput binds when answers are short or the model is small.
+- Prefer cheap prefill, expensive decode: prefill holds ~no KV, so it scales easily.
+- Measure your own link. A 400 GbE NIC does not deliver 400 Gb/s — use an achieved figure, and treat it as a floor.
+- Disaggregate when prefill is a large bursty share **and** the fabric is fast **and** you can instrument both pools.
+- Do **not** disaggregate for short prompts, when monolithic already meets the SLO, or on a 25 GbE fabric.
+
+## Failure modes
+
+| Failure | What you see | Guard |
+|---|---|---|
+| Transfer slower than the step | TTFT inflates, TPOT fine | check transfer share before deploying |
+| Decode pool KV-full | requests rejected or preempted mid-stream | size from p99 concurrency, not mean |
+| Prefill instance dies mid-handoff | decode sees a partial cache | checksummed transfer; retry from prefill |
+| Decode instance dies | KV orphaned on another host | idempotent retry keyed on request id |
+| Pools mismatched | one idles while the other saturates | independent autoscaling per pool |
+| Transfer storms | p99 TTFT spikes in bursts | autoscale prefill on queue depth |
+
+## Reference numbers (Llama-3.1-8B, BF16, H100)
+
+| Quantity | Value |
+|---|---|
+| KV bytes / token | 131,072 (128 KiB) |
+| Prefill per token | 29.5 µs (A100 94 µs, T4 449 µs) |
+| Prefill, 4,096 tokens | 121 ms |
+| Decode step, B=64 @ 4k ctx | 20.3 ms |
+| Decode throughput, B=64 @ 4k | 3,151 tok/s |
+| Sequences per GPU @ 4k | 113 |
+| Ridge point | ~295 FLOP/byte |
+| Transfer, 4k ctx @ 400 GB/s | 1.34 ms |
+
+## Engine support (at the time of writing)
+
+- **vLLM** — KV-connector-based disaggregated prefill/decode: a prefill worker publishes KV into a shared store, a decode worker pulls it.
+- **SGLang** — the same two-pool structure, with overlap between phases.
+- **NVIDIA Dynamo** — RDMA-based KV transfer between prefill and decode pools.
+- **TensorRT-LLM** — disaggregated serving with cache-aware routing.
+
+Names and transports move. The structure — a prefill pool, a decode pool, and a KV path between them — has not.
+
+## The four sentences
+
+1. Prefill is compute-bound, decode is memory-bound. The gap is ~510 vs ~20 FLOP/byte; the ridge between them is ~295.
+2. Prefill hands over the KV cache, the offset and the sampling state. The transfer must stay under 10% of a decode step.
+3. Size prefill by FLOPs; size decode by throughput **and** KV memory; take the binding constraint and say which one it was.
+4. Route by bin-packing, size from p99, and measure your own link — because a shared fleet never gets to skip prefill.

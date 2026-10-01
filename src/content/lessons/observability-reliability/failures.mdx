@@ -1,0 +1,253 @@
+---
+title: 'Timeouts, retries, recovery & chaos testing'
+summary: 'Timeouts bound failure, retries hide it, and both become dangerous the moment failures correlate. Learn to split a deadline across hops, cap amplification with a retry budget, and test the whole thing on purpose.'
+objectives:
+  - Give every dependency a timeout shorter than the budget remaining above it
+  - Split a deadline across sequential hops with an explicit safety margin
+  - Compute retry amplification and distinguish independent from correlated failure
+  - Bound amplification with a retry budget instead of with hope
+  - Run a chaos experiment against a real replica and write down what it proved'
+---
+import FailureBudget from '@/components/viz/observability-reliability/FailureBudget.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every distributed system has the same three mechanisms for handling failure, and every incident you will ever read about involved at least one of them being misconfigured.
+
+**Timeouts** bound how long you wait. **Retries** cover a failure that was transient. **Circuit breakers** stop you hammering something that is definitely down. All three are simple. The reason they cause outages is a single insight that this lesson is entirely about: **the failures you cannot see are the ones that are correlated.**
+
+## Timeouts: bounding the damage
+
+A request with no timeout against a dependency that hangs does not fail fast. It occupies a concurrency slot, a KV allocation and a client connection **forever**. One hung dependency, met with a missing timeout, is enough to exhaust a whole pool.
+
+The rule is not "set a timeout". It is stricter:
+
+> **Every timeout must be shorter than the time remaining in its caller's budget.**
+
+That is a recursive constraint, and you solve it top down. A 2-second user deadline, five sequential hops, 20% held back for the response to actually get back to the client:
+
+$$
+t_{\text{hop}} = \frac{2.0 \times 0.8}{5} = 0.32\ \text{s} = 320\ \text{ms}
+$$
+
+<Callout type="math" title="Why the margin is not optional">
+  If you divide the budget evenly and give every hop the full 320 ms, the five hops consume 1.6 s and 400 ms is still spare — that part is fine. The margin exists for a different reason: **you cannot know how many hops there are**.
+
+  Your call graph has a conditional branch. A prefix-cache hit skips prefill; a cache miss does not. A client that sends 32k tokens adds a hop. The margin is what keeps the worst path from exceeding the deadline when the best-path assumption is wrong. 20% is a common choice; anything under 10% is optimistic.
+</Callout>
+
+<Callout type="pitfall" title="The three ways people break this">
+  1. **A timeout larger than the deadline.** Somewhere down the stack, someone set `timeout=30s` under a `2s` SLA. The request is not faster with a 30 s timeout, it is slower — it waits 30 s for a response that was never going to be used.
+  2. **No timeout on the streaming path.** Streaming responses have no natural completion, so libraries default to "wait forever". Every streaming call needs an explicit idle timeout: *no bytes for N seconds* means dead.
+  3. **Retrying inside the timeout.** A client with a 2 s deadline, 3 attempts and a 500 ms per-attempt timeout can fit all three attempts — but only if you count them. Multiply the per-attempt timeout by the number of attempts and check that against the parent deadline, not the timeout alone.
+</Callout>
+
+## Retries: the honest ledger
+
+A retry is not free. It costs latency, it costs a slot, and — the part people forget — it costs **offered load on a system that is already struggling**.
+
+The <Term t="retry-amplification">retry amplification factor</Term> is the expected number of attempts for a request that fails independently with probability $p$, with up to $r$ retries:
+
+$$
+\mathbb{E}[\text{attempts}] = 1 + p + p^2 + \dots + p^{r}
+$$
+
+Worked, at $p = 0.05$ and $r = 2$:
+
+$$
+1 + 0.05 + 0.0025 = 1.0525
+$$
+
+So a 5% failure rate costs 5.25% extra load. Entirely acceptable, and nobody notices.
+
+Now the same retry count against a backend that is **down**. Every attempt fails with probability ≈ 1, so the factor is $(r + 1) = 3$: your offered load triples at the exact moment the system cannot absorb any. That is a **<Term t="retry-storm">retry storm</Term>**, and it is how a small dependency failure becomes a full outage.
+
+<Scrolly>
+  <FailureBudget client:visible slot="stage" />
+
+  <Step title="1. One deadline, inherited by everything">
+    A 2-second user budget. Every hop below it gets a slice, and any hop that exceeds its slice has failed — regardless of whether it eventually would have succeeded.
+  </Step>
+
+  <Step title="2. Timeouts are about observability, not speed">
+    A timeout does not make your service faster. It makes failure **visible and bounded**: a slot is freed, an error is recorded, a retry can happen. Without one, a hang is silent.
+  </Step>
+
+  <Step title="3. Split the budget, keep a margin">
+    Five hops, 320 ms each, 20% held back. The margin covers the call-graph branches you did not enumerate.
+  </Step>
+
+  <Step title="4. Retries, and what they really cost">
+    Load factor 1.05× here. A 5% independent failure rate is a rounding error — which is why retry policies are written assuming independence and then meet reality.
+  </Step>
+
+  <Step title="5. The storm">
+    One client sending 100 requests against a dead backend. Attempt 1 sends 100, attempt 2 sends 300, attempt 3 sends 900. Every one of those calls occupies a connection on both sides while waiting for a response that will never come.
+  </Step>
+
+  <Step title="6. Correlated failure is the one that matters">
+    The assumption behind safe retrying is that failures are independent. When a backend dies, they are perfectly correlated and the load factor goes from 1.05× to 3× with the same two lines of code.
+  </Step>
+
+  <Step title="7. Bound it with a budget, not with hope">
+    The retry budget: at most a fixed ratio of requests may be retries. At ratio 1.5 on 100 requests, 50 retries are permitted. Amplification is now a property of the client code, not of the failure.
+  </Step>
+
+  <Step title="8. Four layers multiply">
+    Client, gateway, orchestrator and engine each retrying 3 times means four attempts at each of four layers: **256 times** the offered load. This is the single most common self-inflicted outage in the industry, and the only fix is to have retries at exactly one layer.
+  </Step>
+
+  <Step title="9. Runbook">
+    Five numbers decide the incident: total deadline, per-hop timeout, max attempts, budget ratio, and whether the failure mode is independent. Write them before you need them.
+  </Step>
+</Scrolly>
+
+## The retry budget, properly
+
+The **<Term t="retry-budget">retry budget</Term>** is the standard fix, and it is beautifully simple because it does not require knowing anything about the failure:
+
+> A client may spend at most $R \times N$ requests on retries over a window, where $N$ is the request count.
+
+Implementation is a token bucket, refilled with the request rate and capped at the ratio. When the bucket is empty, the client does **not** retry — it returns the error. That single rule converts an unbounded amplifier into a bounded one.
+
+$$
+\text{retries permitted} = N \times (R - 1)
+$$
+
+For $N = 100$ and $R = 1.5$: 50 retries. For $R = 2$: 100 retries, and half of the total traffic becomes retries in the worst case. $R$ above 2 buys you very little and costs you a great deal.
+
+<Callout type="real" title="Retry only what is safe to repeat">
+  Not every failure is retryable, and the classification should be explicit in your client:
+
+  | Failure | Retry? | Why |
+  |---|---|---|
+  | Connection refused, 503, 504 | Yes | Usually transient; no work was done |
+  | 429 (rate limited) | Yes, but honour `Retry-After` | The server told you exactly when |
+  | 500 from a compute kernel | **No** | Deterministic: the same input fails the same way |
+  | Timeout on a non-idempotent write | **No**, unless you have an idempotency key | You may have been served and not heard back |
+  | 400 (bad request) | No | Your bug, not theirs |
+
+  The rule of thumb: **retry only failures where the server did no work, and only when the failure is plausibly independent.**
+</Callout>
+
+## Circuit breakers
+
+A **<Term t="circuit-breaker">circuit breaker</Term>** sits in front of a dependency with three states:
+
+- **Closed** — calls flow through, failures counted over a rolling window.
+- **Open** — calls fail immediately without touching the dependency, for a fixed cooldown.
+- **Half-open** — a small number of probe calls go through. If they succeed, close. If they fail, open again with a longer cooldown.
+
+The breaker exists to prevent the correlated-failure scenario from reaching its conclusion. While the breaker is open, your load on a dead backend is zero rather than the $(r + 1)\times$ a retrying client would produce, and your own service stays healthy enough to serve everything else.
+
+The parameters that matter:
+
+- **Failure threshold** — how many failures before opening. Time-based windows beat count-based, because they work at any request rate.
+- **Cooldown** — how long to stay open. Long enough for a deploy to finish, short enough to not waste a healthy dependency.
+- **Half-open probe count** — how many calls to test with. One is usually right; ten is a re-outage.
+
+<Callout type="pitfall" title="Circuit breakers fail in both directions">
+  - **Too eager**: a brief blip opens the breaker, and a perfectly healthy dependency is taken out of service for the full cooldown. You have converted a 2-second blip into a 30-second outage. Fix: a cooldown that starts short and doubles.
+  - **Too reluctant**: the threshold is set at 50% failure over a minute, which a cascading failure will eventually trip — after the damage.
+  - **One breaker for everything**: a single breaker in front of an engine pool where one replica is unhealthy takes the whole pool down. Breakers belong per *dependency*, and health-aware routing belongs per *replica*.
+</Callout>
+
+## Degradation, not just failure
+
+Sometimes the right answer is to serve a worse answer rather than an error. **<Term t="graceful-degradation">Graceful degradation</Term>** is the deliberate design of a degraded mode:
+
+| Degradation | What you give up | When to use it |
+|---|---|---|
+| Cap `max_tokens` | Answer length | Always available, invisible to users if generous |
+| Reduce precision (drop to FP8) | Small quality loss | Capacity crunch; worth it before refusing work |
+| Shorten context | Answer quality | Long-context requests only |
+| Drop to a smaller model | Quality | If you operate two model tiers |
+| Disable prefix caching | Higher cost per request | Prefill pressure only; protects the tail |
+| Serve from cache only | Freshness | Read-heavy workloads with a stale-tolerant product |
+
+The point is that **degradation is a dial you can turn smoothly**, and refusal is the last setting on that dial, not the only one. A service that can serve a slightly worse answer for everyone beats a service that serves a perfect answer for half of them.
+
+<Callout type="mentor" title="The rule I would put on a wall">
+  **Fast error beats slow success. Near-correct answer beats both.**
+
+  A user who gets a retryable error in 50 ms retries and probably succeeds. A user who waits 30 seconds for a timeout gets an error anyway, plus 30 seconds of your GPU time and their attention. Every design in this lesson follows from that sentence.
+</Callout>
+
+## Recovery: what the service does after it heals
+
+Overload and failure are not the same problem, and recovery is not the same as either.
+
+**State after a crash.** A replica that died mid-stream leaves state behind: allocated KV blocks, an unfinished stream, a half-written trace. On restart, the new process must reclaim that memory before it can serve anything, and the recovery time is the thing your readiness probe must cover (Module 22). A readiness probe that passes during warm-up is a production incident waiting for a deploy.
+
+**Flapping.** A dependency that alternates between healthy and unhealthy for minutes produces worse behaviour than one that is simply down, because every recovery brings a <Term t="thundering-herd">thundering herd</Term>. Fix: exponential backoff on the cooldown, and jitter — otherwise every client retries at the same instant you recover.
+
+**The thundering herd on recovery.** When the breaker closes, every client that failed during the open period retries immediately, and they all arrive together. Add jitter to the retry delay, and ramp the breaker closed gradually rather than all at once.
+
+**Post-incident verification.** The service is "up" when the metrics say so, not when the alert cleared. Specifically: confirm goodput returned to baseline (not just error rate to zero), confirm the queue drained, and confirm the memory footprint is back to normal — a leak that survives recovery is a leak that will cause the next incident.
+
+## Chaos testing: break it on purpose
+
+<Callout type="intuition" title="Why this needs a name">
+  <Term t="chaos-engineering">Chaos testing</Term> is just fault injection with a hypothesis attached — but the discipline is the whole point, and it is what separates it from a demo.
+</Callout>
+
+You cannot reason your way to knowing how a system fails. You have to **make it fail on your own schedule**, on a small scale, with someone watching.
+
+The method is unglamorous and it works:
+
+1. **Write the hypothesis.** Not "test resilience" — "if the prefill replica dies mid-stream, does the router retry on another replica, and does the client see a partial answer or an error?"
+2. **Pick one blast radius.** One replica, one tenant, one dependency. Never the whole fleet on a Tuesday.
+3. **Inject one fault.** Kill a process. Add 500 ms of latency. Drop 5% of packets. Fill the KV cache to 95%. Cut the network to a backend.
+4. **Watch the four panels** from the metrics lesson. You are looking for: did it fail fast, did it stay bounded, did it degrade, did it recover?
+5. **Record the time to detect** and the **time to recover**, both measured.
+
+<Callout type="try" title="Five experiments you can run this week">
+  All of these are safe on a single replica, and all of them find something.
+
+  1. **Kill the replica mid-stream.** Does the client get a clean error, a truncated stream with no indication, or a hang? The truncated-stream case is the dangerous one and it is common.
+  2. **Set the timeout to longer than the deadline**, deliberately, on one hop. Measure how much the p99 degrades. You will be surprised, and you will never do it again.
+  3. **Turn retries up to 5 at two layers**, then kill the backend. Watch the load multiplier. Then set it back and note how long the system took to settle.
+  4. **Fill the KV cache to 95% and double the offered load.** Does admission control hold, or do you OOM? If you OOM, your cap is set above your memory budget.
+  5. **Throttle the network to the engine to 100 Mbit/s.** Watch the KV-transfer span from the tracing lesson grow. Does your disaggregated design degrade or collapse?
+</Callout>
+
+<Callout type="mentor" title="What to write down before you build any of this">
+  Five numbers, in a <Term t="runbook">runbook</Term>, before the incident:
+
+  1. **The total end-to-end deadline**, and where it came from — a user behaviour, not an infrastructure guess.
+  2. **The per-hop timeout** that follows from it, and how many hops it assumed.
+  3. **The retry budget ratio**, and **which single layer** is permitted to retry.
+  4. **The shed threshold and the shed response**: status code, body, whether `Retry-After` is set.
+  5. **What the recovery gate is** — the metric that must return to baseline before you call it fixed.
+
+  Everything else in this lesson can be discovered during an incident. Those five cannot, because discovering them requires knowing what your service was supposed to do.
+</Callout>
+
+<Callout type="recap" title="The failure discipline, in one list">
+  1. **Every timeout shorter than its caller's remaining budget**, with a 20% margin for call-graph branches you did not enumerate.
+  2. **Retry budget, not unlimited retries** — at most $R \times N$ requests, $R \le 2$.
+  3. **Retries at exactly one layer.** Four layers multiply; they do not add.
+  4. **Circuit breaker per dependency**, with a short starting cooldown and exponential backoff.
+  5. **Jitter every retry**, always — otherwise recovery becomes a herd.
+  6. **Degrade before you refuse**: lower precision, cap tokens, shorten context, before a 503.
+  7. **Chaos test one fault at a time**, with a written hypothesis, and record time-to-detect and time-to-recover.
+</Callout>
+
+<KeyNotes>
+  1. A timeout is not about speed — it is about making failure **visible and bounded**. A missing timeout turns one hung dependency into an exhausted pool.
+  2. Split deadlines top-down with a margin of about 20%: each hop gets $\dfrac{2.0 \times 0.8}{5} = 0.32$ s, i.e. **320 ms**. No margin means your worst call-graph path overruns the deadline.
+  3. Retry amplification is $\sum_{i=0}^{r} p^i$: **1.05× at 5% independent failure**, but $(r + 1) = 3\times$ **against a dead backend** — same code, 57× more load.
+  4. Bound it with a **retry budget**: at most $N \times (R-1)$ retries for $R \le 2$. When the bucket is empty, return the error instead of retrying.
+  5. Retries **multiply across layers**. Four attempts at each of four layers is **256 times** the offered load. Put retries at exactly one layer.
+  6. A **circuit breaker per dependency** stops the correlated-failure storm, with a short doubling cooldown and a jittered half-open probe.
+  7. **Degrade before you refuse** — cap tokens, drop precision, shorten context — because a fast retryable error beats a slow success and a near-correct answer beats both.
+  8. On recovery, confirm **goodput returned to baseline**, not that the error rate hit zero, and add jitter everywhere or your recovery becomes a thundering herd.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A client has a 2.0 s end-to-end deadline, calls four hops in sequence, and holds back a 25% safety margin. What per-hop timeout should each hop get?', numeric: true, answer: 375, tolerance: 5, unit: 'ms', why: 'Each hop gets (2.0 × 0.75) ÷ 4 = 0.375 s = 375 ms. The margin covers call-graph branches you did not enumerate — a cache hit that turns into a cache miss, or a client that sends a much longer prompt.' },
+  { q: 'A client retries up to 2 times against a dependency whose per-attempt failure probability is 20% and independent. What is the expected number of attempts per request?', numeric: true, answer: 1.24, tolerance: 0.02, unit: 'attempts', why: '1 + 0.2 + 0.04 = 1.24. So a 20% failure rate costs 24% extra load — noticeable but survivable. Now contrast with the correlated case in the next question.' },
+  { q: 'The same client, same two retries, now against a backend that is completely down (every attempt fails with probability ≈ 1). What is the load multiplier, and what should your client do instead?', options: ['Still 1.24× — the retry count has not changed', '3× — and it should stop retrying because a circuit breaker or an exhausted retry budget has proved the dependency is down, not flaky', '1.0×, because retries to a dead backend are free', '0.5×, because the backend rejects them instantly'], answer: 1, why: 'With p ≈ 1 every retry fails and all three attempts happen: 3× offered load at the worst possible moment. A circuit breaker (or an exhausted retry budget) turns that 3× into approximately 0× while the dependency is down, and probes carefully on the way back.' },
+  { q: 'A service issues 1,000 requests in a window and its clients use a retry budget with ratio 1.25. What is the maximum number of retries those clients may issue?', numeric: true, answer: 250, tolerance: 5, unit: 'retries', why: 'Retry budget = N × (R − 1) = 1,000 × 0.25 = 250. Amplification is now bounded by construction: even a total dependency outage can at most double the load, and the client still returns the error rather than retrying indefinitely.' },
+  { q: 'Retries exist at the client (3 attempts), the API gateway (3) and the orchestrator (3), with no breaker anywhere. The engine becomes slow rather than dead, so every attempt eventually fails after 10 s. Roughly how much extra load reaches the engine?', options: ['3× — only the client retries', '9× — client plus gateway', '27× — the three retrying layers', '81× — four layers of three'], answer: 3, why: 'Retries multiply: 4 × 4 × 4 = 64 across three layers, and 4 × 4 × 4 × 4 = 256 across four. The engine now sees up to 64× its normal offered load from a problem that a single breaker in one place would have capped at 1×. This is the classic self-inflicted outage.' },
+  { q: 'Why must each hop’s timeout be strictly shorter than the budget remaining above it?', options: ['Because HTTP servers round timeouts to whole seconds', 'Because if every hop can consume the full deadline, the request can never fail before its own deadline, so the caller hangs instead of learning the dependency is broken', 'Because shorter timeouts improve throughput', 'Because long timeouts break streaming'], answer: 1, why: 'Timeouts compose additively along the critical path. If each of five hops may consume the whole 2 s, the total possible is 10 s, so a 2 s deadline is never enforced anywhere — the caller waits for the slowest hop, indefinitely. Each hop must fit inside what is left after all the others.' },
+] } />

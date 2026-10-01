@@ -1,0 +1,141 @@
+---
+title: 'Choosing an open model'
+summary: 'Pick an open-weights model you can actually run: use one number (parameters) to estimate memory and speed, decide precision, and fit the biggest good model onto the GPU in front of you.'
+objectives:
+  - Compute the GPU memory a model needs from its parameter count and precision
+  - Explain why GQA and quantization are the two levers that buy back memory
+  - Read a model card’s architecture numbers and predict its memory footprint and decode speed
+  - Decide which model to run first on a given GPU, and justify it with arithmetic
+---
+import ModelFits from '@/components/viz/first-llm/ModelFits.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have finished the transformer. You can write down, by hand, what happens to a single token as it passes through 32 layers. What you have not done is point any of that at a real set of numbers and watch it talk.
+
+That starts with a decision you will now make hundreds of times in this career: **which open model do you load?** Today it is a question with an arithmetic answer. Pick a model and a GPU, and either they fit together or they do not. Learn to do that subtraction in your head, before downloading anything, and every later module gets easier.
+
+## Start from one number
+
+Open an LLM on Hugging Face and you will see a dozen numbers. Ignore most of them. The one that predicts nearly everything is the **parameter count**, written as 0.5B, 8B, 70B.
+
+<Callout type="intuition" title="Why parameters predict everything">
+  A parameter is one learned number — one of the billions in the <Term t="weights">weights</Term>. Three facts follow from how many there are, and you already know each from earlier modules:
+  - **Quality** generally rises with size, then flattens out.
+  - **Memory** is literally `parameters × bytes per weight` (Module 01).
+  - **Decode speed** is limited by how fast you can read all of those weights once per token, and Module 02 gave you that number: it is <Term t="bandwidth">bandwidth</Term>-bound.
+</Callout>
+
+One number, three consequences. Everything else about a model is detail.
+
+<Scrolly>
+  <ModelFits client:visible slot="stage" />
+
+  <Step title="1. Start from one number">
+    Here are five real open models, ordered by parameter count: Qwen2.5-0.5B, Llama-3.2-3B, Llama-3.1-8B, Qwen2.5-32B and Llama-3.1-70B. Pick one. That single decision — 0.5B or 70B — already decides how much memory you need and how fast it will run.
+  </Step>
+
+  <Step title="2. Parameters are bytes on the GPU">
+    Every weight must be held in GPU memory at once. In BF16 each is 2 bytes, so Llama-3.1-8B occupies `8.03B × 2 = 16.1 GB`. Note the word *at once*: an 8B model does not stream its weights in a piece at a time. All of it sits in HBM from the first token to the last.
+  </Step>
+
+  <Step title="3. The GPU is a hard wall">
+    That 16.1 GB has to fit in one GPU. The free Colab T4 you used in Module 02 has about 16 GB. 16.1 does not fit in 16. Move the hatched bar and watch: the model is not "slow" on a small GPU, it does not start. The first question about any model is not "how fast" but "does it fit".
+  </Step>
+
+  <Step title="4. Headroom is not optional">
+    Weights are a floor, not the whole bill. There is also the KV cache — keys and values for the conversation, growing as the answer grows — plus workspace for activations and the CUDA context. A model that uses 100% of memory has zero headroom, and the first moderately long answer is an out-of-memory crash. Budget roughly 10–20% spare.
+  </Step>
+
+  <Step title="5. GQA shrinks the KV cache">
+    The KV slice is not the whole story. Llama-3.1-8B runs 32 query heads but only 8 key/value heads: <Term t="gqa">grouped-query attention</Term> shares each KV head across 4 query heads. The KV cache is therefore 4× smaller than a same-size model with one KV head per query head. Architecture choices like this buy back exactly the headroom you need.
+  </Step>
+
+  <Step title="6. Every model against every GPU">
+    Pull precision and context down to zero and look across. A 7–8B model in BF16 just fits an A100. A 70B model in BF16 fits nothing on this list until you quantize it. Which cells are hatched are models that cannot start; which are pale red are models with weights but no room to breathe.
+  </Step>
+
+  <Step title="7. Speed follows the same bytes">
+    Here is the payoff. Each generated token re-reads every weight exactly once. So decode time is roughly `weight bytes ÷ bandwidth`, and tokens per second is `bandwidth ÷ weight bytes`. Choose INT4 and the 70B model's bytes quarter, so it decodes about four times faster *and* fits where it did not. One lever, two wins.
+  </Step>
+
+  <Step title="8. The whole choice, in one look">
+    Parameter count sets quality, memory and speed together. Precision scales all three at once. The real decision rule: **pick the biggest model that fits with ~15% headroom, then let quality break the tie among the ones that fit.** Bring the GPU and context sliders to your own hardware and read off the answer.
+  </Step>
+</Scrolly>
+
+## The memory arithmetic, carefully
+
+Write this down; every memory question in the course reduces to it:
+
+$$
+\text{weights memory} = \text{parameters} \times \text{bytes per weight}
+$$
+
+Llama-3.1-8B has 8.03 billion parameters, and BF16 uses 2 bytes per weight:
+
+$$
+8.03 \times 10^9 \times 2 = 1.606 \times 10^{10}\ \text{bytes} \approx 16.1\ \text{GB}
+$$
+
+Now change one input at a time and watch the GB move:
+
+| Precision | bytes/weight | 8B weights | 70B weights |
+|---|---|---|---|
+| BF16 / FP16 | 2 | 16.1 GB | 141 GB |
+| FP8 / INT8 | 1 | 8.0 GB | 70.6 GB |
+| INT4 | 0.5 | 4.0 GB | 35.3 GB |
+
+<Callout type="math" title="Decode speed falls out of the same table">
+  Because every token re-reads all the weights, tokens/second is inversely proportional to bytes per weight. On an H100 with ~3.35 TB/s of bandwidth, Llama-3.1-8B in BF16 reads 16.1 GB per token:
+
+  $$
+  t_{\text{token}} \approx \frac{16.1\ \text{GB}}{3.35\ \text{TB/s}} \approx 4.8\ \text{ms} \;\Rightarrow\; \sim 210\ \text{tokens/s} \text{ (upper bound)}
+  $$
+
+  Real engines achieve a fraction of that; treat it as the ceiling, not a promise. The shape of the argument — speed ∝ 1 / bytes — is the part that never changes.
+</Callout>
+
+## What else should you read on a model card?
+
+Parameter count is the number you plan with. Three others are worth ten minutes before you commit:
+
+- **Base or instruct?** A <Term t="architecture-provenance">base model</Term> just continues your text; an <Term t="architecture-provenance">instruct (chat) model</Term> was tuned on conversations and actually answers questions. You almost always want instruct for a product. It is the same architecture and the same weight count — only the behaviour differs.
+- **Licence.** Open weights does not mean "anything goes". Llama and Qwen carry custom community licences with acceptable-use terms; others are Apache 2.0. Read it once; it can end a project.
+- **Architecture numbers.** Layers, hidden size, query heads and KV heads. These tell you the KV cache size per token — the subject of Module 05 — and let you sanity-check the memory before you download.
+
+<Callout type="pitfall" title="The two classic first mistakes">
+  1. **Downloading an 8B in BF16 onto a 16 GB GPU and getting an out-of-memory error.** The error is not mysterious; it is the subtraction you skipped. Check the fit first.
+  2. **Grabbing the base model when you wanted a chatbot.** It will ramble, echo your prompt, or continue it as if it were a document. It is doing exactly what it was trained to do — there is no bug.
+</Callout>
+
+## A concrete first choice
+
+Say you have a free Colab T4 (16 GB). What do you load first?
+
+- **Qwen2.5-0.5B-Instruct** — 0.49B × 2 = **0.98 GB**. Fast, chatty enough to see streaming work, downloads in seconds. This is the right first model for the lab in this module.
+- **Llama-3.1-8B-Instruct** — **16.1 GB**. Exactly the size of the GPU. It will *not* fit with room to spare, so on a T4 you would need 8-bit or 4-bit, or a bigger card.
+
+That contrast is the whole lesson. The 0.5B is not the "better" model; it is the one that leaves you a working GPU to learn on. Master the loop on 0.5B, then move up.
+
+<Callout type="try" title="Predict before you run">
+  Before running the next cell, write down three numbers for the model you plan to use: its weights memory in BF16, whether it fits your GPU with 15% to spare, and roughly how many tokens per second one user would get. Then check yourself against the readout. Being right three times in a row is how the arithmetic stops being a formula and starts being intuition.
+</Callout>
+
+<KeyNotes>
+  1. The parameter count is the number that matters: it sets quality, memory (`params × bytes/weight`) and decode speed all at once.
+  2. All weights sit in GPU memory at once — a model is a floor, not a stream. First question is "does it fit", never "how fast".
+  3. Llama-3.1-8B in BF16 is 16.1 GB, so it does not fit a 16 GB T4 with headroom. Budget 10–20% spare for the KV cache and workspace.
+  4. GQA shrinks the KV cache by the group factor (Llama-3.1-8B: 32 query heads, 8 KV heads, 4× saving) with no loss of model quality.
+  5. Halving the bytes per weight halves memory and roughly doubles decode speed, because each token re-reads all the weights. Quantization is the strongest single lever.
+  6. Prefer an instruct (chat) model over a base model for any product, and read the licence — open weights is not the same as unrestricted use.
+  7. First rule for picking: the biggest model that fits with ~15% headroom, then let quality break the tie. On a free T4 that means starting with Qwen2.5-0.5B-Instruct.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B has 8.03B parameters and is stored in BF16 (2 bytes per weight). How much GPU memory do the weights alone occupy?', options: ['About 8 GB', 'About 16 GB', 'About 32 GB', 'About 64 GB'], answer: 1, why: '8.03B × 2 bytes = 16.06 × 10⁹ bytes ≈ 16.1 GB. Parameter count times bytes per weight. That is why it does not fit a 16 GB T4 with room to spare.' },
+  { q: 'You store Llama-3.1-8B in INT4 (0.5 bytes per weight) instead of BF16. Its weights memory becomes about:', numeric: true, answer: 4, tolerance: 0.3, unit: 'GB', why: '8.03B × 0.5 bytes = 4.0 × 10⁹ bytes = 4.0 GB. Halving bytes per weight from BF16 (16.1 GB) to INT4 quarters the memory here, because BF16 to INT4 is 4×, not 2×. Show the multiply.' },
+  { q: 'Why does reducing bytes per weight speed up single-user decoding?', options: ['Fewer bytes means fewer FLOPs', 'Each generated token re-reads every weight, so speed scales as 1/bytes', 'It uses fewer GPU cores', 'It shortens the tokenizer output'], answer: 1, why: 'Decode is bandwidth-bound and memory-bound: it streams every weight once per token. Halving the bytes roughly halves the time per token, doubling tokens per second.' },
+  { q: 'A model needs 14 GB of weights and you have a 16 GB GPU. Before serving anyone you should assume:', options: ['It fits, because 14 < 16', 'It fits, but leave 20% headroom so long answers do not crash it', 'It will never fit under any precision', 'It fits only if you use INT4'], answer: 1, why: 'Weights are a floor. The KV cache and workspace grow with context and concurrency. Budget 10–20% spare, so a model at 14 GB on a 16 GB card is at risk, not safe.' },
+  { q: 'Llama-3.1-8B has 32 query heads and 8 key/value heads. By what factor does this (GQA) shrink the KV cache compared with one KV head per query head?', numeric: true, answer: 4, tolerance: 0, unit: '×', why: '32 ÷ 8 = 4. Every group of 4 query heads shares one KV head, so the cache of keys and values is 4× smaller than a 32-head MHA model, with the same quality in practice.' },
+  { q: 'You want a model that answers questions rather than just continuing your text. Which do you load?', options: ['The base model', 'The instruct (chat) model', 'Either — they are identical', 'The larger one, regardless of type'], answer: 1, why: 'Base models continue text; instruct models are tuned on conversations to follow instructions. Same architecture and weight count, different behaviour. Read the model card to tell them apart.' },
+]} />

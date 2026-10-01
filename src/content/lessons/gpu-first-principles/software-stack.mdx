@@ -1,0 +1,157 @@
+---
+title: 'The software stack: drivers, CUDA, PyTorch & remote machines'
+summary: 'What happens between model.generate() and silicon, why GPU work is asynchronous and what that does to your timing code, and how to work on a GPU that is not in your room.'
+objectives:
+  - Name the layers between your Python line and a kernel, and what each owns
+  - Explain why CUDA execution is asynchronous, and write a correct timing helper
+  - Read nvidia-smi and PyTorch device properties, and predict what they will say
+  - Describe the practical consequences of the GPU being on another machine
+---
+import SoftwareStack from '@/components/viz/gpu/SoftwareStack.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In Module 01 you timed a matrix multiply and, on your first attempt, got a number 200 times too good. The GPU had barely started when you measured. That was not a bug in your arithmetic; it was the single most common surprise in all of GPU programming, and it lives in the layer between PyTorch and the driver.
+
+This lesson is about that layer, and about the fact that the GPU is frequently not in your room.
+
+## One line, five layers
+
+<Scrolly>
+  <SoftwareStack client:visible slot="stage" />
+
+  <Step title="1. Your code">
+    `model.generate(...)`. PyTorch Python, in your process, on your machine. Every bug you will ever write by hand lives up here, and every error message starts here.
+  </Step>
+
+  <Step title="2. The framework">
+    PyTorch looks at each tensor's dtype, shape and device, picks a kernel out of its library, and asks the CUDA runtime to launch it. On top of that sit **TorchInductor** and **torch.compile`, which fuse chains of small kernels into fewer, larger ones — the software answer to the launch-overhead problem from the last lesson.
+  </Step>
+
+  <Step title="3. The runtime">
+    The CUDA runtime lives in your process. It allocates device memory, launches kernels onto a **stream**, and returns immediately. It also owns `cudaMalloc`, CUDA events, and the `synchronize` you will need for every measurement you take.
+  </Step>
+
+  <Step title="4. The driver">
+    The only software allowed to touch the GPU. It translates launches into device commands, manages the page tables for GPU memory, and schedules work onto the 132 multiprocessors. When something goes wrong at the device level, the message you get is from here, not from the code that caused it.
+  </Step>
+
+  <Step title="5. The GPU">
+    Kernels run. The GPU cannot report anything itself; it raises a signal, and the driver turns that signal into text four layers above the mistake.
+  </Step>
+
+  <Step title="6. Usually, not your GPU">
+    A free T4 in Colab, a rented H100, a machine in a datacentre. Your code runs in a container on a host, the driver and the devices belong to the host, and everything crosses a network to get there. A 40 ms round trip is five decode steps.
+  </Step>
+
+  <Step title="7. Errors name the wrong layer">
+    A shape mismatch is raised by PyTorch and tells you exactly where. An illegal memory access is reported by the driver and tells you almost nothing. Learning to translate the second into the first is a genuine, transferable skill.
+  </Step>
+</Scrolly>
+
+## The thing that will bite you: asynchrony
+
+CUDA work is **asynchronous**. When you write `c = a @ b`, the runtime records the launch and returns straight away. The actual multiplication may not have started yet, let alone finished.
+
+<Callout type="pitfall" title="The bug that makes every benchmark lie">
+  ```python
+  # WRONG: measures the launch, not the work
+  t0 = time.perf_counter()
+  for _ in range(100):
+      c = a @ b
+  dt = time.perf_counter() - t0
+  # dt is milliseconds for 100 *launches*, not 100 matmuls
+  ```
+  Fix it with either of these, and understand why each works:
+
+  ```python
+  # 1. block until the GPU is done
+  torch.cuda.synchronize()
+  t0 = time.perf_counter()
+  for _ in range(100):
+      c = a @ b
+  torch.cuda.synchronize()
+  dt = (time.perf_counter() - t0) / 100
+
+  # 2. let the GPU's own clock do it
+  start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+  start.record()
+  for _ in range(100):
+      c = a @ b
+  end.record()
+  torch.cuda.synchronize()
+  dt = start.elapsed_time(end) / 1000 / 100
+  ```
+
+  CUDA events are the right answer in production code: they are measured **on the GPU**, they do not include any host-side launch overhead, and on a remote machine they are unaffected by network jitter in a way `time.perf_counter` is not.
+</Callout>
+
+<Callout type="intuition" title="Why it is asynchronous at all">
+  Because a GPU is a separate processor with its own memory and its own queue of work. Making the host wait for every kernel would throw away all the overlap that lets a fast host feed a busy device. The cost is that the host's clock and the device's clock are independent, and only you know when the work is really finished.
+</Callout>
+
+## Reading a GPU you cannot touch
+
+Two commands will tell you most of what you need. Run them in any Colab cell.
+
+```bash
+nvidia-smi
+```
+
+That prints the driver version, every GPU in the machine, how much memory is used, and — importantly for a shared machine — **which other processes are using it**. In a free Colab session the T4 is often shared with nothing; on a rented instance it is often shared with your own earlier cells.
+
+```python
+import torch
+p = torch.cuda.get_device_properties(0)
+print(p.name, p.total_memory / 1e9, p.multi_processor_count)
+```
+
+<Callout type="try" title="Predict, then check">
+  Before you run it, guess the answer. For a T4: 40 multiprocessors and about 16 GB. For an L4: 58 and 24 GB. For an A100: 108 and 80 GB. If your guess is right you now know what a GPU *is*, in a way no description gave you. Module 02's lab will have you look up the rest.
+</Callout>
+
+## Working on a remote GPU
+
+Almost every serious exercise in this course happens on hardware you do not own. The practical rules are short.
+
+<Callout type="recap" title="Rules for remote GPUs">
+  - **Colab is disposable.** The disk resets when the runtime dies. Save anything you want to keep to Drive, or download it. Treat each notebook as a fresh machine.
+  - **You are billed for the runtime, not the work.** An idle Colab GPU still burns quota. Close the runtime when you stop.
+  - **Keep the loop on one machine.** The GPU-side token loop and the model should be on the same host. Every model/token trip across the network is a real latency cost you will measure in Module 22.
+  - **Your local files are not its files.** Upload the notebook, or mount a volume. `ls` on your laptop tells you nothing about the GPU host.
+  - **The network is not fast, but it is not the bottleneck yet.** A 40 ms round trip is bad for latency and irrelevant for a 30-second benchmark. Know which one you are doing.
+</Callout>
+
+## The error ladder
+
+When something breaks, the layer that prints the message is almost never the layer that caused it. Read it top-down and fix the first thing you actually recognise.
+
+| Message | Raised by | Usually means |
+|---|---|---|
+| `mat1 and mat2 shapes cannot be multiplied` | PyTorch | your shapes are wrong. You can fix this yourself. |
+| `expected scalar type Half but found Float` | PyTorch | a dtype you did not expect. Cast it, or check a config. |
+| `CUDA out of memory. Tried to allocate 2.00 GiB` | runtime | memory arithmetic, or a leak. Compute what you asked for. |
+| `an illegal memory access was encountered` | driver | something read outside its buffer, usually a custom kernel. Every later line is suspect. |
+| `NCCL error` | the communication library | a multi-GPU link failed. Check the process, not the model. |
+
+<Callout type="mentor" title="The habit worth forming now">
+  When you get an error from below PyTorch, the process is: run the smallest possible reproduction, put the whole thing on the CPU to see if the logic is right, and only then look at the GPU. Half of "GPU bugs" are ordinary Python bugs that a device-specific error message has made look exotic.
+</Callout>
+
+<KeyNotes>
+  1. Five layers: your code → PyTorch/ATen → CUDA runtime → NVIDIA driver → GPU. Each has its own errors, and the one that *reports* is rarely the one at fault.
+  2. CUDA is **asynchronous**: a kernel launch returns immediately. You must `torch.cuda.synchronize()` or use **CUDA events** before you time anything.
+  3. Use CUDA events for production timing: measured on the GPU, no host launch overhead, robust to a remote host.
+  4. `nvidia-smi` shows the driver, the devices, memory used, and which processes are on the GPU. `torch.cuda.get_device_properties(0)` gives you name, memory and multiprocessor count.
+  5. On a remote GPU you are in a container on someone else's host, reached over a network with ~20–80 ms round trips. Your disk is not theirs.
+  6. A 40 ms round trip is five decode steps: fatal for latency, irrelevant for a batch benchmark. Know which you are measuring.
+  7. `torch.compile` and TorchInductor exist to fuse small kernels, which is the software cure for launch overhead.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'You time 100 GPU matrix multiplies with time.perf_counter() and no synchronize, and get 200× too fast a number. Why?', options: ['perf_counter has poor resolution on GPU work', 'The launches return before the GPU has finished the work', 'The GPU caches the repeated identical result', 'Python optimises away the loop'], answer: 1, why: 'CUDA launches are asynchronous. Your loop times 100 launches, not 100 matmuls. Synchronize around the loop, or use CUDA events.' },
+  { q: 'Which layer is the only software permitted to talk directly to the GPU?', options: ['PyTorch', 'The CUDA runtime', 'The NVIDIA driver', 'The Python interpreter'], answer: 2, why: 'The driver is the boundary. Everything above it requests work; the driver alone programs the device and manages GPU memory.' },
+  { q: 'How many multiprocessors does a free Google Colab T4 have?', numeric: true, answer: 40, tolerance: 0, unit: 'SMs', why: 'The T4 has 40 streaming multiprocessors, 16 GB of memory and about 320 GB/s of bandwidth. Check it yourself with torch.cuda.get_device_properties(0).multi_processor_count.' },
+  { q: 'You get "CUDA error: an illegal memory access was encountered". Which layer printed it, and what is the best first move?', options: ['PyTorch, so fix your shapes', 'The driver, so re-read your recent changes and reduce to a minimal repro, testing on CPU', 'The GPU, so reboot the machine', 'The Python interpreter, so upgrade Python'], answer: 1, why: 'The driver reports it, and it means something read outside its buffer. Because the context is now poisoned, every later result is suspect. Reduce, and test the same logic on CPU.' },
+  { q: 'A typical remote GPU round trip over the network is about how long?', options: ['0.05 ms', '1 ms', '40 ms', '500 ms'], answer: 2, why: '20–80 ms in practice. That is roughly five decode steps, which is why a serving engine keeps its whole token loop on one machine.' },
+  { q: 'Why does torch.compile exist?', options: ['To make Python run faster', 'To fuse chains of small kernels into fewer launches', 'To compress the model weights', 'To move code to the CPU'], answer: 1, why: 'Launch overhead is ~5–10 µs each. Fusing many small operations into one kernel removes most of that, and also removes the memory traffic between them.' },
+]} />

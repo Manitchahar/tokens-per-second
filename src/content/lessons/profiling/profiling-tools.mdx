@@ -1,0 +1,263 @@
+---
+title: 'A profiling workflow: PyTorch profiler, Nsight Systems & Compute'
+summary: 'The actual sequence of commands an inference engineer runs when something is slow: measure at the framework level, find the long kernel in a timeline, then open that one kernel in a hardware profiler and read its stall reasons. With the commands, the output to read, and the order to run them in.'
+objectives:
+  - Run the PyTorch profiler on a forward pass and read its per-op table
+  - Export a Chrome trace and open it in a flame-chart viewer
+  - Use Nsight Systems to find launch gaps and CPU bottlenecks
+  - Use Nsight Compute to get the speed-of-light section for a single kernel
+  - Apply the 80% rule to decide when to stop optimizing a kernel
+---
+import FlameTimeline from '@/components/viz/profiling/FlameTimeline.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Something is slow. Not "the benchmark says 40 tokens per second" — you know the number, you just do not know why. This lesson is the workflow: four tools, in an order, each answering one question, and a rule for when to stop.
+
+The order matters more than the tools. Profiling is not an exploration, it is a funnel: measure broadly, zoom once, then fix exactly one thing and re-measure.
+
+## The funnel
+
+<Scrolly>
+  <FlameTimeline client:visible slot="stage" />
+
+  <Step title="1. Start at the framework level">
+    One forward pass, one `torch.profiler` block, one table. This tells you which operation is expensive *as PyTorch sees it*, with shapes and dtypes attached, and it costs about twenty lines of code and no extra install. Start here every time.
+  </Step>
+
+  <Step title="2. Expect more inside a bar than you wrote">
+    A single `aten::mm` in your table is several CUDA kernels plus a memset plus the launches the runtime performs on your behalf. Zooming in is how you learn that your "one op" was four launches, and that the allocator was doing work inside your timing window.
+  </Step>
+
+  <Step title="3. Read the shape of the timeline first">
+    In a real step the GPU row should be nearly solid. Holes mean you are <Term t="launch-bound">launch-bound</Term>. A busy CPU row under an idle GPU means you are **CPU-bound**. Establish which of the three you are before looking at any individual kernel — the fix is completely different in each case.
+  </Step>
+
+  <Step title="4. Three tools, three questions">
+    The PyTorch profiler answers *where did my time go*. <Term t="nsight-systems">Nsight Systems</Term> answers *when did what run and what were the gaps*. <Term t="nsight-compute">Nsight Compute</Term> answers *why is this one kernel slow*. Running them out of order wastes an afternoon.
+  </Step>
+
+  <Step title="5. Nsight Systems: the whole timeline">
+    Capture seconds of real workload with every kernel, memcpy, synchronization and stream on one axis and the CPU above it. This is where you find launch bubbles, a host that cannot keep up, or an NCCL collective that stalls at 200 µs while everyone waits.
+  </Step>
+
+  <Step title="6. Nsight Compute: one kernel, everything">
+    Point it at a single kernel and it replays that kernel many times while varying cache state, then reports a **Speed of Light** section: memory throughput %, compute throughput %, and the achieved occupancy, side by side. The two that matter are the highest of the two.
+  </Step>
+
+  <Step title="7. The 80% rule">
+    If a kernel is already above 80% of the speed of light, there is no meaningful headroom (Module 12.3) and you should move to the next-longest kernel. Most of a well-tuned decode step is above 80% on its bound.
+  </Step>
+
+  <Step title="8. The loop">
+    Profile → find the longest kernel → open it in Compute → read its top stall reason → change **one** thing → re-profile. Changing two things at once is how teams end up not knowing which change worked.
+  </Step>
+</Scrolly>
+
+## Step 1 · The PyTorch profiler
+
+This is where every investigation starts. It needs no installation and works on any GPU.
+
+```python
+import torch
+from torch.profiler import profile, ProfilerActivity, record_function
+
+# warm up: the first steps compile kernels and allocate; profile them and you
+# will spend an hour optimizing cuBLAS handle creation
+for _ in range(5):
+    model(input_ids)
+
+torch.cuda.synchronize()
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    profile_memory=True,
+) as prof:
+    for _ in range(10):
+        model(input_ids)
+    torch.cuda.synchronize()
+
+print(prof.key_averages().table(sort_by="self_device_time_total", row_limit=20))
+```
+
+Read the table like this:
+
+| Column | What it tells you |
+|---|---|
+| `Name` | The op. `aten::mm`, `aten::silu`, `aten::index_select` |
+| `self CUDA time total` | Time in the kernel itself, summed — the number to sort by |
+| `Shapes` | With `record_shapes=True`, so you see the batch and context it ran at |
+| `Memory` | With `profile_memory=True`, allocation spikes and OOM candidates |
+
+<Callout type="pitfall" title="Three ways the PyTorch profiler lies to you">
+  **Warm-up is included.** The first forward pass allocates, compiles and autotunes. Profile it and you will "discover" that cuBLAS workspace allocation is your bottleneck. Warm up at least 5 iterations, and `torch.cuda.synchronize()` before you start the block.
+
+  **CPU time is not GPU time.** `self CPU time total` includes the Python overhead of dispatching. For a decode step these are unrelated numbers, and sorting by CPU time tells you about your interpreter rather than your GPU.
+
+  **Synchronous code hides asynchrony.** Without `torch.cuda.synchronize()` (or `record_function` boundaries) after the loop, the profiler exits while kernels are still queued and you measure the launch, not the work.
+</Callout>
+
+## Step 2 · The Chrome trace
+
+The PyTorch profiler can emit a <Term t="chrome-trace">Chrome trace</Term> that opens in any Chrome-trace viewer — Perfetto, chrome://tracing, or the VS Code built-in flame-chart view. This is the single most useful thing it does, because a per-op table cannot show you *concurrency*.
+
+```python
+prof.export_chrome_trace("trace.json")
+```
+
+```bash
+# Open the resulting file at https://ui.perfetto.dev
+#   or drag it into chrome://tracing
+#   or in VS Code: right-click → "Open Timeline"
+```
+
+What to look for, in this order:
+
+1. **Is the GPU row solid?** Gaps between kernels mean launch overhead dominates. That is Module 15's problem (`torch.compile`, CUDA graphs), not a kernel problem.
+2. **Is anything running that you did not write?** Memsets, `elementwise_kernel`, `vectorized_elementwise_kernel` — those are PyTorch internals, and a surprising number of them means an op that could have been fused.
+3. **Are the long bars the ones you expect?** For Llama-3.1-8B decode they should be the QKV, gate/up, down and lm_head GEMMs, plus attention. If instead the longest bar is `index_select` or `copy_`, you have found your problem: a KV cache layout that is being copied rather than gathered in place.
+
+<Callout type="real" title="A real trace, read out loud">
+  Llama-3.1-8B, batch 32, 2k context, one decode step on an H100, sorted by self GPU time:
+
+  | Op | Self GPU time | Share | Verdict |
+  |---|---|---|---|
+  | `aten::mm` (gate_up + down) | 7.8 ms | 39% | compute-bound, near the roof — leave it |
+  | `flash_attn` / paged attention | 2.4 ms | 12% | context-dependent, the right target at long context |
+  | `aten::mm` (qkv, o_proj) | 5.0 ms | 25% | near the roof |
+  | `aten::silu` + `aten::mul` | 1.8 ms | 9% | two passes over the same tensor — **fuse them** |
+  | `aten::index_select` (KV gather) | 0.9 ms | 5% | fine |
+  | `memset` + allocator | 0.4 ms | 2% | the launch-overhead tax |
+
+  The conclusion is not "make the GEMMs faster". It is **fuse the SiLU and the multiply** (Module 13). Counting the bytes — 147 MB per layer unfused against 88 MB fused, times 32 layers — the saving is 1.9 GB of traffic, which at 85% of peak bandwidth is **0.66 ms on a 20 ms step**, or 3%. Thirty lines of Triton, for 3%. That is what a profile is for.
+
+  Note what the profile did *not* say. It did not say "the GEMMs are the problem" — they are 64% of the time and near the roof. It did not say "attention is the problem" — at 2k context it is 12%. It pointed at 9% of the time that was doing twice the memory traffic it needed to, and that was the cheapest win available.
+</Callout>
+
+## Step 3 · Nsight Systems: the timeline
+
+Nsight Systems watches the whole process — CPU threads, CUDA streams, memcpys, and NCCL — for a fixed duration. It answers "when and what".
+
+```bash
+# Wrap any command. -o writes a .nsys-rep you open in the GUI.
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --sample=none --cpuctxsw=none \
+  --duration=30 \
+  --output=decode \
+  python serve.py
+
+# Then: open decode.nsys-rep in Nsight Systems
+```
+
+Useful flags worth knowing:
+
+| Flag | Why |
+|---|---|
+| `--trace=cuda,nvtx,osrt` | CUDA APIs, NVTX ranges, and OS runtime calls |
+| `--duration=30` | Stop after 30 seconds — do not profile a whole benchmark by accident |
+| `--cuda-graph-trace=node` | See inside CUDA graphs (Module 15) instead of one opaque bar |
+| `--sample=none` | Skip CPU sampling; faster, and we are looking at the GPU |
+
+<Callout type="recap" title="What each pattern in the Systems timeline means">
+  | What you see | What it is | Where to go |
+  |---|---|---|
+  | GPU row solid, CPU mostly idle | GPU-bound, healthy | Optimize the longest kernel (Compute) |
+  | GPU row full of 2–5 µs gaps | Launch-bound | Module 15: `torch.compile`, CUDA graphs |
+  | CPU busy, GPU starved | CPU-bound: Python, sampling, host I/O | Reduce host work per step |
+  | Long `cudaStreamSynchronize` | Waiting on something upstream | Look upstream in the same trace |
+  | A periodic big NCCL bar | Communication stall | Module 18 · Multi-GPU |
+  | `cudaMalloc` appearing mid-run | Allocator thrashing | Preallocate; set a memory fraction |
+</Callout>
+
+## Step 4 · Nsight Compute: inside one kernel
+
+Now, and only now, do you open the single longest kernel.
+
+```bash
+# Replay just one kernel. --kernel-name filters; --launch-count limits replays.
+ncu \
+  --kernel-name regex:"gemm|flash" \
+  --launch-count 1 \
+  --set full \
+  --export report \
+  python serve.py
+```
+
+`--set full` runs every section. For a first look, `--set basic` or `--section SpeedOfLight --section MemoryWorkloadAnalysis` is faster and gives you 90% of the value.
+
+<Callout type="math" title="The Speed of Light section, and how to read it">
+  Nsight Compute prints two percentages side by side, and together they are the <Term t="speed-of-light">Speed of Light</Term> reading:
+
+  - **Compute (SM) Throughput** — achieved FLOP/s ÷ peak.
+  - **Memory Throughput** — achieved bytes/s ÷ peak bandwidth.
+
+  **Whichever is higher is your bound**, and the other one tells you nothing. A kernel at 12% compute and 88% memory is a *good* memory-bound kernel. A kernel at 88% compute and 15% memory is compute-bound and nearly optimal.
+
+  The useful number is the higher one. Anything above 80% means stop. Below 60% means read the next section.
+</Callout>
+
+Then go where the stall reasons are:
+
+| Section | Reads as | Fix |
+|---|---|---|
+| `MemoryWorkloadAnalysis` | "L2 sector throughput 22%" | Bad coalescing (Module 12.2). Check the sector counts |
+| `SchedulerStats` / `WarpStateStats` | "Stall Long Scoreboard 70%" | Waiting on memory — raise occupancy or improve locality |
+| `LaunchStats` | "Registers per thread 168" | Register pressure; try fewer accumulators per thread |
+| `Occupancy` | "Achieved 22% vs theoretical 50%" | Tail effect, or a grid too small (Module 12.1) |
+| `SourceCounters` | Per-line stall attribution | Tells you the exact line to change |
+
+<Callout type="mentor" title="How to read a stall reason without memorizing the whole table">
+  Three stalls cover almost everything, and each is a <Term t="warp-stall">warp stall</Term> with a different cause:
+
+  - **Stall Long Scoreboard** — the warp asked for data from memory and is waiting. Too little occupancy to hide it, or the data is not in cache.
+  - **Stall MIO Throttle** — too many shared-memory or special-function instructions queued. Often a bank conflict or too much `__syncthreads()`.
+  - **Stall Wait / No Instruction** — the instruction cache missed, or a branch serialized the warp.
+
+  If you remember nothing else: a kernel that is slow and memory-bound will almost always show **Long Scoreboard**, and the fix is either more warps or fewer bytes.
+</Callout>
+
+## The workflow, as a checklist
+
+<Callout type="recap" title="Run this every time">
+  1. **Warm up** 5+ iterations, then `torch.cuda.synchronize()`.
+  2. **PyTorch profiler**, sorted by `self_device_time_total`. Find the top op by GPU time.
+  3. **Export a Chrome trace**, open it, and classify: GPU-bound, launch-bound, or CPU-bound.
+  4. **If GPU-bound**: compute intensity (Module 12.3). If the bound is memory, compute MBU; if compute, MFU.
+  5. **Nsight Systems** if the trace showed gaps, NCCL stalls, or allocation churn.
+  6. **Nsight Compute** on the single longest kernel. Read Speed of Light, then the top stall reason.
+  7. **Apply the 80% rule.** Above 80%, move on. Below 60%, the Compute report names the fix.
+  8. **Change one thing.** Re-profile. Record before and after numbers in the same units.
+</Callout>
+
+<Callout type="pitfall" title="Profiling mistakes that cost the most time">
+  **Profiling the wrong workload.** A synthetic `torch.randn` loop has no KV cache, no paging and no scheduler, so it profiles a different program than the one you serve. Profile the real request path, at the real shapes.
+
+  **Profiling inside warm-up.** Kernel autotuning, cuBLAS workspace allocation and lazy module init all land in the first three steps. Warm up first.
+
+  **Comparing across runs without pinning.** Clocks vary with temperature and power. Use Module 06's methodology: pin the workload, warm up, and compare medians of many runs, never two single numbers.
+
+  **Optimizing the biggest bar when it is already optimal.** The longest kernel in a decode step is usually a GEMM at 70–80% MFU, which has 1.3× headroom at most. The eighth-longest bar at 25% MBU has 4×. **Sort by headroom, not by duration.**
+</Callout>
+
+<KeyNotes>
+  1. The funnel: PyTorch profiler → Chrome trace → Nsight Systems → Nsight Compute. Each step answers a narrower question and costs more time, so do not skip ahead.
+  2. Always warm up 5+ iterations and `torch.cuda.synchronize()` before profiling, or you will optimize allocator and autotuning noise.
+  3. Sort the PyTorch table by `self_device_time_total`, not CPU time. Enable `record_shapes` so you see the batch and context each op ran at.
+  4. `prof.export_chrome_trace()` gives you concurrency, which the table cannot: a solid GPU row means GPU-bound, gaps mean launch-bound (Module 15), a busy CPU means CPU-bound.
+  5. Nsight Systems answers *when* — kernels, memcpys, sync points, NCCL stalls — across seconds of real workload. Use `--duration` so you do not profile an entire benchmark.
+  6. Nsight Compute answers *why* for one kernel. Its **Speed of Light** section gives compute % and memory % side by side; the higher one is your bound and the only number worth quoting.
+  7. The 80% rule: above 80% of the speed of light, stop optimizing that kernel. Sort by **headroom**, not by duration.
+  8. Change one thing per iteration and re-profile, or you will not know which change worked.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A kernel reports 12% compute throughput and 88% memory throughput in Nsight Compute. What does that mean?', options: ['It is badly optimized and needs 8× more compute', 'It is a well-behaved memory-bound kernel, close to its floor', 'The measurement is broken', 'It is compute-bound but stalled'], answer: 1, why: 'The higher of the two Speed-of-Light percentages is the bound. 88% memory means it is moving nearly peak bandwidth; the low compute figure is expected, not a defect.' },
+  { q: 'Your Chrome trace shows a solid GPU row but the CPU thread is busy almost all the time. What is the conclusion?', options: ['The GPU is under-utilized, add more batch', 'You are CPU-bound — reduce host work per step, do not optimize kernels', 'The kernels are uncoalesced', 'Nothing is wrong, CPU work overlaps GPU work'], answer: 1, why: 'A busy CPU with a solid GPU means the GPU is keeping up and the host is not the constraint either — but if CPU work per step exceeds GPU work per step, the CPU is setting the pace. Optimize the host path, not the kernels.' },
+  { q: 'The longest kernel in your profile is a GEMM at 78% MFU. What should you do next?', options: ['Spend a week rewriting it in Triton', 'Move on to the next kernel and look for headroom elsewhere', 'Disable it and use a CPU fallback', 'Increase the batch size until it hits 100%'], answer: 1, why: 'Above ~80% of the speed of light there is at most 1.3× available, and cuBLAS is already well tuned. Sort by headroom, not duration — a shorter kernel at 25% MBU has far more to give.' },
+  { q: 'What is the correct first step before profiling any PyTorch forward pass?', options: ['Call torch.cuda.synchronize() inside the loop every iteration', 'Warm up 5+ iterations, then synchronize, then start the profiler', 'Profile on the very first call to catch initialization', 'Set torch.backends.cudnn.benchmark = False'], answer: 1, why: 'The first passes allocate, autotune and lazily initialize. Profiling them shows you cuBLAS workspace and allocator costs, not your model. Warm up, synchronize, then profile.' },
+  { q: 'A kernel moves 12.6 GB in 15.0 ms on an H100 with 3.35 TB/s of peak bandwidth. What MBU does that represent?', numeric: true, answer: 25, tolerance: 3, unit: '%', why: '12.6 GB / 0.015 s = 840 GB/s. 840 / 3350 = 25%. That is far below the 60% line, so the bytes are being moved badly — look at coalescing before blaming the arithmetic.' },
+  { q: 'A decode step launches 420 kernels and each launch costs about 5 microseconds. How much of a 20 ms step is launch overhead?', numeric: true, answer: 10.5, tolerance: 1.5, unit: '%', why: '420 × 5 µs = 2.1 ms of launch overhead. 2.1 / 20 = 10.5%. Above roughly 5% you are launch-bound and the fix is torch.compile or CUDA graphs (Module 15), not better kernels.' },
+  { q: 'Which tool answers "why is this one kernel slow" by reporting warp stall reasons?', options: ['The PyTorch profiler', 'Nsight Systems', 'Nsight Compute', 'nvidia-smi'], answer: 2, why: 'Nsight Compute replays a single kernel and reports Speed of Light, stall reasons, register counts and per-source-line attribution. Systems answers when-and-what; the PyTorch profiler answers where-your-ops-go.' },
+  { q: 'Your GPU row in the trace is full of 3 µs gaps between kernels. Which module owns this problem?', options: ['Module 11 · Quantization', 'Module 15 · Compilation & CUDA Graphs', 'Module 18 · Multi-GPU', 'Module 08 · PagedAttention'], answer: 1, why: 'Gaps between kernels mean you are launch-bound: the GPU is starved by per-launch overhead. torch.compile and CUDA graphs capture the whole step and replay it, which is exactly Module 15.' },
+]} />

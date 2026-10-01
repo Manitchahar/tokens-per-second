@@ -1,0 +1,283 @@
+---
+title: 'Fused RMSNorm & RoPE'
+summary: 'Two tiny, memory-bound operations that every transformer layer runs — take them from four kernel launches to one, and see the launch-overhead arithmetic that makes this the highest-leverage fusion in inference.'
+objectives:
+  - Derive RMSNorm from the residual-stream scaling argument and write it in Triton
+  - Write RoPE as a pair rotation and explain why the head dimension must be even
+  - Fuse a reduction with the elementwise operation that consumes it, eliminating a round trip
+  - Compute how many launches and bytes fusion removes for a real 8B decode step
+  - Decide when fusion is not worth it, using intermediate size versus launch overhead
+---
+import NormRope from '@/components/viz/triton/NormRope.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every transformer layer does the same two things to the residual stream before attention: rescale it with <Term t="rmsnorm">RMSNorm</Term>, then encode position by rotating it with <Term t="rope">RoPE</Term>. Both are small, both are memory-bound, and — this is the punchline — together they are slower than the work they perform, purely because of how many times they leave the GPU's fast memory.
+
+This lesson fuses them into one kernel. It is the single most representative optimization in inference, because the technique generalizes to almost every small operation in the model, and because the win is provably free: no approximation, no quality change, no tradeoff.
+
+## RMSNorm: rescale, don't subtract a mean
+
+You have seen the argument for normalization already, when we built the transformer: activations grow through a deep stack, and without control they drift into ranges where FP16 loses precision or overflows. RMSNorm keeps each token's vector at a known scale.
+
+LayerNorm would subtract the mean and divide by the standard deviation. RMSNorm does something cheaper, and in practice just as good:
+
+$$
+\mathrm{RMS}(x) = \sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2},
+\qquad
+\hat{x}_i = \frac{x_i}{\mathrm{RMS}(x)} \cdot g_i
+$$
+
+Read it as three steps: **square** every element, **average** the squares, **take the square root**. That gives one number per token — the length of $x$, essentially. Then divide every element by it and apply a learned per-element gain $g$. The output has RMS of about 1, whatever came in.
+
+Note what is missing: no subtraction of the mean, no variance computation, and **no mean-centering**. That is the entire "RMS" — root mean square, skip the mean. It saves a subtraction per element and, more importantly, makes the reduction a pure sum, which is the cheapest reduction there is.
+
+```python
+@triton.jit
+def rmsnorm_kernel(x_ptr, out_ptr, w_ptr, n_cols, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0)                       # one program per token
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+
+    x = tl.load(x_ptr + row * n_cols + cols, mask=mask, other=0.0)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+
+    rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / n_cols + eps)   # ONE reduction
+    y = x * rstd * w                               # broadcast against every element
+
+    tl.store(out_ptr + row * n_cols + cols, y, mask=mask)
+```
+
+`x * x` is elementwise, `tl.sum(..., axis=0)` collapses the row, and `1/sqrt(...)` gives a single scalar that then multiplies every element. That is a **reduction feeding an elementwise op** — and that composition is the whole lesson.
+
+<Callout type="pitfall" title="The epsilon is not optional">
+  Without `+ eps` inside the square root, a row of all zeros gives `0/0 = NaN`, and one NaN in the residual stream poisons every subsequent layer. Real models use `eps` around one part in a hundred thousand — in other words, 0.00001 down to 0.000001. It costs one add per row. Keep it.
+
+  Also note `other=0.0` on the load here, **not** `-inf` as in softmax. A padded lane squared and summed adds 0 to the mean — which is exactly the neutral element for a sum, and it is also what keeps the divisor at the right count because we divide by `n_cols`, not by `BLOCK`. This is the rule from the last lesson in action: masked lanes must be neutral *for the operation that consumes them*.
+</Callout>
+
+## RoPE: position as a rotation
+
+Rotary position embeddings encode a token's position by **rotating** its query and key vectors, rather than by adding a position vector to them. The critical design property: rotating two vectors by the same angle preserves their dot product up to a position-dependent shift, so relative position is what attention actually sees, and absolute position never has to be learned.
+
+For each adjacent pair $(x_{2i}, x_{2i+1})$, you rotate by an angle $\theta_i$ that grows with position $m$:
+
+$$
+\begin{pmatrix} x'_{2i} \\ x'_{2i+1} \end{pmatrix}
+=
+\begin{pmatrix} \cos m\theta_i & -\sin m\theta_i \\ \sin m\theta_i & \cos m\theta_i \end{pmatrix}
+\begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}
+$$
+
+Written as arithmetic, which is what you write in a kernel:
+
+$$
+x'_{2i} = x_{2i}\cos(m\theta) - x_{2i+1}\sin(m\theta)
+$$
+$$
+x'_{2i+1} = x_{2i}\sin(m\theta) + x_{2i+1}\cos(m\theta)
+$$
+
+<Callout type="math" title="Worked example: one rotated pair">
+  Take the pair $(1.0,\ 0.0)$ at position $m = 3$ with a base angle giving $\theta = 0.7$ rad. Then $\cos 0.7 = 0.7648$ and $\sin 0.7 = 0.6442$.
+
+  - $x'_0 = 1.0 \times 0.7648 - 0.0 \times 0.6442 = \mathbf{0.7648}$
+  - $x'_1 = 1.0 \times 0.6442 + 0.0 \times 0.7648 = \mathbf{0.6442}$
+
+  The vector $(1, 0)$ has been rotated 40 degrees toward the first axis. Its length is unchanged, because squaring and adding those two gives exactly 1. **Rotation preserves magnitude** — which is why RoPE composes cleanly with RMSNorm, and why it does not fight the norm for control of the vector's scale.
+</Callout>
+
+Two implementation details matter. **The head dimension must be even**, because you rotate in pairs — Llama-style models all use head dimensions of 64 or 128, both even. And **the frequencies are not uniform**: $\theta_i$ decreases with $i$, so low-index pairs (which encode coarse position) rotate quickly while high-index pairs (fine position) rotate slowly. This is why RoPE extrapolates to longer contexts better than learned absolute embeddings, and it is the subject of the long-context module later.
+
+In Triton, the pairing is index arithmetic on the block:
+
+```python
+# rotate every adjacent pair by an angle that depends on position
+half = tl.arange(0, BLOCK // 2)
+lo = tl.load(x_ptr + base + 2 * half, mask=..., other=0.0)    # even indices
+hi = tl.load(x_ptr + base + 2 * half + 1, mask=..., other=0.0)  # odd indices
+theta = m * inv_freq[half]
+c, s = tl.cos(theta), tl.sin(theta)
+out_lo = lo * c - hi * s
+out_hi = lo * s + hi * c
+```
+
+<Callout type="intuition" title="Why `inv_freq` is a precomputed table">
+  Computing $\frac{1}{(\text{base}^{2i/d})}$ for every element on every call means an exponentiation and a log in your kernel. Nobody does that. The inverse frequencies are **constant for the life of the model**, so they are computed once on the CPU and uploaded as a tensor of length `head_dim / 2`. Your kernel just loads and multiplies. Precompute anything that does not depend on your data.
+
+  `cos` and `sin` themselves are genuinely expensive — a few dozen cycles each — and they are recomputed identically for every token at a given position. Real kernels often precompute a combined $\cos(m\theta), \sin(m\theta)$ table up to the maximum sequence length and index it. That trade-off (more memory, less math) is worth taking when the model is bandwidth-bound, which is the situation you are in here.
+</Callout>
+
+## Fusing them: the actual lesson
+
+Now the point. Written in PyTorch, these are separate operations and each is a separate kernel launch:
+
+```python
+x = rmsnorm(x, weight)          # launch 1: read x, write x_norm
+q, k = apply_rope(q, k, pos)    # launch 2 and 3: read x_norm, write q', k'
+```
+
+A **round trip to HBM** sits between them. The intermediate, one token of 4,096 FP16 values, is 8 KB. Let me price that precisely, because the numbers are what make the case.
+
+<Callout type="math" title="Worked example: what 8 KB actually costs">
+  On an H100 with 3.35 TB/s, moving 8 KB takes:
+
+  $$
+  t = \frac{8{,}192\ \text{bytes}}{3.35 \times 10^{12}\ \text{bytes/s}} \approx 2.4\ \text{ns}
+  $$
+
+  One kernel launch costs about **5 µs** = 5,000 ns.
+
+  So the ratio is about **2,000 : 1**. You are not waiting on memory. You are waiting on the CPU to tell the GPU what to do next.
+
+  Fused, the whole thing is one launch: load 8 KB, reduce, normalize, rotate, store 8 KB. One launch instead of three, one read instead of two, one write instead of two. On this shape that is roughly a **3× reduction in wall-clock**, and not one of the numbers changed.
+</Callout>
+
+<Scrolly>
+  <NormRope client:visible slot="stage" />
+
+  <Step title="1. The input">
+    One token's residual stream: hidden size 4,096 in FP16, so 8 KB. That is the entire input to both operations, and it never grows.
+  </Step>
+
+  <Step title="2. RMSNorm rescales it">
+    Square every element, average, square-root, divide, apply the learned gain. One reduction produces one scalar that then touches every element — a reduction feeding an elementwise op.
+  </Step>
+
+  <Step title="3. RoPE rotates it">
+    Each adjacent pair rotates by an angle set by the token's position. The length is unchanged; only the values move. Also one read, one write.
+  </Step>
+
+  <Step title="4. The unfused timeline">
+    Written separately, these are four launches with HBM round trips between them. Each trip is cheap in bytes and expensive in overhead.
+  </Step>
+
+  <Step title="5. Why each step is expensive">
+    At 8 KB the data movement is nanoseconds and the launch is microseconds. You are roughly 200× launch-bound, so the cost is entirely in the launches and the round trips.
+  </Step>
+
+  <Step title="6. The fused kernel">
+    One program loads the vector into registers, computes the RMS, normalizes, rotates and stores once. The reduction result never leaves on-chip memory.
+  </Step>
+
+  <Step title="7. What that buys">
+    Three launches and 48 KB of traffic removed, per layer, per token. An 8B model has 32 layers, and that is a decode step — the phase where every microsecond is latency a user feels.
+  </Step>
+</Scrolly>
+
+The fused kernel is unremarkable to write, which is the best sign:
+
+```python
+@triton.jit
+def fused_rmsnorm_rope(x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr, n_cols, pos, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    half = tl.arange(0, BLOCK // 2)
+    mask = half < (n_cols // 2)
+
+    # ── RMSNorm ──
+    cols = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + row * n_cols + cols, mask=cols < n_cols, other=0.0)
+    rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / n_cols + 1e-6)
+    w = tl.load(w_ptr + cols, mask=cols < n_cols, other=0.0)
+    x = x * rstd * w
+
+    # ── RoPE, in place, in registers ──
+    lo = tl.load(x_ptr + row * n_cols + 2 * half, mask=mask, other=0.0) * rstd * tl.load(w_ptr + 2 * half, mask=mask, other=0.0)
+    hi = tl.load(x_ptr + row * n_cols + 2 * half + 1, mask=mask, other=0.0) * rstd * tl.load(w_ptr + 2 * half + 1, mask=mask, other=0.0)
+    c = tl.load(cos_ptr + pos * (n_cols // 2) + half, mask=mask)
+    s = tl.load(sin_ptr + pos * (n_cols // 2) + half, mask=mask)
+
+    out_lo = lo * c - hi * s
+    out_hi = lo * s + hi * c
+
+    tl.store(out_ptr + row * n_cols + 2 * half,     out_lo, mask=mask)
+    tl.store(out_ptr + row * n_cols + 2 * half + 1, out_hi, mask=mask)
+```
+
+Read it and notice what is **not** there: no temporary tensor, no intermediate store, no `torch.empty` between the two operations. The reduction result `rstd` is a value in registers, and the elementwise operations consume it immediately. That is the entire definition of fusion.
+
+<Callout type="pitfall" title="Fusion is not free — it costs registers">
+  Every value you keep alive across an operation occupies registers. Fusing RMSNorm and RoPE keeps the whole normalized vector plus its rotated pairs live at once. Too much fusion and the block stops fitting in registers, the compiler spills to slower memory, and you lose more than the launches saved.
+
+  The tell is `n_spills` in the compiled kernel's metadata, which you learned to read in Lesson 13.1. **A fused kernel with non-zero spills is worse than the unfused version** — measure it.
+</Callout>
+
+## Scaling it up: what this is worth in a real decode step
+
+Let me price the whole idea for Llama-3.1-8B: 32 layers, hidden 4,096, FP16, one token, batch 1.
+
+Per layer, the unfused RMSNorm + RoPE sequence is about **4 launches**. Fused it is **1**. The saving per layer is 3 launches ≈ 15 µs, plus the round-trip bytes.
+
+<Callout type="math" title="Worked example: 32 layers of decode">
+  - Launches saved per token: 32 layers × 3 each = **96 launches**.
+  - At ~5 µs each: 96 × 5 µs = **480 µs** per generated token.
+
+  Compare that to a decode step's *total* measured time. In Module 00 a naive PyTorch decode of an 8B model on an H100 took about 7 ms. **480 µs is about 7% of that, from one fusion pattern**, repeated across every layer.
+
+  And a real engine fuses more than this. The SiLU-gated MLP (up-projection → activation → multiply → down-projection) is the biggest single win, worth several hundred microseconds on its own per step. RMSNorm and RoPE are the small, clean example of the same technique.
+</Callout>
+
+This is why <Term t="fusion">kernel fusion</Term> is the first thing every inference engine does, and why at the time of writing PyTorch itself ships fused RMSNorm and RoPE kernels and generates this class of kernel automatically via `torch.compile`'s Triton backend. Module 15 covers that compiler path. You now understand what it is doing.
+
+## The rule for when *not* to fuse
+
+Fusion is not universally good, and knowing when to stop is part of the skill. Use one comparison:
+
+<Callout type="math" title="The fusion decision">
+  **Fuse when** the intermediate is small relative to launch overhead.
+
+  $$
+  \text{fuse if} \quad \frac{\text{intermediate bytes}}{\text{bandwidth}} \ll 5\ \mu s
+  $$
+
+  For one token × 4,096 hidden × 2 bytes = 8 KB on an H100: 2.4 ns ≪ 5,000 ns. **Fuse.**
+
+  For a prefill of 4,096 tokens × 4,096 hidden = 32 MB: $\frac{32 \times 10^6}{3.35 \times 10^{12}} = 9.6\ \mu s$, comparable to the launch cost, and the op inside may itself be compute-bound. **Marginal** — fuse only if the operators are genuinely small.
+
+  For a 70B model's weight GEMM: 140 GB of weights, 42 ms of unavoidable memory time. **Do not fuse** — you would add register pressure and gain 0.001%.
+</Callout>
+
+The pattern to internalize: **fusion is about the small stuff**. Big GEMMs are already bandwidth-saturated and there is nothing to win. The wins live in the elementwise and reduction operators that surround them, where the GPU is idle waiting for a launch.
+
+<Callout type="real" title="Where this appears in engines you already know">
+  At the time of writing: vLLM ships fused RMSNorm, fused RoPE and a fused SiLU-and-multiply MLP kernel, all written in Triton, and `torch.compile` with the Triton backend generates equivalent fusions from your PyTorch source. FlashAttention (Module 14) is the same idea applied to the largest memory-bound operation in the model. The technique is not exotic; it is the daily work of inference optimization.
+</Callout>
+
+## Try it yourself
+
+The notebook has an unfused baseline, a fused RMSNorm, a fused RoPE, the combined kernel, and a correctness comparison against PyTorch plus a launch-count measurement.
+
+<Colab nb="13-rmsnorm-rope.ipynb" />
+
+<Callout type="try" title="Predict, then run">
+  1. Count the kernel launches for `rmsnorm(x, w)` followed by `apply_rope(q, k, 0)` on a `[1, 4096]` FP16 tensor in PyTorch. How many does your version of the fused kernel need?
+  2. Measure the fused kernel at batch 1 and at batch 256. Which is closer to peak bandwidth, and why is the small one worse even though it does identical arithmetic?
+  3. Set `eps = 0` and feed an all-zero row. What happens, and which part of the output does it corrupt?
+  4. If `n_spills` is non-zero on your fused kernel, does fusing the RoPE into it still help? Explain what the compiler is telling you.
+</Callout>
+
+<Callout type="recap" title="The idea to remember">
+  RMSNorm is one reduction (sum of squares) feeding one elementwise scale. RoPE is a pairwise rotation with no reduction at all. Both are tiny, both are purely memory-bound, and both are slow **not because of their arithmetic but because of how many times they leave the GPU's fast memory**.
+
+  Fusing them means the reduction result never leaves registers: one load, one store, one launch. For a 1-token decode that is a ~3× wall-clock win on the pair, and about 7% of an entire decode step once you count 32 layers. **This is the highest-leverage, zero-risk optimization in inference — and it is the template for every fusion that follows.**
+</Callout>
+
+<KeyNotes>
+  1. RMSNorm computes $\sqrt{\frac{1}{d}\sum x_i^2}$ then scales by a learned gain — **no mean subtraction**, which makes the reduction a pure sum, the cheapest there is.
+  2. In Triton that is `tl.sum(x * x, axis= 0)` followed by `x * rstd * w`. One reduction feeding one elementwise op — a pattern that recurs constantly.
+  3. RoPE rotates each adjacent pair by $m\theta$, preserving magnitude. The head dimension must be **even**, and the frequencies decrease with index (low pairs rotate fast).
+  4. Precompute `inv_freq`, and often the `cos`/`sin` tables, on the CPU. They are constant for the model's life; never compute an exponentiation in a memory-bound kernel.
+  5. The win from fusion here is **launch overhead, not bandwidth**. 8 KB moves in ~2.4 ns on an H100 but a launch costs ~5 µs — about 2,000:1. Fuse small tensors, not big ones.
+  6. Fusion means the intermediate **never leaves registers**. No temporary tensor, no `torch.empty` between operations. That absence is the definition.
+  7. Fusing RMSNorm + RoPE saves 3 launches per layer; on 32 layers that is ~480 µs per token on an H100 — roughly 7% of a naive decode step.
+  8. Fusion costs registers. Check `n_spills` in the compiled kernel: a fused kernel that spills is **worse** than the unfused version.
+  9. Masked lanes must be neutral for the consuming op: `other=0.0` for RMSNorm's sum, `other=-inf` for softmax's max.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What does RMSNorm compute that LayerNorm does not?', options: ['It subtracts the mean before scaling', 'It omits mean-centering and variance, using only the root-mean-square', 'It uses a higher precision dtype', 'It applies the gain before the reduction'], answer: 1, why: 'RMSNorm normalizes by RMS(x) alone — no mean subtraction, no variance. That makes the reduction a plain sum of squares, and in practice costs nothing in quality.' },
+  { q: 'One token, hidden 4096, FP16, moves 8,192 bytes. How long does that take on an H100 at 3.35 TB/s?', numeric: true, answer: 2.4, tolerance: 0.5, unit: 'ns', why: '8,192 / 3.35e12 = 2.4e-9 s = 2.4 ns. Compare that to the ~5 µs a kernel launch costs — the launch is roughly 2,000× more expensive than the data movement.' },
+  { q: 'Why must the RoPE head dimension be even?', options: ['To avoid overflow', 'Because the rotation acts on adjacent pairs (2i, 2i+1), so an odd dimension would leave one element unpaired', 'To align with tensor cores', 'Because cos and sin need matching sizes'], answer: 1, why: 'RoPE rotates each adjacent pair independently. With an odd dimension the final element has no partner and would have to be handled as a special case.' },
+  { q: 'A Llama-3.1-8B decode step (32 layers) fuses RMSNorm+RoPE from 4 launches to 1. How many launches are saved per generated token?', numeric: true, answer: 96, unit: 'launches', why: '32 layers × 3 launches saved per layer = 96 launches. At ~5 µs each that is about 480 µs per token — roughly 7% of a naive decode step.' },
+  { q: 'Why does a fused kernel with non-zero register spills perform worse than the unfused version?', options: ['Spills disable vectorization', 'The spilled values go to slower memory, adding traffic that cancels out the launches saved', 'Spills cause incorrect results', 'The compiler disables fusion when spilling'], answer: 1, why: 'Fusion keeps many values live simultaneously. If they do not fit in registers the compiler spills to local memory, adding back exactly the traffic fusion was meant to remove. Always check n_spills.' },
+  { q: 'When should you NOT fuse two operations?', options: ['Never — fusion is always a win', 'When the intermediate is large enough that its memory time exceeds launch overhead', 'When both operations are elementwise', 'When the model uses FP16'], answer: 1, why: 'Fusion trades registers for bandwidth. It pays off for small intermediates where the ~5 µs launch dominates. For a 70B weight GEMM the memory time is milliseconds, so fusion adds register pressure and saves nothing.' },
+] } />

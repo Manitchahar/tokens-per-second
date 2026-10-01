@@ -1,0 +1,31 @@
+---
+import Icon from '../Icon.astro';
+type T = 'intuition' | 'mentor' | 'pitfall' | 'math' | 'real' | 'try' | 'recap';
+interface Props { type?: T; title?: string }
+const { type = 'mentor', title } = Astro.props;
+const META: Record<T, { icon: string; label: string }> = {
+  intuition: { icon: 'bulb', label: 'The intuition' },
+  mentor: { icon: 'mentor', label: 'Mentor’s note' },
+  pitfall: { icon: 'warn', label: 'Common trap' },
+  math: { icon: 'sigma', label: 'The math' },
+  real: { icon: 'globe', label: 'In the real world' },
+  try: { icon: 'spark', label: 'Try it' },
+  recap: { icon: 'check', label: 'So far' },
+};
+const m = META[type];
+---
+<aside class:list={['callout', `c-${type}`]}>
+  <p class="c-head"><Icon name={m.icon} size={16} /> <strong>{title ?? m.label}</strong></p>
+  <div class="c-body"><slot /></div>
+</aside>
+
+<style>
+  .callout { margin: 1.8rem 0; padding: 0.9rem 1.1rem 0.2rem; background: var(--ground-2); border: 1px solid var(--rule); border-radius: 4px; font-size: 0.95rem; }
+  .c-head { display: flex; align-items: center; gap: 0.45rem; margin: 0 0 0.4rem; font-size: 0.86rem; color: var(--text); }
+  .c-head :global(.icon) { color: var(--text-2); flex: none; }
+  .c-pitfall .c-head :global(.icon) { color: var(--error); }
+  .c-try .c-head :global(.icon) { color: var(--compute); }
+  .c-body :global(p) { margin-bottom: 0.8em; }
+  .c-body :global(ul), .c-body :global(ol) { margin: 0 0 0.8em; padding-left: 1.2rem; }
+  .c-body :global(.katex-display) { margin: 0.8rem 0; }
+</style>

@@ -1,0 +1,226 @@
+---
+title: 'Cost per million tokens, from scratch'
+summary: 'The price of a token is not a property of the model — it is a property of your configuration, your traffic and your hourly rate. This lesson derives it from one identity, shows why output tokens cost multiples of prompt tokens, and gives you a number you can defend.'
+objectives:
+  - Derive cost per million tokens from machine seconds per request and a price per second
+  - Explain why an output token costs several times a prompt token
+  - Compute dollars per million tokens for a stated model, GPU, precision and concurrency
+  - Say which limit sets the price — bandwidth for decode, FLOP/s for prefill, memory for a model that does not fit
+  - Identify a configuration whose cost number is meaningless because it does not fit
+---
+
+import CostPerToken from '@/components/viz/economics/CostPerToken.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have now spent most of this course learning how to make inference fast. This lesson starts asking a different question: **what does it cost?** And the first thing to unlearn is that there is a number called "the price of a token".
+
+There is not. There is a price of a token *under a configuration you have not chosen yet*. Change the concurrency, the precision, the card, the prompt length or the answer length, and you change the price. Most teams discover this while writing a budget, which is the worst possible time.
+
+So we build the number from scratch, out of things you already know.
+
+<Callout type="intuition" title="Why you are the one who needs this">
+  Engineers rarely get asked "what does this cost?" and then given time to find out. They get asked after a launch, or in a planning meeting, or when finance wants a forecast that must be right. By then the configuration is already built, and changing it is a project.
+
+  The skill in this lesson is not arithmetic. It is being able to *predict* the number before you build, which is what makes it a design tool rather than an accounting exercise.
+</Callout>
+
+## The one identity
+
+Everything in this module reduces to a single line. Take one request, with $n_{in}$ prompt tokens and $n_{out}$ output tokens, arriving at a server that is running $B$ sequences concurrently.
+
+From Module 05 you know what it costs to process it:
+
+- **Prefill** processes all $n_{in}$ prompt tokens in one parallel, compute-bound pass. It belongs to this request alone — nobody else was waiting on those tokens. So its machine time is $t_{pre}$ and it is charged to you in full.
+- **Decode** runs $n_{out}$ steps. Each step reads every weight and every KV byte for *all* $B$ sequences and produces one token for each of them. So your request's share of one step is $t_{step}/B$, and your share of the whole decode phase is $n_{out}\, t_{step}/B$.
+
+Add them, and you have consumed this much **machine time**:
+
+$$
+\text{GPU-seconds per request} = t_{pre} + \frac{n_{out}\, t_{step}}{B}
+$$
+
+<Callout type="math" title="This is service time, read differently">
+  In Module 06 you wrote service time as $S = t_{pre} + n_{out}\, t_{step}$ and used it to find capacity, because a *single* request's latency is what a user waits for.
+
+  Here the batch is divided out. That is the whole difference between a latency number and a cost number. **Latency asks "how long until I have my answer?" Cost asks "how much of the machine did I use to get it?"** They differ by exactly the factor $B$.
+</Callout>
+
+## Machine seconds become dollars
+
+A GPU rented by the hour is charged for every second it exists — busy, idle, or being debugged. So one second of an H100 at \$2.50/hour is:
+
+$$
+\frac{\$2.50}{3{,}600\ \text{seconds}} = \$0.000694\ \text{per second}
+$$
+
+Multiply your machine seconds by that, and you have the price of the request:
+
+$$
+\text{cost of one request} = \left(t_{pre} + \frac{n_{out}\, t_{step}}{B}\right) \times \frac{p}{3600}
+$$
+
+where $p$ is the hourly price in dollars. Divide by the tokens and multiply by a million:
+
+$$
+\text{\$/M output tokens} = \frac{\left(t_{pre} + \dfrac{n_{out}\, t_{step}}{B}\right)\times \dfrac{p}{3600}\times 10^6}{n_{out}}
+$$
+
+That is the number. Everything else in this lesson is about the two terms inside the parentheses and the fact that they are priced by **different limits**.
+
+<Scrolly>
+  <CostPerToken client:visible slot="stage" />
+
+  <Step title="1. A GPU rents by the second">
+    Start with the price of time. A card costs the same whether it is saturated or sitting at an idle prompt, so the only question that matters for cost is how many seconds of it you bought.
+
+    Switch to a \$0.35/hour T4 and every number on this screen gets about seven times cheaper. Same model, same code, same tokens — a different bill.
+  </Step>
+
+  <Step title="2. Prefill is your work alone">
+    The first term is prefill: one parallel pass over the prompt, compute-bound, and charged entirely to the request that sent it.
+
+    It is also, per token, the **cheapest thing the model does**. A token of prompt is priced on arithmetic, and arithmetic is what these chips are built for.
+  </Step>
+
+  <Step title="3. A decode step is shared work">
+    The second term is the one people forget. Every decode step serves the whole batch, so one request only owns $t_{step}/B$ of it.
+
+    This is why doubling concurrency does not merely double throughput — it **halves the cost of every output token already in flight**, because the same weights are now amortized across twice as many sequences.
+  </Step>
+
+  <Step title="4. The identity, complete">
+    Add the two terms: that is the machine time this one request consumed, and it is a quantity of *GPU*, not of wall-clock.
+
+    Note what is not in it. None of the time your GPU spent finishing somebody else's request. You are billed for your own share, and the batch did the sharing.
+  </Step>
+
+  <Step title="5. Multiply by price and you have a bill">
+    Machine seconds times dollars per second is dollars. Divide by tokens, scale to a million, and you have the number a finance conversation is actually about.
+
+    The readout shows both conventions — output-only and blended — and they differ by a large factor. Know which one you are quoting.
+  </Step>
+
+  <Step title="6. Two halves, two different prices">
+    Prefill is compute-bound, so it costs what you pay per unit of FLOP/s. Decode is memory-bound, so it costs what you pay per unit of bandwidth.
+
+    **These are not the same number on any GPU ever built**, which is why the price of a token is a property of your hardware's *price list*, not just its speed.
+  </Step>
+
+  <Step title="7. Your traffic decides which half dominates">
+    Slide the prompt and output lengths. A long prompt with a short answer stays compute-priced no matter how large the batch gets.
+
+    A one-line prompt with a long answer becomes bandwidth-priced immediately. Same model, same card — **a 5× difference in cost per output token**, decided entirely by the shape of your traffic.
+  </Step>
+
+  <Step title="8. When the model will not fit">
+    Sometimes neither regime applies, because the weights do not fit on one card. Then you pay for $k$ cards instead of one, and every step is slowed by the communication between them.
+
+    The cheapest system for a large model is usually not the fastest one. That is the subject of the next lesson.
+  </Step>
+</Scrolly>
+
+## Why output tokens cost so much more
+
+This is the single most useful thing to internalize, and it falls straight out of the identity. Compute dollars per million *prompt* tokens and dollars per million *output* tokens for the same configuration. The quotient is the <Term t="output-premium">output premium</Term>:
+
+| Tokens | \$/M prompt | \$/M output | Ratio |
+|---|---|---|---|
+| 512 in / 256 out | \$0.023 | \$0.20 | 8.5× |
+| 2,048 in / 64 out | \$0.021 | \$0.83 | 39× |
+| 8192 in / 256 out | \$0.021 | \$0.81 | 39× |
+
+*(Llama-3.1-8B on an H100, BF16, 64 concurrent streams, 2,048 tokens of context. Approximate — the shape is the point, the digits are illustrative.)*
+
+<Callout type="math" title="Worked: why a prompt token is so cheap">
+  Prefill of 512 tokens on an H100 takes about **17.1 ms** and is compute-bound:
+
+  $$
+  t_{pre} = \frac{2 \times 8.03\times 10^9 \times 512}{989\times 10^{12}\times 0.55} + 2\ \text{ms} \approx 17.1\ \text{ms}
+  $$
+
+  That is \$0.0000119 per request, or **\$0.023 per million prompt tokens**.
+
+  Now the same request generating 256 output tokens. The decode phase costs $n_{out} \times t_{step}/B$. With $t_{step} \approx 13.9$ ms at batch 64:
+
+  $$
+  \frac{256 \times 0.0139}{64} = 55.6\ \text{ms of decode}\ +\ 17.1\ \text{ms of prefill} = 72.7\ \text{ms}
+  $$
+
+  Spread over 256 output tokens that is **\$0.20 per million** — about **9× the prompt price**.
+
+  And notice the asymmetry that makes this a trap: the ratio is *not* constant. Give the same request a 2,048-token prompt and a 64-token answer, and the ratio jumps to 39×. **Cost per output token is not a property of the model; it is a property of the ratio between your prompt and your answer.**
+</Callout>
+
+<Callout type="pitfall" title="The blended number hides everything">
+  Vendors quote "per million tokens". A request with 512 prompt and 256 output tokens counts 768 tokens, and blends to about \$0.07 per million — cheaper than either headline. That is the <Term t="blended-token-price">blended token price</Term>, and it is true and nearly useless.
+
+  It lets you compute a total bill while telling you nothing about *where* the bill comes from, and therefore nothing about what to optimize. A product with 8,000-token prompts and 50-token answers has the opposite ratio, and the same blended number describes a completely different system.
+</Callout>
+
+## The ratio is the design lever
+
+Because the cost is set by the ratio, the two cheapest optimizations available to you are both about that ratio — and neither requires touching a kernel.
+
+**Shorten the prompt.** Every prompt token you delete removes a share of $t_{pre}$. It is compute time, so it is cheap per token, but a long prompt still dominates the request: at 8,192 prompt tokens, prefill is 81% of the machine time of a 256-token answer.
+
+**Cap the answer.** This is the higher-leverage one, because output tokens are priced ~9× higher than prompt tokens. A `max_tokens` cap is a direct, enforceable cost control, and it is the one most teams leave unset. Module 26 covers structured output and tool calling, both of which reduce generated tokens for the same useful result.
+
+<Callout type="real" title="Where the money actually goes">
+  In a typical chat product, generated tokens are a minority of the token count and an overwhelming majority of the bill — often 80% or more, because they are priced at a multiple and because users talk far more than they type.
+
+  If you are looking for a place to start, start there. Setting a sane `max_tokens`, and using <Term t="prefix-caching">prefix caching</Term> from Module 10 so a long system prompt is prefilled once rather than once per request, are both cheap engineering with immediate returns.
+</Callout>
+
+## Which limit sets the price
+
+The two terms have different denominators, and knowing which one dominates tells you which hardware question to ask.
+
+| Regime | When | Price set by | Batching helps? |
+|---|---|---|---|
+| <Term t="decode-priced">Decode-priced</Term> | Long answers, short prompts | Price per unit of **bandwidth** | Yes, a lot |
+| <Term t="prefill-priced">Prefill-priced</Term> | Long prompts, short answers | Price per unit of **FLOP/s** | Barely at all |
+| <Term t="memory-priced">Memory-priced</Term> | Weights exceed one card | Price per card, times how many | No — it multiplies cost |
+
+<Callout type="intuition" title="Why batching helps one and not the other">
+  Batching divides $t_{step}$ by $B$. It touches only the decode term. Prefill is one parallel pass over one request's prompt — adding other requests to the batch does not make their prefill cheaper, it just interleaves the work on a chip that was already fully busy.
+
+  So if your product is prefill-dominated, throughput per dollar comes from buying faster arithmetic. If it is decode-dominated, it comes from buying faster memory — and, more powerfully, from **fewer bytes**, which is what Module 11's quantization is for.
+</Callout>
+
+## The number that is not a number
+
+A cost figure computed for a configuration that would not actually run is not cheap. It is **fiction**, and it is the most common way a cost model misleads its owner.
+
+If Llama-3.1-70B in BF16 needs 141 GB of weights, no configuration of it on an 80 GB card is cheap, however good the arithmetic looks. The honest statement is "this does not fit; here is what does", and the visual's red hatched overlay is exactly that statement.
+
+<Callout type="pitfall" title="Three ways a cost model produces a fiction">
+  1. **Ignoring the memory edge.** You compute cost for a batch size and context length that would OOM. The number is real arithmetic about a machine that does not exist.
+  2. **Ignoring the cards.** A tensor-parallel deployment is billed $k$ times, and each step is slower from the collectives. A model priced as if it ran on one card is wrong by the factor $k$, plus.
+  3. **Ignoring the reserve.** Activations, the CUDA context and workspace need a few percent of memory before any weights do. Prices computed at exactly 100% memory utilization are prices of crashes.
+</Callout>
+
+<Callout type="recap" title="The sentence to remember">
+  **Cost per million tokens is machine seconds per request times the price of a second.** And machine seconds per request is $t_{pre} + n_{out}\, t_{step}/B$ — one term you own alone, one term you share with the batch.
+
+  Everything else in this module is that identity, applied carefully.
+</Callout>
+
+<KeyNotes>
+  1. The whole module reduces to **GPU-seconds per request = $t_{pre} + n_{out}\,t_{step}/B$**, multiplied by the price of a second. Prefill you own alone; a decode step is shared with the batch.
+  2. Latency and cost differ by exactly the batch size. Service time $t_{pre}+n_{out}t_{step}$ is what a user waits; machine time is what you are billed.
+  3. A rented GPU is billed for every second it exists. Idle time is not free capacity, it is paid-for capacity doing nothing.
+  4. An output token costs **several times a prompt token** — about 9× for a 512-in/256-out request on Llama-3.1-8B — because it is priced on the memory-bound step, not the compute-bound one.
+  5. That ratio is **not constant**. A long prompt with a short answer pushes it past 35×. Cost per output token is a property of your prompt-to-answer ratio, not of the model.
+  6. Prefill is priced per unit of FLOP/s and batching barely helps it; decode is priced per unit of bandwidth and batching helps enormously. Identify which regime your traffic is in before choosing hardware.
+  7. The cheapest levers are the ratio: **shorten prompts** (with prefix caching so shared context is prefilled once) and **cap generated tokens**. Neither needs a kernel change.
+  8. Never quote a cost for a configuration that would not fit, and never price a tensor-parallel deployment as one card. A cost model that ignores the memory edge produces fiction with a currency symbol on it.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A request consumes 17.1 ms of prefill and 55.6 ms of decode. It generates 256 output tokens. On an H100 at \$2.50/hour, approximately what does it cost per million output tokens?', numeric: true, answer: 0.21, tolerance: 0.04, unit: 'USD', why: 'Total machine time = 17.1 + 55.6 = 72.7 ms = 0.0727 s. At \$0.000694 per second that is \$0.0000505 per request. Over 256 output tokens, times 1e6: 0.0000505 × 1e6 / 256 ≈ \$0.197. Round to \$0.20.' },
+  { q: 'You double concurrency from 64 to 128 streams, holding everything else fixed. What happens to the cost per output token?', options: ['It roughly halves, because each request now owns half as much of every shared decode step', 'It is unchanged, because the step time does not change', 'It doubles, because the GPU is more expensive per second', 'It halves, because prefill is now also shared'], answer: 0, why: 'The decode term is n_out × t_step / B. Raising B from 64 to 128 halves that term directly. Prefill is not shared at all — it was never amortized — so the halving is not exactly 2×, but it is the single largest lever in the identity.' },
+  { q: 'A model needs 141 GB of weights. You compute a cost per token on an 80 GB card. What is wrong with that number?', options: ['Nothing — arithmetic is arithmetic', 'It is cheap because 141 GB > 80 GB', 'It describes a configuration that would OOM, so it is fiction rather than a cheap service', 'It is correct but should be reported per request'], answer: 2, why: 'The arithmetic is fine and the machine does not exist. The cheapest possible correct answer is about a configuration that fits: one card with fewer bits, or several cards with the bill and the collective cost of both.' },
+  { q: 'At \$0.35 per hour, what is the price of one second of GPU time, in dollars?', numeric: true, answer: 0.0000972, tolerance: 0.00002, unit: 'USD', why: '0.35 / 3600 = \$0.0000972 per second. Multiply your machine seconds by this to get the price of a request — and note it is about seven times cheaper than an H100 second at \$2.50/hour.' },
+  { q: 'Your traffic is 8,000-token prompts with 100-token answers. Which regime sets your price, and which hardware property should you optimize for?', options: ['Decode-priced — optimize bandwidth', 'Prefill-priced — optimize FLOP/s, since batching will not help prefill', 'Memory-priced — buy more cards', 'Neither — the price is set by the model alone'], answer: 1, why: 'With a long prompt and a short answer, prefill dominates the machine time. Prefill is compute-bound and belongs to one request alone, so adding concurrency does not amortize it. You are buying arithmetic: price per unit of FLOP/s is the number to compare.' },
+  { q: 'Why is a blended "per million tokens" figure nearly useless for deciding what to optimize?', options: ['Because blended figures are always wrong', 'Because it hides the prompt-to-output ratio, which is what decides whether you are paying the bandwidth price or the compute price', 'Because vendors round them badly', 'Because it only works for output tokens'], answer: 1, why: 'A blended number divides by prompt + output together, so two products with completely different cost structures can report the same blended price. Since the ratio is the biggest cost lever you have, hiding it hides the decision.' },
+]} />

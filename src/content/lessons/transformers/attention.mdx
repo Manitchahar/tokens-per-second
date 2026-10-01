@@ -1,0 +1,240 @@
+﻿---
+title: 'Attention from scratch: Q, K and V'
+summary: 'The mechanism the whole architecture is named after, built in six steps: project, score, scale, mask, softmax, mix. Every number is small enough to check by hand, and every step is a place an inference engineer later has to optimise.'
+objectives:
+  - Write out the full attention equation and name each of its six parts
+  - Compute a dot product, a scaled score and a softmax share by hand
+  - Explain the 1/√d scaling and what happens to the softmax without it
+  - Explain the causal mask and why it is applied before the softmax
+  - Compute the FLOPs and bytes of attention for a given context length
+---
+import AttentionViz from '@/components/viz/transformers/AttentionViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is the equation that made transformers work, and the equation every serving engine spends most of its attention modules executing:
+
+$$
+\mathrm{Attention}(Q, K, V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d}} + M\right) V
+$$
+
+That is the entire mechanism. It has no learned parameters of its own beyond the three projections that produce $Q$, $K$ and $V$, and it can be understood completely in about ten minutes of arithmetic. This lesson does that arithmetic, token by token.
+
+## The idea in one sentence
+
+**Each token asks a question, every token answers with a description of itself, and every token offers a contribution.** The attention step works out how well each answer matches the question, turns those matches into shares that sum to 1, and returns the share-weighted average of the contributions.
+
+That is a **soft lookup**. A hard lookup would be: find the one entry whose key matches and return its value. Attention does the same thing but returns a blend of every entry, weighted by similarity — and crucially, the query, key and value for one token all live in the *same* place, so a token's contribution to every later token is available without any index.
+
+## Step 1: three projections
+
+Take a token's hidden vector $\mathbf{x} \in \mathbb{R}^{4096}$ and multiply it by three learned matrices:
+
+$$
+\mathbf{q} = W_Q \mathbf{x}, \qquad \mathbf{k} = W_K \mathbf{x}, \qquad \mathbf{v} = W_V \mathbf{x}
+$$
+
+| | Llama-3.1-8B shape | Parameters | Bytes in BF16 |
+|---|---|---|---|
+| $W_Q$ | 4096 × 4096 | 16.78 M | 33.6 MB |
+| $W_K$ | **4096 × 1024** | 4.19 M | 8.4 MB |
+| $W_V$ | **4096 × 1024** | 4.19 M | 8.4 MB |
+| $W_O$ (output) | 4096 × 4096 | 16.78 M | 33.6 MB |
+
+$K$ and $V$ are narrower because Llama-3.1-8B has 8 key/value heads against 32 query heads — the subject of the next lesson. For this lesson, treat each head as a vector of $d_{\text{head}} = 128$ numbers, and use 4 numbers so you can see everything.
+
+## Step 2: score, by dot product
+
+For the query token, dot its query with **every** key, including its own:
+
+$$
+\text{score}_j = \mathbf{q} \cdot \mathbf{k}_j
+$$
+
+Using the visual's numbers, with query $\mathbf{q} = [0.9,\ 0.2,\ -0.2,\ 1.3]$:
+
+$$
+[2.14,\ 0.40,\ -1.12,\ 2.59]
+$$
+
+One dot product per earlier token. All of them at once is a single matrix multiply, $QK^\top$, and that is why attention is fast on a GPU.
+
+<Callout type="intuition" title="Why a dot product is the right question">
+  You used this in Module 01: $q \cdot k = |q|\,|k|\cos\theta$. If the query and a key point the same way the score is large; if they are unrelated it is near zero. Learned keys are free to arrange themselves so that "points the same way" means "is relevant to". Nobody hand-designed this; it is what a dot product already measures.
+</Callout>
+
+## Step 3: divide by √d, or the softmax breaks
+
+Here is a real failure, not a scare story. A dot product over $d$ numbers grows roughly like $\sqrt{d}$ in typical magnitude. At $d_{\text{head}} = 128$, scores routinely land in the range ±20. A softmax over scores of ±20 is arithmetically fine and *practically* dead:
+
+$$
+e^{20} \approx 4.9 \times 10^8, \qquad e^{-20} \approx 2.1 \times 10^{-9}
+$$
+
+so one key takes 100.000% of the attention and every other key gets a share so small that its gradient underflows to zero in BF16. The mechanism cannot learn — it can only pick the current best match.
+
+Dividing by $\sqrt{d}$ fixes it. It is a **fixed temperature**:
+
+$$
+\sqrt{4} = 2, \qquad \sqrt{128} = 11.31
+$$
+
+**Measure it yourself in the visual.** Drag the divisor and watch the entropy readout. At ÷1 the shares are 35.9%, 6.3%, 1.4%, 56.4% — nearly one-hot, entropy 1.33 bits. At ÷2 they are 34.9%, 14.6%, 6.8%, 43.7%, entropy 1.72 bits. At ÷11.3, the real 128-wide value, the distribution flattens toward uniform: entropy 1.98 of a possible 2.00. Sharp enough to be selective, soft enough to learn from.
+
+## Step 4: the causal mask
+
+An <Term t="autoregressive">autoregressive</Term> model generates left to right. Token 5 cannot look at token 6, because when token 6 was generated nobody knew what it would be. So before the softmax you add a mask:
+
+$$
+M_{ij} = \begin{cases} 0 & j \le i \\ -\infty & j > i \end{cases}
+$$
+
+Minus infinity, not zero. If you added zero the masked positions would get score 0, become $e^0 = 1$, and steal attention. With $-\infty$, $e^{-\infty} = 0$ exactly, and after normalising the remaining shares are correct for the shortened prefix.
+
+<Callout type="pitfall" title="Half the matrix is thrown away">
+  Under a causal mask only the lower triangle of $QK^\top$ is ever computed. A full $T \times T$ score matrix for 8,192 tokens is 67 million numbers; a causal kernel computes about half. Every efficient attention kernel in production exploits this, and it is why attention FLOPs are usually quoted with that factor of two already applied.
+</Callout>
+
+## Step 5: softmax, and Step 6: mix
+
+Softmax turns the scaled, masked scores into shares that sum to 1. Then take the weighted average of the value vectors:
+
+$$
+\mathrm{output} = \sum_j p_j \mathbf{v}_j
+$$
+
+With shares $[0.349,\ 0.146,\ 0.068,\ 0.437]$ and values
+
+$$
+\begin{bmatrix} 1.0 & -1.0 & 0.5 & 0.0 \\ 0.5 & -0.5 & 1.0 & 0.5 \\ -1.0 & 0.0 & 0.5 & 1.0 \\ 0.0 & 0.5 & -0.5 & 1.0 \end{bmatrix}
+$$
+
+you get
+
+$$
+[0.354,\ -0.204,\ 0.136,\ 0.578]
+$$
+
+which is the head's output: four numbers that get concatenated with the other 31 heads and written back into the residual stream.
+
+<Scrolly>
+  <AttentionViz client:visible slot="stage" />
+
+  <Step title="1. Three questions, one per token">
+    Every token produces a **query** (what am I looking for?), a **key** (what do I contain?) and a **value** (what do I hand over if chosen?). Three vectors per token, per layer. Drag the query slider later to ask each token in turn.
+  </Step>
+
+  <Step title="2. Project: Q, K and V">
+    These are not the token's embedding — they are linear projections of it. `q = Wq·x`, `k = Wk·x`, `v = Wv·x`. Three matrices per layer, added in 03.1's count. **RoPE then rotates Q and K, never V.**
+  </Step>
+
+  <Step title="3. Compare the query with every key">
+    One dot product per token pair. The query asks one question; every key answers. On the visual's numbers the raw scores are 2.14, 0.40, −1.12 and 2.59 — computed right in front of you.
+  </Step>
+
+  <Step title="4. Why divide by √d">
+    Dot products over 128 terms grow large, and softmax over large scores goes one-hot: one key takes everything and every other gradient underflows. Drag the divisor to √128 = 11.3, the real value, and watch the entropy climb.
+  </Step>
+
+  <Step title="5. Softmax turns scores into shares">
+    Exponentiate, subtract the max for safety, divide by the total. Four shares that sum to exactly 1: **34.9%, 14.6%, 6.8%, 43.7%**. The token attends mostly to itself and to "France".
+  </Step>
+
+  <Step title="6. The causal mask">
+    Everything to the right of the query is set to −∞ *before* the softmax, so those keys get exactly zero share and the rest renormalise. Slide the query left and watch the shares recompute over a shorter prefix.
+  </Step>
+
+  <Step title="7. Mix the values">
+    Weight each value vector by its share and add them up: [0.354, −0.204, 0.136, 0.578]. Four numbers in, four numbers out — the head's contribution to the residual stream.
+  </Step>
+
+  <Step title="8. One head, done">
+    Project → score → scale → mask → softmax → mix. **32 heads per layer, 32 layers deep.** The next lesson is why there are 32 heads at all, and why there are only 8 key heads.
+  </Step>
+</Scrolly>
+
+## What attention costs
+
+This is where it becomes an inference problem. Count the work per layer:
+
+- **$QK^\top$**: $F_{QK} = 2\,T^2 d_{\text{model}}$ FLOPs for a full $T \times T$ matrix (about half that under the causal mask)
+- **$PV$**: the same again
+- **Weights**: $W_Q, W_K, W_V, W_O$ = 41.94 M parameters = **83.9 MB in BF16**, read once per layer per decode step
+
+So per layer, attention is $F_{\text{decode}} = 4\,T\,d_{\text{model}}$ FLOPs for a single query token against a context of $T$, and $F_{\text{prefill}} = 2\,T^2 d_{\text{model}}$ FLOPs to process a whole prompt of $T$ tokens at once. For Llama-3.1-8B ($d_{\text{model}} = 4096$, $L = 32$):
+
+| Phase | Tokens | Attention FLOPs | Weight bytes |
+|---|---|---|---|
+| Decode, 1 token | $T = 1{,}000$ | 5.2 G | 83.9 MB/layer |
+| Decode, 1 token | $T = 8{,}192$ | **43.0 G** | 83.9 MB/layer |
+| Prefill, $T = 8{,}192$ | | **5.5 T** | 2.68 GB |
+| Prefill, $T = 32{,}768$ | | **88.0 T** | 2.68 GB |
+
+Two things fall out of that table.
+
+**The weight reads are constant.** 83.9 MB per layer, whether you are processing one token or eight thousand. Attention is a <Term t="memory-bound">memory-bound</Term> operation during decode for exactly the reason a GEMM is.
+
+**The compute grows quadratically in context.** At 8,192 tokens a prefill spends 5.5 TFLOP inside attention; at 32,768 it spends 88 TFLOP. Set it against the linear layers' $F_{\text{lin}} = 2\,T\,P$ and you get the crossover:
+
+$$
+2 T^2 d L = 2 T P_{\text{layer}} \quad\Longrightarrow\quad T = \frac{P_{\text{layer}}}{d \cdot L} = \frac{6.979\times 10^9}{4096 \times 32} \approx 53{,}000 \text{ tokens}
+$$
+
+**Below about 53,000 tokens of context, attention costs less FLOPs than the weights do. Above it, attention dominates.** Llama-3.1-8B's advertised context is 128,000 — comfortably past the point where attention is the expensive part. This single derived number explains why long context is hard, and it is the hinge of Module 20.
+
+<Callout type="math" title="The attention KV cache, previewed">
+  For every earlier token you must keep its key and its value. For Llama-3.1-8B that is, per token:
+
+  $$
+  2 \times 32 \text{ layers} \times 8 \text{ KV heads} \times 128 \times 2 \text{ bytes} = 131{,}072 \text{ bytes}
+  $$
+
+  **128 KiB per token, per sequence.** Attention is the only reason you have to remember anything at all, and that memory is the <Term t="kv-cache">KV cache</Term>. Module 05 exists to make it cheap.
+</Callout>
+
+## In code
+
+The whole thing, twenty lines, no libraries:
+
+```python
+import torch, math
+
+def attention(q, k, v, causal=True):
+    """q: [T, d]  k, v: [C, d]  ->  [T, d]"""
+    d = q.shape[-1]
+    scores = (q @ k.T) / math.sqrt(d)                 # 1. score, scaled
+    if causal:
+        T, C = scores.shape
+        scores = scores.masked_fill(torch.triu(torch.ones(T, C, bool), 1), float("-inf"))   # 2. mask
+    p = scores.softmax(dim=-1)                        # 3. shares summing to 1
+    return p @ v                                      # 4. weighted average
+```
+
+PyTorch's fused `scaled_dot_product_attention` does the same thing, and at the time of writing also picks a memory-efficient backend for long sequences — Module 14 is entirely about what those backends do and when you should force one.
+
+<Callout type="try" title="Check your arithmetic against a real head">
+  In the module notebook, load a small model, hook one attention layer, and print its score matrix for a short prompt. Confirm three things by hand: (1) the mask makes everything above the diagonal exactly zero after the softmax; (2) each row of the probability matrix sums to 1; (3) the largest share is usually on the token itself or on a related word. Getting all three true on a real model is the moment attention stops being a diagram.
+</Callout>
+
+<Callout type="real" title="Where inference engineers actually spend their time on attention">
+  Not on the equation. The equation is fixed by the model file. They spend it on three things: **which kernel** runs it (FlashAttention avoids materialising the $T \times T$ matrix at all — Module 14), **where the KV cache lives** (paged, so long sequences do not fragment — Module 08), and **how the mask is applied** (by subtracting a large number, or with $-\infty$, and whether the masked half is skipped). All three are memory problems. The maths is never the problem.
+</Callout>
+
+<KeyNotes>
+  1. Attention is $\mathrm{softmax}(QK^\top/\sqrt{d} + M)V$: **project, score, scale, mask, softmax, mix**. Six steps, no mystery.
+  2. $Q$, $K$, $V$ are three learned projections of the same hidden vector. RoPE rotates $Q$ and $K$ but never $V$.
+  3. The score is a dot product, so it is large when a query and a key point the same way. In Llama-3.1-8B, $W_Q$ and $W_O$ are 4096 × 4096 but $W_K$ and $W_V$ are 4096 × **1024** — 8 KV heads, not 32.
+  4. **Divide scores by $\sqrt{d_{\text{head}}}$**: 11.31 at d = 128. Without it the softmax goes one-hot, other keys' gradients underflow in BF16, and the mechanism cannot learn.
+  5. The **causal mask adds $-\infty$**, not 0, before the softmax, so future keys get exactly zero share. Zero would give them $e^0 = 1$ and steal attention.
+  6. Attention costs $F = 4\,T\,d_{\text{model}}$ FLOPs per layer per decode step and $F_{\text{pre}} = 2\,T^2 d_{\text{model}}$ per layer for a whole prompt. Its weight reads are constant: 83.9 MB per layer.
+  7. Attention overtakes the weights at $T = P_{\text{layer}}/(d \cdot L) \approx 53{,}000$ tokens for Llama-3.1-8B. Below that, long context is a memory problem; above it, a compute problem.
+  8. Keeping K and V for every earlier token costs $B_{KV} = 2\,L\,n_{kv}\,d_h \times 2$ bytes per token — **128 KiB/token** for Llama-3.1-8B. That is the KV cache.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'For the visual’s query q = [0.9, 0.2, −0.2, 1.3] and key k = [1.1, 0.1, −0.1, 1.2], what is q · k?', numeric: true, answer: 2.59, tolerance: 0.02, why: '0.9×1.1 + 0.2×0.1 + (−0.2)(−0.1) + 1.3×1.2 = 0.99 + 0.02 + 0.02 + 1.56 = 2.59.' },
+  { q: 'Attention scores for a real head are divided by √d_head. At d_head = 128, about what is that divisor?', numeric: true, answer: 11.31, tolerance: 0.2, unit: 'FLOP-free', why: '√128 = 11.3137. It is a fixed softmax temperature: without it the scores are too large, softmax goes one-hot, and other keys get zero gradient.' },
+  { q: 'Why does the causal mask use minus infinity rather than zero?', options: ['It is faster on the GPU', 'Because e^(−∞) = 0, so future keys get exactly zero share, whereas a 0 would give them e^0 = 1 and steal attention', 'Because zero is not a valid number in BF16', 'Because softmax cannot handle zeros'], answer: 1, why: 'Masked positions are removed by making their exponential zero. Adding 0 would leave them competing on equal footing with a real score of 0.' },
+  { q: 'Llama-3.1-8B: attention costs 4·T·d_model FLOPs per layer for one decode step. At T = 8,192, how many FLOPs, in GFLOPs, for all 32 layers?', numeric: true, answer: 43, tolerance: 2, unit: 'GFLOP', why: '4 × 8,192 × 4,096 = 134.2 MFLOP per layer, × 32 layers = 4.29 GFLOP ≈ 43 GFLOP. Small against 15 GFLOP of dense weights per token — attention is not the bottleneck at this length.' },
+  { q: 'At roughly what context length does attention overtake the weight matrices in FLOPs for Llama-3.1-8B?', options: ['~500 tokens', '~5,300 tokens', '~53,000 tokens', '~530,000 tokens'], answer: 2, why: 'Set 2T²·d·L = 2·T·P_layer, so T = P_layer/(d·L) = 6.979e9/(4096 × 32) ≈ 53,200 tokens. Below that attention is cheaper than the weights; above it, attention dominates.' },
+  { q: 'How many bytes of KV cache does one token occupy in Llama-3.1-8B, in KiB?', numeric: true, answer: 128, tolerance: 2, unit: 'KiB', why: '2 (K and V) × 32 layers × 8 KV heads × 128 head_dim × 2 bytes = 131,072 bytes = 128 KiB per token per sequence.' },
+] } />

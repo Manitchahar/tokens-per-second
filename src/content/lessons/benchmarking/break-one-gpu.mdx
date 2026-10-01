@@ -1,0 +1,183 @@
+---
+title: 'Break one GPU: sweeps & the operating envelope'
+summary: 'Stop measuring single points and map a whole surface: concurrency against context, against memory, against the SLO. The region that survives is your operating envelope — and everything outside it is a failure you should find on purpose.'
+objectives:
+  - Turn a one-point benchmark into a multi-dimensional sweep'
+  - Choose which two axes matter for your workload and why'
+  - Read a sweep as a set of distributions, not a set of scalars'
+  - Define an operating envelope and find its boundary empirically'
+  - Deliberately break a system to learn how it fails, and turn that into a guardrail'
+---
+
+import OperatingEnvelope from '@/components/viz/benchmarking/OperatingEnvelope.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You now have the vocabulary: the metrics, the distributions, the promises, the goodput. What you do not yet have is a **map**.
+
+A single benchmark is a pin on a map. It tells you that one configuration, at one moment, hit one number. It does not tell you which of the four hundred configurations you might have run would have been better, or which ones would have crashed.
+
+This lesson is about replacing pins with a surface — and about finding out where the surface ends.
+
+## Why one axis is never enough
+
+Almost every number depends on more than one input. Throughput depends on concurrency *and* context length. Memory depends on concurrency *and* context length. Latency depends on concurrency *and* output length.
+
+Measure one axis and you get a slice that is only meaningful at the context length you happened to choose. This is the most common way a benchmark ends up describing a system that does not exist.
+
+| If your workload has... | Then you must sweep... | Because... |
+|---|---|---|
+| Variable prompt lengths | context length | prefill cost and KV memory both scale with it |
+| Many concurrent users | concurrency / batch | the whole latency–throughput trade-off lives here |
+| Long-running conversations | output length | E2E scales linearly; KV memory grows with it |
+| Mixed traffic (chat + long docs) | all three | the mixture is the workload; each case has its own limit |
+
+<Callout type="pitfall" title="The sweep you skipped">
+  A common and expensive mistake: benchmark at context 512, tune concurrency to the knee, ship — and discover that at context 8,192 the KV cache OOMs at a quarter of that concurrency.
+
+  Context is not a minor parameter. It moves memory by more than an order of magnitude across a realistic range, and it moves it *per request*. **Always sweep the axis your users control.**
+</Callout>
+
+## How to run a sweep that means something
+
+A sweep is many runs, so it is much easier to get wrong. The rules:
+
+1. **One variable family per axis.** Sweep concurrency at fixed context, then context at fixed concurrency, then both if you can afford it. Do not let an unrelated knob drift.
+2. **Warm up per cell**, not once for the whole sweep. Cells with different shapes compile different kernels and allocate different memory pools.
+3. **Repeat every cell.** At minimum three repeats per cell, and report the median per cell plus the worst cell's p95. A sweep of 30 cells with one repeat each is 30 anecdotes.
+4. **Interleave across the sweep** if you are comparing two configurations, so thermal drift does not bias the whole second half.
+5. **Record failures as data.** An OOM at batch 256, context 8k is not a crashed benchmark — it is a cell in your map, and a very informative one.
+
+<Callout type="math" title="Sizing a sweep">
+  Sweep cost is roughly: $\text{cells} \times (\text{warm-up} + \text{repeats}) \times t_{\text{request}}$.
+
+  With 6 concurrency values × 5 context values = 30 cells, 5 warm-ups and 3 repeats at ~2 s per request, that is $\text{cells} \times 8 \times 2 = 480$ s — under ten minutes. **There is no excuse for not sweeping.** A serious sweep of your production configuration is a coffee break, not a project.
+
+  Scale it if the requests are longer or the counts higher, but the same arithmetic tells you whether it is feasible before you start.
+</Callout>
+
+## Reading a sweep
+
+The output is a grid: one cell per measurement, coloured by whatever you care about. The shape to look for is a **boundary**.
+
+<Scrolly>
+  <OperatingEnvelope client:visible slot="stage" />
+
+  <Step title="1. Start from one cell">
+    Every measurement begins as a single point: this concurrency, this context length, this number.
+
+    The row labels down the side are batch size. The column labels across the top are context length. Each square is one fully specified run.
+  </Step>
+
+  <Step title="2. Sweep concurrency">
+    Hold context fixed and walk down the rows. Throughput climbs steeply at first — Module 00's four numbers — and then flattens as KV traffic catches up with the weight read.
+
+    Along the way, two things fail. Per-user speed falls the whole way down. And memory fills up, because every row below adds more sequences' worth of KV cache.
+  </Step>
+
+  <Step title="3. Add the context axis">
+    Now sweep context too, and the picture changes shape entirely. At 512 tokens you might reach batch 256. At 8k, the same batch is an OOM.
+
+    This is why a one-dimensional sweep misleads: the safe concurrency at long context is not a slightly lower number, it is a different region.
+  </Step>
+
+  <Step title="4. The grid is the real artifact">
+    Every cell here is a real run: warmed up, repeated, medianed. The colour encodes throughput; red hatched cells are out of memory.
+
+    Note what the grid gives you that a curve never could: the *shape* of the safe space, and the exact location of every cliff.
+  </Step>
+
+  <Step title="5. Read the cells, not just the colours">
+    Each cell is a small distribution, not a scalar. The number in a cell is its median.
+
+    When you are choosing an operating point, look for cells that are safe *and* comfortable — not the cell with the highest median, but a cell whose whole distribution clears your SLO. A cell sitting right on the latency edge will fail on a bad afternoon.
+  </Step>
+
+  <Step title="6. The safe region">
+    The dashed outline is the **safe region**: every cell that both fits in memory and meets the latency objective. Inside it, the service holds its promise.
+
+    Everything you would ever ship runs somewhere in this region. The question is where inside it, which is a goodput question, not a speed question.
+  </Step>
+
+  <Step title="7. The envelope is the boundary">
+    The edge of the safe region is the **operating envelope** — the set of conditions under which your configuration behaves as promised.
+
+    It is not a property of the GPU. It is a property of the GPU *plus the model, plus the quantization, plus the engine version, plus your context and concurrency assumptions*. Change any one of those and you must re-sweep.
+  </Step>
+
+  <Step title="8. Break it on purpose">
+    Go past the boundary. Find out what failure looks like: a clean OOM, a hang, a silent slowdown, a corrupted result.
+
+    Then put a guardrail in front of it — a concurrency cap, a context-length limit, an admission check — so that a future user with a 200k-token prompt gets a clear error instead of taking the service down for everyone else.
+  </Step>
+</Scrolly>
+
+## What failure looks like
+
+An envelope has more than one edge, and they fail in different ways. Know which one you are near:
+
+| Edge | Symptom | Cause | Guardrail |
+|---|---|---|---|
+| **Memory** | OOM, engine refuses to start a request | KV cache + weights exceed GPU memory | Cap concurrency and total KV blocks; set `gpu_memory_utilization` below 1.0 |
+| **Latency** | TPOT climbs, queue grows, p99 explodes | too many requests sharing one step | Cap concurrency; scale out on p95 |
+| **Compute** | prefill stalls decode, TTFT spikes | one long prompt monopolizes the step | Token budgets and chunked prefill (Module 10) |
+| **Prefix** | one user’s cache evicts another’s mid-stream | shared cache under pressure | Refuse new prefixes, or isolate the tenant (Module 10) |
+
+<Callout type="intuition" title="Find the failures you cannot see">
+  The dangerous edge is not OOM — it fails loudly and immediately. It is the **latency** edge, which fails quietly: the service keeps answering, just slowly, and slowly is fine until it is not.
+
+  Sweep deliberately into each edge and watch *which* fails first at your chosen concurrency. That ordering is your real risk profile, and it should determine where you put your monitoring and your limits.
+</Callout>
+
+## The envelope as a living document
+
+The operating envelope is not a result you compute once. It is a document you maintain, and the discipline is knowing when it is stale:
+
+**Re-sweep when any of these change:**
+- the model, or its revision (fine-tunes change the weight shape);
+- quantization (Module 11) — fewer bytes per weight shifts the memory edge substantially;
+- the GPU or its count (Module 18);
+- the engine version or its scheduling defaults (Module 09);
+- your context or concurrency limits;
+- the traffic mix itself, if prompt or output lengths drift.
+
+<Callout type="real" title="What this looks like in a mature setup">
+  At the time of writing, production inference setups keep something like an envelope matrix as a runbook artifact: a table of safe operating points per (model, GPU, quantization) with the measured p95/p99 and the memory headroom, checked in alongside the deployment config, and re-generated when a dependency bumps.
+
+  The value is not the table itself. It is that when something goes wrong at 3 a.m., the first question — "were we inside the envelope?" — has a documented answer.
+</Callout>
+
+## The method, condensed
+
+<Callout type="recap" title="How to break one GPU properly">
+  1. **Fix the workload** (Module 06.3): real prompt and output length distributions, pinned seed, real tokenizer.
+  2. **Sweep the two axes your users control** — concurrency and context — with everything else held constant.
+  3. **Warm up and repeat every cell.** Record median, p95 and p99 per cell, plus memory used.
+  4. **Overlay your SLO.** Cells that fail it are not candidates, however fast they are.
+  5. **Draw the safe region.** That is your envelope.
+  6. **Maximize goodput inside it**, not throughput. That is your operating point.
+  7. **Step past each edge deliberately** and record how it fails.
+  8. **Put a guardrail on each edge** — a limit, not a hope.
+  9. **Re-sweep on every change** to model, precision, hardware or engine.
+</Callout>
+
+The next and final piece is the project: build this as a harness you can run again, which is the only way any of it stays true.
+
+<KeyNotes>
+  1. A benchmark at one point is a pin, not a map. Every metric depends on at least two inputs — **concurrency and context** are the two that matter most.
+  2. Sweep the axes your **users control**. Context length moves KV memory by more than 10× across a realistic range and is the most-skipped axis.
+  3. **Warm up and repeat every cell.** A sweep of single-shot cells is thirty anecdotes, not a surface.
+  4. Estimate sweep cost before starting: 30 cells × 8 runs × 2 s is under ten minutes. A real sweep is cheap; not doing one is not.
+  5. Read each cell as a **distribution**: median for ranking, tail for safety. Do not pick an operating point that only just clears the SLO.
+  6. The **safe region** is the cells that fit in memory and meet the SLO; its boundary is the **operating envelope**, which belongs to the whole configuration — model, precision, GPU, engine version — not to the GPU. Re-sweep when any of them change.
+  7. Sweep deliberately **into each edge** to learn how it fails: memory fails loudly, latency fails quietly, and quiet is more dangerous.
+  8. Convert every edge into a **guardrail**: a concurrency cap, a context limit, an admission check — limits, not hopes.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why must you sweep context length and not just concurrency?', options: ['Because GPUs throttle at high batch', 'Because context sets both prefill cost and KV cache size per request, so it changes which concurrency values are affordable', 'Because context length affects the tokenizer speed', 'Because concurrency cannot be measured without context'], answer: 1, why: 'KV cache per request grows linearly with total context. A concurrency that is safe at 512 tokens can be an OOM at 8k. The safe region is genuinely two-dimensional.' },
+  { q: 'You sweep 6 concurrency values × 5 context values with 5 warm-ups and 3 repeats per cell. At 2 s per request, how long does the sweep take, in seconds?', numeric: true, answer: 480, tolerance: 20, unit: 's', why: '30 cells × 8 runs × 2 s = 480 s. Under ten minutes — which is why a real sweep is affordable and skipping one is not.' },
+  { q: 'The most dangerous edge of the operating envelope is the one where latency degrades rather than the one where memory fails. Why?', options: ['Latency failures cost more to fix', 'Because latency failure is quiet — the service keeps answering, just slowly — while OOM fails loudly and immediately', 'Because memory errors corrupt results', 'Because GPUs handle memory errors gracefully'], answer: 1, why: 'OOM is loud: you get an error immediately and nothing is served incorrectly. Slow responses are served, look "working", and quietly cost you users. That is why you monitor latency and enforce limits, not just errors.' },
+  { q: 'You quantize a model from BF16 to 4-bit. What must you do to your operating envelope?', options: ['Nothing, quantization only affects quality', 'Re-sweep it, because fewer bytes per weight shifts the memory edge and can change your safe concurrency', 'Halve it, because everything is 4× faster', 'Move it to a smaller GPU'], answer: 1, why: 'Quantization changes the bytes-per-weight term in the memory model, so the OOM boundary moves — often allowing much higher concurrency. It does not change everything by 4×, and it certainly is not free of other effects.' },
+  { q: 'In a sweep, which cell should you choose as an operating point?', options: ['The cell with the highest median throughput', 'A cell inside the safe region with good median goodput and tail percentiles comfortably inside the SLO', 'The largest cell that does not OOM', 'The smallest cell, since small is always safer'], answer: 1, why: 'You want the best goodput with margin. A cell at the very edge of the latency objective will breach it the first time the GPU is busy. Choose a cell that clears the SLO with headroom.' },
+  { q: 'At 8,192 tokens of context, each request’s KV cache for Llama-3.1-8B in BF16 is about 1.05 GB. How many such requests fit in the ~64 GB of memory left after the 16 GB of weights on an 80 GB H100?', numeric: true, answer: 61, tolerance: 5, unit: 'requests', why: '64 ÷ 1.05 ≈ 61 requests. At 512 tokens the same calculation allows about 970. That is a 16× swing driven entirely by one user-controlled parameter — and it is exactly why context must be swept.' },
+]} />

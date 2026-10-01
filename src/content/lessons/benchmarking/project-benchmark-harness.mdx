@@ -1,0 +1,200 @@
+---
+title: 'Project: Build your benchmark harness'
+summary: 'Build the tool that makes every other claim in this course checkable. A real harness that measures TTFT, TPOT, ITL and percentiles on a live model, sweeps concurrency and context, and hands you an operating envelope and a goodput number.'
+objectives:
+  - Build a measurement harness that reports latency distributions rather than single numbers
+  - Sweep concurrency and context against a pinned, seeded workload'
+  - Compute goodput against your own written SLO and find your operating point'
+  - Deliberately find the memory edge and write a guardrail below it'
+  - Emit a machine-readable report another engineer can reproduce'
+colab: 06-benchmark.ipynb
+---
+
+You have spent six lessons learning what to measure. This project is the payoff: you build the instrument.
+
+The deliverable is a harness — a program plus a report — that you run on a real model, on real hardware, and that produces numbers you would be willing to put your name on. It is deliberately built so that when it finishes, someone else could take your report and check every claim in it.
+
+<Colab nb="06-benchmark.ipynb" />
+
+## What you are building
+
+A benchmark harness has four parts, and each maps to one of the lessons you just finished:
+
+| Part | What it does | Lesson it comes from |
+|---|---|---|
+| **Instrument** | Times each request correctly: TTFT, per-token ITL, TPOT, E2E, from a client-side clock, on a streamed response | *TTFT, TPOT, ITL* |
+| **Workload** | A seeded, length-distributed set of prompts, pinned so two runs measure the same thing | *Workloads & reproducibility* |
+| **Sweep** | Concurrency and context axes, warmed up and repeated per cell, summarised as medians and percentiles | *Break one GPU* |
+| **Verdict** | Goodput against your SLO, an operating point, a located memory edge, a written guardrail | *SLOs & goodput* |
+
+The notebook walks you through building all four. You are expected to **extend it**, not just run it.
+
+## The deliverable
+
+One repository-quality artifact containing:
+
+1. **`harness.py`** — the measurement code. Streaming timing, seeded workload, warm-up, percentile summaries, a sweep driver, and a JSON report writer.
+2. **`report.json`** — every configuration measured, every metric, plus the full config needed to reproduce it.
+3. **`REPORT.md`** — a one-page write-up: your SLO, your operating point, your envelope table, and the one graph you would show a stakeholder.
+4. **`GUARDRAILS.md`** — the limits you chose, each with the measurement that justifies it and the failure it prevents.
+
+<Callout type="real" title="What makes a benchmark credible">
+  A number without provenance is a rumour. Your report is credible because a reader can answer these five questions from it alone:
+
+  - **What** was measured — model, revision, quantization, dtype, engine flags.
+  - **On what** — GPU model, memory, driver and library versions.
+  - **Doing what** — the workload file, or the seed and generator that produced it.
+  - **How well controlled** — warm-up count, repeats per cell, whether clocks were locked.
+  - **With what result** — medians and percentiles, never a bare mean.
+
+  A harness that answers those five is a tool. A script that prints a number is not.
+</Callout>
+
+## Step 1 · The instrument
+
+Start with timing, because every other number depends on it. The notebook gives you a working streaming collector; your job is to make it **correct and defensive**.
+
+**Requirements:**
+- TTFT measured from before generation starts to the arrival of the first token.
+- **Every** ITL recorded individually, not just the mean.
+- E2E measured to the last token.
+- Token counts from the model's own tokenizer.
+- A minimum token count guard: a response with one token has no meaningful TPOT, so record it but mark it.
+
+```python
+# the shape your collector must have
+{
+    "ttft_s": float,
+    "itls_s": [float, ...],     # one per gap, never pre-averaged
+    "tpot_s": float,             # mean of itls — derived, but stored for convenience
+    "e2e_s": float,
+    "prompt_tokens": int,
+    "output_tokens": int,
+}
+```
+
+<Callout type="pitfall" title="The four timing bugs you will make if you are not careful">
+  1. **Timing the batch instead of the request.** Under concurrency, a per-request clock must still start when *that* request was submitted, including the time it waited for its turn. If you time from "when the loop got to it", you have measured service time and reported it as latency.
+  2. **Pre-averaging the ITLs.** If you keep only the mean, you cannot compute a tail, and you cannot detect a stutter. Store the list.
+  3. **Including warm-up.** Discard every measurement from the first N iterations of every cell.
+  4. **Counting tokens by splitting text.** One token is roughly four characters in English prose and closer to two in code. Always use the tokenizer.
+</Callout>
+
+## Step 2 · The workload
+
+Build a workload with a **real length distribution**, not a fixed prompt. The notebook ships a seeded generator; extend it to mix at least three shapes — a short-chat majority and a long-context tail — because that mixture is what makes the context sweep meaningful.
+
+**Requirements:**
+- Fixed seed, recorded in the report.
+- Prompt and output length distributions recorded as median and p90.
+- Optionally, a mode that loads a JSONL file of real prompts instead.
+
+## Step 3 · The sweep
+
+Two axes: **concurrency** and **context length**. The notebook does concurrency; add a context axis, or better, a two-dimensional grid if your GPU has the headroom.
+
+**Requirements:**
+- Warm up **per cell**, not once per sweep. Different shapes compile different kernels.
+- At least 3 repeats per cell; report the median per cell and keep the raw samples so you can recompute percentiles.
+- Record GPU memory used per cell.
+- Record failures — an OOM is a data point, and it is the most interesting one.
+
+<Callout type="math" title="Keep the sweep inside your time budget">
+  Cost is $\text{cells} \times (\text{warm} + \text{repeats}) \times t_{\text{request}}$. With 4 concurrency × 4 context = 16 cells, 4 warm-ups and 3 repeats at 1.5 s per request, that is $\text{cells} \times 7 \times 1.5 = 168$ s.
+
+  Aim for a sweep that runs in **under ten minutes**. If yours takes an hour, you will not re-run it after every change — and a sweep you do not re-run is a benchmark that quietly goes stale.
+</Callout>
+
+## Step 4 · The verdict
+
+Now turn the numbers into a decision. You will write, explicitly:
+
+1. **Your SLO.** Metric, percentile, threshold, window. Choose it as a user would, before looking at your numbers.
+2. **Your operating point.** The concurrency maximizing goodput, per your SLO.
+3. **Your envelope table.** Which (concurrency, context) cells are safe, and which fail.
+4. **Your memory edge**, located by pushing until OOM, and the **guardrail** you set below it.
+
+<Callout type="intuition" title="The write-up is not the easy part">
+  The measurement is mechanical. The hard, valuable part is the sentence: *"We set max concurrency at 48 because goodput peaks at 52 and p95 TTFT breaches 800 ms at 64, and we cap context at 8,192 because KV cache OOMs at 12,000 on this GPU."*
+
+  That sentence is what an inference engineer actually delivers. Anyone can produce a throughput number; knowing which number to trust, and why, and where it breaks — that is the job.
+</Callout>
+
+## Extend it (pick at least two)
+
+- **A/B against a configuration change.** Compare FP16 against a quantized model, or two engine settings. Interleave the runs so thermal drift does not bias one arm. Report whether the difference exceeds your run-to-run spread.
+- **A load sweep instead of a closed loop.** Instead of a fixed number of concurrent requests, drive arrivals at a fixed *rate* and watch the queue form. This is the direct measurement of the Little's law lesson.
+- **A tail-hunting mode.** Run long enough to collect at least 10,000 samples and report p50/p90/p99/p99.9, with the sample count beside each percentile.
+- **A regression gate.** Save the report under version control and write a test that fails when goodput drops more than 5% or p95 regresses more than 10% against the stored baseline.
+- **A memory-edge prober.** Sweep context and concurrency jointly and emit the exact OOM boundary as a polygon you can paste into a runbook.
+
+## Check yourself
+
+Before you call it done, answer these. If any answer is "no", the harness is not finished.
+
+1. Does every measurement carry the config needed to reproduce it — model revision, dtype, GPU, library versions, seed?
+2. If you ran the whole sweep twice on the same machine, would your medians agree within your stated run-to-run spread?
+3. Can you compute p95 of TTFT directly from the stored data, without re-running anything?
+4. Does your report state the SLO you were aiming at, and show whether each cell met it?
+5. Have you found the memory edge, and is your guardrail set **below** it with a stated margin?
+6. Could a colleague who has never seen your code read `REPORT.md` and reach the same operating-point decision you did?
+
+## Acceptance criteria
+
+You have passed the project when all of the following hold.
+
+**Correctness**
+- TTFT, TPOT, ITL and E2E are measured per request, streamed, client-side, and stored raw.
+- The tokenizer — never a character heuristic — produces every token count.
+- Warm-up iterations are discarded from every reported statistic.
+- The identity $\text{E2E} \approx \text{TTFT} + (n-1)\times\text{TPOT}$ holds for your data to within a few percent. If it does not, you have a timing bug: find it before going further.
+
+**Coverage**
+- At least two sweep axes (concurrency and context), each warmed up and repeated.
+- At least 3 repeats per cell, reported as median with percentiles preserved.
+- Every cell records memory used, and failures are recorded as data.
+
+**Decision quality**
+- A written SLO with all four components.
+- An operating point justified by peak goodput, not peak throughput.
+- An envelope table, and a located memory edge with a guardrail.
+
+**Communication**
+- `REPORT.md` states the operating point in one sentence and defends it with a number.
+- The report is reproducible: a reader can re-run and land within the stated variance.
+
+## Rubric
+
+| Level | What it looks like |
+|---|---|
+| **Distinguished** | Sweeps two or more axes and finds a real optimum, not just the maximum. The memory edge is located empirically and the guardrail is justified with a margin. The write-up states an operating point another engineer would accept, with a number attached to every claim. Variance is reported and controlled. |
+| **Proficient** | Meets all acceptance criteria. Sweeps concurrency and context, reports medians and percentiles, writes a defensible SLO and operating point. The variance discussion is present but the sweep is single-model and single-configuration. |
+| **Developing** | Measures TTFT and TPOT correctly and sweeps one axis. Percentiles are computed but warm-up handling or repeats are inconsistent, so the numbers are not yet trustworthy. The operating point is asserted rather than derived from goodput. |
+| **Beginning** | Reports a single throughput number, or timings that include warm-up, or token counts from character counts. The identity above fails visibly. |
+
+<Callout type="mentor" title="The habit that separates the top band">
+  Everyone in the top band does the same unglamorous thing: **they run it twice and check that it agrees with itself.**
+
+  A harness that has never been checked against its own reproducibility is a hypothesis. The moment you run the same sweep twice and get the same medians within your stated spread, it becomes an instrument — and an instrument is what you are being paid to build.
+</Callout>
+
+## Where this goes next
+
+Keep the harness. It is the instrument you will use for the rest of the course.
+
+- **Module 09 (A Real Engine: vLLM)** — run this same structure against vLLM on the same GPU and workload, and compare. Your Python loop will show the batching effect only weakly, because it processes requests one at a time; vLLM's continuous batching will show the full curve.
+- **Module 11 (Quantization)** — re-run the sweep with a quantized model and watch the memory edge move.
+- **Module 17 (The Engine Landscape)** — this harness is the fair-comparison tool you were missing.
+
+Every claim you make from here on should come out of this harness, not out of a README.
+
+<KeyNotes>
+  1. The harness has four parts — **instrument, workload, sweep, verdict** — and each must be correct before the next is meaningful.
+  2. Store **every ITL**, not the mean. A pre-averaged harness cannot compute a tail and cannot detect a stutter.
+  3. Warm up **per cell**, not once per sweep: different shapes compile different kernels and allocate different memory pools.
+  4. Record **failures as data**: an OOM cell is the most informative cell in the sweep.
+  5. Validate the identity $\text{E2E} \approx \text{TTFT} + (n-1)\times\text{TPOT}$. If it fails, you have a timing bug, and no other result is trustworthy until you fix it.
+  6. Budget the sweep to **under ten minutes** so you actually re-run it after every change. A stale benchmark is worse than none.
+  7. Choose the SLO **before** you look at the numbers, and pick the operating point at peak **goodput**, not peak throughput.
+  8. Locate the memory edge by pushing until it breaks, set the guardrail below it with a stated margin, and **run the whole thing twice** to check it agrees with itself. That last habit is what turns a script into an instrument.
+</KeyNotes>

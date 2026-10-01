@@ -1,0 +1,289 @@
+---
+title: 'Pipeline parallelism'
+summary: 'Giving each GPU a contiguous group of transformer layers and passing activations down the line. You will draw the schedule, count the bubble, and see why micro-batches — not more stages — are the fix.'
+objectives:
+  - 'Draw a P-stage, M-micro-batch pipeline schedule and identify the bubble exactly'
+  - 'Compute the bubble fraction (P-1)/(M+P-1) and the micro-batch count needed for a target'
+  - 'Compute pipeline communication volume and show why it is 10-100x cheaper than tensor parallelism'
+  - 'Explain why inference pipelines are hurt by having no backward pass to fill the bubble'
+  - 'Choose between pipeline and tensor parallelism for a model, a fabric and a workload, with arithmetic'
+---
+import PipelineClock from '@/components/viz/multi-gpu/PipelineClock.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Tensor parallelism makes GPUs disagree a lot: 64 collective calls per forward pass, 147 MB of traffic on a 70B model, all of it inside the node. It works, but it works *expensively* and it cannot leave the island.
+
+<Term t="pipeline-parallelism">Pipeline parallelism</Term> (PP) takes the opposite approach. It splits along the dimension that is already sequential: **the model is a stack of layers, and layer $i$ feeds layer $i+1$.** Give GPU 0 the first 20 layers, GPU 1 the next 20, and hand the activation tensor down the line.
+
+No GPU does half a matrix multiply. No layer is divided. The only communication is one tensor per boundary, and there are $P-1$ boundaries — not 2L.
+
+<Callout type="intuition" title="Factory line, not team project">
+  Tensor parallelism is a group of experts each doing a fraction of one job, then reconciling constantly. Pipeline parallelism is an assembly line: each station does the whole job on a different item, and the cost is that the line has to fill and drain. The fill-and-drain is the bubble, and unlike the collectives it cannot be engineered away.
+</Callout>
+
+## The schedule
+
+Take $P = 4$ stages and $M = 4$ micro-batches. A "micro-batch" is a slice of the request batch — if 32 requests are in flight and $M = 4$, each micro-batch is 8 requests. Time runs left to right; each cell is one stage processing one micro-batch for one unit of time.
+
+```
+         t0  t1  t2  t3  t4  t5  t6
+stage 0  ■1   ■2   ■3   ■4   ·    ·
+stage 1  ·    ■1   ■2   ■3   ■4   ·
+stage 2  ·    ·    ■1   ■2   ■3   ■4
+stage 3  ·    ·    ·    ■1   ■2   ■3   ■4
+```
+
+The diagonal is the pipeline working. The empty top-left triangle and bottom-right triangle are the <Term t="bubble">bubble</Term>: $P$ stages never all have work at the same time. Its size is the <Term t="pipeline-bubble-fraction">bubble fraction</Term>, and it is the single number this lesson is about.
+
+Note the structure of the answer: **the request batch was split into micro-batches, but the total work did not change.** $P \times M$ stage-slots were computed either way. Pipelining changes *when* the work happens, not how much of it there is — so the bubble is pure loss.
+
+Here is the schedule as twenty lines of Python. Build it, print it, and count it — then the formula is something you verified rather than something you were told:
+
+```python
+def schedule(p, m):
+    """The p-stage, m-micro-batch forward-only pipeline.
+    Grid[r][t] is 'busy' iff stage r is processing micro-batch (t - r)."""
+    slots = m + p - 1
+    return [["busy" if 0 <= (t - r) < m else "idle" for t in range(slots)]
+            for r in range(p)]
+
+def show(p, m):
+    g = schedule(p, m)
+    print(f"P={p}, M={m}, slots={len(g[0])}")
+    for row in g:
+        print("  " + " ".join("[]" if c == "busy" else ".." for c in row))
+    busy = sum(r.count("busy") for r in g)
+    total = sum(len(r) for r in g)
+    print(f"  bubble = 1 - {busy}/{total} = {1 - busy/total:.3f}\n")
+
+show(4, 4)
+show(4, 8)
+```
+
+That prints the diagonal you saw above, and a number you can check by hand. Try `show(8, 8)` and then `show(8, 16)`: the first is 47% idle and the second is 30%, and the difference between them is four stages' worth of ramp-up and drain that the extra stages added.
+
+<Scrolly>
+  <PipelineClock client:visible slot="stage" />
+
+  <Step title="1. Four stages, one request">
+    Twenty layers each. A request enters stage 0, walks the pipeline one stage at a time, and comes out the far end with its first token. Nothing inside a layer is split.
+  </Step>
+
+  <Step title="2. The ramp-up is structural">
+    Stage 0 works, then stage 1 works while stage 0 waits. A stage cannot start until the previous one has handed it something — that is the definition of a pipeline, and it is why the first $P-1$ slots are wasted.
+  </Step>
+
+  <Step title="3. There is your bubble">
+    Drop the micro-batch count to 1 and most of the grid is hatched. At $P = 4$, $M = 1$: $(4-1)/(1+4-1) = 75\%$ idle. **Three of every four GPUs are doing nothing.**
+  </Step>
+
+  <Step title="4. Fill it with micro-batches">
+    More micro-batches means more items on the line. At $M = 8$ the bubble is $(4-1)/(8+3) = 27\%$; at $M = 16$, 16%. The hatched area shrinks from the edges inward.
+  </Step>
+
+  <Step title="5. The bubble formula">
+    With $P$ stages and $M$ micro-batches, the schedule is $M + P - 1$ slots long and $P \times M$ are busy. So idle $= 1 - \frac{PM}{M+P-1} = \frac{P-1}{M+P-1}$. **Doubling $M$ halves the bubble; doubling $P$ makes it worse.**
+  </Step>
+
+  <Step title="6. One tensor per boundary">
+    Each stage sends $B \cdot T \cdot h \cdot 2$ bytes to the next. For Llama-3.1-70B at batch 32, decode: 512 KB. Sent $P-1 = 3$ times. Compare to 147 MB for tensor parallelism.
+  </Step>
+
+  <Step title="7. Communication is not the bill">
+    Over InfiniBand, 512 KB takes about 11 µs — roughly 2.5% of a decode step. The bubble, by contrast, can be 40%. **Pipeline parallelism is cheap to communicate and expensive to schedule.**
+  </Step>
+
+  <Step title="8. Inference has no second pass">
+    Training fills bubbles with backward passes. Inference has no backward pass, so the bubble is unfillable except with micro-batches — and micro-batches are limited by the batch size you actually have.
+  </Step>
+</Scrolly>
+
+## The bubble, derived
+
+Count slots and busy cells and the fraction falls out.
+
+- **Schedule length:** $M + P - 1$ slots. $M$ to fill, then one slot per stage as each finishes, then $P - 1$ to drain.
+- **Busy cells:** $M$ per stage, so $P \cdot M$ total.
+- **Idle fraction:**
+
+$$
+\boxed{\;f_{bubble} = 1 - \frac{P M}{M + P - 1} = \frac{P - 1}{M + P - 1}\;}
+$$
+
+Sanity-check the cases. Read the $P$ column as the <Term t="pipeline-parallel-batch">pipeline-parallel batch</Term> (how many contiguous layer groups the request walks through) and $M$ as the <Term t="pipeline-microbatch">micro-batch count</Term>:
+
+| $P$ | $M$ | bubble | what it means |
+|---|---|---|---|
+| 4 | 1 | 3/4 = 75% | three GPUs idle for most of the step |
+| 4 | 4 | 3/7 = 43% | still bad |
+| 4 | 8 | 3/11 = 27% | acceptable |
+| 4 | 16 | 3/19 = 16% | good |
+| 8 | 16 | 7/23 = 30% | more stages is worse again |
+| 8 | 32 | 7/39 = 18% | the rule: $M \geq 2P$ |
+
+**The rule of thumb: $M \approx 4P$ or more.** At $P = 4$ that is 16 micro-batches; at $P = 8$, 32.
+
+<Callout type="math" title="Worked: 70B on 8 H100s, and the batch you need">
+  $P = 8$, bubble at $M = 8$: $\frac{7}{8+7} = 47\%$. Terrible — you would be running at **53% of the hardware's capability**, and paying for all eight GPUs.
+
+  $M = 32$: $\frac{7}{32+7} = 18\%$. Now you're at 82%.
+
+  $M = 64$: $\frac{7}{71} = 9.9\%$.
+
+  But $M$ cannot exceed the number of requests in flight. If your service averages 16 concurrent requests, $M = 32$ is unreachable in steady state and you are stuck near 28% — **no amount of tuning fixes that; only more concurrency does.**
+
+  That is the real constraint on pipelining in inference: the bubble is a function of *load*, so it improves exactly when your throughput is already good and hurts most exactly when you need help.
+</Callout>
+
+<Callout type="pitfall" title="The bubble does not shrink with a faster interconnect">
+  It is tempting to think that a faster link fills the pipeline faster. It does not. The bubble is defined by *stage count* and *micro-batch count* — a property of the schedule, not the wire. Making the boundary transfer 10x faster does not change $(P-1)/(M+P-1)$ by one percent.
+
+  What a faster interconnect does buy you is the ability to use **more stages**, because each extra stage's weight read is smaller and its relative communication is larger. That is a real benefit, but it is indirect.
+</Callout>
+
+## The communication, in contrast
+
+One activation tensor crosses each boundary. Its size is $B \cdot T \cdot h \cdot 2$ bytes — the whole hidden state for the micro-batch, nothing more.
+
+$$
+\text{PP bytes} = (P-1) \cdot B \cdot T \cdot h \cdot 2
+$$
+
+That's it. No ring factor, no factor of 2 for reduce-scatter, and — crucially — **no factor of $L$**.
+
+<Callout type="math" title="The comparison that decides your architecture">
+  Llama-3.1-70B, 80 layers, hidden 8,192, batch 32, decode ($T = 1$). Payload per transfer: $B \times T \times h \times 2 = 32 \times 1 \times 8{,}192 \times 2 = 524{,}288$ B $= 512$ KB.
+
+  | | TP = 8 | PP = 8 |
+  |---|---|---|
+  | transfers per forward pass | 2 x 80 = 160 | 7 |
+  | bytes per transfer (ring) | 1.75 x 512 KB | 512 KB |
+  | **total** | **147 MB** | **3.67 MB** |
+  | time over InfiniBand (50 GB/s, 85%) | 3.5 ms | **88 µs** |
+  | share of a 4.8 ms decode step | **72%** | **1.8%** |
+
+  **Tensor parallelism across InfiniBand is not viable. Pipeline parallelism across it is cheap.** That one table is the entire reason the 3D parallelism layout exists: TP inside the node where NVLink can absorb 147 MB, PP between nodes where InfiniBand cannot.
+</Callout>
+
+Note the asymmetry in what each pays:
+
+| | TP | PP |
+|---|---|---|
+| pays in | bytes moved | time with idle GPUs |
+| scaled by | number of layers $L$ | number of stages $P$ |
+| worst when | $L$ is large | batch is small |
+| best on | NVLink ($\rho \approx 7$) | InfiniBand ($\rho \approx 67$) |
+
+## Who owns which KV cache
+
+This asymmetry decides real deployments, and it is the one people get wrong.
+
+Tensor parallelism splits the KV cache $\frac{1}{t}$, because each rank owns whole attention heads and computes keys and values only for those heads. Pipeline parallelism gives a stage a contiguous group of layers — and that stage needs **every head** of those layers, so it holds the full KV of its own layers. Stage 0 holds layers 0–19's cache, stage 1 holds 20–39's.
+
+So the cache does divide by $P$ — but along **layers**, not along tokens. Both terms scale identically:
+
+$$
+\text{weights per stage} = \frac{L \cdot w_{layer}}{P}, \qquad \text{KV per stage} = \frac{L}{P} \times (\text{per-layer KV per token}) \times T
+$$
+
+**Weights and KV both divide by exactly $P$.** That is worth sitting with, because it means:
+
+<Callout type="math" title="Worked: who owns the KV cache in each scheme">
+  Llama-3.1-70B, 80 layers, $n_{kv} = 8$, $d = 128$, BF16, 8 GPUs, 8,192 tokens of context.
+
+  Per-token, per-layer KV: $kv = 2 \times 8 \times 128 \times 2 = 4{,}096$ B. Each GPU owns 80/8 = 10 layers, so its KV is $T \times 4{,}096 \times 10$ bytes per sequence.
+
+  | Scheme | weights / GPU | KV / GPU (batch 1, 8k ctx) |
+  |---|---|---|
+  | TP=8 | 141/8 = 17.6 GB | 8,192 x 4,096 x 10 = 335 MB |
+  | PP=8 | 141/8 = 17.6 GB | 335 MB |
+
+  Identical — because both divide by $P$. Now raise the workload to **batch 64 at 32k context**, where the KV term dominates:
+
+  | Scheme | weights / GPU | KV / GPU |
+  |---|---|---|
+  | TP=8 | 17.6 GB | 64 x 32,768 x 4,096 x 10 = 85.9 GB |
+  | PP=8 | 17.6 GB | 85.9 GB |
+
+  Still identical — and that is the point: **memory-wise TP and PP are interchangeable at equal GPU count.** Neither scheme rescues this workload; both need $tP \geq 2$ just for the KV.
+
+  Where they diverge is *legality*: TP needs $t \mid n_{kv} = 8$, so $t \in \{1,2,4,8\}$. PP needs $P \leq 80$. For a model with 2 KV heads, TP stops at 2 and PP keeps going — and at that point PP is the only option for reducing the cache, even though it is the weaker tool.
+</Callout>
+
+<Callout type="pitfall" title="The mistake: 'PP reduces my KV cache, so it is fine for long context'">
+  It reduces the cache by exactly the same factor as TP does — $\frac{1}{P}$ — so if TP is a valid option, PP gives you no memory advantage to trade away its bubble for. The only case where PP is the *only* way to reduce the cache is when TP is blocked by divisibility, and in that case you should first ask whether you can shorten the context or quantize the KV cache, because a pipeline you cannot fill is worse than a memory problem you can solve for free.
+</Callout>
+
+## Sizing the micro-batches
+
+You now know the bubble is $(P-1)/(M+P-1)$ and that $M$ is capped by concurrency. So how do you pick $M$ in practice?
+
+Start from the <Term t="mega-batch">mega-batch</Term>: the whole set of micro-batches a pipeline processes together. **Pipelining splits your request batch into micro-batches but never changes the total work** — a pipeline at batch 32 does exactly the FLOPs of a single GPU at batch 32. So:
+
+$$
+M = \left\lceil \frac{B}{B_{chunk}} \right\rceil, \qquad B_{chunk} = \text{requests per micro-batch}
+$$
+
+Three constraints bound $B_{chunk}$ from below:
+
+| Constraint | Effect | Rule of thumb |
+|---|---|---|
+| **Scheduling** | too few chunks and per-chunk overhead dominates | $M \geq 4P$ |
+| **GPU efficiency** | too small a chunk and the GEMMs get skinny | keep each chunk's token count $\geq 256$ |
+| **Batching efficiency** | too large a chunk and CTAs tail off the SMs | keep each chunk's token count $\leq 8{,}192$ |
+
+<Callout type="intuition" title="Why the token-count band exists">
+  At decode, each micro-batch contributes $B_{chunk}$ query rows. A GEMM with $m = 8$ rows uses about 2% of an H100's tensor cores; a GEMM with $m = 4{,}096$ is near peak. This is Module 14's decode attention problem again, in a different costume — **a pipeline with tiny micro-batches throws away most of the hardware it bought you.**
+
+  So $M$ is bounded on both sides, and the window is roughly 256 to 8,192 tokens per micro-batch. At decode with $B = 64$ and $P = 8$ you want $M \approx 8$ to 16, which means $B_{chunk} \approx 4$ to 8 requests. That is a real constraint, and it is why high-throughput decode serving often prefers replicas to pipelines.
+</Callout>
+
+In practice engines expose this as a single knob and the arithmetic above is what they are tuning behind it. <Term t="pipeline-microbatch">Micro-batch count</Term> is chosen as the smallest $M$ that keeps the bubble under a target — commonly 10–20% — given the batch you expect. When the batch is below that, the honest recommendation is fewer stages.
+
+<Callout type="mentor" title="The rule that saves you from a bad pipeline deployment">
+  Compute $M$ from your *expected* concurrency, not from your peak. If $M < 2P$, do not deploy the pipeline — add stages only when you can fill them.
+
+  Concretely: an 8-stage pipeline needs 16 concurrent requests to keep the bubble under 30%. If your median concurrency is 4, you want 2 stages and 2 replicas. You will get lower latency, higher throughput per GPU, and a simpler system. The most common pipeline deployment mistake is not choosing too few stages; it is choosing more than the load can fill.
+</Callout>
+
+## The special case: a model that cannot be tensor-parallelised
+
+Some models have too few heads or too small an MLP for TP. Qwen2.5-1.5B has 12 query heads and 2 KV heads, so its maximum TP degree is 2. If you needed four GPUs to hold it, TP is not available at all.
+
+Pipeline parallelism has no such limit: **any model with at least $P$ layers can be split $P$ ways.** This is why pipeline is the fallback that always works, and it is the reason MoE models — which have huge expert counts and awkward shapes — can be deployed at all (Module 19).
+
+<Callout type="mentor" title="When to add a stage, honestly">
+  Adding a stage halves the weights each GPU must read, so it doubles the batch each GPU can hold for KV cache. That is a *memory* win, and a large one: TP also divides the KV cache by $t$, so the two are comparable in memory effect. The question then becomes: **do you have the micro-batches to fill the pipeline?**
+
+  If yes, add stages and accept the bubble. If no — and small-batch latency-sensitive serving is a very common regime — add a *replica* instead, keep $P = 1$, and get the throughput without the schedule. A 2-GPU TP setup with a full batch almost always beats an 8-stage pipeline with two requests in flight.
+</Callout>
+
+## Where this leaves the module
+
+- Pipeline parallelism splits layers, so communication is $(P-1) \cdot BTh$ bytes — **no $L$ factor**, 40x less than TP at $P = 8$.
+- The cost is a bubble of $(P-1)/(M+P-1)$: 75% at $P=4, M=1$; 16% at $P=4, M=16$. Target $M \approx 4P$.
+- The bubble is a function of *load*, not of hardware. Faster links do not shrink it.
+- Inference has no backward pass to fill bubbles, so micro-batches are the only cure — and they are limited by your concurrency.
+- Any model with at least $P$ layers can be pipeline-parallelised, which makes PP the universal fallback when TP's divisibility constraints block you.
+
+The last lesson adds the two parallelisms that need no collectives at all — data parallelism for throughput, context parallelism for very long prompts — and then puts all four strategies into a single decision procedure.
+
+<KeyNotes>
+  1. Pipeline parallelism splits layers across GPUs. One activation tensor crosses each boundary; there are P-1 boundaries, not 2L.
+  2. The bubble fraction is `(P-1)/(M+P-1)`. At P=4, M=1 it is 75%; at P=4, M=16 it is 16%. Rule of thumb: M ≥ 4P.
+  3. Pipelining does not reduce total work — it reschedules it. Every bubble slot is a GPU you paid for and did not use.
+  4. Communication per forward pass is `(P-1) · B · T · hidden · 2` bytes. For Llama-70B at PP=8, batch 32, that is 3.67 MB versus 147 MB for TP=8 — 40x less.
+  5. That ratio is why TP stays inside the NVLink island and PP crosses the node boundary: 72% of a decode step versus 1.8% on InfiniBand.
+  6. TP and PP divide **both** weights and KV cache by their degree — memory-wise they are interchangeable at equal GPU count. What differs is communication (40x) and the bubble. Legality is where they diverge: TP is capped by $t \mid n_{kv}$, PP only by $P \leq L$.
+  7. The bubble is a property of the schedule, so a faster interconnect does not shrink it — a faster link only makes more stages viable.
+  8. PP has no divisibility constraints beyond "at least P layers", which makes it the universal fallback when a model's head count or MLP width blocks TP.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A pipeline has P=4 stages and M=4 micro-batches. What fraction of the schedule is idle?', numeric: true, answer: 43, tolerance: 2, unit: '%', why: 'Bubble = (P-1)/(M+P-1) = 3/7 = 42.9%. The schedule is M+P-1 = 7 slots and P·M = 16 are busy out of 28 stage-slots: 1 - 16/28 = 42.9%.' },
+  { q: 'P=8 stages, bubble must be under 20%. What is the minimum whole number of micro-batches?', numeric: true, answer: 28, tolerance: 3, unit: 'micro-batches', why: '(8-1)/(M+7) < 0.20 → 7 < 0.20M + 1.4 → M > 28. So M = 29 meets it exactly; M = 28 gives 7/35 = 20%, right at the line. With the usual 4P rule of thumb you would use 32.' },
+  { q: 'Llama-3.1-70B (hidden 8,192), PP=8, batch 32, decode. How many bytes cross the pipeline per forward pass?', numeric: true, answer: 3670016, tolerance: 100000, unit: 'bytes', why: '(P-1) × B × T × hidden × 2 = 7 × 32 × 1 × 8192 × 2 = 3,670,016 B ≈ 3.67 MB. Compare TP=8, which moves 147 MB — 40x more.' },
+  { q: 'Why does a faster interconnect NOT shrink the pipeline bubble?', options: ['It does shrink it proportionally', 'The bubble is (P-1)/(M+P-1) — a property of stage count and micro-batch count, not of transfer time; a faster link only makes more stages viable', 'Faster links reduce layer count', 'The bubble is a kernel-launch problem'], answer: 1, why: 'The schedule is a combinatorial property. Making each slot faster does not change how many slots are idle. The only cures are more stages (worse) or more micro-batches (better, and limited by your concurrency).' },
+  { q: 'Why is tensor parallelism unusable across InfiniBand while pipeline parallelism is fine?', options: ['TP produces wrong results across InfiniBand', 'TP moves 2·L·[2(t-1)/t]·BTh bytes per forward pass — the L factor makes it 147 MB and ~72% of a decode step — while PP moves only (P-1)·BTh = 3.67 MB, about 1.8%', 'InfiniBand cannot do all-reduce', 'PP does not require communication'], answer: 1, why: 'Both use the same link; the difference is volume. TP sends two collectives per layer across 80 layers. PP sends one activation across 7 boundaries. This is why TP lives inside NVLink and PP crosses the node boundary.' },
+  { q: 'Which models can be pipeline-parallelised but NOT tensor-parallelised?', options: ['None — PP and TP have identical constraints', 'Models whose KV head count or MLP width is too small for the TP degree you need (e.g. Qwen2.5-1.5B with 2 KV heads, capped at TP=2, but 28 layers for any PP degree)', 'Models with more than 32 layers', 'Only MoE models'], answer: 1, why: 'PP needs at least P layers; TP needs t to divide heads, KV heads and MLP width. GQA models with few KV heads cap TP hard while remaining freely pipeline-parallelisable — which is why PP is the universal fallback.' },
+] } />

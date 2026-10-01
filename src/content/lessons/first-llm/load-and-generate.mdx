@@ -1,0 +1,196 @@
+---
+title: 'Load, tokenize, generate & stream'
+summary: 'Load a real open model onto the GPU, watch the generate loop run token by token, control it with the sampling and stop parameters that matter, and stream tokens to the user as they are produced.'
+objectives:
+  - Load an open-weights model with transformers and put it on the GPU in the right dtype
+  - Explain what a forward pass returns and how one token is sampled from the logits
+  - Apply a chat template correctly and always set a stop condition
+  - Stream tokens as they are produced, and explain why it changes the felt speed
+---
+import GenerateLoop from '@/components/viz/first-llm/GenerateLoop.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Module 03 ended with a transformer in your head. This lesson puts one on a GPU, and for the first time in the course you will run the thing you came for: a model that answers.
+
+The whole thing is about twenty lines of Python. But those twenty lines contain a loop that you will spend the rest of your career optimising, and every one of its parameters is a decision.
+
+## The five lines
+
+Here is the whole program. Read it before running it, because each line is doing something you already know.
+
+```python
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+tok = AutoTokenizer.from_pretrained(MODEL)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL,
+    dtype=torch.bfloat16,   # 2 bytes per weight: half of FP32
+    device_map="cuda",      # put it on the GPU
+)
+
+messages = [
+    {"role": "system", "content": "You are terse."},
+    {"role": "user", "content": "What is a GPU?"},
+]
+
+# A chat model was trained on a specific text format. The template builds it.
+text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+ids = tok(text, return_tensors="pt").to("cuda")
+
+out = model.generate(
+    **ids,
+    max_new_tokens=128,
+    do_sample=True,
+    temperature=0.7,
+    top_p=0.9,
+    eos_token_id=tok.eos_token_id,
+)
+
+new = out[0][ids["input_ids"].shape[1]:]        # only the tokens it generated
+print(tok.decode(new, skip_special_tokens=True))
+```
+
+<Callout type="intuition" title="Why device_map instead of .to?">
+  The weights are downloaded and cast **on the GPU**, so they never need a CPU copy on the way. `device_map` lets `transformers` place each part of the model as it loads. For a model that fits on one GPU, loading on the CPU and then calling `.to('cuda')` is equally correct — it just makes an extra trip through host memory you do not need.
+</Callout>
+
+Two of those lines carry most of the meaning. `dtype=torch.bfloat16` decides the memory arithmetic from the previous lesson. `max_new_tokens` is the difference between a program that finishes and a program that never does.
+
+## The loop inside `generate`
+
+Everything else in the course is an optimisation of one loop. Let us name it, because you will write it yourself in Module 05.
+
+<Scrolly>
+  <GenerateLoop client:visible slot="stage" />
+
+  <Step title="1. The loop you will rebuild">
+    Read the whole picture first: text goes in on the left, comes out as tokens on the right, and one arrow feeds a produced token back into the model. **Run the model. Sample one token. Append it. Repeat until it stops.** That is `generate`, and that is the entire algorithm.
+  </Step>
+
+  <Step title="2. Your text becomes tokens">
+    The string is split by the <Term t="tokenizer">tokenizer</Term> into integers. "Write one sentence about the sea." is 8 tokens here. Those integers index the <Term t="embedding">embedding table</Term> you built in Module 03 — the model never sees your letters, only these numbers.
+  </Step>
+
+  <Step title="3. Prefill: the prompt at once">
+    All 8 prompt tokens enter the network together in one forward pass. Every token attends to every earlier token, and the <Term t="kv-cache">KV cache</Term> is filled with a key and a value for each of them. This phase is called <Term t="prefill">prefill</Term>, and it is **compute-bound**: lots of math, plenty to keep the tensor cores busy.
+  </Step>
+
+  <Step title="4. The first token appears">
+    The output of the last position is a vector of 151,936 <Term t="logits">logits</Term> — one score per token in the vocabulary. You sample one token from them and decode it back to text. This is the first word the user sees, and it arrives only after the *entire* prompt was processed.
+  </Step>
+
+  <Step title="5. Decode: one token, fed back">
+    Now only the new token enters the network. It attends to everything before it using the cached keys and values. Crucially, it still has to read **every weight in the model** to do it. That is <Term t="decode">decode</Term>, and it is **memory-bound**: the arithmetic is tiny, the byte traffic is the whole model.
+  </Step>
+
+  <Step title="6. Feed the token back in">
+    Follow the dashed arrow. The sampled token is appended to the sequence and becomes part of the input for the next step. The loop closes on itself. This is what <Term t="autoregressive">autoregressive</Term> means, and it is why generation is inherently sequential — no amount of GPU power removes the dependency.
+  </Step>
+
+  <Step title="7. Repeat until a stop token">
+    Something has to end the loop: an <Term t="eos">end-of-sequence token</Term>, your own stopping string, or a hard cap. Look at the red dashed chip — the moment the model emits it, everything stops. Set the cap from `max_new_tokens` and the worst case is bounded no matter what the model decides to do.
+  </Step>
+
+  <Step title="8. Stream it as you go">
+    Instead of collecting all the tokens and returning once at the end, hand each one to the client the moment it exists. `generate` does this with `streamer=`, or you write the loop yourself. The total GPU work is identical.
+  </Step>
+
+  <Step title="9. What streaming buys the user">
+    Time to first token is paid once, at the start. After that, tokens arrive at the decode rate. **Perceived speed is dominated by TTFT, not by total length** — an answer that takes 30 seconds to stream feels completely different from one that appears all at once after 30 seconds of nothing. This is why the very next lesson exists.
+  </Step>
+</Scrolly>
+
+<Callout type="math" title="Why decode is slower than it looks">
+  Prefill of 8 tokens and decode of 1 token do almost the **same number of FLOPs per token**: both pass every token through all 32 layers. But prefill amortises the weight reads across 8 tokens, while decode pays for them alone. On a T4, decoding Qwen2.5-0.5B costs about 2–3 ms per step, almost entirely spent waiting for bytes:
+
+  $$
+  t_{\text{decode}} \approx \frac{\text{weights} + \text{KV cache}}{\text{bandwidth}} + \text{overhead}
+  $$
+
+  Prefill is faster per token because it reads the weights once for the whole prompt. Module 05 turns this observation into the central idea of the course.
+</Callout>
+
+## The parameters that actually matter
+
+`generate` takes many arguments. Four are worth your attention; the rest can be defaults.
+
+| Argument | What it does | Getting it wrong means |
+|---|---|---|
+| `max_new_tokens` | Hard cap on generated length | Unbounded run, unbounded cost |
+| `do_sample` | `False` = greedy (always the top token), `True` = sample | Greedy can loop forever on the same token |
+| `temperature` | Divides logits before the softmax. `< 1` sharpens, `> 1` flattens | `0` makes it greedy and brittle |
+| `eos_token_id` | When to stop | Runs to `max_new_tokens` every time |
+
+<Callout type="pitfall" title="Three bugs that cost real money">
+  1. **No `max_new_tokens`.** A model that does not want to stop simply does not stop. The default in many versions is 20 — safe — but a hand-rolled loop has no default at all.
+  2. **Greedy decoding on a loop-prone prompt.** With `do_sample=False` the same context can produce the same favourite token forever. A repetition penalty or a sampling setting fixes it.
+  3. **Skipping the chat template.** Feed a chat model raw text and it responds like a document, not an assistant. The template is not in the weights; it lives on the tokenizer as `apply_chat_template`.
+</Callout>
+
+## Sampling: turning logits into a choice
+
+You built this in Module 03 (`Logits to tokens: sampling`). Here it is in code, so you can see which knob is which.
+
+```python
+# Greedy: always the argmax. Deterministic, can loop.
+next_id = logits.argmax(dim=-1)
+
+# Sampling: sample from the softmax distribution.
+probs = torch.softmax(logits / temperature, dim=-1)
+next_id = torch.multinomial(probs, num_samples=1)
+```
+
+<Callout type="intuition" title="Why temperature is a divisor">
+  Dividing the logits by a temperature before the softmax is the same as raising each probability to the power of one over temperature. Above 1 it flattens the distribution and flattens your choices; below 1 it sharpens it. At `temperature` very near zero it collapses to argmax, which is exactly why `temperature=0` is just greedy decoding with extra steps.
+</Callout>
+
+## Streaming: the loop, written out
+
+`generate` hides the loop. When you stream — and when you start optimising in Module 05 — you want to see it. This is the whole thing:
+
+```python
+import torch
+from transformers import TextIteratorStreamer
+from threading import Thread
+
+streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+
+worker = Thread(
+    target=model.generate,
+    kwargs={**ids, "max_new_tokens": 128, "streamer": streamer},
+)
+worker.start()
+
+for piece in streamer:
+    print(piece, end="", flush=True)   # one token, as it appears
+
+worker.join()
+```
+
+`generate` runs on a background thread because a streaming iterator is a blocking call — you pull the next token only after it exists. This structure is exactly what you will need when tokens must cross a network to a browser instead of a print statement.
+
+<Callout type="try" title="Change one thing at a time">
+  Run the prompt with `do_sample=False`, then with `temperature=0.2`, then `1.2`. Read all three. Then set `max_new_tokens=5` and watch a good answer become a sentence fragment. Each of those is a knob you will tune in production, and now you have an intuition for the direction each one moves.
+</Callout>
+
+<KeyNotes>
+  1. The generate loop is: run the model, sample one token, append it, repeat until a stop condition. Everything in the rest of the course optimises this loop.
+  2. Load with `dtype=torch.bfloat16` and `device_map="cuda"`. In BF16, Llama-3.1-8B is 16.1 GB of weights — that dtype choice is the memory arithmetic.
+  3. Prefill processes the whole prompt in one parallel, compute-bound pass and fills the KV cache; decode then adds one token per step, memory-bound.
+  4. Chat models need `apply_chat_template`. The format is not in the weights, and skipping it makes an instruct model behave like a base model.
+  5. Always set `max_new_tokens` and the correct `eos_token_id`. They are what bound a request's cost and length.
+  6. `do_sample`, `temperature` and `top_p` control randomness; `temperature` divides the logits before the softmax, and near zero it collapses to greedy.
+  7. Streaming costs no extra GPU work but makes perceived speed depend on time to first token rather than total answer length — which is why the next lesson is about the GPU.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'In the generate loop, what happens on a decode step that did not happen during prefill?', options: ['All prompt tokens are re-processed', 'The new token is appended and fed back as part of the next input', 'The KV cache is discarded', 'The logits are converted to a chat template'], answer: 1, why: 'Decode appends the sampled token to the sequence and feeds the whole thing back as input next step. That self-feeding is what makes generation autoregressive. Prompt tokens are not re-processed; their K and V are cached.' },
+  { q: 'Qwen2.5-0.5B has 0.49B parameters stored in BF16. How many bytes are the weights?', numeric: true, answer: 0.98, tolerance: 0.05, unit: 'GB', why: '0.49B × 2 bytes = 0.98 × 10⁹ bytes ≈ 0.98 GB. Multiply parameter count by bytes per weight.' },
+  { q: 'Why is streaming described as making perceived speed depend on TTFT rather than total length?', options: ['It makes the GPU generate more tokens', 'Tokens are delivered as produced, so only time-to-first-token is a delay; later tokens arrive at the steady decode rate', 'It skips prefill entirely', 'It shortens the prompt'], answer: 1, why: 'With streaming the user sees the first token after TTFT and each subsequent token after one decode step. Total answer length no longer adds to the perceived wait in the same way.' },
+  { q: 'You forgot max_new_tokens and the model will not emit a stop token. What is the most likely outcome?', options: ['generate stops at 20 tokens by default', 'It runs until memory runs out or you interrupt it — unbounded cost', 'It crashes on the first step', 'It returns an empty string'], answer: 1, why: 'A hard cap is what bounds a run. The transformers default (20 when unset in older versions) is small, but any hand-rolled loop has no cap, and a model can generate indefinitely.' },
+  { q: 'temperature is set very close to 0. The softmax over the logits becomes nearly:', options: ['Uniform over the whole vocabulary', 'A one-hot on the highest-scoring token (greedy)', 'All probabilities zero', 'A one-hot on the lowest-scoring token'], answer: 1, why: 'Dividing logits by a tiny temperature multiplies them by a huge number, so softmax collapses onto the argmax. That is exactly why temperature=0 is greedy decoding.' },
+  { q: 'You send raw text (no apply_chat_template) to an instruct model. What happens?', options: ['It works identically', 'It often continues or echoes text instead of answering, because it never saw its conversation format', 'It raises an error', 'It loads the base model instead'], answer: 1, why: 'An instruct model was fine-tuned on a specific chat format. That format lives on the tokenizer as a chat template, not in the weights. Without it the model is off-distribution and behaves more like a base model.' },
+]} />

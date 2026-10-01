@@ -1,0 +1,32 @@
+---
+// The lesson's takeaways. The learner can copy them into their personal notes.
+---
+<section class="keynotes" data-keynotes>
+  <div class="kn-head">
+    <h2>Key notes</h2>
+    <button type="button" class="btn ghost kn-copy" data-copy-keynotes>Copy into my notes</button>
+  </div>
+  <div class="kn-body"><slot /></div>
+</section>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>('[data-copy-keynotes]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const body = b.closest('[data-keynotes]')?.querySelector('.kn-body');
+      const items = Array.from(body?.querySelectorAll('li') ?? []).map((li) => '- ' + (li.textContent || '').replace(/\s+/g, ' ').trim());
+      window.dispatchEvent(new CustomEvent('tps:append-notes', { detail: '## Key notes\n' + items.join('\n') }));
+      b.textContent = 'Added to your notes';
+    });
+  });
+</script>
+
+<style>
+  .keynotes { margin: 4rem 0 2rem; border-top: 1px solid var(--rule-2); padding-top: 1.6rem; }
+  .kn-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .kn-head h2 { font-size: 1.7rem; margin: 0; }
+  .kn-copy { font-size: 0.78rem; padding: 0.5em 0.8em; }
+  .kn-body :global(ol), .kn-body :global(ul) { list-style: none; padding: 0; margin: 0; counter-reset: kn; display: grid; gap: 0.2rem; }
+  .kn-body :global(li) { counter-increment: kn; position: relative; padding: 0.65rem 0 0.65rem 2.4rem; border-bottom: 1px solid var(--rule); margin: 0; }
+  .kn-body :global(li)::before { content: counter(kn, decimal-leading-zero); position: absolute; left: 0; top: 0.85rem; font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-3); }
+  .kn-body :global(li p) { margin: 0; }
+</style>

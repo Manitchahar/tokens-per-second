@@ -1,0 +1,147 @@
+---
+title: 'Module 06 · Measure Like a Pro'
+module: benchmarking
+---
+
+## The four latency numbers
+
+Let $t_i$ be the arrival time of token $i$ and $t_0$ the moment the request was sent.
+
+| Metric | Definition | Dominated by |
+|---|---|---|
+| **TTFT** | $t_1 - t_0$ | queueing + prefill |
+| **ITL** | $t_i - t_{i-1}$, each gap | decode step time |
+| **TPOT** | $(t_n - t_1)/(n-1)$ | decode step time |
+| **E2E** | $t_n - t_0$ | the sum |
+
+$$
+\text{E2E} = \underbrace{\text{queue} + \text{prefill} + 1\ \text{step}}_{\text{TTFT}} + (n-1)\times\text{TPOT}
+$$
+
+Per-user speed $= 1/\text{TPOT}$ tokens/s. Above ~40 tok/s per user, extra speed is invisible and wastes capacity.
+
+## Estimating each term (Llama-3.1-8B on H100)
+
+$$
+t_{\text{prefill}} \approx \frac{2P\,n_{\text{prompt}}}{\text{peak FLOP/s}\times 0.55} \approx n_{\text{prompt}} \times 29\ \mu\text{s}
+$$
+
+$$
+t_{\text{step}} \approx \frac{\text{weight bytes}}{\text{bandwidth}\times 0.8} + 1.5\ \text{ms overhead}
+$$
+
+- BF16 weights = 2 × P bytes: 8B → 16 GB.
+- On H100 (3.35 TB/s): 16 ÷ 2.68 ≈ 6.0 ms, + 1.5 ms overhead = **7.5 ms**.
+- At batch 64 the step is **10.7 ms** (KV reads add up) yet produces 64 tokens.
+- Overhead ≈ 300 kernel launches × 5–10 µs. This is why measured > bandwidth floor.
+
+## Throughput, service time, capacity
+
+$$
+\text{throughput} = \frac{B}{t_{\text{step}}}, \qquad
+S = t_{\text{prefill}} + n_{\text{out}} \times t_{\text{step}}, \qquad
+\text{capacity} = \frac{1}{S}
+$$
+
+- **Concurrency** = requests in flight. **Batch size** = requests in this step. Not the same.
+- Concurrency above batch size = queue, and queue is where latency comes from.
+- Capacity depends on the workload (prompt/output lengths), not just the GPU.
+
+## Little’s law
+
+$$
+L = \lambda \times W
+$$
+
+requests in system = arrival rate × time in system. Converts a latency budget into a concurrency requirement with no knowledge of the implementation.
+
+Worked: 12 req/s, 5 s budget → $L = 60$ requests in flight. At 0.46 req/s per GPU and 60% target load → 12 ÷ (0.46 × 0.6) ≈ **44 GPUs**.
+
+## Queueing: why the edge is a cliff
+
+$$
+W_{\text{queue}} = \frac{\rho}{1-\rho}\times S
+$$
+
+| $\rho$ | queue wait | | $\rho$ | queue wait |
+|---|---|---|---|---|
+| 50% | 1× S | | 90% | 9× S |
+| 80% | 4× S | | 95% | 19× S |
+
+Run at **50–70%**. Autoscale on **queue depth or p95 latency**, never on utilization.
+
+## Percentiles
+
+- **p99** = the value 99% of requests beat. At 10,000 req/s that is 100 unhappy users per second.
+- Latency is **right-skewed**: mean describes no actual request; it can exceed the median by 1.4× (exponential tails) or far more.
+- p50 = typical user. p95/p99 = the tail.
+- **Never** average percentiles across replicas — pool raw samples, then take the percentile.
+- A p99 from under ~1,000 samples is noise.
+- Always report **p50 / p95 / p99** together, plus throughput and the workload.
+
+## SLOs and goodput
+
+An SLO names four things: **metric, percentile, threshold, window**.
+
+> p95 TTFT < 600 ms and p95 TPOT < 40 ms, over any rolling 5-minute window.
+
+$$
+\text{goodput} = \text{throughput} \times \Pr(\text{request meets SLO})
+$$
+
+- **Goodput is not monotonic in load.** It peaks around **55–65% of capacity** and falls after.
+- Worked: at 95% load, 5,089 tok/s throughput × 17% pass rate = **840 tok/s goodput** — 83% of the GPU's output violates your own promise.
+- A p95 SLO caps your pass rate at 95%: a permanent 5% tax on goodput.
+- Goodput per dollar, in good tokens delivered per dollar spent:
+
+$$
+\text{goodput per dollar} = \frac{\text{goodput (tok/s)} \times 3600}{\text{GPU dollars per hour}}
+$$
+- Enforce with **admission control** (concurrency cap), **load shedding**, autoscaling on latency.
+- Three numbers: **throughput** (what the GPU did), **goodput** (what arrived on time), **goodput per dollar** (whether it works).
+
+## Sweeps and the operating envelope
+
+- Sweep the axes your **users control**: concurrency and context. A single point is a pin, not a map.
+- Context moves KV memory by >10× across a realistic range: 8,192 tokens = 1.05 GB/request for Llama-3.1-8B BF16 (128 KB/token). On an 80 GB H100, ~16 GB weights leaves room for **~61 such requests** versus ~970 at 512 tokens.
+- **Warm up per cell**; repeat ≥3×; report median + tail per cell.
+- Record failures as data — an OOM cell is the most informative cell.
+- Budget: `cells × (warm + repeats) × t_request`. Aim for **under 10 minutes**.
+- **Operating envelope** = the (concurrency, context) region that fits in memory and meets the SLO. It belongs to model + precision + GPU + engine version. Re-sweep on any change.
+
+## Edges and guardrails
+
+| Edge | Symptom | Guardrail |
+|---|---|---|
+| Memory | OOM | cap concurrency and total KV blocks; `gpu_memory_utilization` < 1.0 |
+| Latency | p99 explodes, queue grows | cap concurrency; scale on p95 |
+| Compute | prefill stalls decode | token budgets, chunked prefill |
+| Prefix | cache eviction mid-stream | cap or isolate tenants |
+
+The **latency** edge is the dangerous one: OOM fails loudly, latency fails quietly.
+
+## Benchmarking discipline
+
+1. **Warm up until flat.** First calls pay compilation, allocation, cold caches, clock ramp. Discard, do not average.
+2. **Repeat ≥5×**; report median + tail. Means are dragged up by outliers.
+3. **Realistic workload**: prompt and output length *distributions*, not one sentence. Averages hide the tail.
+4. **Interleave A/B**; block A-then-B biases against whichever ran second.
+5. **Pin** seed, tokenizer, sampling, library versions, GPU clocks. Check `nvidia-smi` for other tenants.
+6. Repeats to detect effect $\delta$ with rig noise $c$: $k \approx (2c/\delta)^2$. Reduce $c$ first.
+7. **Count tokens with the tokenizer**, never by splitting characters.
+8. Clock the **client**, stream the response.
+
+## Checklist for any result
+
+A benchmark is a claim about a **system, on hardware, under a workload, at a moment**. Report:
+
+- model revision, quantization, dtype, engine flags
+- GPU, memory, driver and library versions
+- workload file or seed, length distributions
+- warm-up count, repeats per cell
+- median / p95 / p99 per metric, plus throughput and goodput
+
+## Module order
+
+- 06.1 latency-metrics → 06.2 throughput-concurrency → 06.3 workloads-reproducibility → 06.4 percentiles → 06.5 slos-goodput → 06.6 break-one-gpu → 06.P project-benchmark-harness
+- Next: **Module 07 Batching & Scheduling** — continuous batching, token budgets, preemption. Your envelope's concurrency axis becomes their scheduler knobs.

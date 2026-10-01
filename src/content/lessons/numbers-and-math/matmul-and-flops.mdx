@@ -1,0 +1,137 @@
+---
+title: Matrix multiply, step by step, and counting FLOPs
+summary: The one operation that dominates every LLM. See exactly what a matrix multiply computes, count its work (2mkn), and derive the famous rule that a model needs about 2 FLOPs per parameter per token.
+objectives:
+  - Compute a small matrix product by hand, as rows times columns
+  - Derive the FLOP count of a matrix multiply, 2·m·k·n
+  - Derive that a forward pass costs about 2 × parameters FLOPs per token
+  - Estimate compute time from FLOPs and a GPU's FLOP/s
+  - Explain why matrix × vector (decode) reuses weights far less than matrix × matrix (prefill)
+---
+import MatmulViz from '@/components/viz/math/MatmulViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+If you profiled an LLM and sorted every GPU operation by time, one would sit at the top, far ahead of the rest: **matrix multiplication**, called a **GEMM** (GEneral Matrix Multiply) in GPU-speak. Over 90% of an LLM's arithmetic is GEMMs. Understand this one operation deeply and you understand where the time goes.
+
+## What a matrix multiply computes
+
+<Scrolly>
+  <MatmulViz client:visible slot="stage" />
+
+  <Step title="1. The setup">
+    Take **A**, 3 rows × 4 columns. Think of it as 3 tokens, each a vector of 4 numbers (tiny, so we can watch). Take **B**, 4 × 3: a weight matrix. Their product **C = A × B** has shape 3 × 3.
+
+    The rule for shapes: `[m × k] × [k × n] → [m × n]`. The inner sizes (**k**) must match, and they disappear.
+  </Step>
+
+  <Step title="2. One output cell">
+    Each cell of C is a **dot product**. To get C[0, 0], walk along **row 0 of A** and down **column 0 of B**, multiply the pairs, and add them up: 1×2 + 2×1 + 0×0 + 1×1 = **5**.
+
+    That is all a matrix multiply is: lots of dot products, one per output cell.
+  </Step>
+
+  <Step title="3. Count the work">
+    That cell needed **k = 4 multiplications** and 4 additions (counting the first add into zero). Each is one **FLOP**, a floating-point operation. So one output cell costs **2k FLOPs**.
+
+    GPUs actually do a multiply and an add as one "fused multiply-add" (FMA), but everyone still counts it as 2 FLOPs, and so will we.
+  </Step>
+
+  <Step title="4. Every cell">
+    Repeat for every cell: every row of A meets every column of B. There are m × n = 9 cells, each costing 2k = 8 FLOPs.
+  </Step>
+
+  <Step title="5. The formula">
+    Total work:
+
+    $$\text{FLOPs} = 2 \cdot m \cdot k \cdot n$$
+
+    For a real layer, 1,000 tokens through a 4,096 × 4,096 weight, that is 2 × 1000 × 4096 × 4096 ≈ **33.6 billion FLOPs**. For one layer. Of one kind. Now you see why we need GPUs.
+  </Step>
+
+  <Step title="6. Decode: matrix × vector">
+    During decode we feed **one token** at a time, so m = 1. The GPU must load all 33.5 MB of this weight from memory, then does just 2 × 4096 × 4096 = 33.5 M FLOPs with it. That is about **1 FLOP per byte** loaded. The weight is used once and thrown away.
+  </Step>
+
+  <Step title="7. Prefill: matrix × matrix">
+    During prefill we feed the **whole prompt**, say 512 tokens (m = 512). The weight is loaded once and reused for all 512 rows: **512× more math for the same bytes**.
+
+    This ratio, FLOPs per byte, is called **arithmetic intensity**. It is the single most important number in GPU performance, and Module 02 builds everything on it.
+  </Step>
+</Scrolly>
+
+## From one GEMM to a whole model: 2 FLOPs per parameter
+
+Here is a beautiful shortcut you will use for the rest of your career.
+
+In a matrix × vector product, each weight $W_{ij}$ is used in **exactly one** multiply-add: it multiplies one input number and adds into one output. That is 2 FLOPs per weight per token.
+
+Almost all of an LLM's parameters live in such weight matrices, and every token passes through all of them once. So:
+
+$$
+\text{FLOPs per token} \approx 2 \times \text{number of parameters}
+$$
+
+<Callout type="math" title="Worked example">
+  Llama-3.1-8B has about 8 × 10⁹ parameters. Generating one token costs ≈ 2 × 8 × 10⁹ = **16 GFLOP** (16 billion FLOPs).
+
+  A 1,000-token prompt (prefill) costs ≈ 1,000 × 16 GFLOP = **16 TFLOP** (16 trillion).
+</Callout>
+
+This ignores the attention computation between tokens (the part that grows with context length). For short and medium contexts it is small. We add it back in Module 05.
+
+## From FLOPs to seconds
+
+A GPU's compute speed is quoted in **FLOP/s** (FLOPs per second). An H100 does about **989 TFLOP/s** (989 × 10¹² per second) in dense BF16 on its tensor cores. The free T4 does about **65 TFLOP/s** in FP16.
+
+$$
+\text{time} \ge \frac{\text{FLOPs}}{\text{FLOP/s}}
+$$
+
+The 1,000-token prefill on an H100: 16 × 10¹² ÷ 989 × 10¹² ≈ **16 ms** at perfect efficiency. Real kernels reach 50–70% of peak, so expect around 25–30 ms.
+
+<Callout type="pitfall" title="Peak FLOP/s is a ceiling, not a promise">
+  Spec sheets list the fastest possible rate, often *with sparsity* (which inference rarely uses). That doubles the number. Always use the **dense** figure, and expect to reach only part of it. The fraction you reach is called **MFU**, model FLOPs utilization.
+</Callout>
+
+## The question that drives everything
+
+The same formula says one decode token of an 8B model is 16 GFLOP, which takes an H100 just **0.016 ms** of math. Yet in Module 00 a decode step took about 7 ms. Where did the other 99.8% of the time go?
+
+Into **loading 16 GB of weights from memory** to do that little bit of math. For decode, FLOPs are not the limit; bytes are. Keeping both numbers in view, FLOPs and bytes, is what the next module is about.
+
+## In code
+
+```python
+import torch, time
+
+m, k, n = 1024, 4096, 4096
+a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+b = torch.randn(k, n, device="cuda", dtype=torch.float16)
+
+torch.cuda.synchronize(); t0 = time.perf_counter()
+for _ in range(20):
+    c = a @ b                                   # [1024 x 4096] @ [4096 x 4096]
+torch.cuda.synchronize(); dt = (time.perf_counter() - t0) / 20
+
+flops = 2 * m * k * n
+print(f"{flops/1e9:.1f} GFLOP in {dt*1e3:.2f} ms = {flops/dt/1e12:.1f} TFLOP/s")
+```
+
+On a T4, expect somewhere around 25–45 TFLOP/s: a good fraction of its 65 TFLOP/s peak. You will run this in the lab.
+
+<KeyNotes>
+  1. Shapes: `[m × k] × [k × n] → [m × n]`. Each output cell is a dot product of a row and a column.
+  2. A matrix multiply (GEMM) costs **2·m·k·n FLOPs**: k multiplies and k adds per output cell.
+  3. Each weight is used once per token, so a forward pass costs about **2 × parameters FLOPs per token** (plus attention).
+  4. Time ≥ FLOPs ÷ FLOP/s. Real kernels reach maybe 50–70% of peak; use dense, not sparse, peak numbers.
+  5. **Decode** (m = 1) uses each loaded weight once: ~1 FLOP per byte. **Prefill** (m = hundreds) reuses each weight for every token.
+  6. FLOPs per byte loaded is **arithmetic intensity**, the key to whether a job is limited by math or by memory.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What is the shape of [16 × 4096] × [4096 × 11008]?', options: ['[4096 × 4096]', '[16 × 11008]', '[16 × 4096]', 'The shapes do not match'], answer: 1, why: 'Inner dimensions (4096) match and vanish, leaving [m × n] = [16 × 11008].' },
+  { q: 'How many FLOPs is [16 × 4096] × [4096 × 11008]? Answer in billions (GFLOP).', numeric: true, answer: 1.443, tolerance: 0.02, unit: 'GFLOP', why: '2 × 16 × 4096 × 11008 = 1,442,840,576 ≈ 1.44 GFLOP.' },
+  { q: 'Roughly how many FLOPs does a 70B-parameter model need per generated token?', numeric: true, answer: 140, tolerance: 3, unit: 'GFLOP', why: '≈ 2 × parameters = 2 × 70 × 10⁹ = 140 GFLOP per token (ignoring attention).' },
+  { q: 'A 2,000-token prompt through an 8B model on a GPU sustaining 500 TFLOP/s. Minimum prefill time in milliseconds?', numeric: true, answer: 64, tolerance: 2, unit: 'ms', why: '2 × 8e9 × 2000 = 3.2e13 FLOPs. 3.2e13 ÷ 5e14 = 0.064 s = 64 ms.' },
+  { q: 'Why does decode get so little math done per byte of weights loaded?', options: ['Decode uses lower precision', 'Only one token (m = 1) uses each loaded weight, so each byte feeds about one FLOP', 'The weights are compressed', 'Decode skips the MLP layers'], answer: 1, why: 'With m = 1 each weight is loaded, used in a single multiply-add, and dropped. Prefill reuses it across all prompt tokens.' },
+]} />

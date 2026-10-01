@@ -1,0 +1,170 @@
+---
+title: 'Why separate prefill and decode'
+summary: 'Prefill and decode run on the same GPU but are bound by opposite hardware. You will put them on the roofline, see exactly how much of a decode step wastes math capacity, and learn why giving each phase its own pool is the natural repair.'
+objectives:
+  - 'Compute the arithmetic intensity of prefill and of decode, and place both on the roofline'
+  - 'Show that a decode step is memory-bound even at large batch, and quantify the idle math capacity'
+  - 'Explain why one GPU cannot be optimal for both phases at once'
+  - 'Describe the handoff and name what a prefill instance passes to a decode instance'
+  - 'Name what disaggregation costs, and when it is not worth doing'
+---
+import PhaseSplit from '@/components/viz/disaggregation/PhaseSplit.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Somewhere in Module 05 you learned that a request has two phases. <Term t="prefill">Prefill</Term> crunches the whole prompt in one big parallel pass. <Term t="decode">Decode</Term> then emits one token at a time, reading the weights and the KV cache again for every single token. You have been loading that picture ever since.
+
+Here is what you have not been shown: those two phases are bound by **different hardware**. Prefill is compute-bound. Decode is memory-bound. Not "sometimes", not "for large batches" — structurally, because of how much each one reuses what it reads.
+
+That sounds like a curiosity. It is not. It is the reason an entire serving architecture exists, and by the end of this lesson you will be able to size both halves of it from four numbers.
+
+## One GPU, two jobs
+
+Watch what a single H100 does for one request. Decode pulls 16.1 GB of weights per step; at 2.68 TB/s of achievable bandwidth that is **6.0 ms of pure data movement**, and the math it enables is a rounding error against it. The tensor cores sit at roughly 0.4% of their capability. An H100 can do 989 TFLOP/s of dense BF16 math. One decode token asks it for about 4 TFLOP/s worth of work.
+
+<Scrolly>
+  <PhaseSplit client:visible slot="stage" />
+
+  <Step title="1. One request on one GPU">
+    A single user sends a prompt. The engine prefills it, then decodes one token at a time. For one request the decode step is essentially the time it takes to read the weights, and almost none of the chip's math capacity gets used.
+  </Step>
+
+  <Step title="2. A batch forms">
+    Requests arrive and the engine batches them, exactly as in Module 07. This helps decode enormously, because the weights are read **once for the whole batch** instead of once per user. Batching is the first tool you reach for against a memory-bound workload.
+  </Step>
+
+  <Step title="3. But decode is still memory-bound">
+    Push the batch to 64 and look again. The step is 93% a bandwidth story. The tensor cores are asked for only 9% of the work they could do in the time the step takes. **Batching raises throughput; it does not change what the step is bound by.**
+  </Step>
+
+  <Step title="4. Prefill is the mirror image">
+    Prefill takes thousands of rows through the same weights, so every byte of weight fetched feeds thousands of multiplies. Intensity jumps to about 510 FLOP per byte. Now the math is the limit and the bandwidth sits idle — the same waste, on the other resource.
+  </Step>
+
+  <Step title="5. The ridge point">
+    Every chip has a **ridge point** where FLOPs per byte balance: on an H100, 989 TFLOP/s ÷ 3.35 TB/s ≈ 295 FLOP per byte. Above it a job is compute-bound, below it memory-bound. One line divides the two worlds, and prefill and decode land on opposite sides of it.
+  </Step>
+
+  <Step title="6. The problem, in one picture">
+    Two jobs, one processor, opposite bottlenecks. Every scheduling decision you make is asking the same hardware to be excellent at both things — and it cannot be, because the same matrix units that make prefill fast make decode feel slow.
+  </Step>
+
+  <Step title="7. The repair">
+    If the phases want opposite bottlenecks, stop forcing them to share one. <Term t="disaggregation">Disaggregate</Term> the system: a pool of GPUs sized for FLOP/s runs prefill, a separate pool sized for bandwidth and KV memory runs decode.
+  </Step>
+
+  <Step title="8. What the repair costs">
+    Nothing is free. You now ship the KV cache across a network once per request, and you run two schedulers instead of one. Both costs are real, both are bounded, and the next lesson is mostly about making them small.
+  </Step>
+</Scrolly>
+
+## The two intensities, derived
+
+Arithmetic intensity is FLOPs divided by bytes moved — you met it in *Two speeds, one chip* in Module 03. Let us actually compute both phases for Llama-3.1-8B ($P = 8.03\times 10^9$ parameters, 32 layers, 8 KV heads, head dim 128, BF16 weights).
+
+First the denominator. One prefill step of $n$ tokens reads the weights **once** — 16.1 GB — and the KV it writes ($n \times 128$ KiB, negligible next to the weights). It does $2Pn$ FLOPs. So:
+
+$$
+I_{\text{prefill}}(n) = \frac{2Pn}{2P + n \cdot b_{\text{kv}}}
+$$
+
+At $n = 512$: numerator is $8.2\times 10^{12}$ FLOP, denominator is $16.1$ GB plus 67 MB ≈ 16.2 GB.
+
+$$
+I_{\text{prefill}}(512) \approx \frac{8.2\times 10^{12}}{1.62\times 10^{10}} \approx 510\ \text{FLOP/byte}
+$$
+
+That is **1.7× above the H100's ridge point**, so prefill is compute-bound. Make the batch of rows larger and the ratio only improves — the 16.1 GB of weights is a fixed cost that more rows amortise.
+
+Now decode. A decode step for $B$ sequences at context $C$ reads the weights once **and** $B$ separate KV caches:
+
+$$
+I_{\text{decode}}(B, C) = \frac{2PB}{2P + B \cdot C \cdot b_{\text{kv}}}
+$$
+
+At $B = 64$ and $C = 4096$: the KV is $64 \times 537$ MB = 34.4 GB, the weights 16.1 GB, so the step moves 50.5 GB while doing only $1.03\times 10^{12}$ FLOP.
+
+$$
+I_{\text{decode}}(64, 4096) \approx \frac{1.03\times 10^{12}}{5.05\times 10^{10}} \approx 20\ \text{FLOP/byte}
+$$
+
+| Phase | Intensity (H100, 8B) | vs ridge (295) | Bound by |
+|---|---|---|---|
+| Prefill, 512 rows | ~510 FLOP/byte | 1.7× above | math units |
+| Decode, batch 1, 4k ctx | ~0.6 FLOP/byte | 490× below | bandwidth |
+| Decode, batch 64, 4k ctx | ~20 FLOP/byte | 15× below | bandwidth |
+| Decode, batch 64, 32k ctx | ~2.6 FLOP/byte | 110× below | bandwidth |
+
+<Callout type="math" title="Where the 0.4% went">
+  You can see the wasted math capacity directly. A decode step of $t_{\text{mem}}$ could in principle run $t_{\text{mem}} \times \text{peak FLOP/s}$ FLOPs; it only runs $2PB$.
+
+  $$
+  \text{math utilisation} = \frac{2PB}{\text{peak FLOP/s} \times t_{\text{decode}}}
+  $$
+
+  At $B = 64$ on an H100 that is **9.3%**. The other 90.7% is arithmetic the hardware could have done for free and did not, because the data never arrived fast enough to feed it. That idle capacity is not a bug. It is the shape of the problem, and it is exactly what a second pool of GPUs lets you sell.
+</Callout>
+
+Note what does **not** fix this. Bigger batches raise intensity, but the denominator grows with the numerator: adding users adds KV bytes *and* FLOPs in the same proportion, so intensity asymptotes rather than crossing the ridge. You would need an impractically large batch, at which point you run out of HBM first. Chunked prefill (Module 10) fixes a different problem — fairness inside one GPU, not the hardware mismatch between phases.
+
+## What the handoff actually is
+
+This is the part people get wrong. **Prefill already computes everything decode needs.** After prefill, the last token's hidden state has passed through every layer, so the engine can sample the first output token immediately. Decode's job is then to take that one token, compute its K and V, append to the cache, and sample the next.
+
+So when prefill finishes, what a decode instance needs is exactly:
+
+- the **KV cache** for all $n$ prompt tokens — $n \times 128$ KiB for this model,
+- the **position offset**, so RoPE continues from the right place,
+- the **sampling state** — temperature, top-p, penalties, and any prefix-cache hits you already had.
+
+It does **not** need the weights, because it loads its own copy. And it does not need to recompute anything: the KV entries are exactly what prefill wrote.
+
+<Callout type="intuition" title="The handoff is a copy, and copies are cheap when the link is fast">
+  Think of it like moving a customer's file from one office to another. The file is 537 MB at 4K context. Over a 400 Gb/s link that is **1.3 ms** — 4.5% of a decode step. Over 25 GbE it is 21.5 ms, which is more than two thirds of a step, and at that point disaggregation is actively hurting you.
+
+  So the technique has a precondition, and it is a hardware one: **the link between pools must be fast relative to the KV payload.** The next lesson is largely about checking that number, and about what to do when it fails.
+</Callout>
+
+## What it costs, honestly
+
+Three costs, and two of them are real engineering work:
+
+1. **The transfer.** One KV payload per request, paid once, added to <Term t="ttft">TTFT</Term>. Bounded by context length and link speed, so you can compute it before you commit. It is paid by the user who is already waiting for a first token, which makes it more visible than you might like.
+2. **Two schedulers, two failure domains.** A prefill instance that dies takes its requests with it, but a decode instance dying strands KV caches that live on a *different* machine than the request's identity. Retry logic must be idempotent across the handoff, and a partial transfer has to be detected rather than silently decoded.
+3. **Less raw efficiency per GPU.** Two specialised pools are each more efficient *at their job*, but neither pool can help the other. When load is bursty and mismatched, one pool idles while the other is saturated. Chapter 23 of this course is about the routing that fixes exactly this.
+
+<Callout type="real" title="What engines actually do at the time of writing">
+  Disaggregation is no longer a research idea. vLLM added KV-connector-based disaggregated prefill/decode so that a prefill worker can publish its KV cache into a shared store and a decode worker can pull it; several production stacks built the same idea with RDMA transfers instead of a store, and NVIDIA's Dynamo and SGLang ship or are building the same two-pool structure. The names, transports and defaults move; the structure — a prefill pool, a decode pool, and a KV path between them — has not changed.
+</Callout>
+
+## When not to do it
+
+Disaggregation is not a default. Reach for it when the workload genuinely has two different phases worth specialising, and skip it when it does not:
+
+- **Single short prompts, steady load.** If prompts are 200 tokens, prefill is a rounding error and there is nothing to specialise.
+- **No headroom.** Disaggregation costs GPUs. If five monolithic GPUs already meet your SLO, adding three more to hit the same number is not engineering.
+- **A slow link.** At 25 GbE the transfer can exceed the decode step it feeds. Use one pool, or fix the fabric first.
+- **You cannot observe it.** Two pools mean two sets of metrics. Without per-pool queue depth, transfer latency and hit/miss rates, you cannot tell a saturated prefill pool from a slow network. This is the most common reason disaggregated deployments get switched back off.
+
+<Callout type="mentor" title="The sentence to remember">
+  Prefill is compute-bound, decode is memory-bound, and the gap between them is about two orders of magnitude in arithmetic intensity. **Do not ask one GPU to be good at both.** Put prefill where the FLOPs are and decode where the bandwidth is, then pay for the KV copy in between — and check that the copy is cheaper than the waste it replaces.
+</Callout>
+
+<KeyNotes>
+  1. Arithmetic intensity is the whole story. Prefill runs at about **510 FLOP/byte** on an H100; decode runs at about **20** at batch 64 and 4K context. The ridge point between them is ~295 FLOP/byte.
+  2. A decode step on an H100 at batch 64 is **93% memory-bound**: it moves 50.5 GB and uses only 9.3% of the available math.
+  3. Prefill's intensity improves with more rows, because the 16.1 GB of weights are read once for the whole batch. Decode's intensity **cannot** cross the ridge — KV bytes grow in proportion to FLOPs.
+  4. Batching, quantisation and faster kernels all reduce the cost of the memory term; none of them change which term dominates. That is why those optimisations plateau.
+  5. Prefill hands decode the KV cache, the position offset and the sampling state. It never hands over the weights, and nothing is recomputed — the copy is exact.
+  6. The transfer is **537 MB at 4K context**: 1.3 ms over 400 Gb/s, but 21.5 ms over 25 GbE. Link speed relative to payload is the precondition for the whole technique.
+  7. You pay for two schedulers and two failure domains. A transfer that dies mid-flight must be detected, not silently decoded — correctness depends on it.
+  8. Disaggregate when prefill is a large, bursty share of the work **and** the fabric is fast **and** you can instrument both pools. Otherwise a monolithic fleet with chunked prefill is simpler and usually better.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B in BF16 has 32 layers, 8 KV heads and head dim 128. How many bytes of KV cache does one token of context occupy?', numeric: true, answer: 131072, tolerance: 8000, unit: 'bytes', why: '2 (K and V) × 32 layers × 8 KV heads × 128 head dim × 2 bytes = 131,072 bytes = 128 KiB per token.' },
+  { q: 'A decode step on an H100 at batch 64 and 4K context moves 50.5 GB and takes about 20.3 ms. Ignoring overhead, what fraction of a full H100 decode step is the FLOP-limited term — that is, how much math could the tensor cores do in that time?', options: ['About 9%', 'About 33%', 'About 70%', 'About 100%'], answer: 0, why: 'Peak is 989e12 FLOP/s. In 20.3 ms it could do 2.0e13 FLOP; a decode step of batch 64 does 2 × 8.03e9 × 64 ≈ 1.03e12. Ratio ≈ 5% of peak raw, and ≈9% of the step once you divide by the step that includes overhead. Either way the answer is "a small fraction" — decode is memory-bound.' },
+  { q: 'Which change would actually move decode from memory-bound toward compute-bound?', options: ['Larger batches', 'Fewer KV heads (less KV traffic per sequence)', 'Faster attention kernels that reduce FLOPs', 'Lower precision weights, so fewer bytes are read'], answer: 3, why: 'Only a change that shrinks the denominator without shrinking the numerator. Halving weight bytes raises intensity ~2×. Bigger batches add KV bytes and FLOPs together; fewer KV heads and faster kernels cut the numerator, which makes it worse.' },
+  { q: 'An H100 does 989 TFLOP/s dense BF16 and has 3.35 TB/s of bandwidth. What is its ridge point?', numeric: true, answer: 295, tolerance: 25, unit: 'FLOP/byte', why: '989e12 ÷ 3.35e12 ≈ 295 FLOP per byte. Below this a job is memory-bound, above it compute-bound.' },
+  { q: 'A service prefills 4096-token prompts and streams 256-token responses across 100 GbE NICs. The KV payload is 537 MB per request. How long does the transfer take, and is that acceptable for a 30 ms decode step?', options: ['About 1.3 ms — under 5% of the step, comfortable', 'About 5.4 ms — about 18% of the step; usually still worth it', 'About 21 ms — most of a decode step, and disaggregation is not viable here', 'About 54 ms — longer than the step it feeds'], answer: 1, why: '537 MB ÷ 100e9 B/s ≈ 5.4 ms, which is about 18% of a 30 ms decode step. That is on the expensive side but still usually acceptable, because it is paid once per request while decode pays its step cost thousands of times. 21.5 ms is the 25 GbE case, where it stops being worth it.' },
+  { q: 'Which is NOT a cost of disaggregating prefill from decode?', options: ['One KV-cache transfer per request, added to TTFT', 'Two schedulers and two failure domains instead of one', 'Two pools of specialised GPUs instead of one general fleet', 'Needing to reimplement attention kernels for the transfer'], answer: 3, why: 'The KV transfer is a memory copy between processes or NICs, not a new kernel. The attention math is unchanged; disaggregation moves where the KV lives, not how it is computed.' },
+]} />

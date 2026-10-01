@@ -1,0 +1,211 @@
+---
+title: 'Structured output & tool calling'
+summary: 'Getting a model to emit valid JSON is not a prompting problem, it is a decoding problem. You constrain the sampler with a grammar so invalid output becomes impossible, then discover that the interesting costs are in the tool loop around it: tokens spent on boilerplate, a second schema-driven parse, and a validation step that grammar cannot do for you.'
+objectives:
+  - Explain how constrained decoding replaces free sampling with walking a grammar
+  - Compute the allowed-token fraction at a given state of a JSON grammar
+  - Explain why constrained decoding adds latency proportional to grammar complexity but not to answer length
+  - Break down the token cost of a tool call into boilerplate and payload
+  - Decide which constraints to enforce in the sampler and which to enforce in validation
+---
+import StructuredOutput from '@/components/viz/specialized-workloads/StructuredOutput.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Ask a language model to return a JSON object and it will, with beautiful confidence, return something that is almost JSON. A missing comma. A single quotes instead of double. A number where a string belongs, or a string where a number belongs. Then your parser throws, your agent crashes, and — worst of all — it fails *sometimes*, which is the hardest kind of bug to ship around.
+
+Here is the uncomfortable truth underneath that: the model did not make a reasoning error. It sampled a token that was perfectly plausible in the distribution and illegal in your grammar. Fixing it with a better prompt is a losing game, because you are asking the sampler to respect a rule it has no representation of.
+
+<Callout type="mentor" title="The fix is not a better prompt">
+  A prompt says "return JSON". A <Term t="constrained-decoding">constrained decoder</Term> makes every other token impossible. One is a request; the other is a guarantee. For anything a machine will parse, you want the guarantee.
+</Callout>
+
+## From "please emit JSON" to "nothing else is possible"
+
+Ordinary sampling, at each step, is a softmax over the whole vocabulary followed by a draw. Nothing about the distribution knows about braces.
+
+<Scrolly>
+  <StructuredOutput client:visible slot="stage" />
+
+  <Step title="1. Free text: the whole vocabulary is open">
+    Every step, every token in the vocabulary is a candidate. That is what makes generation flexible — and it is exactly why a stray token can end your JSON half-written. **The grammar does not exist yet.**
+  </Step>
+
+  <Step title="2. A grammar turns sampling into walking a state machine">
+    Compile a JSON Schema, a regular expression or a grammar into a parser. Now the engine knows, at every point mid-generation, which tokens keep the parse alive. That set is the **allowed set**.
+  </Step>
+
+  <Step title="3. The mask: one bit per token, recomputed each step">
+    The engine builds a mask over the vocabulary and applies it to the logits with a single elementwise `where` before the softmax. On a 128K vocabulary that is a few hundred microseconds — **against a decode step measured in tens of milliseconds.**
+  </Step>
+
+  <Step title="4. Alternating narrow and wide">
+    This is the part that surprises people. A JSON grammar is *not* uniformly tight: right after a token that ends a key, almost nothing is legal, but inside a string almost everything is. **The mask breathes**, and the wasted probability mass is where it goes.
+  </Step>
+
+  <Step title="5. Pinning a schema: the allowed set collapses">
+    Add an enum and the field is pinned to its members exactly. Pin the whole schema and you have traded model freedom for an output your parser can never reject.
+  </Step>
+
+  <Step title="6. Why it is almost free">
+    Constrained decoding adds **no tokens** and no extra forward passes. It costs one mask evaluation per step. It makes generation *correct*, not *faster* — and that distinction is the whole lesson.
+  </Step>
+
+  <Step title="7. A tool call, token by token">
+    Walk a real `get_weather` call. Most of the tokens are the scaffolding the grammar forced: the function name, the field names, the punctuation. **Only the values are actual model choice.**
+  </Step>
+
+  <Step title="8. What the caller must still validate">
+    A grammar guarantees *syntax*. It cannot know the city exists, the ID is real, or the user is allowed. That check lives in your service, and it is not optional.
+  </Step>
+</Scrolly>
+
+## The arithmetic of the allowed set
+
+The allowed set is a subset of the vocabulary, so it has a size, and the size is a fraction worth computing. Consider Llama-3.1's vocabulary of 128,256 tokens and the schema `{"city": string, "unit": "c"|"f"}`.
+
+At the very start, the next thing that can legally be emitted is `{`. How many tokens in a 128K vocabulary encode just a curly brace? A handful — typically fewer than a hundred distinct token IDs can produce a bare `{`. So:
+
+$$
+\text{allowed fraction} \approx \frac{50}{128{,}256} = \boxed{3.9\times 10^{-4}}
+$$
+
+That is **0.04% of the vocabulary**. Every other token has been projected to zero probability by the mask, and no amount of model confidence can resurrect it.
+
+Now step *inside* the string value, after `"city": "`. What is legal? Any token that continues a legal JSON string: letters, digits, spaces, escapes — and the closing quote. Most of a language model's vocabulary is ordinary words, and all of those are legal here:
+
+$$
+\text{allowed fraction} \approx \frac{80{,}000}{128{,}256} = \boxed{0.62}
+$$
+
+**62%.** The same grammar, one token apart, swings from 0.04% to 62%.
+
+<Callout type="intuition" title="Why the narrow states matter more than they look">
+  A state that permits 0.04% of the vocabulary is effectively a *forced* token. The model's opinion is almost irrelevant; the grammar has decided. So a JSON schema is mostly a machine for forcing punctuation, and the model's real freedom is confined to the inside of string values.
+</Callout>
+
+This gives a useful diagnostic. If a model keeps producing invalid JSON, look at *where* it fails. Failures at the narrow states are grammar bugs in your schema. Failures inside string values are usually truncation or a token cap, not a sampling problem.
+
+## What constrained decoding costs
+
+Now the number an inference engineer actually wants. Three costs, in order of importance:
+
+| cost | size | why |
+|---|---|---|
+| extra tokens emitted | **zero** | constrained decoding never adds a token; it only forbids some |
+| extra forward passes | **zero** | the model runs exactly as before |
+| mask evaluation | ~0.2–1 ms per step | one `where` over 128K floats, plus the grammar transition |
+
+Against a decode step of 10–40 ms for an 8B model on an H100, the mask is roughly **1–3% overhead**. On a cheap model on a small card the mask is a larger relative cost, because the decode step is smaller — which is one reason production engines apply the mask on-device in a fused kernel rather than as a separate PyTorch op.
+
+<Callout type="math" title="The grammar transition is where complexity hides">
+  For a JSON grammar the transition table is small and the mask can be computed incrementally. For a regular expression the mask is a DFA over the pattern, which can be exponential in the worst case. For a full context-free grammar (programming languages, SQL dialects) engines typically compile to a pushdown automaton and cache states.
+
+  The practical rule: **JSON Schemas are cheap, regexes are moderate, arbitrary grammars are a project.** Check what your engine supports before designing around it.
+</Callout>
+
+## The real cost: tokens, not masking
+
+The mask is cheap. The *output* is not free, because a tool call is mostly not information.
+
+Walk a call like this one:
+
+```json
+{"name": "get_weather", "arguments": {"city": "Paris", "unit": "c"}}
+```
+
+Count the tokens. Using Llama-3.1's tokenizer, the JSON punctuation and key names are dense single tokens; the *values* are the only part that carries information. A rough decomposition:
+
+| part | tokens | who chose them |
+|---|---|---|
+| function name and tags | 8 | the grammar |
+| keys, braces, quotes, colons | 10 | the grammar |
+| values (`"Paris"`, `"c"`) | 14 | **the model** |
+
+So a 32-token call is roughly 44% actual payload. Add arguments and the ratio improves, because each argument adds a value but only one more key:
+
+$$
+\text{payload fraction} = \frac{7n}{8 + 5n + 7n} = \frac{7n}{8 + 12n}
+$$
+
+| arguments $n$ | total tokens | payload share |
+|---|---|---|
+| 1 | 20 | 35% |
+| 2 | 32 | 44% |
+| 3 | 44 | 48% |
+| 5 | 68 | 51% |
+
+As $n \to \infty$ the share approaches $7/12 = 58\%$. **Even in the best case, more than 40% of a tool call is overhead the grammar forced.**
+
+<Callout type="pitfall" title="Long tool schemas are a latency tax, not a documentation practice">
+  That 40% floor is a real cost measured in streamed tokens and in TTFT. A 30-function tool catalogue dumped into the system prompt costs hundreds of tokens of prefill before the model has decided anything. This is Module 10's lesson about prefix caching, applied to prompts: **the tool schema is a prefix**, so cache it and put it first.
+</Callout>
+
+## Grammar versus validator
+
+This is the distinction people get wrong, and getting it wrong is how you ship a security bug.
+
+| the grammar guarantees | only your validator can check |
+|---|---|
+| well-formed JSON | the city exists |
+| required fields present | the user may access that record |
+| correct types | the argument is in range |
+| enum values are members | the call is not a replay |
+| no trailing garbage | the result is actually safe to run |
+
+Constrained decoding is a **type system**, not a security boundary. The moment your model can call a tool that touches money, permissions or a database, validation runs in your service, in the same transaction as the side effect.
+
+```python
+# What constrained decoding gives you: a shape.
+args = json.loads(raw)          # cannot fail on syntax — the grammar guaranteed it
+
+# What you still have to do: everything that matters.
+if args["days"] > MAX_DAYS:    # range check: the schema said int, not "in range"
+    raise InvalidToolCall()
+if not user_may_access(user, args["account_id"]):
+    raise PermissionDenied()   # the grammar knows nothing about your ACLs
+```
+
+<Callout type="real" title="Where engines draw the line">
+  At the time of writing, mainstream engines support JSON Schema and a few regex dialects for guided decoding; they do **not** support arbitrary context-free grammars. That means a syntax-level guarantee is available to you today for the formats that matter, and a semantic guarantee is not available at any price. Design accordingly: make the grammar do everything it can, and put the rest behind validation you control.
+</Callout>
+
+## Putting it together
+
+A production tool-calling stack, in the order the constraints should apply:
+
+1. **Prompt** — put the tool schema first, so it is the cached prefix.
+2. **Constrained decoding** — a JSON Schema, so the output parses.
+3. **Schema narrowing** — enums and types as tight as the task allows, because tightness is what collapses the allowed set.
+4. **Parse** — cannot fail; if it does, you have an engine bug.
+5. **Validate** — ranges, permissions, existence. Your code, your transaction.
+6. **Execute and return**, with the tool result fed back as the next turn's context.
+
+Note that step 5 is where an inference engineer stops and a normal backend engineer starts. That is a real and good thing: the model is good at producing a *plausible* argument, and the parts of the system with real consequences should not be the parts the model touches.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. A grammar allows 0.04% of a 128,256-token vocabulary at some step. How many tokens is that, and what fraction of the vocabulary is *not* allowed?
+  2. Your JSON grammar allows 62% of the vocabulary inside a string and 0.04% right after a comma. Which state is more likely to produce a decoding failure, and why?
+  3. A tool call with 3 arguments costs 44 tokens and 48% of it is payload. What is the total token cost with 6 arguments, using the formula in the lesson?
+  4. Constrained decoding adds no extra forward passes and no extra tokens, yet costs 1–3% of wall-clock. Where does that time go, and why is the relative cost *higher* on a small model than a large one?
+  5. Your schema says `{"amount": int}`. Name three things the grammar guarantees and three it cannot.
+</Callout>
+
+<KeyNotes>
+  1. Constrained decoding replaces free sampling with walking a parser: the engine builds an allowed-token mask each step and zeroes everything else in the logits before the softmax.
+  2. The mask costs one elementwise pass over the vocabulary — roughly 1–3% of a decode step. Constrained decoding adds **no tokens and no forward passes**; it buys correctness, not speed.
+  3. A JSON grammar alternates between near-forced states (under 0.1% of the vocabulary allowed, e.g. right after a comma) and nearly-unconstrained ones (tens of percent, inside a string). The model's real freedom lives inside string values.
+  4. A tool call is mostly not information: even with many arguments, more than 40% of the tokens are grammar-forced scaffolding — function name, keys, and punctuation.
+  5. Tool schemas are prompt prefixes, so put them first and let prefix caching keep them off the critical path; a large catalogue is a prefill tax.
+  6. Grammar complexity is the real cost driver: JSON Schemas are cheap, regexes moderate, and arbitrary context-free grammars are a project. Check engine support before designing around one.
+  7. Constrained decoding is a type system, not a security boundary. It guarantees syntax, types and enums; existence, range and permissions are your validator's job.
+  8. When the mask is narrow the model has almost no choice, so decoding failures point at your schema or at truncation — not at the model's reasoning.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'At one step of constrained decoding, a JSON grammar allows 50 tokens out of a 128,256-token vocabulary. What fraction of the vocabulary is allowed?', numeric: true, answer: 0.04, tolerance: 0.01, unit: '%', why: '50 / 128,256 = 3.9e-4 = 0.039%, so about 0.04%. A state this narrow is effectively a forced token: the model has almost no influence on which token is emitted.' },
+  { q: 'A tool call costs 32 tokens for 2 arguments and is 44% payload. Using the lesson formula payload = 7n/(8+12n), what is the total token cost for 6 arguments?', numeric: true, answer: 80, tolerance: 4, unit: 'tokens', why: 'For n = 6: boilerplate = 8 + 5(6) = 38, payload = 7(6) = 42, total = 38 + 42 = 80 tokens. The payload share is 42/80 = 52.5%, approaching the 58% ceiling as n grows — even with many arguments, under half the call is real information.' },
+  { q: 'Constrained decoding adds latency but no extra tokens. What actually costs the time?', options: ['Re-running the model once per grammar state', 'The logits must be recomputed for the whole vocabulary', 'One mask evaluation over the vocabulary per step, plus the grammar transition', 'The output must be parsed twice'], answer: 2, why: 'The model runs exactly once per token as usual. The extra work is building and applying a vocabulary-sized mask — one elementwise `where` before the softmax — plus advancing the parser. That is ~1-3% of a decode step.' },
+  { q: 'Why is constrained decoding a *relatively* larger overhead on a small model than on a large one?', options: ['Small models have bigger vocabularies', 'The mask cost is roughly fixed while the decode step is much shorter on a small model', 'Grammar compilation only works on large models', 'Small models need longer grammars'], answer: 1, why: 'The mask work scales with vocabulary size, which is similar for both models, while the decode step scales with the weight read. A small model on the same GPU has a much shorter step, so the same fixed mask cost is a larger fraction of it.' },
+  { q: 'Which of these can a JSON Schema grammar NOT check?', options: ['That required fields are present', 'That an enum value is one of its members', 'That the user is permitted to access the record named in the call', 'That the output is well-formed JSON'], answer: 2, why: 'Grammar is a type system over syntax. It knows nothing about your ACLs, your database, or whether a city exists. Permissions, existence and range checks all belong in a validator inside your service.' },
+  { q: 'A model repeatedly produces invalid JSON. Where does that failure most likely originate?', numeric: false, options: ['At the wide states inside string values', 'At the narrow states after punctuation, indicating a schema or truncation problem', 'From sampling temperature being too high', 'From an insufficiently large batch'], answer: 1, why: 'Inside a string most tokens are legal, so those states rarely fail. Narrow states — right after a comma or quote — are where a mismatch between what the model expects and what the grammar permits shows up, and that points at your schema or a token cap rather than at sampling.' },
+]} />

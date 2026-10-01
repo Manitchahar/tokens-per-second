@@ -1,0 +1,235 @@
+---
+title: 'Batch inference & RL rollouts'
+summary: 'Reinforcement learning on a language model needs thousands of complete generations per optimisation step, all in memory at once, all finishing at different times. Almost every property of an RL inference system falls out of that one requirement — and the arithmetic that sizes it is the same KV formula you have used all course.'
+objectives:
+  - Compute the KV cache of a rollout group and size a cluster to it
+  - Explain why KV, not weights, is the binding constraint for RL rollout generation
+  - Explain why no SLO applies and how that moves the optimal batch size
+  - Quantify the cost of ragged completion as the batch drains
+  - Choose a generation cap and explain the headroom it must leave
+---
+import BatchRlRollouts from '@/components/viz/specialized-workloads/BatchRlRollouts.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Everything so far in this course has been about serving people. One user sends a request, waits, gets tokens, leaves. Every design decision traced back to somebody's patience.
+
+Now the goalposts move. To fine-tune a model with reinforcement learning you need, for a single optimisation step: **take a frozen policy, generate thousands of complete answers, score them all, and update the weights.** No user is waiting on any individual answer. Nothing has a time-to-first-token target. The only thing that matters is how many tokens per second the cluster produces.
+
+That changes the arithmetic, the batching, and the failure modes — in ways that are worth understanding precisely, because RL fine-tuning is where most of the frontier work now happens.
+
+<Callout type="mentor" title="The single sentence that explains this workload">
+  RL rollouts are **batch inference with no SLO**, thousands of sequences resident at once, all draining to completion at different times. Every rule that follows is a consequence of that sentence.
+</Callout>
+
+## Why it is a different workload
+
+Three structural differences from serving.
+
+**Nobody is waiting.** This is not a small difference; it changes everything downstream. With no latency target, the optimal operating point moves far to the right on Module 06's latency–throughput curve.
+
+**Every sequence is a whole conversation.** Not a prompt and a short reply — a full rollout including prompt, generation, and often a reward computation. At 4,096 tokens each, 1,024 rollouts is 4.2 million tokens of live state.
+
+**They finish at different times.** Rollout lengths vary by an order of magnitude. The batch starts full and drains continuously — the exact opposite of serving, where finished requests are replaced and the batch stays full.
+
+<Scrolly>
+  <BatchRlRollouts client:visible slot="stage" />
+
+  <Step title="1. RL needs thousands of whole generations">
+    One optimisation step, one group of rollouts, all held at once. **This is not a serving request** — it is a batch job with a memory bill.
+  </Step>
+
+  <Step title="2. The KV cache is the whole problem">
+    Each rollout is a full sequence, so each holds a full KV cache. Multiply by group size and you have the number that decides your cluster size.
+  </Step>
+
+  <Step title="3. Sizing a group to a cluster">
+    Weights are resident once per GPU. **KV is what grows**, and it grows with tokens, not with parameters.
+  </Step>
+
+  <Step title="4. Nobody is waiting, so batch until it hurts">
+    Decode is memory-bound, so a bigger batch costs surprisingly little. **Without an SLO you should run far past any serving operating point.**
+  </Step>
+
+  <Step title="5. The batch drains as rollouts finish">
+    It starts at the full group and shrinks. This is backwards from serving, and it means **your peak memory is the group size, not the average.**
+  </Step>
+
+  <Step title="6. Why the tail is slow">
+    As the batch shrinks, the weight read is amortised over fewer tokens and arithmetic intensity rises. The last few rollouts run at a fraction of the first ones.
+  </Step>
+
+  <Step title="7. Generation length: the dial people get wrong">
+    Too short and rollouts are truncated mid-thought; too long and some never terminate and the step hangs. **Cap it hard, and leave headroom.**
+  </Step>
+
+  <Step title="8. What a rollout budget looks like">
+    GPUs needed, wall-clock per step, tokens per second. **Those three numbers are what a research team plans around.**
+  </Step>
+</Scrolly>
+
+## The arithmetic: KV is the constraint
+
+Use the formula from Module 05, unchanged. For a rollout of $S$ tokens on a model with $L$ layers, $H_{kv}$ KV heads of dimension $D$:
+
+$$
+\text{KV per rollout} = S \times \underbrace{2 L H_{kv} D \times b}_{\text{KV bytes per token}}
+$$
+
+Take Llama-3.1-8B: 32 layers, 8 KV heads of 128 dims, BF16.
+
+$$
+\text{KV per token} = 2 \times 32 \times 8 \times 128 \times 2 = \boxed{131{,}072 \text{ B} = 128 \text{ KB}}
+$$
+
+$$
+\text{KV per rollout at 4096 tokens} = 4096 \times 131{,}072 = \boxed{0.54 \text{ GB}}
+$$
+
+Now the group. On 8 H100s (640 GB total), with 16.06 GB of weights resident per GPU — 129 GB of the cluster — that leaves **511 GB for KV**:
+
+$$
+\text{rollouts that fit} = \frac{511\text{ GB}}{0.54\text{ GB}} = \boxed{952}
+$$
+
+| group size | total KV | share of cluster | GPUs needed |
+|---|---|---|---|
+| 512 | 0.27 TB | 43% | 1 of 8 |
+| 1,024 | 0.55 TB | 86% | 2 of 8 |
+| 4,096 | 2.20 TB | 344% | 5 of 8 — **does not fit** |
+
+<Callout type="math" title="The parameter count is nearly irrelevant">
+  Compare the two constraints. The weights are 16 GB — **3% of the cluster**. The KV cache at a 1,024-rollout group is 550 GB — **86% of the cluster**.
+
+  So a rollout cluster is sized by *tokens in flight*, not by model size. The corollary is useful and slightly counterintuitive: **doubling the model size barely changes your cluster requirement, while doubling the sequence length doubles it.** Every lever an inference engineer normally reaches for — quantisation, tensor parallelism — is aimed at the 3%.
+</Callout>
+
+Which model you pick still matters, but through a different channel — the KV-head count:
+
+| model | layers | KV heads | KV/token | KV per 4096-token rollout |
+|---|---|---|---|---|
+| Qwen2.5-1.5B | 28 | 2 | 28 KB | 0.12 GB |
+| Qwen2.5-7B | 28 | 4 | 56 KB | 0.23 GB |
+| Llama-3.1-8B | 32 | 8 | 128 KB | 0.54 GB |
+
+Llama-3.1-8B has 5× the parameters of Qwen2.5-1.5B and **4.5× the KV cache per token**. The KV-head count, not the parameter count, is what decides rollout economics — which is why GQA (Module 03) is not optional for long-context or RL work.
+
+## Batch as large as memory allows
+
+With no SLO, the calculus is simple: decode is memory-bound, so adding sequences to a batch costs almost nothing per token.
+
+On one H100, Llama-3.1-8B in BF16 at 4,096 context:
+
+| batch | bytes per step | step time | aggregate throughput | per-sequence rate |
+|---|---|---|---|---|
+| 8 | 20 GB | 7.1 ms | 1,119 tok/s | 140 tok/s |
+| 64 | 50 GB | 17.7 ms | 3,614 tok/s | 56 tok/s |
+| 256 | 153 GB | 53.9 ms | 4,749 tok/s | 19 tok/s |
+| 512 | 291 GB | 102.2 ms | 5,011 tok/s | 10 tok/s |
+
+Read that table carefully, because it teaches something that transfers to every workload in this course.
+
+**Throughput goes up 4.5× from batch 8 to 512. Per-sequence rate goes down 14×.** A single sequence in a batch of 512 moves at 10 tokens per second — catastrophically slow for a user, and completely irrelevant here.
+
+The mechanism: the weight read is 16 GB regardless of batch. At batch 8 you amortise it over 8 tokens; at batch 512 you amortise it over 512. The KV term grows, but it starts from nothing.
+
+<Callout type="intuition" title="Why batch 8 and batch 512 differ so little in aggregate">
+  At batch 8 the step moves 20 GB, of which 16 GB is weights. At batch 512 it moves 291 GB, of which 16 GB is weights. The weight fraction fell from 80% to 5.5%.
+
+  **This is the same curve as Module 06's, and for the same reason** — decode is memory-bound, so it is always reading the same weights until the KV term catches up. The batch size at which that happens is the roofline knee, and for an 8B model at 4k context it is somewhere around batch 128. Past the knee, more batch buys you nothing but memory pressure.
+</Callout>
+
+## Ragged completion, and why the tail is slow
+
+Rollouts finish at different lengths. Assume completions spread uniformly over the first 80% of the generation window:
+
+| progress | rollouts remaining |
+|---|---|
+| start | 1,024 |
+| 25% | 704 |
+| 50% | 384 |
+| 75% | 64 |
+| 80% | 0 |
+
+Three consequences, and they are not equally important.
+
+**One: peak memory is the group size.** You must provision for the moment when all 1,024 are alive, not for the average. Any capacity plan based on average occupancy will OOM at the start of every step.
+
+**Two: throughput degrades as the batch drains.** Fewer rows per GEMM means the weight read is amortised over fewer tokens — precisely the batch-8 regime of the table above, which runs at 1,119 tok/s instead of 5,011. So the last fifth of your generation window runs at roughly a quarter of peak.
+
+**Three: KV cache fragmentation.** Finished rollouts must free their blocks while others are mid-generation, so your allocator is doing harder work than in serving (Module 08). This is where preemption policies start to matter.
+
+<Callout type="pitfall" title="Stragglers are worse here than in serving">
+  In serving, a slow sequence delays one user. In RL, one unfinished rollout **delays the entire optimisation step**, because you cannot compute a reward until every sample is done.
+
+  So the failure mode is a hang rather than a slow response, and the mitigation is a hard generation cap plus an explicit penalty for rollouts that hit it. **An RL system without a cap will eventually wedge**, and it will do so hours into a run.
+</Callout>
+
+## Generation length: the dial people get wrong
+
+Let $T_{\text{seq}}$ be the sequence length and let the cap apply to the generated portion. The obvious move is to set the cap as high as the context allows. That is wrong, for two reasons.
+
+**Truncation destroys the reward signal.** A rollout cut off mid-reasoning has not expressed a preference — it has been interrupted. If 30% of your rollouts hit the cap, 30% of your training signal is noise.
+
+**The cap must leave headroom.** A rollout that reaches the context limit has no room for the reward model's own forward pass, or for a retry. So:
+
+$$
+\text{cap} = \lceil 0.75\, T_{\text{seq}} \rceil, \qquad \text{headroom} = 25\%
+$$
+
+At a 4,096 context that is a 3,072-token generation cap with 1,024 tokens of slack — the reward pass needs roughly that much.
+
+| cap as % of context | generation budget | headroom | verdict |
+|---|---|---|---|
+| 100% | 3,072 | 0 | **broken** — no room for the reward pass |
+| 75% | 3,072 | 1,024 | sensible default |
+| 50% | 2,048 | 2,048 | safe; check your truncation rate |
+| 25% | 1,024 | 3,072 | too aggressive for hard tasks |
+
+<Callout type="real" title="What people actually get wrong">
+  In practice the two common mistakes are the same mistake in opposite directions: **too generous a cap**, so rollouts run long, batches drain slowly, and the step takes three times longer than planned; or **no cap at all**, so one non-terminating rollout hangs the run overnight.
+
+  The fix is boring and mechanical: measure the distribution of completion lengths on your actual prompts, set the cap at roughly the 90th percentile, and add an explicit "did not terminate" penalty to the reward so the policy learns to finish. This is a data question, not an engineering one — but it shows up as an engineering outage.
+</Callout>
+
+## Budgeting a rollout run
+
+Pull it together for Llama-3.1-8B, 1,024 rollouts at 4,096 tokens, 75% generated, on 8 H100s:
+
+| quantity | value |
+|---|---|
+| KV per rollout | 0.54 GB |
+| total KV | 550 GB (86% of the cluster) |
+| weights | 129 GB (3%) |
+| peak rollouts per GPU | ~64 |
+| generated tokens | 3.1M |
+| aggregate throughput at peak batch | ~5,000 tok/s |
+| wall-clock per optimisation step | **≈ 10 minutes** |
+
+Ten minutes per step is the number a research team plans around. It is also why RL experiments are expensive and why throughput work in this area pays off directly: a 2× improvement halves the time to every experiment.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. Llama-3.1-8B on 8 H100s. Compute KV bytes per token, then KV per 4,096-token rollout.
+  2. With 16.06 GB of weights per GPU on a 640 GB cluster, how many 4,096-token rollouts fit? What fraction of the cluster is weights versus KV?
+  3. A decode step at batch 8 moves 20 GB and at batch 512 moves 291 GB. Why does aggregate throughput improve only 4.5× over a 64× batch increase, and where does the rest go?
+  4. Rollouts drain from 1,024 to 0 over a window. Why is peak memory the group size rather than the average, and what happens to throughput in the last fifth?
+  5. Your context is 4,096 tokens and the generation fraction is 75%. Set a cap that leaves room for a reward pass, and say what fraction of the context the cap uses.
+</Callout>
+
+<KeyNotes>
+  1. RL rollouts are batch inference with no SLO: thousands of whole sequences resident at once, draining to completion at different times. Every other property follows from that.
+  2. KV, not weights, is the binding constraint. At a 1,024-rollout group on 8 H100s, KV is 86% of cluster memory and weights are 3%.
+  3. So rollout clusters are sized by **tokens in flight**, not model size. Doubling sequence length doubles the requirement; doubling model size barely moves it.
+  4. The KV-head count, not the parameter count, decides rollout economics — Llama-3.1-8B has 5× the parameters of Qwen2.5-1.5B and 4.5× the KV per token, which is why GQA is mandatory here.
+  5. Without an SLO, batch as large as memory allows: throughput rises 4.5× from batch 8 to 512 while the per-sequence rate falls 14×, and none of that matters when nobody is waiting.
+  6. Ragged completion means **peak memory is the group size**, and throughput degrades to roughly a quarter of peak as the batch drains, because fewer rows re-expose the batch-8 regime.
+  7. A single unfinished rollout stalls the entire optimisation step, so a hard generation cap is not optional — and it should sit at ~75% of context to leave room for the reward pass.
+  8. Measure your own completion-length distribution and set the cap near its 90th percentile. RL runs are long enough that a missing cap wedges them hours in.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B has 32 layers, 8 KV heads of 128 dims, BF16. How many bytes of KV cache does one token cost?', numeric: true, answer: 131072, tolerance: 2000, unit: 'bytes', why: '2 × 32 × 8 × 128 × 2 = 131,072 B = 128 KB per token. This is the Module 05 formula with nothing changed. At 4,096 tokens per rollout it becomes 0.54 GB per sequence.' },
+  { q: 'On 8 H100s (640 GB) with 16.06 GB of weights per GPU, how many 4,096-token Llama-3.1-8B rollouts fit?', numeric: true, answer: 952, tolerance: 30, unit: 'rollouts', why: 'Free memory is 640 - 8 × 16.06 = 511 GB. Each rollout needs 4,096 × 131,072 = 0.54 GB. So 511 / 0.54 ≈ 950 rollouts. Note the shape of the answer: weights are 3% of the cluster and KV is the rest, which is why rollout clusters are sized by tokens in flight rather than by parameter count.' },
+  { q: 'A decode step moves 20 GB at batch 8 and 291 GB at batch 512. By what factor does aggregate throughput improve?', options: ['About 4.5×', 'About 8×', 'About 64×', 'About 256×'], answer: 0, why: 'Throughput improves only 4.5× (1,119 → 5,011 tok/s) for a 64× batch increase, because bytes per token rise with the batch. The weight read is fixed at 16 GB, so its share of traffic falls from 80% at batch 8 to 5.5% at batch 512. Past the roofline knee, extra batch buys throughput very poorly and mostly costs memory.' },
+  { q: 'Rollouts complete at different lengths. Why must you provision memory for the full group size rather than the average?', options: ['Because the KV cache is compressed only after completion', 'Because all rollouts are resident at the start of the step, so the peak is the group size', 'Because weights grow with batch size', 'Because throughput improves with more resident rollouts'], answer: 1, why: 'The batch starts with every rollout alive, so peak occupancy equals the group size. Sizing for average occupancy OOMs at the start of every step. Finished rollouts free blocks as the batch drains, but by then the damage would already have happened.' },
+  { q: 'A rollout context is 4,096 tokens with 75% generated. Using a 75% cap, how many tokens are left for the reward pass?', numeric: true, answer: 1024, tolerance: 40, unit: 'tokens', why: 'Cap = 0.75 × 4,096 = 3,072, leaving 25% = 1,024 tokens of headroom. A rollout that reaches the context limit has no room for the reward model’s own forward pass or a retry, which is why the cap sits below the context limit rather than at it.' },
+]} />

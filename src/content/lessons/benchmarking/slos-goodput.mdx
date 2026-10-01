@@ -1,0 +1,194 @@
+---
+title: 'SLOs & goodput'
+summary: 'Turn a user expectation into a number you can be held to, then measure the only quantity that matters: work delivered inside that promise. Goodput falls when throughput rises — and that is the whole game.'
+objectives:
+  - Write a service-level objective that names a metric, a percentile, a threshold and a window
+  - Define goodput as throughput multiplied by the fraction of requests meeting the SLO
+  - Explain why goodput peaks and then falls as load increases
+  - Choose an operating point that maximizes goodput rather than throughput
+  - Connect goodput to cost per useful token'
+---
+
+import GoodputCurve from '@/components/viz/benchmarking/GoodputCurve.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Everything so far has been about measuring. This lesson is about the moment you stop measuring and start **promising** — and about the one number that survives contact with that promise.
+
+The trap is obvious once you see it: a team is judged on tokens per second, so they maximize tokens per second. The system gets faster and faster while getting worse and worse to use.
+
+## An SLO is a contract, not a hope
+
+A **service-level objective** is a measurable promise about your service. It has four parts, and all four are required:
+
+1. **The metric** — TTFT, TPOT, end-to-end.
+2. **The percentile** — p50, p95, p99.
+3. **The threshold** — how many milliseconds.
+4. **The window** — over what period it must hold.
+
+> p95 TTFT under 600 ms and p95 TPOT under 40 ms, over any rolling 5-minute window.
+
+Any missing part makes the objective unenforceable. Without a percentile it is ambiguous; without a window you can fail on one bad afternoon and be technically correct.
+
+<Callout type="intuition" title="Where the number should come from">
+  Not from the hardware. From **users**. What is the longest a person will wait for a first token before they conclude the product is broken?
+
+  Find it by looking at where abandonment happens in your existing product, or by asking. Then pick a percentile that matches the population you are willing to disappoint — usually p95 or p99 for interactive work. Then choose a threshold slightly *inside* that, so you have room.
+</Callout>
+
+<Callout type="pitfall" title="The two-sided mistake">
+  Set the SLO too loose and you ship something nobody notices is bad. Set it too tight and your team spends every sprint chasing a number that users never asked for, and burns money on capacity to hit it.
+
+  An SLO is a **product decision with an engineering consequence**. The person who sets it owns the bill that follows.
+</Callout>
+
+## Goodput: the only number that counts
+
+**Goodput** is throughput restricted to the work that met its SLO:
+
+$$
+\text{goodput} = \text{throughput} \times \Pr(\text{request meets its SLO})
+$$
+
+That is the entire definition. Everything interesting is in the second factor.
+
+<Callout type="math" title="Worked example">
+  At 95% of capacity your system produces **5,089 tokens/s**. But only **17%** of requests finish inside the SLO, because the rest are queuing.
+
+  $$
+  \text{goodput} = 5{,}089 \times 0.17 \approx 840\ \text{tokens/s}
+  $$
+
+  **83% of the GPU's output is work that violates your own promise.** You are paying full price for it. And the dashboard showing "5,089 tokens/s" looks like your best day ever.
+</Callout>
+
+At 60% load the same system produces about 4,100 tokens/s and almost all requests meet the SLO, so goodput is nearly 4,100. **The busier system delivers roughly a fifth of the useful work** and costs more to run.
+
+<Scrolly>
+  <GoodputCurve client:visible slot="stage" />
+
+  <Step title="1. Write the promise first">
+    Before any measurement, write the SLO. In this visual: p95 TTFT under 600 ms.
+
+    Everything below is measured against that line. Without it, "throughput" has no failure condition and rises forever.
+  </Step>
+
+  <Step title="2. Two curves, one axis">
+    Horizontal axis is offered load, from nothing to full capacity. Two curves come out of it.
+
+    The amber curve is **throughput**: tokens produced per second, counting every token whether or not the user got a usable answer.
+  </Step>
+
+  <Step title="3. At low load they agree">
+    At 30% load, essentially every request meets the SLO. So goodput and throughput are the same number and the two curves sit on top of each other.
+
+    This is why a benchmark run at low load can look perfect while production, at 80%, is falling apart.
+  </Step>
+
+  <Step title="4. The SLO starts biting">
+    Past about 55% load, queueing starts pushing TTFT past 600 ms. Requests begin to miss the SLO.
+
+    They still count in throughput. The model did the work. But the user waited too long, so as far as the product is concerned that work is worthless.
+  </Step>
+
+  <Step title="5. Goodput turns over">
+    The green curve reaches its peak at roughly **59% of capacity**, then falls.
+
+    This is the most important shape in serving: **goodput is not monotonic in load.** There is an optimum, and it is below the point where the machine is fully busy.
+  </Step>
+
+  <Step title="6. Past the optimum is strictly worse">
+    Slide to 95%. Throughput has gone up. Goodput has collapsed, and the red wedge is the gap between them: work produced, delivered late.
+
+    You have made the dashboard better and the product worse, and you are paying more for the privilege.
+  </Step>
+
+  <Step title="7. Report goodput">
+    The line to remember: **goodput = throughput × fraction meeting the SLO.**
+
+    Put goodput on the wall next to cost. That pair — useful work delivered, and dollars spent — is the only honest summary of an inference service, and it is what *Break one GPU* will use to find your operating point.
+  </Step>
+</Scrolly>
+
+## Why the tail ruins goodput
+
+Goodput inherits the tail problem from the last lesson, and it is worse than it looks.
+
+Suppose your SLO is p95 TTFT. By definition **5% of requests are allowed to miss it**. That is a permanent 5% tax on goodput, before anything else goes wrong. If you want half your throughput to be good, you must have a pass rate around 50% — which in the visual means operating at roughly 80% load, with a much worse median to show for it.
+
+<Callout type="math" title="The percentile tax">
+  Let the SLO be at percentile $q$ (as a fraction, e.g. 0.95). At best, the pass rate is $q$, so:
+
+  $$
+  \text{goodput}_{\max} = q \times \text{throughput}_{\text{at that load}}
+  $$
+
+  A **stricter** SLO (higher $q$) allows a higher pass rate but forces a lower load. A **looser** SLO (lower $q$) allows a higher load but caps your pass rate. There is no percentile that is purely better — you are trading one against the other, and the optimum depends on your latency curve.
+
+  This is why the p95-versus-p99 decision is an economic one, not a technical one.
+</Callout>
+
+## Choosing the operating point
+
+The practical method, which *Break one GPU* turns into a full sweep:
+
+1. **Define the SLO** (metric, percentile, threshold, window).
+2. **Sweep offered load** from idle to overload, in steps.
+3. **At each step, record throughput, the SLO pass rate, goodput, and the tail percentiles.**
+4. **Find the peak of goodput.** That is your operating point.
+5. **Verify it has headroom** — sit at perhaps 80% of the peak load, so bursts and deploys do not push you over.
+6. **Re-run whenever anything changes**: a new model, a quantization, an engine upgrade, a traffic mix shift.
+
+<Callout type="real" title="How this looks in production">
+  In practice you enforce the operating point with **admission control and load shedding**, not by hoping:
+
+  - A **maximum queue depth** or **maximum concurrency**, so you refuse work rather than let it wait. This is what keeps the tail flat when traffic spikes.
+  - **Autoscaling on p95 latency or queue depth**, since (as the queueing math showed) those lead utilization.
+  - **A load-shedding policy** at the edge: past a threshold, fail fast with a retryable error. A fast error beats a slow success — it protects goodput for everyone else.
+
+  At the time of writing, the major serving engines expose concurrency and token-budget limits that, tuned this way, are how you hold an SLO. Module 23 covers the surrounding orchestration.
+</Callout>
+
+## Goodput per dollar
+
+Once you have an operating point, the cost question follows immediately. Goodput per dollar is the metric that decides whether your service is viable:
+
+$$
+\text{goodput per dollar} = \frac{\text{goodput (tokens/s)} \times 3600}{\text{GPU dollars per hour}}
+$$
+
+<Callout type="math" title="Worked: two configurations, same GPU">
+  One H100 rented at 2.50 dollars per hour, running Llama-3.1-8B.
+
+  - **At 60% load:** ~4,100 tok/s goodput, so about 4,100 × 3,600 = 14.8M tokens per hour. Goodput per dollar = 14.8M ÷ 2.50 = **5.9M good tokens per dollar**.
+  - **At 95% load:** 5,089 tok/s throughput, but only 840 tok/s goodput, so about 3.0M tokens per hour → **1.2M good tokens per dollar**.
+</Callout>
+
+## The three numbers to keep
+
+<Callout type="recap" title="If you remember nothing else from this module">
+  1. **Throughput** — what the GPU produced. Meaningless alone.
+  2. **Goodput** — what arrived inside the promise. This is the deliverable.
+  3. **Goodput per dollar** — whether the business works.
+
+  All three are reported as distributions, over a stated workload, on stated hardware, at a stated time. A number without those four things is not a result.
+</Callout>
+
+<KeyNotes>
+  1. An **SLO** names a metric, a percentile, a threshold and a window. Missing any one makes it unenforceable.
+  2. Choose the SLO from **user behaviour**, not from what the hardware can currently do, and from the users you are willing to disappoint.
+  3. **Goodput = throughput × the fraction of requests that met their SLO.** The second factor is where all the difficulty lives.
+  4. **Goodput is not monotonic in load.** It peaks below saturation — around 55–65% of capacity in typical configurations — and falls beyond it. At 95% load in the worked example, 83% of produced tokens violated the SLO: full price for unusable work.
+  5. An SLO at percentile $q$ caps your pass rate at $q$, so a p95 objective taxes goodput by 5% before any real failure.
+  6. Find the operating point by **sweeping load and measuring goodput**, then sit below the peak with headroom for bursts.
+  7. Enforce it with admission control, a concurrency cap and autoscaling on latency or queue depth — never on utilization.
+  8. Report **goodput per dollar**. Between two configurations it can differ by 5× while throughput differs by less than 20%.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'At 90% of capacity a service produces 4,975 tokens/s and 33% of requests meet the SLO. What is the goodput, in tokens per second?', numeric: true, answer: 1642, tolerance: 60, unit: 'tok/s', why: 'Goodput = 4,975 × 0.33 ≈ 1,642 tok/s. The other 3,333 tok/s are tokens delivered to users who waited too long — paid for, worthless.' },
+  { q: 'Your SLO is “p95 TTFT under 600 ms”. At best, what fraction of requests can meet it?', numeric: true, answer: 95, tolerance: 1, unit: '%', why: 'By definition p95 means 5% of requests exceed the threshold. That 5% is a permanent tax on goodput before anything actually goes wrong.' },
+  { q: 'Why does goodput fall after about 60% of capacity while throughput keeps rising?', options: ['The GPU overheats at high load', 'Requests start queueing and missing the SLO, so the multiplied pass-rate factor falls faster than throughput rises', 'Throughput is measured wrong at high load', 'Memory runs out above 60% load'], answer: 1, why: 'Goodput = throughput × pass rate. Past the knee, queueing makes the pass rate collapse while throughput only flattens. The product of the two turns over.' },
+  { q: 'An SLO says “TTFT under 1 second”. What is wrong with it?', options: ['Nothing, that is a valid SLO', 'It names no percentile, so it is ambiguous, and it names no window, so one bad period counts as failure', 'TTFT is not a valid metric', 'It needs to be in seconds not milliseconds'], answer: 1, why: 'A valid SLO needs metric, percentile, threshold and window. Without a percentile, “under 1 second” could mean the median (easy) or p99 (hard). Without a window, a single bad afternoon is a breach.' },
+  { q: 'One GPU at $2.50/hour. Configuration A: goodput 14.8M tokens/hour. Configuration B: goodput 3.0M tokens/hour. How many times better is A, per dollar?', numeric: true, answer: 4.9, tolerance: 0.5, unit: '×', why: '14.8 ÷ 3.0 ≈ 4.9. Configuration B may well show higher raw throughput, but it delivers roughly a fifth of the value per dollar. This is the comparison that decides purchases.' },
+  { q: 'What is the right way to hold a goodput target under a traffic spike?', options: ['Scale on GPU utilization', 'Cap admission with a concurrency or queue-depth limit, and shed load past a threshold', 'Increase the batch size to its maximum', 'Disable streaming to reduce overhead'], answer: 1, why: 'Utilization leads latency, and unbounded queues just convert a spike into an outage. A concurrency cap plus load shedding keeps the tail flat and protects goodput for everyone already in the system.' },
+]} />

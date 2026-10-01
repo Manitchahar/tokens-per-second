@@ -1,0 +1,100 @@
+---
+title: 'Module 28 · Research & Capstone'
+module: research-capstone
+---
+
+## Reading a paper
+
+**Reading order** (never results first):
+
+**title → abstract → setup → method → threats to validity → results**
+
+| Question | Where | Why |
+|---|---|---|
+| What speed limit does it attack? | title + method | decode is memory-bound, prefill compute-bound |
+| Is the hardware mine? | setup | relevance dies here if not |
+| Is the workload mine? | setup | batch, context, arrival pattern |
+| What does it cost? | method + results | speedup without its memory/latency cost is incomplete |
+| What would break it? | threats | the authors' own list; find the one matching you |
+
+Three lenses: **skim** (~10 min, title/abstract/results/conclusion), **deep** (~1 h, + method/setup/threats), **reproduce** (~1 day, + all artifacts).
+
+## The verdict sheet
+
+Five lines, written before any work:
+
+1. **Claim** — one number, one setup, one metric.
+2. **Setup match** — same GPU? same model? same workload? what does the difference cost?
+3. **Evidence** — is the effect bigger than the noise?
+4. **Threats** — which author-listed threat applies to you?
+5. **Cost** — memory, latency, quality; and does the code exist?
+
+## Reproducing a result
+
+**The five moves**: pin the claim → pin the setup (or admit you can't) → measure noise first → check the effect → report honestly.
+
+$$
+\text{repeats needed} \quad k \approx \left(\frac{2c}{\delta}\right)^2
+$$
+
+| Effect δ | c = 5% | c = 8% | c = 10% |
+|---|---|---|---|
+| 4% | 6 | 16 | 25 |
+| 6% | 3 | 7 | 11 |
+| 10% | 1 | 3 | 4 |
+| 20% | 1 | 1 | 1 |
+
+Reduce $c$ before adding repeats — **interleaved A/B runs** are the cheapest lever, and it helps quadratically.
+
+**Three verdicts, all honest:**
+
+| Verdict | Meaning |
+|---|---|
+| **Reproduced** | your band contains the claim |
+| **Did not reproduce** | your band excludes it — say why |
+| **Inconclusive** | noise too large — say the $k$ you would need |
+
+Bands **overlap** = reproduced. "Close" is not reproduced. Never launder a failure into a vague success.
+
+If you cannot match hardware: reproduce the **mechanism** (measure memory traffic, the prefill-vs-decode asymmetry) instead of the headline number.
+
+## The system design
+
+**Design backwards from the SLO.** Goodput, not raw throughput, is the number that matters.
+
+$$
+\begin{aligned}
+\text{weights} &= P \times b \\
+\text{reserve} &\approx 0.04 \times \text{mem} \\
+\text{kv\_per\_tok} &= 2 \times L \times H_{kv} \times d_h \times 2 \\
+\text{pool} &= \text{mem} - \text{weights} - \text{reserve} \\
+\text{max\_batch} &= \frac{\text{pool}}{\text{ctx} \times \text{kv\_per\_tok}} \\
+\text{\$ per M tok} &= \frac{\text{GPU \$/hr}}{\text{goodput tok/s} \times 3600} \times 10^6
+\end{aligned}
+$$
+
+- **Weights decide what is possible**; the **KV cache decides how many users fit**.
+- Context length is a **capacity column**, not a footnote — doubling it roughly halves concurrency.
+- Size replicas at **~70% utilization**, with headroom.
+- Quantization buys memory and bandwidth at a **measured** quality cost.
+- Show every optimization **with its cost**, not just its gain.
+
+## Numbers to derive cold
+
+| Quantity | Value |
+|---|---|
+| KV bytes/token, Llama-3.1-8B | $2 \times 32 \times 8 \times 128 \times 2 = 128$ KB |
+| Decode step, 8B on H100 @ B=1 | $16$ GB ÷ 3.35 TB/s ≈ 5 ms |
+| Llama-3.1-70B weights, BF16 | 70.6e9 × 2 = **141 GB** |
+| Cost, \$2.50/hr @ 8,000 tok/s | ≈ **\$0.09 / M tokens** |
+| Little's law: 4,000 users × 8 s | ≈ **500 in flight** |
+
+If you forget a number, **derive it** on the whiteboard. Watching you reconstruct it is the point.
+
+## The defense
+
+One page: the design in **one defensible sentence**, the evidence (goodput + cost at the SLO load point), the derived arithmetic, the alternatives rejected **with reasons**, and **what would change your mind**.
+
+<Callout type="recap" title="The one sentence">
+  *"Serve Llama-3.1-8B in BF16 on A100s with vLLM continuous batching and prefix caching; 220 streams per GPU at 2,048-token context, sized for headroom at 70% utilization; \$0.09 per million good tokens at p95 TTFT under 1 s — and the measurement that would change our mind is doubling context, which halves concurrency and would push us to disaggregation."*
+</Callout>

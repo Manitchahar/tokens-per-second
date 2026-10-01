@@ -1,0 +1,137 @@
+---
+title: How a number lives in memory
+summary: Bits, bytes, integers and floating point. Why LLMs run in BF16, FP8 and 4-bit, and how to turn "8 billion parameters" into gigabytes in your head.
+objectives:
+  - Convert between bits, bytes, KB, MB, GB (and know the GB vs GiB trap)
+  - Explain how integers and floating-point numbers are stored
+  - Compare FP32, FP16, BF16, FP8 and INT4 by range, precision and size
+  - Compute a model's weight memory from its parameter count and format
+---
+import NumberFormats from '@/components/viz/math/NumberFormats.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A language model is, physically, a very long list of numbers. Llama-3.1-8B is about 8 billion of them. Every inference problem (will it fit, how fast is it, what does it cost) starts with one question: **how many bytes does each of those numbers take?**
+
+So we start at the very bottom: how a single number is stored.
+
+## From bits to formats
+
+A computer stores everything as **bits**: tiny switches that are either 0 or 1. Group them and you get patterns. A **format** is simply an agreed rule for what number each pattern means. Scroll through the formats you will meet again and again, and try different numbers with the buttons under the picture.
+
+<Scrolly>
+  <NumberFormats client:visible slot="stage" />
+
+  <Step title="1. Bits and bytes">
+    One bit has 2 states. Eight bits, a **byte**, have 2 × 2 × … × 2 = 2⁸ = **256** possible patterns. Each extra bit doubles the number of patterns.
+
+    Reading binary works like reading decimal, but each position is worth double the one to its right: 128, 64, 32, 16, 8, 4, 2, 1. So `01101001` = 64 + 32 + 8 + 1 = **105**.
+  </Step>
+
+  <Step title="2. Integers">
+    The simplest rule: each pattern is a whole number. With 8 bits you get **INT8**, covering −128 to 127. With 4 bits, **INT4**, just −8 to 7.
+
+    Try π or 0.1 with the buttons. INT8 rounds them to 3 and 0. Try 70000: it gets **clipped** to 127. Integers have no fractions and a hard ceiling.
+  </Step>
+
+  <Step title="3. The floating-point idea">
+    To store both tiny and huge numbers, computers borrow **scientific notation**. Avogadro's number is written −6.022 × 10²³: a **sign**, some **significant digits** (the *mantissa*), and a **power** (the *exponent*).
+
+    A floating-point number stores those three pieces in binary. Exponent bits buy **range** (how big or small). Mantissa bits buy **precision** (how many digits are right).
+  </Step>
+
+  <Step title="4. FP32: the old default">
+    **FP32** ("single precision") uses 32 bits = **4 bytes**: 1 sign bit, 8 exponent bits, 23 mantissa bits. It holds about 7 correct decimal digits and numbers up to ~10³⁸.
+
+    Try 0.1: even FP32 cannot store it exactly (just as 1/3 can't be written exactly in decimal). Every format rounds; the only question is by how much.
+  </Step>
+
+  <Step title="5. FP16 vs BF16">
+    Both are **2 bytes**, half of FP32, but they spend the bits differently.
+
+    **FP16** keeps 10 mantissa bits (good precision) but only 5 exponent bits, so its largest number is **65,504**. Try 70000: it overflows. **BF16** ("brain float") keeps FP32's 8 exponent bits (same huge range) and only 7 mantissa bits (~2–3 correct digits).
+
+    Neural networks care more about range than about the 4th digit, so **BF16 is the default for LLMs**.
+  </Step>
+
+  <Step title="6. FP8 and 4-bit">
+    **FP8** squeezes a number into **1 byte**. The E4M3 variant has 4 exponent bits and 3 mantissa bits. Recent GPUs (NVIDIA Hopper and Blackwell) multiply FP8 at twice BF16's speed.
+
+    **4-bit** formats use half a byte and need a stored **scale** to mean anything (Module 11). Watch the rounding error grow as the bits shrink. That error is the price of **quantization**.
+  </Step>
+
+  <Step title="7. What it costs">
+    Now multiply by 8 billion. The same model takes **32 GB** in FP32, **16 GB** in BF16, **8 GB** in FP8 and **4 GB** in 4-bit.
+
+    That decides whether it fits on a GPU at all (the free Colab T4 has 16 GB), and, since decode reads every weight once per token, **how fast it can generate**.
+  </Step>
+</Scrolly>
+
+## Units: count the bytes
+
+You will do this arithmetic constantly, so it is worth making automatic.
+
+| Unit | Bytes | Say it as |
+|---|---|---|
+| 1 KB | 1,000 | a thousand bytes |
+| 1 MB | 1,000,000 = 10⁶ | a million |
+| 1 GB | 1,000,000,000 = 10⁹ | a billion |
+| 1 TB | 10¹² | a trillion |
+
+<Callout type="pitfall" title="GB vs GiB">
+  Computers often measure memory in powers of two: 1 **GiB** = 2³⁰ = 1,073,741,824 bytes, about 7% more than 1 GB. `nvidia-smi` and PyTorch report **MiB/GiB**, while GPU spec sheets and model cards usually say **GB**. An "80 GB" H100 shows up as about 81,559 MiB. When a model "should just fit" and doesn't, this 7% is a common reason. This course uses GB = 10⁹ unless it says otherwise.
+</Callout>
+
+### The one formula you will use every day
+
+$$
+\text{weight memory (bytes)} = \text{number of parameters} \times \text{bytes per parameter}
+$$
+
+The shortcut: **billions of parameters × bytes per parameter = gigabytes**, because the 10⁹s cancel.
+
+- 8B model in BF16: 8 × 2 = **16 GB**
+- 70B model in BF16: 70 × 2 = **140 GB** (too big for one 80 GB GPU)
+- 70B model in 4-bit: 70 × 0.5 = **35 GB** (fits)
+
+## Which format is used where?
+
+| Format | Bytes | Where you meet it in inference |
+|---|---|---|
+| FP32 | 4 | Rarely. Some accumulations inside kernels, some norms and softmax |
+| FP16 | 2 | Older GPUs such as the T4 and V100, which lack BF16 tensor cores |
+| **BF16** | 2 | **The default** for weights, activations and KV cache |
+| FP8 | 1 | Weights, activations and KV cache on H100/H200/B200; ~2× faster math |
+| INT8 | 1 | Weights (W8A8), KV cache |
+| INT4 / FP4 | 0.5 | Weights in AWQ/GPTQ/NVFP4 quantization; biggest memory savings |
+
+<Callout type="intuition">
+  Picture a ruler. **Exponent bits** decide how long the ruler is, from atoms to galaxies. **Mantissa bits** decide how many tick marks it has. BF16 is a very long ruler with few ticks. FP16 is a short ruler with many ticks. FP8 is a short ruler with very few ticks. Neural networks mostly need the length.
+</Callout>
+
+## Why fewer bytes means faster, not just smaller
+
+In Module 00 you saw that decode reads every weight once per generated token, and that this reading, not the math, is the bottleneck. If each weight is half as many bytes, the GPU reads the whole model in half the time. So dropping from BF16 to FP8 can make decode close to **2× faster**, on top of halving memory.
+
+The catch is the rounding error you watched grow. Quantization is the art of shrinking bytes while keeping that error from hurting answers. That is Module 11. For now, the takeaway is the exchange rate: **bytes are time**.
+
+<Callout type="mentor">
+  When someone says a model size, convert it to gigabytes before you think anything else. "Mixtral 8×7B, 47B parameters, in FP8" → 47 GB. "Fits on one H100 with about 30 GB left for KV cache." That reflex is half of capacity planning.
+</Callout>
+
+<KeyNotes>
+  1. 1 byte = 8 bits = 256 patterns. A format is a rule mapping patterns to numbers.
+  2. Floating point = sign × mantissa × 2^exponent. Exponent bits give **range**; mantissa bits give **precision**.
+  3. FP32 = 4 bytes, FP16/BF16 = 2, FP8/INT8 = 1, INT4/FP4 = 0.5.
+  4. **BF16** is the LLM default: FP32's range in half the bytes. FP16 overflows above 65,504.
+  5. Weight memory = parameters × bytes per parameter. In your head: **billions × bytes = GB**.
+  6. Fewer bytes per weight means less memory **and** faster decode, since decode reads every weight per token. The cost is rounding error.
+  7. Watch GB (10⁹) vs GiB (2³⁰): tools often report GiB, about 7% bigger per unit.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'How much memory do the weights of a 13-billion-parameter model take in BF16?', numeric: true, answer: 26, tolerance: 0.5, unit: 'GB', why: '13 billion × 2 bytes = 26 billion bytes = 26 GB.' },
+  { q: 'Why is BF16 preferred over FP16 for LLMs?', options: ['It uses fewer bytes', 'It has the same range as FP32, so large values do not overflow', 'It is more precise', 'It is the only format GPUs support'], answer: 1, why: 'Both are 2 bytes. BF16 spends 8 bits on the exponent like FP32, so it rarely overflows. FP16 has more precision but maxes out at 65,504.' },
+  { q: 'A 70B model in 4-bit weights: roughly how many GB?', numeric: true, answer: 35, tolerance: 1, unit: 'GB', why: '70 billion × 0.5 bytes = 35 GB.' },
+  { q: 'Your decode speed is limited by reading weights from memory. You switch the weights from BF16 to FP8. Roughly what happens to decode speed, ignoring overhead?', options: ['No change', 'About 2× faster', 'About 2× slower', 'About 4× faster'], answer: 1, why: 'Half the bytes to read per token means about half the time per decode step, so close to 2× faster.' },
+  { q: 'nvidia-smi says your GPU has 81,559 MiB. About how many GB is that?', numeric: true, answer: 85.5, tolerance: 1, unit: 'GB', why: '81,559 × 1,048,576 bytes ≈ 85.5 × 10⁹ bytes. That is an "80 GB" H100: its "80 GB" is really about 80 GiB, a reminder that units get mixed even on spec sheets.' },
+]} />

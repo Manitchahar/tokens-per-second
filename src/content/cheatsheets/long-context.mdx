@@ -1,0 +1,160 @@
+---
+title: 'Module 20 · Long Context & Tiered KV'
+module: long-context
+---
+
+## The three walls
+
+Long context is **three problems**, not one. Each has its own crossover length, its own cost shape, and its own fix.
+
+$$
+\begin{aligned}
+\text{Wall 1 · memory}   &:\quad N_{\max} = \left\lfloor \frac{(M - W - S)\cdot 0.9}{T\,b_{kv}} \right\rfloor \\
+\text{Wall 2 · prefill}  &:\quad T^* = \frac{P}{2 d L} \qquad\text{attention = projections} \\
+\text{Wall 3 · decode}   &:\quad T_{\text{cross}} = \frac{P\,b}{b_{kv}} \qquad\text{cache read = weight read}
+\end{aligned}
+$$
+
+| Wall | Llama-3.1-8B | Llama-3.1-70B | Qwen2.5-0.5B |
+|---|---|---|---|
+| Memory (32 conv, H100) | **13,000** tok | 9,300 tok | 142,000 tok |
+| Prefill $P/(2dL)$ | **30,600** tok | 53,900 tok | 11,400 tok |
+| Decode $2P/b_{kv}$ | **122,500** tok | 430,000 tok | 79,700 tok |
+
+- **Memory is linear and predicted.** 12 conversations at 32K on an H100, 3 at 128K. It is a capacity *cliff*, not a slope.
+- **Prefill is quadratic.** $2Pn$ projections + $4n^2 d L$ attention. 512 tok = 16 ms; 32K = 1.28 s; 128K = **12 s** on an H100, **66 s** on a T4.
+- **Decode is linear but permanent.** It taxes **every** token, forever. At 32K, batch 32, the cache is **89%** of the step's traffic; per-user speed has fallen to **18 tok/s**.
+- FlashAttention cuts attention *traffic*, not *FLOPs*. Wall 2 is arithmetic and stays.
+- Bigger models push walls 2 and 3 **out** (P grows faster than d·L and b_kv). Smaller models pull them **in**.
+
+## What fixes what
+
+| Fix | Memory | Prefill | Decode | Lost in the middle |
+|---|---|---|---|---|
+| FP8 / INT8 KV | **halves** | — | **halves** | — |
+| Shorter max context | linear | linear | linear | — |
+| Chunked prefill (M10) | — | bounds stall | — | — |
+| FlashAttention (M09) | helps | traffic only | a little | — |
+| More GPUs, TP (M18) | — | **splits FLOPs** | adds comms | — |
+| Better placement | — | — | — | **yes** |
+
+**Capacity fixes and quality fixes are different problems.** Buying a faster GPU solves neither lost-in-the-middle nor a prompt-assembly bug.
+
+## Lost in the middle
+
+Retrieval accuracy against long context is **U-shaped in position**: strong at the start, worst in the middle, recovering at the end.
+
+1. Restate the question **before and after** the long context — a handful of tokens, the highest-value fix available.
+2. Sort retrieved chunks by relevance, **best first**.
+3. Query-aware compression: drop chunks, keep the relevant ones.
+4. Do **not** just raise `--max-model-len`. A window the model cannot use is pure cost.
+
+No serving metric detects this. Latency is fine; the answer is wrong.
+
+## The tier ladder
+
+| Tier | Sustained bandwidth | Per machine | Fetch one token of 8B |
+|---|---|---|---|
+| GPU HBM (H100 SXM) | **3.35 TB/s** | 80–141 GB | 39 ns |
+| Host DRAM, PCIe 5.0 ×16 | **55 GB/s** | 256 GB–2 TB | 2.4 µs |
+| Local NVMe, PCIe 4.0 ×4 | **7 GB/s** | 2–30 TB | 19 µs |
+| Remote node, 10 GbE | **1.25 GB/s** | node-sized | 105 µs |
+
+~2,700× from top to bottom. One token of KV for 8B = 131,072 bytes.
+
+## Recompute, and the crossover
+
+$$
+t_{\text{recompute}} = \frac{2P}{\text{peak FLOP/s} \times \text{MFU}} \approx 29.5\ \mu\text{s} \quad\text{(8B, H100)}
+$$
+
+$$
+BW_{\text{crossover}} = \frac{b_{kv}}{t_{\text{recompute}}}
+$$
+
+| Model | KV/token | Recompute | Crossover BW |
+|---|---|---|---|
+| Qwen2.5-0.5B | 12,288 B | 1.8 µs | **6.9 GB/s** |
+| Llama-3.1-8B | 131,072 B | 29.5 µs | **4.4 GB/s** |
+| Qwen2.5-32B | 262,144 B | 118 µs | **2.2 GB/s** |
+| Llama-3.1-70B | 327,680 B | 258 µs | **1.3 GB/s** |
+
+- Recompute is cheap **because decode is memory-bound**: the tensor cores are ~5% busy, so the FLOPs cost almost nothing.
+- **PCIe always wins.** NVMe wins above a few billion parameters. **10 GbE loses to recompute** — use 25–100 GbE or do not bother.
+- The crossover **falls** as the model grows: bigger models tolerate slower storage.
+
+## The streaming budget
+
+$$
+\text{streamed bytes per step} \le \text{BW}_{\text{tier}} \times t_{\text{weights}}
+$$
+
+For an H100: weight read 6.0 ms, so PCIe allows **330 MB/step** at zero added latency; NVMe 42 MB; 10 GbE 7.5 MB.
+
+- **Resident window** $R$ (most recent tokens, in HBM) + **streamed tail** (everything else, every step).
+- Streaming the *whole* cache every step is the failure mode that makes tiered KV look impossible.
+- Tiered KV buys **capacity, not speed** — and it is free only where the latency lands where attention does not care.
+
+## Four mechanisms, four traps
+
+| Mechanism | Trap |
+|---|---|
+| **Prefetch & overlap** | depth 0 = a visible stall; prefetch ≥ 1 step ahead |
+| **Overlap compute with transfer** | last shard sets latency; split unevenly |
+| **Chunked attention over the cache** | must rescale by each chunk's running max, or the answer is wrong |
+| **Recompute as fallback** | fetching *and* recomputing costs both |
+
+**Silent correctness hazards**
+
+- **Transfer/compute race** — a block overwritten mid-read. Garbage output, no crash. Fix: double buffering or a per-step fence.
+- **RoPE positions must travel** with the cache — a key carries its rotation.
+- **Quantization scales** are part of the payload, not metadata about it.
+- **Pageable host memory** is silently slow; use pinned memory.
+- **No backpressure** on a slow tier: blocked requests pin GPU blocks for the whole round trip, and a traffic spike becomes an outage.
+
+## Measuring a tier
+
+- **Achieved bandwidth, not the spec sheet** — measure in your own process, pinned, after warmup.
+- Pageable vs pinned is routinely **3–10×**, and it decides whether a CPU tier is viable at all.
+- First-byte latency on a remote tier is **milliseconds**; batching and prefetch depth matter more than bandwidth there.
+
+## Reference numbers
+
+| GPU | Peak BF16 | Bandwidth | Memory |
+|---|---|---|---|
+| T4 (free Colab) | 65 TFLOP/s | 320 GB/s | 16 GiB |
+| A100 80GB | 312 TFLOP/s | 2.0 TB/s | 80 GB |
+| H100 SXM | 989 TFLOP/s | 3.35 TB/s | 80 GB |
+| H200 | 989 TFLOP/s | 4.8 TB/s | 141 GB |
+| B200 | ~2,250 TFLOP/s | 8.0 TB/s | 180 GB |
+
+Llama-3.1-8B BF16: 131,072 B/token. H100 KV budget 54.7 GB = **417,000 context tokens**.
+
+| Context | KV/conv | On H100 | Decode step (batch 32) | Per user |
+|---|---|---|---|---|
+| 4,096 | 537 MB | 101 conv | 12.3 ms | 81 tok/s |
+| 8,192 | 1.07 GB | 50 conv | 18.8 ms | 53 tok/s |
+| 32,768 | 4.29 GB | **12 conv** | 57.0 ms | 18 tok/s |
+| 131,072 | 17.2 GB | **3 conv** | 211 ms | 4.7 tok/s |
+
+Qwen2.5-0.5B BF16: 12,288 B/token. On a T4 with ~12 GB of budget that is 977,000 context tokens, so ~30 conversations at 32K.
+
+## Vocabulary
+
+| Term | Meaning |
+|---|---|
+| Context cliff | Capacity edge where one token more costs a whole conversation |
+| Prefill compute wall | $P/(2dL)$: where quadratic attention overtakes the projections |
+| Decode bandwidth wall | $Pb/b_{kv}$: where the cache read overtakes the weight read |
+| Lost in the middle | U-shaped retrieval accuracy; the middle of a context is used worst |
+| Attention mass | Concentration of attention near the end of the context |
+| Derived data | Regenerable instead of stored — the KV cache qualifies |
+| Tiered KV | Cache across HBM / host / NVMe / remote, fetched per tier |
+| KV offload | Cache in host memory, gathered on demand (`cpu_offload_gb`, `hicache`) |
+| Fetch-vs-recompute crossover | $b_{kv}/t_{\text{recompute}}$: bandwidth where fetching stops paying |
+| Resident window | The most recent $R$ tokens held in GPU memory permanently |
+| Streaming budget | Tier bandwidth × weight-read time: free bytes per step |
+| Prefetch depth | Steps ahead that blocks are fetched |
+| Double buffering | Two buffers, so writes never clobber a live read |
+| Tier backpressure | Bounding concurrent sequences served from a slow tier |
+| Achieved bandwidth | What your code actually moves — not the spec sheet |

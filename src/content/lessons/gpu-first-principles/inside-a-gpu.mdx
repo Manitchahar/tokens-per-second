@@ -1,0 +1,128 @@
+---
+title: 'Inside a GPU: SMs, tensor cores & memory'
+summary: 'A tour of the silicon you will spend the rest of the course reasoning about: what a streaming multiprocessor contains, why a warp is 32 threads, and the four levels of memory between your code and DRAM.'
+objectives:
+  - Name the four levels of GPU memory and put an approximate size and latency on each
+  - Describe what a streaming multiprocessor contains and what a warp is
+  - Explain coalescing, and why a badly written load wastes bandwidth
+  - Compute the memory footprint of a tile, and the reuse it buys
+---
+import DieMap from '@/components/viz/gpu/DieMap.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Module 01 gave you a number: an 8B model in BF16 is about 16 GB. That number only becomes engineering once you know *where* those 16 GB sit, how fast they can answer, and what has to happen for the arithmetic units to see a single byte of them.
+
+This is that tour. Nothing here is decoration: every figure in it becomes a constraint in a later module.
+
+## The four levels, and why there are four
+
+Memory is a hierarchy, and every level trades **capacity** for **distance**. Small and close is fast but holds little. Big and far holds plenty but is slow. A program that runs fast is a program that keeps its data as close to the math as it can.
+
+On an H100, from closest to the arithmetic to furthest:
+
+| Level | Size | Latency | Who manages it |
+|---|---|---|---|
+| Registers | 256 KB per SM | ~1 cycle | the compiler, per thread |
+| L1 / shared memory | 256 KB per SM | ~30 cycles | you, explicitly |
+| L2 cache | 50 MB, shared | ~200 ns | the hardware, on the die |
+| HBM | 80 GB | ~600–700 ns | you, with the hardware |
+
+<Callout type="intuition" title="The ladder in one sentence">
+  Data in a register is free. Data in HBM is a 700-nanosecond phone call. A fast kernel is not one that does clever arithmetic; it is one that makes as few of those phone calls as possible.
+</Callout>
+
+<Scrolly>
+  <DieMap client:visible slot="stage" />
+
+  <Step title="1. The package">
+    An H100 is one die, 814 mm² of it, in a package with five stacks of HBM memory alongside. The memory is deliberately **not** on the die: you could not fit 80 GB of DRAM on a piece of silicon that size, and a die that large would have unusable wire delays.
+  </Step>
+
+  <Step title="2. HBM, the model’s home">
+    HBM is DRAM, so it is slow to answer, but it is wired to the die with a **5,120-bit bus** instead of the ~64 bits per channel a normal motherboard socket offers. That bus is the reason a GPU can read 3.35 TB/s.
+  </Step>
+
+  <Step title="3. L2, the shared cache">
+    50 MB of cache sits on the die and is shared by everything on it. It exists to catch the traffic that would otherwise go to HBM. On Ampere and later, parts of L2 can even be **reserved** for one tensor’s data across a whole forward pass, so a KV cache can live in L2 instead of HBM. You will meet that trick in Module 08.
+  </Step>
+
+  <Step title="4. The multiprocessors">
+    132 of them, tiled across the die. Each has its own small caches, its own registers, and its own tensor cores. The grid of 132 is not a design detail; it is the reason the machine has throughput, and it is what a kernel launch is programmed with.
+  </Step>
+
+  <Step title="5. Inside one multiprocessor">
+    An SM has four processing blocks. Each block has a **warp scheduler**, a small instruction cache, 32 FP32 lanes, and one **tensor core**. Underneath sit the two small fast memories: a 128 KB register file, and 256 KB that you can split between L1 cache and explicitly-managed shared memory.
+  </Step>
+
+  <Step title="6. The latency ladder, quantified">
+    About 700 ns from HBM, 200 ns from L2, 30 ns from L1, and effectively free from a register. Nothing else in this course matters as much as staying at the top of this ladder.
+  </Step>
+
+  <Step title="7. The takeaway">
+    Hardware will happily give you a terabyte per second from HBM and thirty times that from the shared memories. Every byte you can serve from higher up the ladder is a byte you never spent.
+  </Step>
+</Scrolly>
+
+## A warp is 32 threads in lockstep
+
+The SM does not schedule threads. It schedules **warps**, and on every current NVIDIA GPU a warp is exactly **32 threads** that execute the same instruction, in lockstep, on 32 lanes of the arithmetic unit.
+
+<Callout type="pitfall" title="If the threads in a warp disagree, the warp splits">
+  ```python
+  if a > 0:          # some threads take this branch...
+      out = a * 2    # ...and some take the other one
+  else:
+      out = a * 3
+  ```
+  A GPU cannot give half a warp one instruction and the other half another, so it **executes both branches**, with the other half masked off. Two branches cost two instructions. Four branches cost four. This is **warp divergence**, and it is the reason kernels with data-dependent `if` statements run far slower than the code looks.
+
+  The rule that follows: never branch on data inside a GPU kernel. Use `torch.where`, arithmetic, or a mask instead. Every branching decision is better made on the CPU, before the work reaches the GPU.
+</Callout>
+
+## Coalescing: how 32 threads read memory at once
+
+When a warp loads from global memory, the hardware gathers the 32 addresses, finds the **128-byte cache lines** they touch, and fetches whole lines. If the 32 threads are reading 32 consecutive numbers, that is 128 bytes, one line, one fetch. Perfect.
+
+If the 32 threads are reading scattered addresses, one "load" instruction turns into up to 32 separate line fetches, and you have used 32× the bandwidth for the same amount of useful data. That is **poor coalescing**, and it is the second great silent killer of GPU performance.
+
+<Callout type="math" title="What coalescing is worth">
+  A `[1, 4096]` vector times a `[4096, 4096]` weight, in BF16, must read 33.5 MB of weights. The tensors are in row-major order, so consecutive threads take consecutive elements of a row. Coalesced: 33.5 MB moved, 33.5 MFLOP done. Intensity ≈ 1 FLOP/byte.
+
+  Transpose the activation so the innermost index is no longer contiguous and the *same* 33.5 MB now arrives in 32 separate strided fetches. The FLOPs are identical. The bytes on the wire are up to 32× worse.
+
+  Nothing about the mathematics changed. Only the memory layout did. This is why **contiguity** shows up again and again in optimization work.
+</Callout>
+
+## Shared memory, and the metric that matters
+
+Of the 256 KB an SM has on the fast side of L2, you may carve out a chunk as **shared memory**: on-chip, explicitly addressed, and roughly ten times faster than L1. It is how a matrix multiply gets reuse.
+
+A thread block loads one tile of a matrix into shared memory, then every thread in the block reads that tile many times from fast on-chip storage. The number of times each byte loaded from HBM is used before being discarded is the **data reuse** of the kernel.
+
+<Callout type="math" title="Reuse buys intensity, and intensity buys everything">
+  A tile-based matrix multiply with tile size $T \times T$ reuses each loaded element about $T$ times per dimension. Compare:
+
+  - Naive, one element at a time from HBM: intensity ≈ 1 FLOP/byte.
+  - 128 × 128 tiles: intensity in the hundreds.
+
+  Module 01's roofline and Module 13's Triton kernels are both about exactly this: move each byte from HBM once, then reuse it as many times as the register file and shared memory will allow.
+</Callout>
+
+<KeyNotes>
+  1. Four levels: registers (256 KB per SM, ~1 cycle) → L1/shared (256 KB per SM, ~30 cycles) → L2 (50 MB, ~200 ns) → HBM (80 GB, ~600–700 ns). Capacity trades against distance at every step.
+  2. An SM has 4 processing blocks, each with a warp scheduler, 32 FP32 lanes, and one tensor core. H100: 132 SMs, so 528 tensor cores.
+  3. HBM is off-die, joined by a 5,120-bit bus. That bus width, not the memory chips, is what makes 3.35 TB/s possible.
+  4. A **warp** is 32 threads executing one instruction in lockstep. If they disagree on a branch, both sides run, masked. Never branch on data in a kernel.
+  5. **Coalescing**: a warp's 32 loads are gathered into 128-byte cache lines. Consecutive addresses cost one fetch; scattered addresses can cost 32.
+  6. Shared memory is 256 KB per SM you carve out of the L1 budget, about 10× faster than L1, and the main source of reuse in a tiled matrix multiply.
+  7. **Data reuse** — how many times each byte is used after being read — is the single metric that turns into FLOPs per byte, and FLOPs per byte is what decides your speed.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Rank these from closest to the arithmetic to furthest: HBM, L1/shared, registers, L2.', options: ['L2 → registers → L1/shared → HBM', 'registers → L1/shared → L2 → HBM', 'L1/shared → registers → HBM → L2', 'registers → L2 → H1/shared → HBM'], answer: 1, why: 'Registers are per-thread and effectively instant. Then L1/shared (256 KB per SM), then the shared L2 (50 MB), then HBM (80 GB) at ~700 ns.' },
+  { q: 'How many threads make up one warp on a current NVIDIA GPU?', numeric: true, answer: 32, tolerance: 0, unit: 'threads', why: 'A warp is exactly 32 threads that issue the same instruction in lockstep on 32 lanes of the arithmetic unit.' },
+  { q: 'An H100 has 132 multiprocessors with 4 tensor cores each. How many tensor cores in total?', numeric: true, answer: 528, tolerance: 0, unit: 'tensor cores', why: '132 × 4 = 528. Each SM has one tensor core per processing block.' },
+  { q: 'A warp loads 32 scattered float32 values instead of 32 consecutive ones. Roughly how much worse can the memory traffic get?', options: ['No change, the compiler sorts it', '2×', '32×', '128×'], answer: 2, why: 'A warp load is gathered into 128-byte cache lines. 32 consecutive float32s are exactly 128 bytes, one line. Scattered addresses can touch 32 different lines: up to 32× the traffic for the same useful data.' },
+  { q: 'Roughly how long does a read from HBM take on an H100?', numeric: true, answer: 700, tolerance: 120, unit: 'ns', why: 'About 600–700 ns. L2 is around 200 ns and L1 around 30 ns, so registers are the only genuinely cheap place to keep a number.' },
+  { q: 'What happens when threads within one warp take different branches of an if/else?', options: ['Only the larger branch runs', 'The threads split into separate warps automatically', 'Both branches execute, with the other threads masked off', 'The kernel crashes'], answer: 2, why: 'Warp divergence: the hardware executes every branch with the unused lanes masked, so N branches cost N instructions.' },
+]} />

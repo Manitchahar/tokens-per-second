@@ -1,0 +1,199 @@
+---
+title: 'Module 26 · Specialized Workloads'
+module: specialized-workloads
+---
+
+Six workloads that break the defaults the rest of the course taught you. Each one has a different bottleneck, and each one is wrong somewhere you would expect it to be right.
+
+| workload | unit of work | cache | bound by | the trap |
+|---|---|---|---|---|
+| structured output | token, grammar-masked | none needed | neither (mask is ~1–3%) | thinking it costs tokens |
+| multi-LoRA | token, per-adapter batch | prefix cache | nothing (footprint) | forgetting batch mixing |
+| multimodal | image → 576 tokens | image tokens | prefill (compute) | forgetting the vision tower |
+| agents / reasoning | growing prefix | **prefix cache** | decode | quadratic prefill |
+| RL rollouts | thousands of whole sequences | none | KV memory | sizing by parameters |
+| diffusion | whole image, ×20–50 | feature cache | **compute** | thinking it is memory-bound |
+
+## 1 · Structured output
+
+$$
+\text{allowed fraction} = \frac{|\text{tokens legal at this grammar state}|}{|V|}
+$$
+
+| state | example | allowed (V = 128,256) |
+|---|---|---|
+| unconstrained | start | 100% |
+| pinned to a character | after a comma, expecting `"` | ~0.04% |
+| inside a string | a city name | ~62% |
+| enum field | `unit: "c" \| "f"` | ~0.0001% |
+
+- **Cost:** one mask evaluation per step. **Zero extra tokens, zero extra forward passes.**
+- A tool call is mostly not information: payload fraction $= 7n/(8 + 12n)$, so **>40% is scaffolding** even with many arguments.
+- **Grammar = type system, not a security boundary.** Existence, range, permissions → your validator.
+- JSON Schemas cheap, regexes moderate, arbitrary CFGs a project.
+
+## 2 · Multi-LoRA
+
+$$
+P_{\text{lora}} = r(in + out) \qquad \text{share} = \frac{r(in+out)}{in \cdot out}
+$$
+
+Llama-3.1-8B (32 layers, $d=4096$, FFN 14336, 8 KV heads × 128):
+
+| $r$ | attention only | attn + FFN | share of base | BF16 |
+|---|---|---|---|---|
+| 8 | 6.8M | 16.3M | 0.202% | 33 MB |
+| **16** | **13.6M** | **32.5M** | **0.405%** | **65 MB** |
+| 32 | 27.3M | 65.0M | 0.810% | 130 MB |
+| 64 | 54.5M | 130M | 1.619% | 260 MB |
+
+$$
+M_{\text{total}} = P_{\text{base}} b + N \cdot P_{\text{lora}} b
+$$
+
+| adapters | total (BF16 base, A100) | base share |
+|---|---|---|
+| 8 | 16.58 GB | 96.9% |
+| 16 | 17.10 GB | 93.9% |
+| 64 | 20.22 GB | 79.4% |
+
+- **The $r/d$ shorthand understates by 2×** on a square matrix. Always compute $r(in+out)/(in\cdot out)$.
+- **Batch mixing:** rows group per adapter into separate GEMMs. Slowdown 1.06× (2 adapters) → 1.47× (8) → 1.96× (16).
+- Adapter count per step ≡ batch size. Spreading a batch over tenants is shrinking the batch.
+- Adapter FLOPs are 0.4% of the base's — invisible in latency. Cost is memory and batching only.
+
+## 3 · Multimodal
+
+$$
+\text{image tokens} = \left(\frac{336}{14}\right)^2 \times \text{crops} \div \text{pooling}
+$$
+
+| model | crops | patches | tokens | vision FLOPs |
+|---|---|---|---|---|
+| LLaVA-1.5-7B | 1 | 576 | **576** | 1× |
+| LLaVA-1.6-7B | 4 | 2,304 | **576** | 4× |
+
+Prefill budget, 576 tokens + 80-token question, H100:
+
+| part | FLOPs | time |
+|---|---|---|
+| vision tower (0.3B × 576) | 0.35 TFLOP | 0.9 ms |
+| language prefill (6.7B × 656) | 8.8 TFLOP | 16 ms |
+| projector (~10M) | negligible | ~0 |
+
+- **Any-resolution pooling decouples detail from token cost.** Tokens per image is a design choice.
+- **KV cost is permanent:** 576 tokens × 128 KB = **74 MB per image, per sequence, forever.**
+- Tower batches over **images**, not sequences — a second bottleneck with its own capacity plan.
+- **Cache encoded images by hash of their bytes.** Biggest win available.
+
+## 4 · Agents & reasoning
+
+$$
+\text{saved prefill} = 1 - \frac{\sum \text{new tokens}}{\sum \text{context lengths}}
+$$
+
+6-turn chat (contexts 960→1640, 840 new tokens): 7,800 → 840 token-prefills = **89% saved**.
+
+$$
+\text{agent prefill without cache} = \sum_{t=1}^{T}(s + to) = Ts + o\frac{T(T+1)}{2} = O(T^2)
+$$
+
+8 turns, $s=800$, $o=3000$: 24,000 (cached) vs 114,400 → **4.8×**; 20 turns → 646,000 → **10.8×**. Ratio $\approx 2T$.
+
+$$
+\text{trace total} = \frac{wT/B + kv\,T^2/2}{\text{BW}\cdot\text{MBU}}
+$$
+
+8B BF16 on H100, 128 KB KV/token, MBU 0.85:
+
+| batch | 200 tok | 16,000 tok | 16k takes |
+|---|---|---|---|
+| 1 | 177 tok/s | 157 tok/s | 96 s |
+| 8 | 1,400 tok/s | 694 tok/s | 17 s |
+| 32 | 5,392 tok/s | 1,096 tok/s | 8.7 s |
+| 64 | 10,274 tok/s | 1,213 tok/s | 7.3 s |
+
+- **Batch 1 is a trap** — 16 GB read for one token, pinned near 160 tok/s regardless of trace length.
+- Weight amortisation ($w/B$) and KV growth are **inseparable effects**; batch decides which dominates.
+- Kill the cache hit rate with: a timestamp in the prompt, non-deterministic tool output, swapping adapters mid-conversation.
+- Three levers: cap observations, cache the prefix, truncate/summarise old turns.
+
+## 5 · Batch inference & RL rollouts
+
+$$
+\text{KV/token} = 2 L H_{kv} D b \qquad \text{KV per rollout} = S \cdot \text{KV/token}
+$$
+
+| model | KV/token | KV per 4,096-token rollout |
+|---|---|---|
+| Qwen2.5-1.5B (28L, 2 KV heads) | 28 KB | 0.12 GB |
+| Qwen2.5-7B (28L, 4 KV heads) | 56 KB | 0.23 GB |
+| Llama-3.1-8B (32L, 8 KV heads) | 128 KB | 0.54 GB |
+
+8× H100 = 640 GB, 16.06 GB weights/card → 511 GB free → **952 rollouts fit**.
+
+| group (4,096 tok) | total KV | share | GPUs of 8 |
+|---|---|---|---|
+| 512 | 0.27 TB | 43% | 1 |
+| 1,024 | 0.55 TB | 86% | 2 |
+| 4,096 | 2.20 TB | 344% | won't fit |
+
+Decode throughput, 8B on one H100 at 4,096 context:
+
+| batch | bytes/step | aggregate | per-seq |
+|---|---|---|---|
+| 8 | 20 GB | 1,119 tok/s | 140 tok/s |
+| 64 | 50 GB | 3,614 tok/s | 56 tok/s |
+| 512 | 291 GB | 5,011 tok/s | 10 tok/s |
+
+- **KV is the constraint, not weights** (86% vs 3%). Size by **tokens in flight**, not parameters.
+- **Peak memory = group size**, never average. Sizing for average OOMs at step start.
+- Batch drains → tail runs at ~¼ peak throughput (that is the batch-8 regime).
+- **Cap generation at ~75% of context**, leaving 25% for the reward pass. No cap → the run wedges.
+
+## 6 · Diffusion inference
+
+$$
+\text{latent} = \frac{512}{8} = 64,\quad 4 \times 64 \times 64 = 16{,}384 \text{ values}
+$$
+
+$$
+\text{BW utilisation} = \frac{\text{bytes / peak BW}}{\text{step time}}
+$$
+
+SD 1.5, 512², A100 (2.0 TB/s): 2.7 GB per step, 55 ms → 1.35 ms of bandwidth → **2.5% → compute-bound**.
+
+| workload | BW utilisation | bound by |
+|---|---|---|
+| LLM decode batch 1 | 20–35% | memory |
+| LLM decode batch 32 | 60–80% | memory |
+| **diffusion step** | **~2%** | **compute** |
+
+Memory (SD 1.5, 512², FP16):
+
+$$
+\text{widest tensor} = 320 \times 512 \times 512 \times 2 = 168\text{ MB};\quad \times 6 \approx 1.0\text{ GB/image}
+$$
+
+2.1 GB of weights → **activations overtake weights at batch 2.**
+
+| model | steps | s/image (A100) |
+|---|---|---|
+| SD 1.5 | 20 | 1.2 |
+| SD 2.1 | 25 | 1.8 |
+| SDXL base | 30 | 4.5 |
+| SDXL-Turbo | 4 | 0.8 |
+
+- Latency is **linear in steps**; quality flattens → distilled few-step models win (5.6×).
+- **CFG = 2× cost**, always on. Published timings include it.
+- Feature caching retains 15–35% of compute, **lossy** (unlike prefix caching).
+- Per-image latency is **flat in batch** → run the largest batch that fits. No latency/throughput trade-off.
+
+## The six sentences
+
+1. **Structured output** adds no tokens and no forward passes — one mask per step. It is a type system, not a security boundary, and more than 40% of a tool call is grammar-forced scaffolding.
+2. **Multi-LoRA** makes a tenant cost tens of megabytes against a 16 GB base, but adapter count per step is really batch size, and the memory table hides that tax.
+3. **Multimodal** is a 576-token prefill with a second model in front; resolution buys vision FLOPs, not context, and the KV cost of an image is permanent.
+4. **Agents and reasoning** are a growing prefix with perfect reuse; without a cache prefill is $O(T^2)$, and at batch 1 a long trace is a trap because the weight read dominates everything.
+5. **RL rollouts** are sized by tokens in flight, not parameters — KV is 86% of the cluster and peak occupancy is the group size.
+6. **Diffusion** is compute-bound at ~2% of peak bandwidth, which inverts every purchasing intuition from the rest of the course, and its memory is activations rather than weights.

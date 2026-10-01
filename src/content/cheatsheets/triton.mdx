@@ -1,0 +1,234 @@
+---
+title: 'Module 13 · Triton'
+module: triton
+---
+
+## The programming model
+
+A Triton kernel is a **grid of independent programs**. You write one program body and
+declare how many to launch; parallelism is given to you.
+
+```python
+@triton.jit
+def add_kernel(x_ptr, y_ptr, c_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)                                 # which program am I?
+    offs = pid * BLOCK + tl.arange(0, BLOCK)               # my slice of the vector
+    mask = offs < n                                        # ragged edge
+    a = tl.load(x_ptr + offs, mask=mask)
+    b = tl.load(y_ptr + offs, mask=mask)
+    tl.store(c_ptr + offs, a + b, mask=mask)               # same mask, always
+
+grid = (triton.cdiv(n, BLOCK),)
+add_kernel[grid](x, y, c, n, BLOCK=BLOCK)
+```
+
+| Line | What it does |
+|---|---|
+| `@triton.jit` | Marks a GPU kernel. JIT-compiled on first call, cached per signature. |
+| `tl.program_id(0)` | This program's index in the grid. The only thing that says which slice you own. |
+| `tl.arange(0, BLOCK)` | The offsets *within* a block: `[0, 1, … BLOCK-1]`. |
+| `offs = pid*BLOCK + arange` | Global offsets. A **vector expression, not a loop**. |
+| `mask = offs < n` | Skips out-of-range lanes. Required on load **and** store. |
+| `tl.load / tl.store` | Gather / scatter a whole block in parallel. |
+| `triton.cdiv(n, B)` | Ceiling division: how many programs to launch. |
+
+- **2-D grid:** `pid_m = tl.program_id(0)`, `pid_n = tl.program_id(1)`; offsets by
+  `rows[:, None] * N + cols[None, :]` (broadcast); mask with `&`.
+- A program *is* a warp-wide cooperative operation. Contiguous `arange` offsets
+  coalesce into 128-byte fetches. You just never manage the warp.
+
+## Block size
+
+`BLOCK_SIZE: tl.constexpr` is baked in at compile time. It trades two things:
+
+| Too small | Too large |
+|---|---|
+| Launch overhead dominates | Registers spill to slower memory |
+| 100K programs for 256 KB | Too few programs to fill the SMs |
+
+Start from **a few thousand programs total**, and a block small enough that
+`n_spills == 0`. Check the metadata after compiling:
+
+```python
+ck = kernel[grid](...)      # returns the CompiledKernel
+ck.n_regs, ck.n_spills, ck.num_warps, ck.shared
+```
+
+## Reductions
+
+A reduction is a **tree**, not a loop: $\log_2 n$ steps, each halving the width.
+
+```python
+s = tl.sum(x)              # whole block → 1 value
+m = tl.max(x, axis=0)
+s = tl.sum(tile, axis=1)   # one value per row
+```
+
+Masked lanes must be **neutral for the consuming op**:
+
+| Reduction | Neutral value for padded lanes |
+|---|---|
+| `tl.sum`, `tl.max` over a sum | `0.0` |
+| `tl.max` | `-float('inf')` |
+
+Getting this wrong is silent: no error, no NaN, just wrong answers.
+
+## Softmax
+
+Three-pass (naive) → **3 reads + 1 write**. Fused → **1 read + 1 write**.
+
+$$
+p_i = \frac{e^{z_i - m}}{\sum_j e^{z_j - m}}, \qquad m = \max_j z_j
+$$
+
+```python
+x = tl.load(x_ptr + row*n_cols + cols, mask=mask, other=-float('inf'))
+m = tl.max(x, axis=0)
+e = tl.exp(x - m)                 # all values ≤ 0, so e ≤ 1 — no overflow
+l = tl.sum(e, axis=0)
+tl.store(out_ptr + row*n_cols + cols, e / l, mask=mask)
+```
+
+**Online softmax** (rows wider than one block) — carry a running max and sum, and
+rescale whenever the max rises:
+
+$$
+\ell \leftarrow \ell \cdot e^{m_{\text{old}} - m_{\text{new}}}, \quad m \leftarrow \max(m, m_{\text{block}})
+$$
+
+## RMSNorm
+
+$$
+\mathrm{RMS}(x) = \sqrt{\tfrac{1}{d}\sum_i x_i^2}, \qquad \hat{x}_i = \frac{x_i}{\mathrm{RMS}(x)} g_i
+$$
+
+No mean subtraction — that is what makes the reduction a plain sum.
+
+```python
+rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / n_cols + eps)
+y = x * rstd * w
+```
+
+**Keep `eps`** (~1e-5): without it an all-zero row gives `0/0 = NaN` and poisons the
+residual stream. Use `other=0.0` on the masked load here (not `-inf`).
+
+## RoPE
+
+Rotate each adjacent pair by $\theta = m \cdot \text{inv\_freq}[i]$:
+
+$$
+x'_{2i} = x_{2i}\cos\theta - x_{2i+1}\sin\theta, \qquad
+x'_{2i+1} = x_{2i}\sin\theta + x_{2i+1}\cos\theta
+$$
+
+- Head dimension must be **even** (rotation is pairwise).
+- Frequencies **decrease** with index: low pairs rotate fast.
+- Rotation **preserves magnitude** — that is why it composes with RMSNorm.
+- **Precompute** `inv_freq`, and usually the `cos`/`sin` tables, on the CPU.
+
+## Fusion
+
+Fusing = the intermediate **never leaves registers**. No temporary, no
+`torch.empty` between ops. That absence is the definition.
+
+$$
+\text{fuse if} \quad \frac{\text{intermediate bytes}}{\text{bandwidth}} \ll 5\ \mu s
+$$
+
+Reference numbers (approximate):
+
+| Shape | Bytes | Moves in | Launch costs | Verdict |
+|---|---|---|---|---|
+| 1 token × 4096 hidden FP16 | 8 KB | ~2.4 ns (H100) | ~5 µs | **fuse** (2000:1) |
+| 4,096 tokens × 4096 | 32 MB | ~9.6 µs | ~5 µs | marginal |
+| 70B weight GEMM | 140 GB | ~42 ms | ~5 µs | **never** |
+
+- Fusing RMSNorm+RoPE on 32 layers: **96 launches and ~480 µs saved per token**.
+- **Fusion costs registers.** A kernel with `n_spills > 0` is *worse* than unfused.
+- Big GEMMs are already bandwidth-saturated. The wins live in the small ops
+  *around* them.
+
+## Benchmarking honestly
+
+Four mistakes, each with a known size:
+
+| Mistake | Overstatement | Fix |
+|---|---|---|
+| No warmup | ~1000× (you measure the JIT compiler) | Run it a few times first |
+| No synchronize | Measures CPU enqueue time | CUDA events |
+| No L2 flush | ~3× too fast (measures cache) | Write a >L2 buffer each rep |
+| One iteration | Pure jitter | Median over ≥100 reps |
+
+```python
+def bench_kernel(fn, warmup=25, reps=200):
+    for _ in range(warmup): fn()
+    torch.cuda.synchronize()
+    flush = torch.empty(int(128e6 // 4), dtype=torch.int, device='cuda')
+    times = []
+    for _ in range(reps):
+        flush.zero_()
+        s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+        s.record(); fn(); e.record(); torch.cuda.synchronize()
+        times.append(s.elapsed_time(e) * 1e3)      # ms → µs
+    times.sort()
+    return times[len(times) // 2]                   # median, µs
+```
+
+Or just use `triton.testing.do_bench(fn, return_mode='median')` (returns ms).
+
+Then convert to a **rate**:
+
+$$
+\text{GB/s} = \frac{b_{\text{read}} + b_{\text{write}}}{t} \div 10^9,
+\qquad
+\text{TFLOP/s} = \frac{F}{t} \div 10^{12}
+$$
+
+**Judge against the roofline:** above ~70% of peak → done. Below ~30% → launch-bound,
+occupancy-bound, or a bug.
+
+## Autotuning
+
+```python
+@triton.autotune(
+    configs=[triton.Config({'BLOCK': 1024}, num_warps=4),
+             triton.Config({'BLOCK': 4096}, num_warps=8)],
+    key=['size_bucket'],        # NOT the raw size
+)
+```
+
+- Tuning cost is paid **once per key value**; the winner is cached.
+- Key on something **slow-varying**. Keying on `n` re-tunes every call in a serving
+  workload, because continuous batching changes batch constantly.
+  Use a bucket: `1 << n.bit_length()`.
+- Tune the tuner only with a correct benchmark — it optimises whatever you measure.
+
+## When to write Triton
+
+**Yes:** elementwise, reductions, small tiled GEMMs, fusions of those, and
+quantized GEMMs.
+
+**No:** large GEMMs (cuBLAS/cuBLASLt are excellent), irregular/sparse work, or
+anything you have not measured. Profile first; try `torch.compile` before
+hand-writing.
+
+## Reference GPUs (approximate)
+
+| GPU | Peak BF16 | Bandwidth | Memory | Ridge (FLOP/B) |
+|---|---|---|---|---|
+| T4 (free Colab) | 65 TFLOP/s | 320 GB/s | 16 GB | ~203 |
+| L4 | 121 TFLOP/s | 300 GB/s | 24 GB | ~403 |
+| A100 80GB | 312 TFLOP/s | 2.0 TB/s | 80 GB | ~156 |
+| H100 SXM | 989 TFLOP/s | 3.35 TB/s | 80 GB | ~295 |
+
+## Intensity of the operations in this module
+
+| Operation | Intensity | Bound |
+|---|---|---|
+| Vector add | ~0.3 | memory |
+| Fused softmax | ~2 | memory |
+| SiLU-gated MLP elementwise | ~0.67 | memory |
+| RMSNorm | ~0.7 | memory |
+
+All of them sit deep on the memory slope. **Their speed is set by bytes, not FLOPs** —
+so the only levers are fewer bytes and fewer launches.

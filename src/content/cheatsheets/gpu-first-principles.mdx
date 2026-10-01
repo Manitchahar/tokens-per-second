@@ -1,0 +1,84 @@
+---
+title: 'Module 02 · The GPU'
+module: gpu-first-principles
+---
+
+## The two limits
+
+$$
+t \ge \max\left(\frac{F}{\text{peak FLOP/s}},\ \frac{B}{\text{bandwidth}}\right)
+$$
+
+$$
+\text{arithmetic intensity} = \frac{F}{B}\ [\text{FLOP/byte}] \qquad
+\text{ridge} = \frac{\text{peak FLOP/s}}{\text{bandwidth}}
+$$
+
+- Below the ridge: **memory-bound**. Buying arithmetic does nothing.
+- Above it: **compute-bound**. Buying bandwidth does nothing.
+
+## Reference GPUs (approximate, dense)
+
+| GPU | Peak (BF16) | Bandwidth | Memory | Ridge |
+|---|---|---|---|---|
+| T4 (free Colab) | 65 TFLOP/s | 320 GB/s | 16 GB | ~203 |
+| L4 | 121 TFLOP/s | 300 GB/s | 24 GB | ~403 |
+| A100 80GB | 312 TFLOP/s | 2.0 TB/s | 80 GB | ~156 |
+| H100 SXM | 989 TFLOP/s | 3.35 TB/s | 80 GB | ~295 |
+| H200 | 989 TFLOP/s | 4.8 TB/s | 141 GB | ~206 |
+| B200 | ~2,250 TFLOP/s | 8.0 TB/s | 180 GB | ~281 |
+
+Use the **dense** number. Spec sheets often quote the 2:4-sparsity figure, which doubles it.
+
+## Memory hierarchy
+
+| Level | Size (H100) | Latency | Managed by |
+|---|---|---|---|
+| Registers | 256 KB per SM | ~1 cycle | compiler |
+| L1 / shared | 256 KB per SM | ~30 cycles | you |
+| L2 | 50 MB | ~200 ns | hardware |
+| HBM | 80 GB | ~600–700 ns | you |
+
+## Hardware shape
+
+- Warp = 32 threads, one instruction, lockstep. Branches inside a warp run **all** paths.
+- H100: 132 SMs × 4 tensor cores = 528 tensor cores. 4 processing blocks per SM, each with 1 scheduler + 32 FP32 lanes + 1 tensor core.
+- Coalescing: a warp's 32 loads gather into 128-byte lines. Contiguous = 1 fetch; scattered = up to 32.
+- Occupancy = resident warps per SM, limited by registers (256 KB) and shared memory.
+- Kernel launch ≈ 5–10 µs. Fuse small kernels.
+
+## Intensity of each LLM operation
+
+| Operation | Arithmetic intensity |
+|---|---|
+| Elementwise (SiLU, add) | ~0.3 |
+| KV cache write | ~0.5 |
+| **Decode GEMM (m = 1)** | **~1** |
+| Attention, context T (Llama-8B BF16) | **T / 8** |
+| Prefill GEMM (m = 512) | ~410 |
+
+For `[m × 4096] · [4096 × 4096]` in BF16:
+
+$$
+F = 2m \cdot 4096^2, \qquad B = (4096^2 + 2m \cdot 4096)\times 2
+$$
+
+Intensity grows almost exactly linearly in $m$: the weight bytes are constant.
+
+## The two moves
+
+Every optimization in this course is one of:
+
+1. **Raise intensity** — batch, reuse in cache or registers, use a better kernel.
+2. **Lower bytes** — quantize, fuse, compress, reuse the KV cache.
+
+## The stack
+
+```
+your code → PyTorch / ATen / Inductor → CUDA runtime → NVIDIA driver → GPU
+```
+
+- CUDA is asynchronous. `torch.cuda.synchronize()`, or CUDA events, before you time.
+- Errors name the wrong layer: a driver "illegal memory access" is usually your bug, four layers up.
+- Remote GPU: ~20–80 ms round trip, container on someone else's host, disk is not shared.
+- `nvidia-smi`; `torch.cuda.get_device_properties(0)`.

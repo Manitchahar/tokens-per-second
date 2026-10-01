@@ -1,0 +1,247 @@
+---
+title: 'Module 19 · Mixture-of-Experts Inference'
+module: moe
+---
+
+## The one structural change
+
+Attention is untouched. Only the block's feed-forward network is replaced.
+
+$$
+\text{dense: } W_{up} \in \mathbb{R}^{4d \times d},\ W_{down} \in \mathbb{R}^{d \times 4d} \Rightarrow 8d^2
+$$
+
+$$
+\text{MoE: } E \text{ experts of width } \tfrac{4d}{E}
+\;\Rightarrow\; E \times \Big(\tfrac{4d}{E}\cdot d + d \cdot \tfrac{4d}{E}\Big) = 8d^2 \quad \text{(identical)}
+$$
+
+$$
+\mathbf{g} = \mathbf{W}_{\text{router}}\,\mathbf{x} \in \mathbb{R}^{E}, \qquad \text{ExpertSet}(x) = \operatorname{topK}(\mathbf{g})
+$$
+
+Router cost: $(E+1)d$ params. Mixtral: $9 \times 4096 = 33{,}768$ against an expert's 176M — routing is ~0.02% of what it chooses.
+
+## The two parameter counts
+
+$$
+P_{\text{total}} = \underbrace{L(2 d H D + 2 d H_{kv} D) + Vd}_{\text{attention + embedding}}
++ \underbrace{L_{\text{moe}}\big(3E d h_e + 3 S d h_e + (E+S+1)d\big)}_{\text{experts + shared + routers}}
++ \underbrace{(L - L_{\text{moe}})\cdot 3 d \cdot 4d}_{\text{dense layers}}
+$$
+
+$$
+P_{\text{active}} = \underbrace{L(2 d H D + 2 d H_{kv} D) + Vd}_{\text{all of it}}
++ \underbrace{L_{\text{moe}}\big(3k d h_e + 3 S d h_e + (E+S+1)d\big)}_{\text{top-}k \text{ only}}
++ \underbrace{(L - L_{\text{moe}})\cdot 3 d \cdot 4d}_{\text{all of it}}
+$$
+
+$$
+\boxed{\text{sparsity} = P_{\text{total}} / P_{\text{active}}}
+$$
+
+| | Mixtral 8x7B | DeepSeek-MoE-16B | Qwen3-30B-A3B |
+|---|---|---|---|
+| Blocks $L$ | 32 | 27 | 48 |
+| Hidden $d$ | 4096 | 2048 | 2048 |
+| Experts $E$ | 8 | 64 | 128 |
+| Top-$k$ | 2 | 6 | 8 |
+| Shared $S$ | 0 | 2 | 1 |
+| Expert intermediate $h_e$ | 14336 | 1408 | 768 |
+| Total (derived) | 45.3B | 16.0B | 30.5B |
+| Total (published, approx) | 46.7B | 16.4B | 30.5B |
+| Active (derived) | 12.6B | 2.95B | 3.27B |
+| Active (published, approx) | 12.9B | 2.8B | 3.3B |
+| **Sparsity** | **3.6×** | **5.4×** | **9.3×** |
+| KV bytes / token | 131,072 | 442,368 | 98,304 |
+
+Say "about 46B" and show the derivation — it agrees to within 3%. The gap is accounting convention (tied vs untied embeddings), not arithmetic.
+
+## Mixtral's dense twin
+
+$$
+P_{\text{dense twin}} = 1.47\text{B} + 32 \times 3 \times 4096 \times 14336 = 7.1\text{B}
+$$
+
+**Mixtral has 6.4× more parameters than the dense model of its own shape.** The gain is not "same model, fewer FLOPs" — it is "many more parameters than dense could afford, at the FLOPs of a much smaller one."
+
+## The decode step
+
+Substitute $P_{\text{active}}$ for $P$ in both terms. That single substitution is the entire MoE latency story.
+
+$$
+\text{bytes}_{\text{step}} = P_{\text{active}}\cdot \tfrac{b_w}{8} + B\,T\cdot 2L H_{kv} D \cdot \tfrac{b_{kv}}{8}
+\qquad
+t_{\text{step}} = \max\Big(\tfrac{\text{bytes}}{\text{BW}\cdot\text{MBU}},\ \tfrac{2 P_{\text{active}} B}{\text{FLOP/s}\cdot\text{MFU}}\Big)
+$$
+
+Mixtral, BF16, $B{=}32$, $T{=}4096$, H100 (2.68 TB/s effective):
+
+| term | bytes | |
+|---|---|---|
+| active weights | $12.6\text{e}9 \times 2 = 25.2$ GB | sparse |
+| KV cache | $32 \times 4096 \times 131{,}072 = 17.18$ GB | **compulsory** |
+| total | 42.4 GB | |
+
+$42.4 / 2.68 = 15.8$ ms; FLOPs $2 \times 12.6\text{e}9 \times 32 = 8.1$ TFLOP → 14.8 ms. Memory-bound at **15.8 ms**.
+
+**41% of that traffic is KV, and MoE does nothing for it.** As context grows the compulsory part grows and the sparsity benefit stays fixed, so MoE's edge over a same-active-size dense model narrows at long context.
+
+## Memory vs latency
+
+| | BF16 | FP8 | 4-bit |
+|---|---|---|---|
+| Mixtral weights | 90.6 GB | 45.3 GB | 22.7 GB |
+| H100 (80 GB) | no | yes | yes |
+| H200 (141 GB) | yes | yes | yes |
+| GPUs at BF16 | 2 | 1 | 1 |
+
+**Quantize before you shard.** FP8 halves the weights and can put a 45B model on one card — no EP, no all-to-all, no communication at all. Sharding is what you do when the alternative is not running.
+
+## Expert parallelism
+
+$$
+\text{experts per GPU} = E / g, \qquad g \mid E
+$$
+
+Divisibility is why published expert counts are large powers of two. Mixtral's 8 → $g \in \{1,2,4,8\}$. Qwen's 128 → any power of two to 128. **A model with 6 experts and 8 GPUs has EP degree at most 2.**
+
+## The all-to-all
+
+$$
+f_{\text{remote}} = \Big(1 - \tfrac{1}{g}\Big)\cdot I
+\qquad
+\text{bytes}_{\text{dispatch}} = T \cdot f_{\text{remote}} \cdot d \cdot b
+$$
+
+$$
+\boxed{\text{bytes}_{\text{step}} = 2 \cdot T \cdot f_{\text{remote}} \cdot d \cdot b \cdot L_{\text{moe}}}
+$$
+
+Mixtral, $g{=}8$, $T{=}256$, $d{=}4096$, BF16, $L_{\text{moe}}{=}31$, $I{=}1$:
+
+$$f_{\text{remote}} = 0.875, \quad 256 \times 0.875 \times 4096 \times 2 = 1.84\ \text{MB/layer} \;\Rightarrow\; 114\ \text{MB/step} \approx 0.38\ \text{ms at NVLink}$$
+
+$$\frac{\text{comm bytes}}{\text{FLOPs}} = \frac{f_{\text{remote}} \cdot d \cdot b}{P_{\text{active}}} = 5.7\times 10^{-7}\ \text{B/FLOP}$$
+
+**Batch $T$ cancels.** The comm-to-compute ratio is a property of the model and topology, not your traffic. Budget: $\sim 5.6$ GB/s of free wire before the all-to-all binds.
+
+| batch | all-to-all | share of a step |
+|---|---|---|
+| 1 | ~0.5 MB | absolute cost tiny, **latency exposed** |
+| 32 | 14 MB | ~1% |
+| 256 | 114 MB | ~0.6% |
+| 2048 | 912 MB | ~1% |
+
+Low batch hurts for a reason the percentage hides: **the all-to-all is a serialisation point.** Expert $j$ cannot start until its tokens arrive. At batch 1 the fixed weight read dominates and the collective's latency is fully exposed.
+
+## Load imbalance
+
+$$
+\text{imbalance } I = \frac{\max_e c_e}{kT/E}, \qquad
+G = \frac{2\sum_i i\,c_{(i)}}{n \sum_i c_i} - \frac{n+1}{n}
+$$
+
+$c_{(i)}$ sorted ascending. $G$: 0 = perfect equality, 1 = one expert takes everything.
+
+| $G$ | verdict |
+|---|---|
+| < 0.10 | suspicious — experts may not have specialised |
+| 0.10–0.30 | healthy |
+| 0.30–0.45 | straggler risk |
+| > 0.45 | severe; capacity and placement must adapt |
+
+Three costs of imbalance, arriving together:
+
+1. **Traffic** — $f_{\text{remote}}$ scales with $I$; at $I=2$ Mixtral moves 227 MB/step.
+2. **Stragglers** — synchronous step, maximum sets latency. The worst of the three.
+3. **Buffers** — the hot card needs 2× the activations; fixed buffers overflow.
+
+## Capacity factor
+
+$$
+C = \Big\lceil c \cdot \tfrac{kT}{E} \Big\rceil, \qquad \text{overflow}_{\text{hot}} = \max(0,\ 1 - c/I)
+$$
+
+| $c$ | memory | overflow at $I=1.5$ | note |
+|---|---|---|---|
+| 1.0 | 1× balanced | 33% | never used |
+| **1.25** | 1.25× | 17% | **the default** |
+| 2.0 | 2× | 0% | safe, wastes memory |
+| 4.0 | 4× | 0% | never useful |
+
+**Zero overflow needs $c \geq I$.** Start at 1.25; raise only if your measured overflow rate is non-trivial *on your traffic*.
+
+## Hybrid parallelism
+
+$$
+\text{total GPUs} = g_{\text{EP}} \times g_{\text{TP}}
+$$
+
+Three constraints: $g_{\text{EP}} \mid E$; $g_{\text{TP}} \mid H$; expert intermediate $\div g_{\text{TP}}$ must stay a workable GEMM (a few thousand).
+
+**EP cannot shard one expert.** Narrow experts → wide EP. Wide experts → force TP.
+
+Qwen3-30B-A3B on 8 H100s: one expert $3 \times 2048 \times 768 = 4.72$M; $g_{\text{EP}}{=}8$ → 16 experts/card → 75.5M/block → **3.62B params, 7.25 GB BF16 per card**. Expert width 768 is too narrow to tensor-parallel usefully ($768/2 = 384$ is a bad GEMM), so $g_{\text{TP}}{=}1$. All eight cards go to EP.
+
+## The auxiliary loss
+
+$$
+\mathcal{L} = \mathcal{L}_{\text{task}} + \alpha\, E \sum_{e=1}^{E} f_e\, P_e
+$$
+
+$f_e$ = fraction of tokens routed to $e$; $P_e$ = mean router probability for $e$. Large when **either** factor is large, so the minimum is $f_e = P_e = 1/E$ — uniform load.
+
+Trained on this alone, the router converges to uniform load **and the experts become identical copies**. Balance without specialisation is a dense model with extra memory and an extra matmul. $\alpha$ is the dial between the two.
+
+## Reference configurations
+
+| | Mixtral 8x7B | DeepSeek-MoE-16B | Qwen3-30B-A3B | DeepSeek-V3 |
+|---|---|---|---|---|
+| Blocks | 32 | 27 | 48 | 61 |
+| Hidden | 4096 | 2048 | 2048 | 7168 |
+| Experts | 8 | 64 | 128 | 256 |
+| Top-$k$ | 2 | 6 | 8 | 8 |
+| Shared | 0 | 2 | 1 | 1 |
+| Expert width | 14336 | 1408 | 768 | 2048 |
+| Sparsity | 3.6× (derived) | 5.4× (derived) | 9.3× (derived) | ≈18× (published) |
+
+The first three are derived here from published configs and match the published totals within a few percent. DeepSeek-V3 is quoted, not derived: it uses multi-head latent attention, so the attention parameter count — and therefore the sparsity — does not follow the GQA formula used above.
+
+## Interconnect reference (approximate)
+
+| link | per-link bandwidth |
+|---|---|
+| PCIe 4.0 x16 | ~25 GB/s |
+| PCIe 5.0 x16 | ~50 GB/s |
+| NVLink 3 (Hopper) | ~300 GB/s |
+| NVLink 4 (Blackwell) | ~450 GB/s |
+| NVSwitch (NVL72) | ~900 GB/s aggregate |
+
+An all-to-all achieves roughly **half** the peak link rate — it is a ring, not a memcpy.
+
+## Engine knobs (at the time of writing)
+
+| setting | effect |
+|---|---|
+| parallel config `{data, tensor, pipeline, expert}` | EP degree; must divide expert count, else fails at startup |
+| capacity / drop policy | slots per expert; overflow → drop or reroute |
+| `--quantization fp8` / `awq` / `gptq` | often removes the need for EP entirely |
+| `--kv-cache-dtype fp8` | shrinks the compulsory 41% of traffic |
+
+**Verify on a real deployment:** the all-to-all is genuinely overlapped with independent compute, and expert weights are resident in HBM rather than streamed from host memory over PCIe. Host-streamed experts look comm-free on paper and are slower.
+
+## The decision
+
+1. Does it fit in one card after FP8? → **Do not shard.** No all-to-all beats a fast single card.
+2. Still too big → EP degree = largest power of two dividing $E$ that fits the cluster.
+3. Expert width $\div g_{\text{TP}} < 4096$? → $g_{\text{TP}} = 1$; widen EP instead.
+4. Set capacity factor 1.25, then measure the overflow rate on your prompts.
+5. Sweep batch size and find the comm/compute crossover. Above it, MoE is compute-bound and fine; below it, expect pain.
+6. Dashboard the **imbalance ratio** (a straggler multiplier), not just throughput. Page above ~1.5 sustained.
+
+## The three sentences
+
+1. Parameter count sets **memory**, active parameter count sets **latency**; MoE is the first architecture that separates them, and sparsity is the ratio that describes the gap.
+2. Splitting an MoE across GPUs moves the tokens away from their experts, so every layer pays an all-to-all — and routing imbalance multiplies its volume while making one card the straggler that sets everyone's latency.
+3. Quantize first, shard only if you must, provision capacity for the imbalance you actually measure, and check on every deployment that the collective is overlapped and the experts live in HBM.

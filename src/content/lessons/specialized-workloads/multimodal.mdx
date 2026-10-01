@@ -1,0 +1,222 @@
+---
+title: 'Vision-language & multimodal inference'
+summary: 'A vision-language model does not have a special inference path. It converts an image into tokens, appends them to your prompt, and runs an ordinary prefill — which means every lesson about long prompts, chunked prefill and KV cache applies to images unchanged. The one genuinely new thing is a second model sitting in front of the language model.'
+objectives:
+  - Explain how an image becomes a sequence of tokens the language model can read
+  - Compute the token cost of an image from resolution, patch size and pooling
+  - Explain the any-resolution trick and why it costs vision FLOPs but not tokens
+  - Separate the vision tower, the projector and the language model in a prefill time budget
+  - Explain why image-heavy traffic has a second bottleneck the text path does not
+---
+import Multimodal from '@/components/viz/specialized-workloads/Multimodal.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is a number that surprises people the first time they measure it. A user uploads one photograph and asks a question about it. The request that reaches your server is **576 tokens of "text"** — and it is not the question. The image itself is 576 tokens.
+
+That single fact is the whole lesson. Multimodal inference is not a new architecture problem or a new kernel problem; it is Module 10's long-prompt problem wearing a different hat. Everything you learned about chunked prefill, prefix caching and KV cache arithmetic applies to images without modification.
+
+<Callout type="mentor" title="The one thing that is genuinely new">
+  There is a second model. A <Term t="vision-tower">vision tower</Term> runs before the language model, on a different input, producing a different number of tokens. Almost every "multimodal is hard" feeling comes from forgetting that there are now two things to size and two things to batch.
+</Callout>
+
+## Pixels become patches become tokens
+
+The pipeline has three stages, and each is worth understanding separately.
+
+**Stage one: the vision tower.** A vision transformer slices the image into fixed-size patches and runs a transformer over those patches. For LLaVA-1.5 the tower is CLIP ViT-L/14 at 336 pixels with 14-pixel patches:
+
+$$
+\text{patches per side} = \frac{336}{14} = 24, \qquad \text{patches total} = 24 \times 24 = \boxed{576}
+$$
+
+**Stage two: the projector.** Each patch vector (1024 dimensions for ViT-L) is mapped into the language model's hidden width (4096 for a 7B model). Two linear layers, with a nonlinearity between:
+
+$$
+\text{projector params} = 1024 \times 2048 + 2048 \times 4096 \approx \boxed{10.5\text{M}}
+$$
+
+Compare that to the 7B language model. **The projector is 0.15% of the model** — it is a translation layer, not a component that matters for capacity.
+
+**Stage three: prefill as usual.** The 576 image tokens are concatenated with your question's tokens and the language model prefills the whole thing in one pass.
+
+$$
+\text{sequence length} = \underbrace{576}_{\text{image}} + \underbrace{80}_{\text{question}} = 656 \text{ tokens}
+$$
+
+<Scrolly>
+  <Multimodal client:visible slot="stage" />
+
+  <Step title="1. An image arrives as pixels, not tokens">
+    The request reaches the engine as image bytes. **Nothing about it is a token yet** — the model has no vocabulary entry for a photograph.
+  </Step>
+
+  <Step title="2. The vision tower cuts it into patches">
+    24×24 patches at 336 pixels. Each patch becomes a vector, and a transformer runs over the patch grid the way the language model runs over tokens.
+  </Step>
+
+  <Step title="3. The projector makes patches into tokens">
+    A 10M-parameter MLP maps each patch into the language model's width. **Tiny compared with either model** — which is why multimodal fine-tuning mostly tunes the projector and the language model.
+  </Step>
+
+  <Step title="4. Now it is just a long prompt">
+    Image tokens and question tokens in one sequence, one prefill. **This is the whole insight**, and from here the workload is the one you already know.
+  </Step>
+
+  <Step title="5. Where the FLOPs actually go">
+    The vision tower is compute-bound and small. The language model prefill dominates. **Know which part is expensive before you optimise either.**
+  </Step>
+
+  <Step title="6. Resolution buys tokens, not FLOPs">
+    Higher resolution means more patches, which the projector pools back down. LLaVA-1.6 sees four crops for the same 576 tokens. **You pay in vision compute, not in context.**
+  </Step>
+
+  <Step title="7. Batching images is a second bottleneck">
+    The vision tower runs once per image and cannot be batched away. **A separate constraint**, sitting in front of the language model.
+  </Step>
+
+  <Step title="8. Sizing an image-heavy service">
+    Two levers: tokens per image and images per second. Both scale with batch — but **VRAM will run out before bandwidth does.**
+  </Step>
+</Scrolly>
+
+## Resolution, patches and the anyres trick
+
+The obvious way to see more detail is to feed a bigger image. The obvious cost is more tokens. LLaVA-1.6 found a way around this, and the mechanism is worth understanding because it explains a whole family of modern models.
+
+Instead of one 336-pixel view, look at **four** 336-pixel crops covering more of the image, then pool each 2×2 block of patches into one token:
+
+$$
+\underbrace{4 \text{ crops} \times 576 \text{ patches}}_{\text{vision work}} \div \underbrace{4}_{\text{pooling}} = \boxed{576 \text{ tokens}}
+$$
+
+The token count is identical to LLaVA-1.5. The image coverage is four times larger. The trade is paid entirely in vision-tower compute:
+
+| model | crops | patches processed | tokens | vision FLOPs |
+|---|---|---|---|---|
+| LLaVA-1.5-7B | 1 | 576 | 576 | 1× |
+| LLaVA-1.6-7B | 4 | 2,304 | 576 | **4×** |
+
+<Callout type="math" title="What this means for you as an inference engineer">
+  Any-resolution pooling decouples *image detail* from *context cost*. The two are usually conflated, and conflating them leads to bad capacity planning.
+
+  A model that uses this trick has a **fixed token budget regardless of input resolution**. So its KV cache per image is bounded and predictable, its TTFT is bounded, and memory planning becomes tractable. What scales is vision-tower time, and that scales with how many crops the configuration uses.
+</Callout>
+
+The general principle: **tokens per image is a design choice, not a consequence of resolution.** Any system where you can tune that number independently is far easier to capacity-plan than one where they are welded together.
+
+## The prefill time budget
+
+Now put numbers on it. LLaVA-1.5-7B, one image plus an 80-token question, on an H100 (989 TFLOP/s dense BF16):
+
+**Vision tower.** One forward over 576 patches, with roughly one weight-multiply per output value per patch:
+
+$$
+\text{FLOPs} \approx 2 \times 0.3\text{e}9 \times 576 = 0.35 \text{ TFLOP} \quad\Rightarrow\quad \frac{0.35}{989 \times 0.4} = \boxed{0.9\text{ ms}}
+$$
+
+**Language model prefill.** 656 tokens through 6.7B parameters:
+
+$$
+\text{FLOPs} = 2 \times 6.7\text{e}9 \times 656 = 8.8 \text{ TFLOP} \quad\Rightarrow\quad \frac{8.8}{989 \times 0.55} = \boxed{16\text{ ms}}
+$$
+
+**Total: about 17 ms**, of which the vision tower is **5%**.
+
+<Callout type="intuition" title="Why the vision tower is so cheap">
+  It processes 576 patches against the language model's 6.7 billion parameters — but those parameters are only 0.3 billion. Ratio: 576 tokens against a model 22× smaller. Multiplying through, 0.3e9 × 576 = 1.7e11 against 6.7e9 × 656 = 4.4e12, so the tower is 3.9% of the language model's FLOPs.
+
+  The vision tower is a *small model on a short sequence*. Prefill is a *big model on a short-ish sequence*. There is no contest.
+</Callout>
+
+Swap to LLaVA-1.5-13B and the balance shifts: the tower is unchanged at 0.9 ms, but the language model has 13.4B parameters, so prefill roughly doubles to about 32 ms. **Bigger text models scale the whole cost; the vision tower is fixed overhead.**
+
+### What happens to the KV cache
+
+Here's where multimodal stops being free. Those 576 image tokens now live in the KV cache exactly like any other tokens — they are never evicted, never compressed, and they are read by every subsequent decode step.
+
+For Llama-3.1-8B-style GQA at 128 KB per token:
+
+$$
+576 \text{ image tokens} \times 128\text{ KB} = \boxed{74 \text{ MB per image, per sequence, forever}}
+$$
+
+<Callout type="pitfall" title="Images are a KV cache problem, not a prefill problem">
+  A user who uploads 10 images and holds a long conversation carries **740 MB of KV that they never look at and cannot delete.** Vision encoders like LLaVA-1.6 deliberately compress to a fixed token budget for exactly this reason.
+
+  Three mitigations, in order of effectiveness: cap images per request; cap total image tokens per request; and run the vision encoder with pooling so high resolution does not inflate the token count.
+</Callout>
+
+## The second bottleneck
+
+Text-only serving has one bottleneck: the language model. Multimodal serving has two, and they are not the same resource at the same time.
+
+| | language model | vision tower |
+|---|---|---|
+| what it reads | weights + KV cache | weights + pixels |
+| bound by | bandwidth (decode) / compute (prefill) | compute |
+| batches over | sequences | **images** |
+| scales with | token count | image count and crops |
+
+The row that matters is the fourth. If your traffic is 64 text requests per step and 8 of them carry images, the vision tower must process 8 images **in that step**. You cannot amortise that across the other 56 requests — they have no image. So:
+
+$$
+\text{tower invocations per step} = \underbrace{B}_{\text{requests in flight}} \times \underbrace{n}_{\text{images per request}}
+$$
+
+which grows with batch in a way the text path does not.
+
+<Callout type="real" title="What this means for capacity planning">
+  An image-heavy service has a **second sizing axis**. Your language model needs enough KV cache for 576 tokens per in-flight image; your vision tower needs enough memory to hold several images' activations at once.
+
+  In production this is why VLM serving is often deployed with a **separate encoder pool** or with encoders on dedicated replicas, rather than simply running the vision tower inline on every replica. Encode once, cache the image tokens, and let the language-model replicas see only tokens. If the same image is asked about repeatedly, you should be caching the *encoded image*, not re-encoding it.
+</Callout>
+
+### Encoding once and reusing
+
+That last idea deserves emphasis because it is the highest-leverage optimisation in multimodal serving. The vision tower is a pure function of the image bytes. Two requests with the same image and different questions produce **identical image tokens**.
+
+So the efficient architecture is:
+
+1. Upload the image once. Run the vision tower. Get tokens.
+2. Store those tokens, keyed by a hash of the image bytes.
+3. Serve every subsequent question as a *text-only* prefill over cached tokens.
+
+With that, a multi-turn conversation about one image costs **one** vision-tower pass instead of $k$. This is prefix caching's exact idea applied at a coarser granularity, and it is worth more than any kernel optimisation you will do to the encoder.
+
+## Configuring a multimodal service
+
+| decision | guidance |
+|---|---|
+| images per request | cap at 2–4; it is a KV cache budget decision |
+| resolution | prefer any-resolution models so tokens stay bounded |
+| batching | group by image count so the tower sees a uniform shape |
+| prefix caching | the system prompt and few-shot examples cache normally |
+| image token caching | **cache encoded images; do not re-encode** |
+| prefill | chunked prefill (Module 10) applies unchanged |
+
+<Callout type="try" title="Check yourself before continuing">
+  1. LLaVA-1.5 uses 336-pixel images with 14-pixel patches. How many patches, and therefore how many tokens does one image cost?
+  2. LLaVA-1.6 looks at 4 crops and pools each 2×2 into one token. How many tokens, and how many times the vision FLOPs of LLaVA-1.5?
+  3. For LLaVA-1.5-7B on an H100, roughly how do the vision tower's FLOPs and the language model's prefill FLOPs compare? Which dominates?
+  4. A conversation holds 10 images with a model at 131 KB of KV per token. How much KV cache do those images occupy, and why can none of it be reclaimed?
+  5. Your batch is 64 requests and 8 of them carry one image each. How many vision tower invocations happen per step, and why does that not amortise across the other 56?
+</Callout>
+
+<KeyNotes>
+  1. A vision tower cuts an image into patches, a small projector maps them into the language model's width, and the result is a normal prefill — so long-prompt techniques apply unchanged.
+  2. LLaVA-1.5 at 336 pixels with 14-pixel patches is 24×24 = **576 image tokens**, which is more tokens than most questions are worth.
+  3. The projector holds about 10M parameters, 0.15% of a 7B model. **It is a translation layer, not a capacity component**, so multimodal fine-tuning mostly tunes it and the language model.
+  4. Any-resolution pooling decouples image detail from token cost: LLaVA-1.6 processes 4× the patches for the *same* 576 tokens. Tokens per image is a design choice, not a consequence of resolution.
+  5. In a prefill budget the language model dominates by about 20×: the tower costs ~0.9 ms against ~16 ms for the text model on an H100. The tower is fixed overhead.
+  6. Image tokens occupy the KV cache permanently at the full rate, so 576 tokens is **75 MB per image per sequence** on an 8B GQA model — a memory problem, not a latency one.
+  7. The vision tower batches over *images*, not sequences, so a step with 8 image requests out of 64 must still run 8 encoder passes. Multimodal traffic has a second bottleneck.
+  8. The highest-leverage multimodal optimisation is caching *encoded images* keyed by a hash of their bytes, so a follow-up question about the same image is a text-only prefill.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'LLaVA-1.5 resizes images to 336 pixels and uses 14-pixel patches. How many tokens does one image cost?', numeric: true, answer: 576, tolerance: 10, unit: 'tokens', why: '336 / 14 = 24 patches per side, so 24 × 24 = 576 patches, each becoming one text token. This is the number quoted in the LLaVA model card, and it is why an image usually costs more context than the question about it.' },
+  { q: 'LLaVA-1.6 processes 4 crops of 576 patches and pools each 2×2 into one token. How many tokens, and how many times LLaVA-1.5’s vision FLOPs?', numeric: true, answer: 576, tolerance: 10, unit: 'tokens', why: '4 crops × 576 patches = 2,304 patches, pooled 4:1 gives 2,304 / 4 = 576 tokens — identical to LLaVA-1.5. But the vision tower does 4× the work. Detail is bought with vision compute, not with context.' },
+  { q: 'On an 8B GQA model with 128 KB of KV cache per token, how much KV cache does a single 576-token image permanently occupy?', numeric: true, answer: 74, tolerance: 3, unit: 'MB', why: '576 × 128 KB = 73.7 MB. Image tokens are ordinary tokens in the KV cache — never compressed, never evicted — so a conversation holding ten images carries about 737 MB of KV the user never looks at. That is why capping images per request matters more than it seems.' },
+  { q: 'A decode step has 64 requests, 8 of which carry one image. How many vision tower invocations occur in that step?', numeric: true, answer: 8, tolerance: 0, unit: '', why: 'One per image, per step. The tower batches over images, not sequences, so it cannot amortise across the 56 text-only requests. This is the second bottleneck that makes multimodal traffic need its own capacity plan.' },
+  { q: 'The vision tower is a small model (0.3B) on a short sequence (576 patches) while the language model is 6.7B on 656 tokens. Which dominates prefill?', options: ['The vision tower, because vision is harder', 'Roughly equally, so optimise both', 'The language model, by about 20×', 'Neither — prefill is memory-bound'], answer: 2, why: 'Tower: 2 × 0.3e9 × 576 = 0.35 TFLOP. Text: 2 × 6.7e9 × 656 = 8.8 TFLOP — about 25× more. The tower is fixed overhead that does not scale with the text model, so a bigger text model scales the whole cost while the tower stays put.' },
+]} />

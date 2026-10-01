@@ -1,0 +1,122 @@
+---
+title: 'Lab: Cached vs uncached & will it fit?'
+summary: 'Measure the KV cache on real hardware. Time generation with the cache on and off, decompose a decode step, measure the cache in the memory manager rather than on paper, and find out how many conversations your GPU can actually hold.'
+objectives:
+  - Compare cached and uncached generation on your own GPU and explain the gap
+  - Separate prefill from decode and check the per-token cost ratio
+  - Measure real KV bytes per token and reconcile it with the formula
+  - Predict how many conversations fit at a given context, then prove it with an allocation
+  - Record five numbers that Modules 08, 10, 11, 20 and 25 will all use
+colab: 05-kv-cache.ipynb
+---
+import CacheStepBudget from '@/components/viz/kv-cache/CacheStepBudget.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+This is the lab for the module. Everything so far was arithmetic on paper, and the two questions that decide everything about a serving system are empirical: **does the cache actually pay for itself**, and **will it fit**. Both are answerable in ten minutes on the free Colab T4, and both will disagree with your arithmetic in interesting ways.
+
+Use the notebook below. It is written to run top to bottom, and every section ends with the number you should expect to see.
+
+<Colab nb="05-kv-cache.ipynb" />
+
+## Before you start
+
+Pick a model that fits. Qwen2.5-0.5B-Instruct is the default in the notebook: 0.49 B parameters, 24 layers, 2 key/value heads, head dimension 64. That last combination is why it works on a 16 GB card — and why its cache is 12 KB a token, ten times smaller than Llama-3.1-8B's.
+
+The simulator below runs the same arithmetic for big models and real GPUs, so you can plan before you measure. Do that first: pick the model and GPU you actually care about, drag the sliders to your prompt and answer lengths, and read the three answers — how long a step is, what the cache buys, and how many conversations fit.
+
+<Wide>
+  <CacheStepBudget client:visible />
+</Wide>
+
+## Task 1 · Does the cache pay for itself?
+
+Generate the same prompt with `use_cache=True` and `use_cache=False`, at four prompt lengths (about 128, 512, 2,048 and 8,192 tokens), timing both.
+
+**Expected:** the ratio starts near 1 at the shortest prompt and climbs to roughly **15–20×** by 8,192 tokens on a T4. At the shortest prompt the uncached run can even be *faster*: the cached version pays its per-step overhead 32 times over, while the uncached one gets a 128-token batched matrix multiply for free. That is not a bug, and it is the same lesson as lesson 05.1 — arithmetic is not the scarce resource at short context.
+
+**How to read it:** the notebook also prints the ratio of *token-forwards*, which is the theoretical ceiling on the gain. For these prompts it is about 29–32× and almost constant, because the prompt dwarfs the 32 output tokens. Compare the three numbers: forwards ratio, measured clock ratio, and the gap between them. The gap is the idle tensor cores, and it is why the answer is never simply "115× faster".
+
+## Task 2 · Prefill versus decode
+
+Time one prefill pass, then time a single decode step against the cache it produced.
+
+**Expected:** a per-token ratio in the hundreds. For a 2,048-token prompt on a T4, prefill takes tens of milliseconds and a decode step about 5 ms — but prefill does two thousand tokens of work in that time, so the *per token* cost of decode is around 200× higher.
+
+**How to read it:** also compare the decode step with its own floor. Weights are about 1 GB for this model; at 80% of the T4's 320 GB/s that is about 4 ms. If your measured step is close to that, the cache read is invisible at this context length. It will not stay invisible.
+
+## Task 3 · Watch the cache read grow
+
+Time a decode step against a deliberately built cache of increasing length, and print the bytes that cache represents next to the time.
+
+**Expected:** measured times roughly proportional to cache size, and a slope that implies something close to the T4's bandwidth once the cache is bigger than a few hundred MB. Flat at small sizes, climbing steadily after that.
+
+**How to read it:** fit a line through your table. The slope is bytes per second and the intercept is the fixed cost. Those two numbers are the real speed limit of decode on this machine, and they are the ones you will use in Module 12 when you profile.
+
+## Task 4 · Measure the cache, do not trust the formula
+
+Now measure it. Compare peak memory with and without the cache, and then walk the returned cache object and add up its tensors.
+
+**Expected:** measured bytes per token equals `2 × layers × kv_heads × head_dim × 2`, to the byte.
+
+**Watch out for:** the **logits tensor**. A prompt of $T$ tokens against a 152,000-word vocabulary allocates $T \times 152{,}000 \times 2$ bytes of scores before anything else happens. At 4,096 tokens that is 1.2 GB, dwarfing a 50 MB cache. This is the single most common reason a long prompt runs out of memory, and it has nothing to do with the cache. Newer versions of Transformers can skip all but the last few logit positions; if yours can, switch it on and re-measure.
+
+## Task 5 · How many conversations fit?
+
+Compute the budget from the free memory you measured at the start, minus the weights, with 10% held back, divided by the cache per conversation. Then **prove it**: try to allocate that many cache slots and see whether the allocation survives.
+
+**Expected:** the prediction and the allocation agree to within a few percent. Any gap is the workspace reserve, which is a guess, and which is why you leave headroom.
+
+**Then push it:** raise the context length until the prediction reaches zero, and compare with where the allocation actually fails. The gap between those two numbers is the honest cost of the workspace.
+
+## Task 6 · Halve it
+
+Repeat the budget with the cache in 8 bits instead of 16.
+
+**Expected:** exactly half the memory per conversation, and roughly twice the conversation count.
+
+**How to read it:** the cache format is a completely independent choice from the weight format. You can run BF16 weights with an FP8 or INT8 cache. This section measures only memory — what it costs you in output quality is Module 11's subject, and at the time of writing FP8 KV cache is well established on recent NVIDIA hardware and less well supported elsewhere.
+
+## Task 7 · Share a prefix
+
+The notebook builds a shared system prompt and asks a simple question: what do ten requests that all begin with the same 1,600-token prompt cost, when each also has its own 120-token tail?
+
+**Expected:** every request stores its own copy of the prefix until you stop it. On this small model, ten requests come to about 210 MB of cache without sharing and 34 MB with it.
+
+**How to read it:** this is not an optimisation you implement in your application. It is a property the engine can exploit, and it is the entire content of prefix caching in Module 10. The point of doing it by hand once is that you will know exactly what is being saved.
+
+## Task 8 · Check the cache is not lying to you
+
+Run the equivalence test on the real model. First compare a cached prefill against an uncached one over the same five tokens: the difference should be **exactly zero**, because a cache changes where values are stored, not what is computed. Then feed one more token through the cache and compare that decode step against an uncached forward over all six tokens.
+
+**Expected:** zero for the prefill, then a maximum difference of order 10⁻³ in float16 — floating-point noise from the order of summation in the attention dot products — and the same predicted token.
+
+**If you see something much larger,** you have one of the classic bugs. Most likely the cache is being written before the rotary position embedding is applied, or a cache layout is being read with the wrong stride. Re-read *Build a KV cache yourself*, and test at two context lengths: a short one catches logic errors, a long one catches layout errors.
+
+## Check yourself
+
+Answer these from your own notebook output before you move on. If a number is missing, that is the section to go back to.
+
+1. At a 1,024-token prompt generating 32 tokens, how many token-forwards did the uncached run do, and how many did the cached run do? (Answer: 32 × 1,024 + 496 = 33,264 against 1,056, so 31.5×.)
+2. Your measured KV bytes per token: is it exactly the formula, and if not, what is the ratio?
+3. How many 4,096-token conversations does this GPU hold with the model you chose? Compare with the number of 32,768-token conversations.
+4. Your decode step time at 1,024 tokens of context, and again at 8,192. What does the ratio tell you about when the cache starts to dominate? With a 12 KB-per-token model the honest answer may be "almost not at all" — in which case use the algebra: at what context length would the cache read exceed the 1 GB of weights, and how does that compare with what the 8B models in Module 05.4 need?
+5. What fraction of peak bandwidth did your Task 3 line imply? Compare with the ~320 GB/s spec figure.
+6. If you had to double your concurrency overnight, which would you change: the cache format, the context length, the number of GPUs, or the batch size? Justify it in one sentence using a number from this lab.
+
+<KeyNotes>
+  1. Always verify a cache by comparing against `use_cache=False` on the same tokens. Expect agreement to floating-point noise, and test at two context lengths.
+  2. Cached generation is not 100× faster than uncached, because recomputing spends the resource decode was not using. Report the measured speed-up, never the forward ratio.
+  3. Measure the cache in the memory manager. The formula should match to the byte, and if it does not, you have found something.
+  4. The logits tensor, not the KV cache, is usually what makes a long prompt run out of memory on a big-vocabulary model.
+  5. Decode step time is `max(memory, compute) + overhead`. The cache moves the memory term and the compute term stays tiny until the context is very long.
+  6. Fit a line of time against cache bytes to get this machine's real decode bandwidth. That is a measurement, not a spec sheet.
+  7. Halving the cache format exactly doubles conversation count. Context length cuts it linearly. Only one of those two is a quality decision.
+  8. Leave 10% headroom and measure the workspace rather than guessing it: the gap between predicted and actual capacity is the workspace.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A 1,024-token prompt generates 32 tokens with no cache. How many token-forwards does that take?', numeric: true, answer: 33264, tolerance: 400, unit: 'token-forwards', why: 'n·p + n(n−1)/2 = 32 × 1,024 + 32 × 31 / 2 = 32,768 + 496 = 33,264. The cached run needs 1,024 + 32 = 1,056, so 31.5× less arithmetic.' },
+  { q: 'Qwen2.5-0.5B has 24 layers, 2 key/value heads and head dimension 64, with a float16 cache. How many bytes does one token of context cost?', numeric: true, answer: 12288, tolerance: 200, unit: 'bytes', why: '2 (K and V) × 24 layers × 2 heads × 64 dims × 2 bytes = 12,288 bytes = 12 KB per token. Compare Llama-3.1-8B at 131,072 bytes — the difference is layers and KV heads, nothing else.' },
+  { q: 'Your decode step takes 8 ms at 1,024 tokens of context and 12 ms at 16,384. What is the most likely explanation?', options: ['The model weights have grown', 'The cache read is a growing share of the memory traffic, so the memory-bound step is getting slower', 'Attention is now compute-bound because of quadratic FLOPs', 'The tokenizer is slower at longer contexts'], answer: 1, why: 'The weights are constant. A decode step reads one new query against T cached keys, so its attention FLOPs grow linearly while its cache read grows linearly too — and the memory term is what the step is waiting on. Attention in decode is linear in context, not quadratic; the quadratic version is prefill.' },
+  { q: 'A 4,096-token prompt on a model with a 152,000-token vocabulary allocates scores for every position. About how many bytes is that, in FP16?', numeric: true, answer: 1.24, tolerance: 0.08, unit: 'GB', why: '4,096 × 152,000 × 2 bytes = 1.245 × 10⁹ bytes = 1.24 GB. For comparison, the KV cache at 12 KB a token is only 50 MB, so the logits tensor is 25× larger and is the real memory constraint on long prompts.' },
+] } />

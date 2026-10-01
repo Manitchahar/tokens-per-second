@@ -1,0 +1,207 @@
+---
+title: 'Project: The quality/speed/memory frontier'
+summary: 'Build the matrix that a real quantization decision requires: eight configurations, each measured for quality, throughput and memory, then reduced to a Pareto frontier you can defend in a design review. You will end with a recommendation and a written argument, which is the actual deliverable.'
+objectives:
+  - Define a quantization candidate matrix for a specific workload
+  - Measure quality, throughput and memory for every candidate on real hardware
+  - Compute the Pareto frontier and identify dominated configurations
+  - Write acceptance criteria with a named decision and a rollback plan
+  - Defend the choice against the two most obvious alternatives
+colab: 11-quantize-and-measure.ipynb
+---
+import ParetoFrontier from '@/components/viz/quantization/ParetoFrontier.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Six lessons, and you can now explain every number in a 4-bit checkpoint. What you cannot yet do is **choose one**, because choosing requires all six lessons' outputs in one place: a matrix of configurations, measured on real hardware, scored on three axes, reduced to a decision someone will sign.
+
+That is what this project is. It is deliberately shaped like the document you would actually hand a team.
+
+## The deliverable
+
+One repository, one report, four artefacts:
+
+| Artefact | What it is |
+|---|---|
+| **`matrix.md`** | The candidate table: every configuration, every measurement, every source |
+| **`report.md`** | The decision: the chosen point, acceptance criteria, rollback, and what would change it |
+| **`harness/`** | Reproducible scripts that produce the performance and quality numbers |
+| **`frontier.png`** | The frontier plot, with dominated points marked |
+
+The harness matters as much as the numbers. A frontier you cannot regenerate in an hour is a frontier nobody will trust when the model is retrained next quarter.
+
+## Define the workload first
+
+Everything downstream depends on this, and most bad decisions come from skipping it. Write down, concretely:
+
+```
+MODEL       Llama-3.1-8B-Instruct (or Qwen2.5-7B-Instruct if your GPU is smaller)
+HARDWARE    1 × NVIDIA H100 80GB, or 1 × T4 16GB for the scaled-down version
+WORKLOAD    chat, p50 prompt 600 tokens, p50 output 300 tokens, p99 context 16k
+SLO         p95 TTFT < 500 ms, TPOT < 40 ms  (an interactive chat product)
+LOAD        target 30 output tokens/s aggregate, peak 120
+QUALITY     your own eval set, ≥ 3,000 samples, paired testing
+```
+
+Three of those lines are decisions, not measurements. **The SLO is a product decision** — it comes from what makes the product feel instant. **The quality bar is a product decision** — a coding assistant and a summariser have different ones. Write down who made each decision. When the frontier gets uncomfortable, knowing who owns the SLO is what lets you have the conversation instead of guessing.
+
+<Scrolly>
+  <ParetoFrontier client:visible slot="stage" />
+
+  <Step title="1. Three axes, not one">
+    Quality, speed, memory. Speed and memory are nearly the same axis — decode is memory-bound, so fewer bytes is both a smaller footprint and a shorter step. Quality is the axis that is not on that line, which is exactly why collapsing them into a single "quantization score" destroys the decision.
+  </Step>
+
+  <Step title="2. Plotting the candidates">
+    Eight configurations: BF16, FP8, W8A8, BF16+KV8, W4, W4+KV8, W4+KV4, W8+KV4. Throughput against quality. Click any point to see its numbers, and drag the load slider — the shape of the frontier depends on how many users you are serving.
+  </Step>
+
+  <Step title="3. The frontier is the answer">
+    The highlighted points are non-dominated: nothing else is at least as fast *and* at least as accurate. Everything grey has a strictly better alternative and should be deleted from consideration rather than debated.
+  </Step>
+
+  <Step title="4. Reading your own shape">
+    At low load the frontier is steep — memory dominates and every byte you remove is throughput. At high batch it flattens, because you become compute-bound and quantization buys you concurrency rather than speed.
+  </Step>
+
+  <Step title="5. The choice you actually face">
+    Pick a point and say why. Then write down what would move you off it. That last sentence is what separates a decision from a preference, and it is the part your reviewer will actually read.
+  </Step>
+</Scrolly>
+
+<Colab nb="11-quantize-and-measure.ipynb" />
+
+## Part 1 · Build the candidate matrix
+
+Eight candidates, chosen because they span the space rather than because they are fashionable:
+
+| # | Weights | KV cache | Why it is in the matrix |
+|---|---|---|---|
+| 1 | BF16 | BF16 | The baseline everything is measured against |
+| 2 | FP8 | BF16 | Best quality per bit on Hopper+ |
+| 3 | INT8 | FP8 | The safe production default |
+| 4 | BF16 | FP8 | Isolates the KV effect — pure memory win |
+| 5 | INT4 g128 | BF16 | Isolates the weight effect — pure memory win |
+| 6 | INT4 g128 | FP8 | The common long-context configuration |
+| 7 | INT4 g128 | INT4 | Maximum density, maximum risk |
+| 8 | INT8 | INT4 | Tests whether INT4 KV is survivable with strong weights |
+
+Rows 4 and 5 are the ones people skip and they are the most informative: each isolates one variable. If you only test BF16 and INT4, you cannot tell whether a regression came from the weights or the cache.
+
+## Part 2 · Measure performance
+
+For every candidate, on real hardware, with the harness from Module 06 (warm-up, fixed seeds, percentiles, not averages):
+
+| Metric | How | Why this metric |
+|---|---|---|
+| TTFT | p50, p95, p99 at target and peak load | Long-prompt sensitivity |
+| TPOT | p50, p95 | What a user feels as "smoothness" |
+| Throughput | output tokens/s at the SLO-goodput point | The honest capacity number |
+| Goodput | requests/s meeting the SLO | What you can actually promise |
+| Peak memory | weights + KV + workspace | The concurrency ceiling |
+| Users | max concurrent at the SLO | Derived from memory, but verify it |
+
+**If you do not have an H100**, run this on a T4 with Qwen2.5-0.5B-Instruct and scale the *shape*, not the numbers. The notebook in this module does exactly that. What transfers is the ratio between configurations and the ordering of the frontier — the absolute milliseconds do not.
+
+<Callout type="pitfall" title="Three measurement traps that will ruin your matrix">
+  **Unfused dequantization.** If your INT4 path is slower than BF16, check whether the GEMM is actually fused before concluding quantization is slow. On most engines it is; in a hand-rolled harness it usually is not.
+
+  **No warm-up.** The first decode step pays CUDA graph capture, kernel autotuning and allocator growth. A benchmark without warm-up measures the warm-up. Use the `bench()` helper in this module's notebook.
+
+  **A prefix cache you did not mean to have.** If your harness reuses the same prompt across requests, you are measuring Module 10's optimization, not quantization. Disable it or randomize the prompts.
+</Callout>
+
+## Part 3 · Measure quality
+
+This is where projects usually go wrong, so be deliberate.
+
+1. **Perplexity** on a held-out corpus resembling your traffic. Cheap; run it first to catch anything catastrophic.
+2. **At least three task benchmarks**, including one from your own eval set. Public benchmarks (GSM8K, HumanEval, MMLU) plus your own.
+3. **Paired testing, ≥ 3,000 samples per task.** From Lesson 11.6: a 4-bit regression is 1–4 points, and you cannot resolve that at 200 samples.
+4. **A context-length sweep** for any candidate with a quantized KV cache, at 1k / 8k / 32k.
+5. **Twenty hand-read failures** for any candidate that regresses more than 1 point, categorised by signature (repetition / lost needle / late hallucination / near-miss code).
+
+Produce a table like this, with the CI, not just the delta:
+
+| Candidate | PPL | GSM8K | HumanEval | LongQA @32k | worst delta |
+|---|---|---|---|---|---|
+| BF16 | 6.72 | 62.5 ± 0.7 | 48.2 ± 0.8 | 71.0 ± 0.7 | — |
+| FP8 | 6.73 ± — | 62.3 | 48.0 | 70.8 | −0.2 |
+| INT8+FP8 | 6.74 | 62.0 | 47.6 | 70.2 | −0.8 |
+| INT4 g128 | 6.89 | 59.1 | 44.3 | 69.4 | **−3.9** |
+| INT4 g128 + FP8 KV | 6.89 | 58.8 | 43.9 | 64.1 | **−5.1** |
+
+That last row is the finding: the weights cost 3.9 points, the KV cache costs another 1.2 — **but only at long context**. A team that evaluated at 1k would have concluded INT4 KV was free.
+
+## Part 4 · Compute the frontier and decide
+
+For every candidate you now have three numbers: quality, throughput, memory. Define **domination**:
+
+> Configuration A dominates B if A is at least as good on every axis and strictly better on at least one.
+
+Delete dominated configurations. What remains is the frontier, and it is typically 3–4 points wide. Choose among them using your **quality budget**:
+
+- If the SLO is already met at BF16 and the only goal is cost → pick the most aggressive point whose quality regression is inside your budget.
+- If you are compute-constrained on throughput → pick the highest-throughput point whose quality regression is inside budget.
+- If the product is long-context → INT4 KV is probably out; W4 + FP8 KV is usually the answer.
+
+**Then write the falsifier.** One sentence naming what would move you off your chosen point:
+
+> "We would move to INT4 + INT4 if the quality regression on our eval drops below 1.5 points after we retrain with GPTQ on our own calibration set."
+
+That sentence is worth more than the recommendation itself. It converts a preference into something the next person can act on.
+
+<Colab nb="11-quantize-and-measure.ipynb" />
+
+## Part 5 · Acceptance criteria and rubric
+
+**Acceptance criteria** — your config is done when:
+
+1. p95 TTFT and TPOT meet the SLO at peak load, on the target GPU.
+2. No task benchmark regresses by more than your stated budget, with intervals reported.
+3. Long-context QA at your maximum served context is within budget.
+4. Peak memory leaves ≥ 10% headroom (Module 22 will thank you).
+5. The BF16 checkpoint is retained and the config is switchable by one flag.
+6. The harness reproduces the whole matrix in under two hours.
+
+**Rubric** — how this is graded:
+
+| Criterion | Weight | What earns full marks |
+|---|---|---|
+| **Measurement rigour** | 25% | Real hardware, warm-up, percentiles not means, prefix cache disabled, results reproducible from a committed script |
+| **Quality methodology** | 25% | Paired tests, enough samples, a length sweep for KV, failures actually read and categorised |
+| **Frontier correctness** | 20% | Domination computed correctly, dominated configs identified and removed, memory treated as an axis |
+| **The decision** | 20% | A named configuration, acceptance criteria met, a rollback plan, and a falsifier sentence |
+| **Communication** | 10% | A reader can check your arithmetic, sources are cited, uncertain claims are marked as uncertain |
+
+The weighting says something on purpose: **measurement rigour and quality methodology together are half the grade**, more than the decision itself. A correct decision reached by sloppy measurement is a coincidence, and this project is built to be hard to get right by accident.
+
+<Callout type="mentor" title="What separates a strong frontier from a plausible one">
+  The strong version contains a **surprise** — something the candidate matrix was not supposed to show.
+
+  Real examples from this kind of exercise:
+  - "W4 weights cost 4 points but 40% throughput. W8 weights cost 0.5 points and 20%. At our load we are not throughput-bound, so **W8 wins and W4 was never worth it**."
+  - "KV FP8 was free on our benchmark and cost 1.2 points on our own long-context eval. We would have shipped it blind."
+  - "INT4 was 3× on the model we benchmarked and 1.2× on the model we serve, because the second is compute-bound at our batch size."
+
+  If your frontier is boring — a straight line from BF16 to INT4 — you probably did not measure the axis that mattered. Go back and look for the variable you held fixed.
+</Callout>
+
+<KeyNotes>
+  1. The deliverable is a matrix, a frontier and a decision with acceptance criteria and a falsifier — not a single recommended number.
+  2. Write down the workload, SLO and quality budget explicitly, and record who decided each. Everything downstream depends on them.
+  3. Include per-axis candidates (KV-only, weights-only) so a regression can be attributed to one variable rather than to "quantization".
+  4. Measure p50/p95/p99 and goodput on real hardware with warm-up, prefix cache disabled, and seeds fixed. Averages and shared prefixes will lie to you.
+  5. Quality needs paired tests and ≥ 3,000 samples per task; a 4-bit regression is 1–4 points and is invisible at 200 samples.
+  6. Always sweep context length when the KV cache is quantized — INT4 KV is nearly free at 1k and damaging at 32k.
+  7. Compute domination explicitly and delete the dominated configurations. Most debates about quantization are debates about already-dominated points.
+  8. Write the falsifier: one sentence naming what would move you off your choice. It is what makes the decision actionable rather than decorative.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Configuration A has quality 0.95 and 2,000 tok/s. B has quality 0.96 and 1,800 tok/s. C has quality 0.95 and 2,200 tok/s. Which are on the Pareto frontier?', options: ['All three', 'A and B', 'A, B and C, because none is strictly worse on both axes than another', 'B and C'], answer: 2, why: 'C dominates A (same quality, higher throughput), so A is out. B survives because nothing beats it on quality — to dominate B you would need at least 0.96 quality AND at least 2,000 tok/s, which nothing does. The frontier is {B, C}.' },
+  { q: 'Llama-3.1-8B on an H100 with 80 GB of memory, at 8k context in BF16. How many concurrent users fit in the KV budget, leaving 80% of memory for weights plus KV?', numeric: true, answer: 39, tolerance: 5, unit: 'users', why: 'Budget = 0.8 × 80 GB = 64 GB. Weights take 16.06 GB, leaving 47.9 GB for KV. Per user: 8192 tokens × 131,072 bytes = 1.07 GB. 47.9 / 1.07 ≈ 44.7, so about 39–45 users depending on the workspace reserve you assume. Halving the KV cache to 8 bits roughly doubles this, which is why long-context serving always quantizes the cache.' },
+  { q: 'Your target is 1,500 tok/s at p95 TPOT under 40 ms. W8 meets both. W4 meets the throughput target but regresses your primary task by 6 points. Which do you ship, and what is the deciding argument?', options: ['W4, because throughput is the SLO', 'W8, because the SLO is already met, so extra throughput buys nothing while the quality regression is a real product regression', 'W4 on a 10% traffic canary, W8 everywhere else', 'Neither — stay on BF16'], answer: 1, why: 'This is the quality-budget decision. Once throughput is not the binding constraint, more of it has no value, and quality is a separate axis you do not trade silently. The canary is reasonable if you want evidence, but the reasoning is the point: an unmet need versus a met one.' },
+  { q: 'Your frontier looks like a straight line from BF16 down to INT4 with no interesting structure. What does that most likely mean?', options: ['Your measurements are correct and the frontier really is linear', 'You probably failed to measure the axis that mattered — for example you held batch size fixed, or never swept context length, so the KV cache effect and the compute-bound regime are invisible', 'You should use a log scale instead of a linear one', 'The frontier is always linear in practice'], answer: 1, why: 'The frontier bends where the bottleneck moves. At large batch you cross from memory-bound to compute-bound, which flattens the speed benefit of quantization. At long context the KV cache becomes the dominant byte term. If both are absent from your sweep, you have measured a narrow slice and the linearity is an artifact of your setup.' },
+  { q: 'Why does the rubric weight measurement rigour and quality methodology above the decision itself?', options: ['Because the decision is easy and there is nothing to learn there', 'Because a correct decision reached by sloppy measurement is a coincidence; the skill being assessed is knowing what you do not know', 'To make the project take longer', 'Because quality measurement is the most enjoyable part'], answer: 1, why: 'The frontier and the decision can be done from arithmetic — the module has already given you the formulas. What cannot be faked is knowing whether your quality delta is real at 300 samples or 3,000, whether the decode step was warmed up, and whether a shared prefix inflated your throughput. Half the grade is on epistemic hygiene.' },
+  { q: 'Llama-3.1-8B in INT4 (group 128) plus an 8-bit KV cache, batch 32 at 4k context. What is the memory saving against BF16 with the same KV, as a percentage?', numeric: true, answer: 61, tolerance: 5, unit: '%', why: 'BF16 weights + BF16 KV = 16.06 + 17.18 = 33.24 GB. INT4 weights + INT8 KV = 4.27 + 8.59 = 12.86 GB. Saving = (33.24 − 12.86)/33.24 = 61%. Note the two levers contribute almost equally here — which is why a matrix that only tests weight quantization systematically understates the prize.' },
+]} />

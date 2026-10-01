@@ -1,0 +1,158 @@
+---
+title: 'Module 05 · Prefill, Decode & the KV Cache'
+module: kv-cache
+---
+
+## Why a cache exists
+
+An autoregressive model emits **one token per forward pass**. A naive generator re-runs the whole sequence every step.
+
+$$
+W_{\text{naive}} = np + \frac{n(n-1)}{2} \qquad W_{\text{cached}} = p + n
+$$
+
+| Prompt $p$ | Output $n$ | Naive token-forwards | Needed | Ratio | Wasted |
+|---|---|---|---|---|---|
+| 128 | 64 | 10,208 | 192 | 53× | 98.1% |
+| 512 | 128 | 73,664 | 640 | 115× | 99.1% |
+| 1,024 | 256 | 294,784 | 1,280 | 230× | 99.6% |
+| 4,096 | 512 | 2,227,968 | 4,608 | 484× | 99.8% |
+
+- A **token-forward** = one token through the whole model = $F = 2P$ FLOPs. 16.1 GFLOP for Llama-3.1-8B.
+- Per generated token a naive loop spends $p + (n-1)/2$ token-forwards: the **average context length**.
+- 99% wasted FLOPs is only ~2.2× wasted time on an H100 — decode is memory-bound, so the extra arithmetic runs on idle tensor cores. **Waste costs what it is made of.**
+- The waste is fatal where arithmetic is the scarce resource: long answers, any batching, long context.
+
+## The cache
+
+Holds **only K and V**, per token, per layer. Nothing else about an old token is ever read again.
+
+$$
+\text{bytes/token} = 2 \times L \times H_{kv} \times D \times b
+$$
+
+| Model | Layers | Q heads | KV heads | Group | KB/token BF16 | FP8 | Cache at 128K |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 24 | 14 | 2 | 7× | 12 | 6 | 1.5 GB |
+| Llama-3.2-3B | 28 | 24 | 8 | 3× | 112 | 56 | 14 GB |
+| Llama-3.1-8B | 32 | 32 | 8 | 4× | **128** | 64 | 16 GB |
+| Qwen2.5-32B | 64 | 40 | 8 | 5× | 256 | 128 | 32 GB |
+| Llama-3.1-70B | 80 | 64 | 8 | 8× | 320 | 160 | 40 GB |
+| Llama-3.1-405B | 126 | 64 | 8 | 8× | 504 | 252 | 63 GB |
+
+- **128 KB per token** for Llama-3.1-8B in BF16. In your head: layers × 4 KB each.
+- The cache scales with **KV heads, not query heads**. GQA gives 4–8× over full MHA.
+- Keys are cached **after** RoPE, so entries carry their position: no reordering, no re-positioning.
+- Allocate `[n_layers, batch, 2, kv_heads, MAXLEN, head_dim]` once. Write at index *t*. Read `0 … t`.
+- Never `torch.cat`: it copies 1 + 2 + … + t rows. 524,800 rows for a 1,024-token request.
+- With a batch, the cursor becomes a length **per row**, and attention masks the padding.
+- Verify against `use_cache=False`: same tokens, logits agree to ~10⁻⁶ (FP32). Test at two context lengths.
+
+## Prefill vs decode
+
+| | **Prefill** | **Decode** |
+|---|---|---|
+| Tokens per step | $T$ | 1 |
+| FLOPs | $2PT + 4T^2 d L$ | $2P + 4T d L$ |
+| Bytes | $2Pb + T b_{kv}$ + activations | $2Pb + T b_{kv}$ |
+| Intensity | $\approx T$ | $\approx 1$ |
+| Limited by (H100) | compute, above ~300 prompt tokens | memory, at any context |
+| Llama-8B, T=512, H100 | ~15 ms | ~7.5 ms |
+| Tokens/s | ~33,000 | ~133 per user |
+| Growth | quadratic in FLOPs | linear in bytes |
+| User feels it as | TTFT | TPOT |
+
+- Prefill's attention is **quadratic**; decode's is **linear** (one query, T keys). Never carry one intuition into the other.
+- Prefill intensity $\approx T$: it becomes compute-bound once the prompt is longer than the GPU's ridge point — about 300 tokens on H100, 160 on A100, 200 on T4.
+- One prefill token ≈ 1/225 of a decode token in time: 33 µs versus 7.5 ms.
+- Prefill's share of GPU time: 1.7% for a 512-token prompt, 41% at 16K, 63% at 32K. Know your prompt lengths.
+
+**Two walls for long context**
+
+$$
+T^* = \frac{P}{2 d L} \approx 30{,}600 \text{ tokens (8B)}, \quad 54{,}000 \text{ (70B)} \qquad \text{prefill: compute}
+$$
+
+$$
+T_{\text{crossover}} = \frac{2Pb}{b_{kv}} \approx 122{,}500 \text{ tokens (8B)} \qquad \text{decode: bandwidth}
+$$
+
+## Memory budget
+
+$$
+N_{\max} = \left\lfloor \frac{(M - W - S) \times 0.9}{T \cdot b_{kv}} \right\rfloor
+$$
+
+$$
+\text{context tokens per GPU} = \frac{(M - W - S) \times 0.9}{b_{kv}}
+$$
+
+| Llama-3.1-8B BF16 | Free after weights + workspace + headroom | Context tokens | At 4K | At 8K | At 32K | At 128K |
+|---|---|---|---|---|---|---|
+| T4 (17.2 GB) | 0.39 GB | 2,980 | 0 | 0 | 0 | 0 |
+| A100 / H100 80GB | 54.7 GB | 417,000 | 101 | 50 | 12 | 3 |
+| H200 141GB | 107.4 GB | 819,000 | 199 | 99 | 24 | 6 |
+
+- Three consumers: **weights** (fixed), **KV cache** (users × context), **workspace** (~4% + 10% headroom).
+- **Memory decides capacity; bandwidth decides speed.** Equal memory, equal conversations, different tok/s.
+- Weights: 8.03 B × 2 B = 16.06 GB. The T4's "16 GB" is 16 **GiB** = 17.2 GB, which is why 8B just fits and then OOMs. 70B BF16 = 141 GB fits on **no** single card.
+- Fits is not serves. Every extra conversation's cache is read every step (Llama-8B, 4K, H100):
+
+| Batch | Step | Throughput | Per user |
+|---|---|---|---|
+| 1 | 7.7 ms | 130 tok/s | 130 tok/s |
+| 8 | 9.1 ms | 879 tok/s | 110 tok/s |
+| 32 | 13.9 ms | 2,300 tok/s | 72 tok/s |
+| 64 | 20.3 ms | 3,152 tok/s | 49 tok/s |
+| 100 | 27.5 ms | 3,636 tok/s | 36 tok/s |
+
+- Four levers: fewer KV heads, FP8/INT8 cache, shorter contexts, smaller model or more GPUs. Plus **shared prefixes**: 2,000 shared tokens on 8B = 262 MB saved per request.
+- Watch the **logits tensor**: $T \times$ vocab $\times$ 2 bytes. At 4,096 tokens with a 152K vocab that is 1.24 GB — often the real memory constraint.
+
+## Reference numbers
+
+| GPU | Peak BF16 | Bandwidth | Memory | Ridge |
+|---|---|---|---|---|
+| T4 (free Colab) | 65 TFLOP/s | 320 GB/s | 16 GiB | ~203 |
+| A100 80GB | 312 TFLOP/s | 2.0 TB/s | 80 GB | ~156 |
+| H100 SXM | 989 TFLOP/s | 3.35 TB/s | 80 GB | ~295 |
+| H200 | 989 TFLOP/s | 4.8 TB/s | 141 GB | ~206 |
+| B200 | ~2,250 TFLOP/s | 8.0 TB/s | 180 GB | ~281 |
+
+Llama-3.1-8B on one H100: 16.06 GB weights, 131,072 B/token, 7.6 ms per decode step at 1K context, 13.9 ms at 128K. Prefill 512 tokens ≈ 15 ms, ≈ 33,000 tok/s.
+
+## The API surface
+
+```python
+# reference implementation
+class KVCache:
+    def __init__(self, n_layers, n_kv, d_head, max_len):
+        self.k = torch.zeros(n_layers, n_kv, max_len, d_head)
+        self.v = torch.zeros_like(self.k); self.t = 0
+    def append(self, layer, k_new, v_new):      # one token, one row, O(1)
+        self.k[layer, :, self.t] = k_new
+        self.v[layer, :, self.t] = v_new
+        self.t += 1
+        return self.k[layer, :, :self.t], self.v[layer, :, :self.t]
+
+# HuggingFace
+out = model(input_ids=ids, use_cache=True)              # prefill, fills the cache
+out = model(input_ids=nxt, past_key_values=out.past_key_values, use_cache=True)   # one decode step
+model.generate(..., use_cache=False)                    # the naive reference
+```
+
+## Vocabulary
+
+| Term | Meaning |
+|---|---|
+| token-forward | One token pushed through the whole model, $2P$ FLOPs |
+| prefill | Process the whole prompt in one batched pass; compute-bound |
+| decode | One token per step; memory-bound |
+| KV cache | Stored K and V of every previous token, per layer |
+| GQA / MQA | Several query heads share one key/value head; shrinks the cache |
+| RoPE | Rotary position embedding; rotate K **before** caching |
+| past_key_values | The cache, as HuggingFace passes it |
+| StaticCache / DynamicCache | Preallocated buffer / growing list of blocks |
+| PagedAttention | Store the cache in fixed blocks with a block table (Module 08) |
+| Prefix caching | Reuse cached rows for a shared prompt (Module 10) |
+| TTFT / TPOT | Time to first token / time per output token (Module 06) |

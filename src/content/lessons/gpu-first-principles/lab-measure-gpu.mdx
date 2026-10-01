@@ -1,0 +1,78 @@
+---
+title: 'Lab: Measure your GPU’s two speed limits'
+summary: Measure this machine, not a spec sheet. You will time your own bandwidth and compute, derive the ridge point, sweep the decode-to-prefill curve, and plot your own roofline.
+objectives:
+  - Write a timing helper that survives CUDA asynchrony
+  - Measure HBM bandwidth and FP16 compute on real hardware
+  - Derive the ridge point from your own two numbers
+  - Sweep m from 1 to 2048 and see decode and prefill on opposite sides of the roofline
+  - Plot a roofline with your own measurements on it
+colab: 02-gpu.ipynb
+---
+
+Everything so far has been arithmetic on paper. This lab puts the two numbers of Module 02 on your own screen: how many bytes per second this GPU can read, and how many FLOP per second it can do. You will then build a roofline out of them, and every later module will refer back to the notes you write at the end.
+
+<Colab nb="02-gpu.ipynb" />
+
+## What you will do
+
+### 1. Look at what you are running on
+
+Print the device properties and run `nvidia-smi`. Predict the multiprocessor count and memory size **before** you run it. A T4 has 40 SMs and about 16 GB; the mismatch between what you guessed and what you got tells you something worth knowing.
+
+### 2. Prove the asynchrony bug on your own machine
+
+Time a matrix multiply with and without `torch.cuda.synchronize()`. The unsynchronized version measures *launches*, not work, and will be off by an order of magnitude or more. Then time the same thing with **CUDA events** and see that you get the honest number without the host-side overhead.
+
+This is the measurement you will reuse for the rest of the course, so do not skip it.
+
+### 3. Measure bandwidth
+
+Copy a 1 GB tensor. You are reading 1 GB and writing 1 GB, so 2 GB have moved. Divide by the time and you have bytes per second.
+
+Then repeat at 1, 4, 16, 64, 256 MB and 1 GB. The number at small sizes will disappoint you, and understanding why is worth more than the final figure.
+
+### 4. Measure compute
+
+Multiply large (8,192 square) FP16 matrices and convert to TFLOP/s. Then sweep the size to find where it saturates, and compare FP32, FP16 and BF16.
+
+Record: `my_bw` and `my_peak`.
+
+### 5. Derive the ridge point
+
+Divide the two numbers you just measured, being careful with units. The T4 reference is about 320 GB/s and 65 TFLOP/s, giving roughly 203 FLOP/byte. Compare yours.
+
+### 6. Sweep m from 1 to 2048
+
+For each m, measure a `[m × 4096] · [4096 × 4096]` multiply in BF16 and report the measured time, the floor implied by your two limits, your efficiency as a percentage, TFLOP/s, GB/s, and arithmetic intensity.
+
+Read the table before going further. The measured time should be almost **flat** from m = 1 to m = 32. That flatness is the empirical fact underneath the whole of Module 07: the first few dozen users of a batch cost you nearly nothing, because they are all reading the same weights at the same time.
+
+### 7. Plot your roofline
+
+One chart, log-log: your bandwidth floor, your compute ceiling, the ridge point, and one dot per row of the sweep. This is the picture you will keep.
+
+### 8. Launch overhead, and the memory hierarchy
+
+Time 1, 10, 100, 1,000 and 10,000 tiny kernels and divide. That per-call cost is why fusion exists. Then read the same tensor at three sizes to see the L1/L2/HBM ladder in your own numbers.
+
+## Write these down
+
+At the end, in **My notes**, four numbers:
+
+- `my_bw` — your measured bandwidth, GB/s
+- `my_peak` — your measured FP16 compute, TFLOP/s
+- `my_ridge` — the ratio
+- the GB/s at m = 1 from section 6
+
+Every memory calculation from Module 05 onward uses these. If you do nothing else in this course, measure these four things on the hardware you will actually use.
+
+<KeyNotes>
+  1. Always warm up, always synchronize or use CUDA events, always average. A timing helper you cannot trust poisons every conclusion drawn from it.
+  2. Bandwidth: copy a large tensor, count **read + write** bytes, divide by the time. The number is a floor you can never beat.
+  3. Compute: multiply large FP16 matrices and convert FLOPs to TFLOP/s. Small matrices never reach peak; find the size where it saturates.
+  4. Ridge point = peak compute ÷ peak bandwidth, in FLOP per byte. Everything left of it is memory-bound.
+  5. Sweeping m shows measured time almost flat from 1 to 32 rows. Adding users is nearly free at first, and that is a measured fact, not a theory.
+  6. Kernel launch costs single-digit microseconds, so 10,000 tiny operations can be pure overhead. Fuse them.
+  7. The same read at three sizes gives three different bandwidths. That spread is the memory hierarchy, visible.
+</KeyNotes>

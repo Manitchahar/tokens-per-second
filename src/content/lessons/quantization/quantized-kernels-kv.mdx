@@ -1,0 +1,188 @@
+---
+title: 'Quantized GEMMs & KV cache quantization'
+summary: 'The math of quantization is easy; the engineering is the whole job. You will learn why a quantized GEMM is only fast if the dequantization is fused into the kernel, and how KV cache quantization works as a separate pipeline with its own error lifetime.'
+objectives:
+  - Explain why unfused dequantization can be slower than BF16
+  - Describe the stages of a fused dequantize-and-matmul kernel
+  - Compute decode bytes and step time from weights and KV terms independently
+  - Choose a KV cache bit width and grouping, and predict its quality cost
+  - Explain why KV cache error accumulates with sequence length
+---
+import QuantizedKernels from '@/components/viz/quantization/QuantizedKernels.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last four lessons have been about the *math*: scales, granularity, schemes, the three clever methods. This one is about the part that actually determines whether your deployment is faster or slower, and it is a single question with a single correct answer: **when does the integer become a float?**
+
+## The one decision that matters
+
+You have a matrix of INT4 codes in memory. You need $Y = XW$. At some point each code has to be turned back into a BF16 value, because the tensor cores that do the multiply only speak BF16 (or FP8, or INT8 — but they do not speak "INT4 with a scale attached").
+
+There are exactly two places that turn can happen:
+
+### Unfused: dequantize to HBM, then GEMM
+
+```python
+W_bf16 = (codes.to(torch.float32) - zero_points) * scales   # writes P×2 bytes
+Y = X @ W_bf16                                                # reads P×2 bytes, writes a BF16 temp
+```
+
+Count the bytes. You saved memory *on disk* — the packed model is 4.3 GB. But the moment you start serving, you read the 4.3 GB of codes and then **write and read back 16 GB of BF16**. The decode step, which from Lesson 11.1 is *entirely* determined by bytes moved, now moves **more** bytes than BF16 did.
+
+<Callout type="pitfall" title="This is why people report that quantization made their model slower">
+  Nothing is wrong with the quantization. The arithmetic is correct and the answer is right. You simply paid the bandwidth cost of materialising a BF16 copy on every single decode step, which is strictly worse than never quantizing at all.
+
+  It shows up in three places: a slow first token after a cold load, a step time that does not improve with INT4, and a GPU memory report that says you are using 16 GB despite loading a 4-bit checkpoint.
+</Callout>
+
+### Fused: dequantize inside the GEMM
+
+The fix is to never materialise the BF16 matrix. A fused kernel:
+
+1. Loads a **packed tile** of codes from HBM — 4-bit codes are tiny, so a large tile arrives in one transaction.
+2. Writes them to **shared memory**, still packed.
+3. **Widens to BF16 in registers** as it streams into the tensor cores.
+4. Runs the matmul, accumulating in FP32, and writes the BF16 output.
+
+The widened values exist only in on-chip registers, in a tile a few kilobytes across, and are overwritten before the next tile arrives. **HBM only ever sees the packed codes.** The byte count drops by the full factor you bought.
+
+<Scrolly>
+  <QuantizedKernels client:visible slot="stage" />
+
+  <Step title="1. Where the dequantization has to happen">
+    Three timelines, one scale: bytes moved per decode step divided by bandwidth. The top bar is BF16. The others are the same model at 4 bits. The whole question is which of the bottom two you actually get.
+  </Step>
+
+  <Step title="2. The unfused path, and why it is slower">
+    Unfused, you read the small packed weights and then **write and re-read a full BF16 copy**. The red bar is longer than the BF16 bar. You saved disk and lost bandwidth, and bandwidth is what the decode step is made of.
+  </Step>
+
+  <Step title="3. The fused path">
+    Fused: load the packed tile into shared memory, widen it to BF16 in registers, and hand it straight to the tensor cores. The green bar is a quarter of the BF16 bar. Nothing writes a BF16 copy back to HBM — that is the entire trick.
+  </Step>
+
+  <Step title="4. The KV cache is a separate pipeline">
+    Now the other term. The KV cache is written once per token and read once per step, with a different access pattern and different error lifetime. It takes different bit widths and different grouping from the weights.
+  </Step>
+
+  <Step title="5. How far can KV go">
+    Halve the KV cache and the users who fit roughly double. But KV error accumulates over sequence length, so 4-bit KV costs real quality on long prompts — more than the same 4-bit cost on weights.
+  </Step>
+
+  <Step title="6. What this buys a decode step">
+    Weights and KV are independent levers on the same byte count. Pull both and you get a shorter step *and* more concurrency from the same card. This is where the memory saving finally becomes a throughput number.
+  </Step>
+</Scrolly>
+
+## The arithmetic of a quantized decode step
+
+You now have everything needed to size a configuration. Recall the byte count from Lesson 11.1:
+
+$$
+\text{bytes} = \underbrace{P \cdot \frac{b_w}{8}\cdot(1 + \tfrac{32}{g\,b_w})}_{\text{weights, incl.\ scales}} \;+\; \underbrace{B\,T \cdot 2LH_{kv}D \cdot \frac{b_{kv}}{8}}_{\text{KV}}
+$$
+
+For Llama-3.1-8B ($P = 8.03$e9, $L = 32$, $H_{kv} = 8$, $D = 128$) at $B = 32$, $T = 4096$, on an H100 (3.35 TB/s, 80% achieved = 2.68 TB/s):
+
+| Config | Weights | KV | Total bytes | Step time |
+|---|---|---|---|---|
+| BF16 / BF16 | 16.06 GB | 17.18 GB | 33.24 GB | 12.4 ms |
+| W4A16 / BF16 (g=128) | 4.27 GB | 17.18 GB | 21.45 GB | 8.0 ms |
+| FP8 / FP8 | 8.03 GB | 8.59 GB | 16.62 GB | 6.2 ms |
+| W4 (g=128) / KV8 | 4.27 GB | 8.59 GB | 12.86 GB | 4.8 ms |
+| W4 (g=128) / KV4 | 4.27 GB | 4.29 GB | 8.56 GB | 3.2 ms |
+
+Read that table as an engineer, because the last three rows are where people get into trouble:
+
+- **W4 alone is only 1.55×.** Not 4×. The KV cache was already 52% of the bytes and you did not touch it.
+- **Halving the KV cache is a bigger lever than the weights** at this batch and context, and it is the one people skip.
+- **Doing both is where the 4× lives** — 3.9× on the step, and a large multiple on concurrency.
+
+<Callout type="math" title="When does weight-only quantization become the bigger lever again?">
+  Look at the ratio:
+
+  $$
+  \frac{\text{KV bytes}}{\text{weight bytes}} = \frac{B\,T \cdot 2LH_{kv}D \cdot (b_{kv}/8)}{P\,(b_w/8)}
+  $$
+
+  KV dominates at **small batch, long context**. At $B = 8$, $T = 32{,}000$, the KV cache for Llama-8B is $1 \times 32{,}000 \times 131{,}072 = 33.6$ GB — twice the BF16 weights. In that regime, weight quantization buys you very little and KV quantization buys you everything.
+
+  Weights dominate at **large batch, short context**. At $B = 512$, $T = 512$, KV is only 34 GB for a batch of 512 — hmm, still large; but the *per-user* KV is small, so what actually limits you is the weights and the compute term, and W8A8/FP8 is the right lever.
+
+  **Compute the ratio for your configuration before choosing.** It takes thirty seconds and it prevents the most common quantization mistake.
+</Callout>
+
+## KV cache quantization, properly
+
+The KV cache is a different problem from weights, and the differences matter.
+
+| | Weights | KV cache |
+|---|---|---|---|
+| Written | once, offline | every step, per token |
+| Error lifetime | permanent, but measurable once | recomputed per request |
+| Distribution | you can inspect it offline | varies per token, per request |
+| Can you store extra metadata? | yes, freely | yes, but scales must be cheap to apply |
+
+### Grouping: how many numbers share one scale
+
+The same lesson applies. The KV cache has structure you can exploit:
+
+- **Per-tensor.** One scale for the entire cache. Cheapest, and the worst for outliers. Rarely a good idea.
+- **Per-token.** Each token's K and V vectors get their own scale. This is the standard and it is cheap, because a scale is naturally associated with a token — the engine already knows which token's row it is writing.
+- **Per-head.** Each attention head gets its own scale. Finer still, and it matches the structure of attention itself.
+
+Most production KV quantization uses **per-token**, sometimes refined to **per-head** at 4 bits. The rule of thumb from the weights lesson holds exactly: group size and quality trade against each other, and metadata is cheap here because there is only one scale per token per head, not per weight.
+
+<Callout type="pitfall" title="Why KV cache quantization damages long context specifically">
+  Consider a single attention score for token $i$ attending back to token $j$:
+
+  $$
+  s_{ij} = \frac{q_i \cdot k_j}{\sqrt{d_h}}
+  $$
+
+  Both $q_i$ and $k_j$ are quantized. Now put $j = 1$ — the very first token — and ask what happens as the sequence grows to 8,000 tokens. There are now 8,000 quantized key vectors contributing to every attention distribution, each carrying its own error. The errors do not cancel: they accumulate in the softmax denominator and in the weighted sum of values.
+
+  The symptom is not gibberish. It is **repetition** and **losing the ability to recall something stated 6,000 tokens ago** — the model attends to the wrong tokens because their keys moved slightly in a high-dimensional space. This is why KV quantization at 4 bits is much more dangerous at 128k context than at 4k.
+</Callout>
+
+### The practical settings
+
+| KV bits | Grouping | Verdict |
+|---|---|---|
+| FP8 (E4M3) | none needed (per-element exponent) | **Best default on Hopper+.** Halves KV memory at minimal quality cost. |
+| INT8 | per-token | Safe, universally supported, and what to use off Hopper. |
+| INT4 | per-token, per-head scales | Real quality cost at long context. Only with an eval that shows it is acceptable. |
+| INT2 | — | Do not. |
+
+<Callout type="real" title="Engine support, at the time of writing">
+  vLLM exposes KV cache dtype directly (`--kv-cache-dtype`), accepting `auto` (model's native), `fp8`, and `fp8_e4m3` / `fp8_e5m2`. For INT8 KV it has historically gone through a calibration path. SGLang and TensorRT-LLM expose equivalent knobs.
+
+  The thing to verify in whatever engine you use: **does the attention kernel actually support this dtype natively**, or will it dequantize the whole cache to BF16 into a workspace before the attention call? The second case gives you the memory saving and none of the speed, which is the unfused mistake from the top of this lesson, one level up.
+</Callout>
+
+<Callout type="try" title="Check yourself before continuing">
+  1. Llama-3.1-8B, batch 32, 4k context, H100. Compute bytes per step for W4A16/KV16 and for W4A16/KV8. Why is the second not exactly half the first?
+  2. You are at batch 8 with 32k context. Which term dominates bytes per step, and therefore which lever should you pull first?
+  3. Someone loads an INT4 checkpoint and measures the same decode step time as BF16. Name the three most likely causes, in order of probability.
+  4. Why does per-token grouping cost almost nothing for the KV cache, when per-weight grouping costs 6% for weights?
+  5. You quantize the KV cache to FP8 with no scales. Why is that possible when INT8 with no scale is not?
+</Callout>
+
+<KeyNotes>
+  1. A quantized GEMM is only fast if the dequantization is **fused into the kernel**. Unfused, you move more bytes than BF16 and it is genuinely slower.
+  2. A fused kernel loads packed tiles to shared memory, widens to BF16 in registers, and never writes a BF16 copy to HBM. That single fact is the speedup.
+  3. Bytes per step = weights + KV. These are independent levers; W4 alone was 1.55× here because the KV cache was already half the bill.
+  4. Compute the KV-to-weight byte ratio for your batch and context before choosing. Small batch and long context makes KV the dominant term.
+  5. KV cache quantization groups per token (or per head), not per weight, because the scale has to be cheap to apply during attention.
+  6. KV cache error accumulates over sequence length: 8,000 quantized keys all shift slightly. The symptom is repetition and lost long-range recall, not gibberish.
+  7. FP8 KV is the best default on Hopper+ because the per-element exponent removes the scale problem entirely; INT8 per-token is the safe portable choice.
+  8. Verify your engine's attention kernel is **native** in the KV dtype. A dequantize-to-BF16 workspace gives memory savings and no speed.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Llama-3.1-8B, batch 32, 4,096 tokens of context. With W4 (group 128) and 8-bit KV, how many bytes does one decode step read?', numeric: true, answer: 12.9, tolerance: 0.8, unit: 'GB', why: 'Weights: 8.03e9 × 0.5 × 1.0625 = 4.27 GB. KV: 32 × 4096 × 131072 / 2 = 8.59 GB. Total = 12.86 GB. At 2.68 TB/s that is 4.8 ms, against 12.4 ms for BF16 — a 2.6× step.' },
+  { q: 'You deploy INT4 weights with a group of 128, but the measured decode step time is identical to BF16. What is the most likely cause?', options: ['The model was loaded with torch_dtype=float16 instead of bfloat16', 'Dequantization is happening outside the GEMM, so a full BF16 copy is written and re-read every step', 'The GPU does not support 4-bit storage', 'The KV cache was also quantized'], answer: 1, why: 'The unfused path reads the packed weights, writes a BF16 copy, reads that back, and computes — more total bytes than plain BF16. A fused dequantize-and-matmul kernel keeps the widened values in registers and never touches HBM with them. Check whether your GEMM kernel claims INT4 support.' },
+  { q: 'At batch 8 with 32,000 tokens of context on Llama-3.1-8B, roughly how much KV cache is being read per decode step, versus the BF16 weights?', options: ['About 33.6 GB of KV versus 16.1 GB of weights — KV dominates', 'About 16.1 GB of KV versus 33.6 GB of weights — weights dominate', 'Both are about 16 GB', 'Both are negligible; only activations matter'], answer: 0, why: 'KV = 8 × 32,000 × 131,072 = 33.6 GB, more than twice the 16.06 GB of BF16 weights. In this regime weight quantization barely moves the needle and KV quantization is the whole lever — which is why long-context serving almost always quantizes the cache.' },
+  { q: 'A fused INT4 GEMM reads 4.3 GB of packed weights per decode step. An unfused implementation additionally writes and re-reads a BF16 copy. Roughly how many extra bytes does the unfused version move?', numeric: true, answer: 32.1, tolerance: 4, unit: 'GB', why: 'The BF16 copy is 2 bytes per weight × 8.03e9 = 16.06 GB. Writing it once and reading it back adds 32.1 GB, not 16.1 — so the unfused path moves 36.4 GB against BF16’s 16.1 GB. That is why unfused quantization is slower than not quantizing at all.' },
+  { q: 'Which of these is NOT a symptom of KV cache quantization damage?', options: ['The model repeats a phrase instead of progressing', 'It cannot recall a fact stated thousands of tokens back', 'Code compiles but uses a wrong identifier', 'Attention drifts toward the wrong cached tokens'], answer: 2, why: 'Near-miss code with a wrong identifier is the signature of **weight** quantization, concentrated in the MLP — the same weight is multiplied by a slightly different value on every token. Repetition, lost needles and drifting attention are all attention-side, which is where the KV cache lives.' },
+  { q: 'You must choose a KV precision for a service whose longest context is 128k tokens. Which is the defensible choice, and why?', options: ['INT4, because memory pressure is extreme at that length', 'INT8 per-token, because INT4 KV damage compounds over the number of cached tokens and 128k makes that worst', 'FP16, because any narrowing is unacceptable at long context', 'INT2, because it halves memory again'], answer: 1, why: 'The damage scales with how many quantized keys contribute to each attention distribution. At 128k there are 131,072 of them, so INT4’s per-token error accumulates into a visible failure — repetition and lost long-range recall. INT8 per-token keeps the per-token error small enough to survive the accumulation; INT2 is not a viable format.' },
+]} />

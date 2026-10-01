@@ -1,0 +1,212 @@
+---
+title: 'Module 11 · Quantization'
+module: quantization
+---
+
+## Where the bits are
+
+Two numbers dominate everything. Activations are rounding errors next to them.
+
+| | count | bytes | Llama-3.1-8B in BF16 |
+|---|---|---|---|
+| Weights | $P$ | $2P$ | 16.06 GB |
+| KV cache / token | $2LH_{kv}D$ | $2\cdot2LH_{kv}D$ | 131,072 B = 128 KiB |
+| Activations / token | ~$5d_{model}$ | ~$10\,d_{model}$ | ~41 kB — negligible |
+
+## The algorithm
+
+$$
+q = \operatorname{clamp}\!\big( \operatorname{round}\big(\tfrac{v-z}{s}\big) + z,\ 0,\ 2^b-1\big),
+\qquad \hat{v} = s\,(q - z)
+$$
+
+$$
+s = \frac{\max|v|}{2^{b-1}-1}, \qquad
+|\hat v - v| \le \frac{s}{2} = \frac{\max|v|}{2(2^{b-1}-1)}
+$$
+
+| bits | levels | grid step for max=0.61 | worst-case error |
+|---|---|---|---|
+| 8 | 256 | 0.0048 | 0.4% |
+| 4 | 16 | 0.0871 | 7.1% |
+| 3 | 8 | 0.2033 | 16.7% |
+| 2 | 4 | 0.6100 | 50% |
+
+## Granularity
+
+| scheme | scales for an $m\times n$ matrix | 4-bit error |
+|---|---|---|
+| Per tensor | 1 | worst — outliers delete small weights |
+| Per channel | $m$ | good |
+| Per group $g$ | $\lceil n/g\rceil m$ | best per byte |
+
+$$
+\text{overhead} = \frac{32}{g\,b}, \qquad
+\text{effective bits} = b + \frac{32}{g}
+$$
+
+| group $g$ | 4-bit overhead | effective bits | 8-bit overhead |
+|---|---|---|---|
+| 32 | 25.0% | 5.00 | 12.5% |
+| 64 | 12.5% | 4.50 | 6.25% |
+| **128** | **6.25%** | **4.25** | 3.13% |
+| 256 | 3.13% | 4.13 | 1.56% |
+
+Group 128 at 4 bits is the production default. "4-bit" means 4.25.
+
+## Error accumulation
+
+Independent per-layer errors add in quadrature:
+
+$$
+\varepsilon_{\text{out}} \approx \varepsilon\sqrt{L}
+$$
+
+| bits | per-weight | after 32 layers | after 80 layers |
+|---|---|---|---|
+| 8 | 0.3% | 1.7% | 2.7% |
+| 4 | 6% | 34% | 54% |
+
+Worst case only. Real measured error is several times smaller because errors are structured, not random.
+
+## The decode step
+
+$$
+\text{bytes} = \underbrace{P\cdot\tfrac{b_w}{8}\cdot\Big(1+\tfrac{32}{g b_w}\Big)}_{\text{weights}}
++\underbrace{B\,T\cdot 2LH_{kv}D\cdot\tfrac{b_{kv}}{8}}_{\text{KV}}
+$$
+
+$$
+t_{\text{step}} = \max\!\Big(\tfrac{\text{bytes}}{\text{BW}\cdot\text{MBU}},\ \tfrac{2PB}{\text{FLOP/s}\cdot\text{MFU}}\Big) + \text{overhead}
+$$
+
+Llama-3.1-8B, $B{=}32$, $T{=}4096$, H100 (2.68 TB/s achieved):
+
+| Config | weights | KV | bytes | step |
+|---|---|---|---|---|
+| BF16 / BF16 | 16.06 | 17.18 | 33.24 GB | 12.4 ms |
+| W4 g128 / BF16 | 4.27 | 17.18 | 21.45 GB | 8.0 ms |
+| FP8 / FP8 | 8.03 | 8.59 | 16.62 GB | 6.2 ms |
+| **W4 g128 / KV8** | 4.27 | 8.59 | 12.86 GB | **4.8 ms** |
+| W4 g128 / KV4 | 4.27 | 4.29 | 8.56 GB | 3.2 ms |
+
+Compute the ratio first:
+
+$$
+\frac{\text{KV bytes}}{\text{weight bytes}} = \frac{B\,T\cdot 2LH_{kv}D\cdot(b_{kv}/8)}{P\,(b_w/8)}
+$$
+
+Small batch + long context → KV dominates → quantize the cache first.
+Large batch + short context → weights dominate → quantize the weights first.
+
+## Choosing a scheme
+
+| Scheme | W | A | Tensor cores | Prefill | Decode | Risk |
+|---|---|---|---|---|---|---|
+| BF16 | 16 | 16 | BF16 | 1× | 1× | none |
+| FP8 | 8 | 8 | FP8 (Hopper+) | up to 2× | ~1.5× | low |
+| W8A8 | 8 | 8 | INT8 | up to 2× | ~2× | moderate |
+| **W4A16** | 4 | 16 | INT8 after dequant | **1×** | ~3× | low |
+| W4A16 unfused | 4 | 16 | BF16 | **slower** | **slower** | — |
+
+- **W4A16**: weights only. 4× less weight memory, ~3–4× shorter decode step, prefill unchanged.
+- **W8A8**: activations too, so INT8 tensor cores engage. The prefill/throughput lever.
+- **FP8**: per-element exponent, no group scales, no metadata, outlier-tolerant. 2× tensor-core rate on Hopper+; memory-only win on Ampere/T4.
+- **A4/A8 activation quantization** needs a per-token dynamic scale, fused into the preceding kernel.
+
+Choose in this order: **bottleneck → hardware → quality budget → kernel support.**
+
+## The three methods
+
+| | RTN | AWQ | GPTQ | SmoothQuant |
+|---|---|---|---|---|
+| Key idea | quantize each weight alone | protect salient channels | push rounding error forward | move activation outliers into weights |
+| Signal used | none | $\lVert W_{:,j}\rVert\lVert X_{:,j}\rVert$ | $H^{-1} = (XX^\top)^{-1}$ | per-channel activation max |
+| Calibration | none | ~128 seqs | ~128 seqs | ~512 seqs |
+| Exact? | — | no | no | **yes** (algebraic identity) |
+
+**AWQ**: salient = $\lVert W_{:,j}\rVert\lVert X_{:,j}\rVert$; 1% of channels often carry a large share. Give them a finer grid, not more bits.
+**GPTQ**: quantize column-by-column; after column $i$, spread $\delta_i$ onto later columns weighted by $H^{-1}$. Greedy, forward-only → order matters (blocks, act-order).
+**SmoothQuant**: $\hat X_{\cdot,j} = s_j X_{\cdot,j}$, $\hat W_{j,\cdot} = W_{j,\cdot}/s_j$. Output unchanged in exact arithmetic. $\alpha \approx 0.5$–$0.8$ for W8A8.
+
+Compose them: **AWQ scaling as preprocessing, GPTQ as quantizer** is the common best-quality default.
+
+## Kernels
+
+Fused or nothing:
+
+```
+fused:     load packed tile → shared memory → widen to BF16 in registers → tensor cores
+unfused:   read packed → WRITE BF16 copy → read it back → matmul   (moves MORE bytes than BF16)
+```
+
+## KV cache
+
+| bits | bytes/token (8B) | grouping | verdict |
+|---|---|---|---|
+| BF16 | 131,072 | — | default |
+| FP8 E4M3 | 65,536 | none needed | best default on Hopper+ |
+| INT8 | 65,536 | per-token | safe, portable |
+| INT4 | 32,768 | per-token or per-head | real cost at long context |
+| INT2 | — | — | do not |
+
+Error accumulates with sequence length: 8,000 quantized keys all shift slightly. Symptom is **repetition and lost long-range recall**, not gibberish.
+
+**Always sweep context length when the KV cache is quantized.**
+
+## Measuring quality
+
+$$
+\text{PPL} = \exp\!\Big(-\tfrac1N\sum_i \log p(x_i\mid x_{<i})\Big), \qquad
+\text{SE} \approx \sqrt{\tfrac{p(1-p)}{n}}
+$$
+
+| samples | 95% interval |
+|---|---|
+| 200 | ±6.8 pts |
+| 1,000 | ±3.0 pts |
+| **5,000** | **±1.4 pts** |
+| 20,000 | ±0.7 pts |
+
+A 4-bit regression is 1–4 points → you need thousands of samples. Use **paired McNemar** (5–10× more sample-efficient).
+
+Failure signatures:
+
+| signature | cause |
+|---|---|
+| repetition | KV quantization, long context |
+| lost needle | KV quantization |
+| late hallucination | 4-bit weights + greedy decoding |
+| near-miss code | 4-bit weights (MLP) |
+
+## The decision
+
+**Domination:** A dominates B if A ≥ B on every axis and > B on one. Delete the dominated points; the survivors are the frontier.
+
+Quality index ≈ $1 - (\varepsilon_w + 0.6\,\varepsilon_{kv})\sqrt{L}$.
+
+Pick by **quality budget**:
+
+- SLO already met at BF16 → most aggressive config inside budget.
+- Throughput-constrained → fastest config inside budget.
+- Long-context → W4 + FP8 KV; INT4 KV usually out.
+
+Write the **falsifier**: one sentence naming what would move you off your choice.
+
+## Engine knobs (at the time of writing)
+
+| Engine | Knob | Effect |
+|---|---|---|
+| vLLM | `--quantization fp8` / `awq` / `gptq` | weight scheme |
+| vLLM | `--kv-cache-dtype fp8` / `fp8_e5m2` | KV precision |
+| vLLM | `--kv-cache-group-size` | KV grouping |
+| SGLang | `--quantization` | weight scheme |
+| TensorRT-LLM | `quantization` in config | weight scheme + engine rebuild |
+
+Verify: is the GEMM **fused**? Is the KV dtype **native** in the attention kernel? Reported weight memory after load should match the checkpoint size.
+
+## The three sentences
+
+1. Decode reads every weight and all the KV cache every step, so **bytes per step is the latency** — and quantization is the only lever that moves it directly.
+2. At 4 bits the grid step is set by outliers and errors accumulate as $\sqrt{L}$, so **granularity and calibration are not polish, they are the method**.
+3. Always measure quality at your **longest served context** with **enough samples** to resolve 2 points, and pick the least aggressive config that meets your speed target.

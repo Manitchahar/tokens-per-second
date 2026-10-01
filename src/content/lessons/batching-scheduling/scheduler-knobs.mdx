@@ -1,0 +1,176 @@
+---
+title: 'The scheduler’s knobs: token budgets & limits'
+summary: A scheduler is three numbers. Learn what each one actually caps, why the seat count runs into a wall in KV bytes rather than in arithmetic, and how to tell from two measurements whether to turn a knob up or down.
+objectives:
+  - Name the three numbers a serving scheduler is made of and what each one bounds
+  - Compute the real seat limit from a memory budget and a KV-per-token figure
+  - Predict how the decode step time changes with batch size, and identify the knee where KV reads overtake weight reads
+  - Calculate the cost in decode steps of one prefill, and explain chunked prefill
+  - Diagnose a starved or saturated engine from average batch and queue depth alone
+---
+import SchedulerKnobs from '@/components/viz/batching-scheduling/SchedulerKnobs.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson ended with a rule: form the batch fresh every step, fill freed seats immediately. That rule is easy to state and leaves every real decision unanswered. How many seats does the engine have? What stops a request from being admitted? How much work is allowed to happen in one step?
+
+Those questions are answered by three numbers, and in a serving engine they are the three numbers you actually change when you tune it. Get them wrong and the GPU idles; get them badly wrong and the engine crashes.
+
+Everything below is computed for the standing example of this module: **Llama-3.1-8B in BF16 on one 80 GB H100.** The numbers come from the same model as the earlier modules, so if you have been reading along, they will look familiar.
+
+## The three numbers
+
+| Number | Bounds | Typical starting point | vLLM name (at the time of writing) |
+|---|---|---|---|
+| Seats | how many sequences decode at once | 128–256 | `max_num_seqs` |
+| Memory budget | what fraction of HBM the KV cache may take | 0.85–0.92 | `gpu_memory_utilization` |
+| Tokens per step | how many tokens one step may process | 2,048–8,192 | `max_num_batched_tokens` |
+
+That is the whole API surface of scheduling, and each number answers a different question. The first two are about **how much memory you have**; the third is about **how long a step may take**.
+
+<Callout type="intuition" title="Why three numbers and not one knob">
+  Because they bound different resources. Seats bound how many conversations can be in flight, and memory is what actually limits them — every seat is holding a KV cache that grows as its answer gets longer. The token budget bounds *time*, not memory: it is the lever that stops one enormous prompt from freezing the GPU for everyone else. Turning the wrong one is the classic mistake, so it is worth being precise about which is which.
+</Callout>
+
+## Knob 1: seats, and why they are not free
+
+The first instinct is that seats are free. They are not, and the reason is in Module 05's KV cache: a seat is not an empty chair, it is a growing pile of keys and values.
+
+For Llama-3.1-8B with grouped-query attention, the KV cache per token is:
+
+$$
+2 \times 32 \text{ layers} \times 8 \text{ KV heads} \times 128 \text{ head dim} \times 2 \text{ bytes} = 131{,}072 \text{ B} = 128 \text{ KiB}
+$$
+
+At a 2,048-token context that is **256 MiB per seat**. At 8,192 tokens it is a gigabyte per seat. Seats are not free because their cost is set by something other than the batch size.
+
+But seats also slow the step down, and the visual shows exactly how. Watch where a decode step's milliseconds go:
+
+<Scrolly>
+  <SchedulerKnobs client:visible slot="stage" />
+
+  <Step title="1. Three numbers, one loop">
+    The scheduler runs the retire → schedule → step loop from 07.2. The three numbers above decide what the schedule step is allowed to do: how many seats it may fill, how much memory those seats may use, and how many tokens the resulting step may process.
+  </Step>
+
+  <Step title="2. The weight read does not move">
+    Look at the bottom blue block in every bar. That is the 16.06 GB weight read, and it is **6.0 ms whether there is one seat or two hundred**. Batching is free here because that read is paid once per step no matter who is in it.
+  </Step>
+
+  <Step title="3. The KV read grows">
+    Now look at the KV read — the second blue block. At 8 seats it is 0.8 ms, at 64 it is 6.4 ms, at 196 it is 19.6 ms. **Every seat you add makes every step slower**, because every seat's whole conversation has to be read from HBM each step.
+  </Step>
+
+  <Step title="4. The knee at 196 seats">
+    Here is the number worth remembering: at 196 seats the KV read is **19.6 ms against a 6.0 ms weight read**. Past this point the step is no longer "mostly reading weights" — it is mostly reading conversations, and adding seats hurts per-user latency much faster than it helps throughput.
+  </Step>
+
+  <Step title="5. The budget is not all of HBM">
+    The seat limit is not a number you choose; it is a number memory gives you. The engine claims a fraction of HBM for the KV cache. The rest has to stay free for activations, the CUDA context, and workspace, or you get an OOM at 2 a.m. instead of a tuning mistake at 3 p.m.
+  </Step>
+
+  <Step title="6. Divide to get the real limit">
+    Free bytes divided by KV bytes per token is the answer. At 90% of 80 GB, after the 16.06 GB of weights and about 3.2 GB of workspace, the engine has 52.7 GB of KV: **196 seats at 2,048 tokens**, but only **49 at 8,192 tokens**.
+  </Step>
+
+  <Step title="7. The token budget is about time">
+    The third number caps tokens per step. It is mostly a prefill knob, and its job is to bound how long any single step may take so one request cannot monopolize the GPU.
+  </Step>
+
+  <Step title="8. What a prefill costs the people waiting">
+    A 2,048-token prefill takes about 62 ms on this GPU. With 64 users decoding at 14 ms per step, that single prefill is **4.5 steps during which nobody gets a token**. This is the mechanism behind "one user sent a huge prompt and everyone else felt it".
+  </Step>
+
+  <Step title="9. Turn one knob at a time">
+    The green and red lines are the whole diagnostic. Average batch near the seat limit with a deep queue means the step is too long. Average batch low with an empty queue means you are starved. The numbers tell you which knob to move, and they rarely tell you to move both.
+  </Step>
+</Scrolly>
+
+## The step-time table
+
+Here is the honest picture for Llama-3.1-8B on an H100 at 2,048 tokens of context, all from the roofline model of Module 02:
+
+| Seats | Weight read | KV read | Math | Step | Throughput | Per user | Fits in 80 GB? |
+|---|---|---|---|---|---|---|---|
+| 1 | 6.0 ms | 0.1 ms | 0.03 ms | 7.6 ms | 132 tok/s | 132 tok/s | yes |
+| 8 | 6.0 ms | 0.8 ms | 0.2 ms | 8.3 ms | 965 tok/s | 121 tok/s | yes |
+| 32 | 6.0 ms | 3.2 ms | 0.9 ms | 10.7 ms | 2,991 tok/s | 93 tok/s | yes |
+| 64 | 6.0 ms | 6.4 ms | 1.9 ms | 13.9 ms | 4,603 tok/s | 72 tok/s | yes |
+| 128 | 6.0 ms | 12.8 ms | 3.8 ms | 20.3 ms | 6,301 tok/s | 49 tok/s | yes |
+| 196 | 6.0 ms | 19.6 ms | 5.8 ms | 27.1 ms | 7,226 tok/s | 37 tok/s | yes |
+| 256 | 6.0 ms | 25.6 ms | 7.6 ms | 33.1 ms | 7,726 tok/s | 30 tok/s | **no — 88 GB** |
+
+<Callout type="math" title="Read the marginal return">
+  Going from 1 seat to 8 gives you **7.3× the throughput** for a step that is 9% slower. Going from 128 to 196 gives you **1.15× the throughput** for a step that is 34% slower. The first eight seats are nearly free; the last ones are expensive. This is why "just raise max_num_seqs" is the right instinct at 4 seats and the wrong one at 128.
+</Callout>
+
+The last row is the one to notice. At 256 seats the model wants 88 GB of memory and only 80 exist. The step would work fine if memory were infinite — which is exactly why OOM shows up as a crash, not as a slowdown.
+
+## Knob 3: tokens per step, and chunked prefill
+
+The token budget exists because prefill and decode have completely different costs. Decode is memory-bound and takes one step per token. Prefill is compute-bound and takes **one step for the whole prompt**:
+
+$$
+t_{\text{prefill}} \approx \frac{2 \cdot M \cdot n}{\text{FLOP/s} \cdot \text{MFU}}
+$$
+
+| Prompt tokens | Prefill time on an H100 |
+|---|---|
+| 512 | 17 ms |
+| 2,048 | 63 ms |
+| 8,192 | 244 ms |
+
+So a user who pastes a long document stalls the GPU for a quarter of a second. Everyone else in the batch gets nothing for that time — their tokens are ready and there is nowhere to put them.
+
+<Term t="chunked-prefill">Chunked prefill</Term> is the fix: split a long prompt into pieces the size of the token budget, and run one piece per step, interleaved with everyone's decode.
+
+<Callout type="real" title="What engines actually do here">
+  This is a live design question rather than a settled one. At the time of writing, vLLM schedules long prefills alongside decodes in the same iteration, which keeps the GPU busy and the memory high but lets one big prefill delay the decodes sharing its step; SGLang has pushed harder on interleaved chunked prefill to keep decode latency flat. Both are attacking the same number: **the longest step**, because per-user decode speed is exactly the step time.
+</Callout>
+
+## Diagnose before you tune
+
+The single most useful thing a serving engineer can do is refuse to change a knob until two numbers are on the dashboard. Those numbers are **average batch size** and **queue depth**, and between them they identify which of the two failure modes you have.
+
+| What you see | Diagnosis | The knob to turn |
+|---|---|---|
+| avg batch low, queue empty | **Starved.** Not enough requests; you are paying for a GPU to serve a few people. Seats are not the constraint. | Raise max_num_seqs, or serve more traffic. Expect no gain in latency — none was ever lost. |
+| avg batch at limit, queue deep | **Saturated.** Every seat is busy and users are waiting. Throughput is capped by step time. | Cut max_num_batched_tokens, chunk prefills, shrink the model, or add GPUs. More seats will not help. |
+| avg batch high, queue deep, TTFT climbing | **Prefill storms.** Long prompts are monopolising steps. | Lower max_num_batched_tokens; enable chunked prefill. |
+| avg batch high, queue deep, TPOT climbing | **Contexts too long.** The KV read is growing with every generated token. | Cap context length, or shrink KV with quantization (FP8 KV halves it). |
+
+<Callout type="pitfall" title="The mistake this prevents">
+  A team sees TTFT climb, concludes "not enough capacity", and raises max_num_seqs from 128 to 256. Every step now takes 33 ms instead of 20 ms, so every request in flight gets *slower*, and the queue is still full. The queue was a symptom of a long step; adding seats made the step longer. Check queue depth and step time before you touch capacity — they look identical from the outside and call for opposite responses.
+</Callout>
+
+## Choosing the three numbers, in order
+
+A workable default for an 8B model on an 80 GB GPU, and the reasoning:
+
+1. **Set the memory budget to 0.90.** Leaves 8 GB for activations and workspace. Pushing to 0.95 buys a few more seats and risks an OOM; dropping to 0.80 wastes memory you could have used.
+2. **Derive the seat limit, do not guess it.** Seats = free KV bytes ÷ KV bytes per seat at your *typical* context, not your maximum. Using the maximum is the classic error: it produces a seat count sized for the one request in a thousand that nobody cares about.
+3. **Set the token budget to 2,048.** Big enough that ordinary prompts are a single chunk; small enough that a chunk cannot stall a step for more than about 60 ms.
+4. **Check the arithmetic against the table above.** If your seat count is in the steep part of the curve (past ~128 at this context), you probably want fewer, better-filled batches than the memory math allows.
+
+<Callout type="mentor" title="The habit this lesson builds">
+  Turn a knob only when a number tells you which way. "Average batch" says whether seats are wasted; "queue depth" says whether they are scarce; "step time" says what per-user speed you are paying. Those three readings cover almost every serving problem you will be asked to solve, and they take one dashboard panel to see.
+</Callout>
+
+<KeyNotes>
+  1. A scheduler is three numbers: seats (max_num_seqs), memory budget (gpu_memory_utilization), tokens per step (max_num_batched_tokens).
+  2. KV cache for Llama-3.1-8B is 128 KiB per token: 256 MiB per seat at 2,048 tokens, 1 GiB at 8,192.
+  3. The weight read is a flat 6.0 ms per step no matter the batch size; the KV read grows linearly with seats × context.
+  4. At 196 seats and 2,048 context the KV read (19.6 ms) is 3× the weight read — that is the knee where seats stop being cheap.
+  5. The seat limit is derived, not chosen: at 90% of an 80 GB H100, Llama-3.1-8B fits about 196 seats at 2,048 tokens, or 49 at 8,192.
+  6. A 2,048-token prefill takes about 63 ms, which is 4.5 decode steps at 64 seats — one long prompt stalls everyone sharing those steps.
+  7. Chunked prefill splits a long prompt into budget-sized chunks and interleaves them with decode steps to bound the longest step.
+  8. Diagnose before tuning: avg batch low + empty queue means starved; avg batch at the limit + deep queue means the step is too long. They need opposite responses.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why does adding a seat make every decode step slower, when the weight read is unchanged?', options: ['The weights must be re-read for each new sequence', 'Each seat adds KV cache that must be read from HBM every step, so the step time grows', 'More sequences means more kernel launches that dominate', 'The GPU throttles at higher batch sizes'], answer: 1, why: 'The 16.06 GB weight read is paid once per step regardless of batch size. But every sequence in the batch has its own KV cache, and all of it is read each step. At 196 seats and 2,048 context that KV read is 19.6 ms against a flat 6.0 ms for weights.' },
+  { q: 'Llama-3.1-8B in BF16 on an 80 GB H100 at 90% memory utilization, 2,048 tokens of context. Using 16.06 GB of weights and 3.2 GB of workspace, how many sequences fit in the KV cache?', numeric: true, answer: 196, tolerance: 8, unit: 'sequences', why: 'Budget = 0.9 × 80 − 16.06 − 3.2 = 52.7 GB. KV per token = 2 × 32 × 8 × 128 × 2 = 131,072 B, so per sequence = 2,048 × 131,072 = 268 MB. 52.7 GB ÷ 0.268 GB ≈ 196.' },
+  { q: 'Your engine shows avg batch at its seat limit and a queue that keeps growing. What should you change?', options: ['Raise max_num_seqs', 'Lower max_num_batched_tokens or chunk the prefill — the step time is the constraint', 'Raise gpu_memory_utilization', 'Switch to static batching'], answer: 1, why: 'A full batch plus a deep queue means the engine is saturated: throughput is capped by step time. Adding seats makes each step slower, which makes the queue longer. Shorten the longest step instead — cap tokens per step or chunk prefills.' },
+  { q: 'A 2,048-token prefill takes about 63 ms. With 64 sequences decoding at 13.9 ms per step, roughly how many decode steps does that single prefill block?', numeric: true, answer: 4.5, tolerance: 0.4, unit: 'steps', why: '63 ÷ 13.9 ≈ 4.5 steps. For four and a half steps every user who already had a token ready is waiting for the GPU, which is exactly the "one big prompt froze everyone" symptom.' },
+  { q: 'Why is sizing seats from your maximum context length a mistake?', options: ['Maximum context is not known', 'It sizes the engine for the rare huge request instead of the typical one, leaving seats you will never fill', 'Long contexts use less memory', 'It disables chunked prefill'], answer: 1, why: 'Seat count = free KV bytes ÷ KV bytes per seat, and KV per seat scales with context. Size it on typical context and you get a batch that actually fills. Size it on the 128K-token maximum and you get a large seat count that a normal workload can never reach, so the batch sits half empty.' },
+  { q: 'At 90% memory utilization and 8,192 tokens of context, roughly how many Llama-3.1-8B sequences fit on one 80 GB H100? (Budget 52.7 GB, KV per token 131,072 B.)', numeric: true, answer: 49, tolerance: 3, unit: 'sequences', why: 'Per sequence = 8,192 × 131,072 = 1.074 GB. 52.7 ÷ 1.074 ≈ 49. The same memory that held 196 short conversations holds only 49 long ones — which is why context length is the strongest constraint on concurrency.' },
+]}/>

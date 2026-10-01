@@ -1,0 +1,98 @@
+---
+import { getCollection } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import CourseWaterfall from '../../components/site/CourseWaterfall.astro';
+import LessonTrack from '../../components/site/LessonTrack.astro';
+import { modules, parts, flatLessons, totalMinutes } from '../../data/course';
+import { url } from '../../site';
+
+const all = await getCollection('lessons');
+const available = new Set(all.map((e) => e.id));
+const first = flatLessons[0];
+const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtime depth', scale: 'Scale depth', research: 'Engine & research depth' };
+---
+<Base title="Course map" description="Every module and lesson of Tokens per Second, drawn as one timeline.">
+  <div class="page">
+    <header class="head">
+      <h1>The course, as one trace</h1>
+      <p class="lead">
+        {modules.length} modules, {flatLessons.length} lessons, about {Math.round(totalMinutes / 60)} hours. Read it like a profiler trace: time runs left to right, and each row is a module.
+        Your finished lessons fill in, and a flag marks where you stopped.
+      </p>
+      <a class="btn" href={url(first.href)} data-resume data-resume-alt>Start at {first.code}: {first.title}</a>
+    </header>
+
+    <CourseWaterfall />
+
+    <section class="paths">
+      <h2>Which path is yours?</h2>
+      <div class="path-grid">
+        <p><strong>Applied inference engineer.</strong> Parts 1 to 4, then 7. Serve models well on one GPU, then run them in production.</p>
+        <p><strong>Performance engineer.</strong> Add Part 5: kernels, FlashAttention, compilation and speculative decoding.</p>
+        <p><strong>Distributed engineer.</strong> Add Part 6: tensor and pipeline parallelism, MoE, long context and disaggregation.</p>
+        <p><strong>Engine builder.</strong> Everything, finishing with Part 8, where you build your own mini vLLM and reproduce research.</p>
+      </div>
+    </section>
+
+    {parts.map((p) => (
+      <section class="part" id={`part-${p.num}`}>
+        <header class="part-head">
+          <h2><span class="pnum">Part {p.num}</span> {p.title}</h2>
+          <p>{p.question}</p>
+        </header>
+        {modules.filter((m) => m.part === p.num).map((m) => {
+          const lessons = flatLessons.filter((l) => l.module.slug === m.slug);
+          const keys = lessons.map((l) => `${m.slug}/${l.slug}`).join(',');
+          const mins = m.lessons.reduce((s, l) => s + l.minutes, 0);
+          return (
+            <article class="mod">
+              <div class="mod-info">
+                <h3><a href={url(`learn/${m.slug}/`)}><span class="mnum">{m.num}</span> {m.title}</a></h3>
+                <p class="tag">{m.tagline}</p>
+                <p class="mmeta"><span data-module-progress={keys}>0/{lessons.length}</span> done · {Math.round(mins / 6) / 10} h{m.track !== 'core' && <> · {trackNames[m.track]}</>}</p>
+              </div>
+              <div class="mod-track">
+                <LessonTrack lessons={lessons} available={available} showLabels size="md" />
+              </div>
+            </article>
+          );
+        })}
+      </section>
+    ))}
+  </div>
+</Base>
+
+<script>
+  // "Start" becomes "Resume" once the learner has a flag.
+  import { load } from '../../scripts/progress';
+  const s = load();
+  const a = document.querySelector<HTMLAnchorElement>('[data-resume-alt]');
+  if (a && s.last) { a.href = s.last.href; a.textContent = `Resume at ${s.last.code}: ${s.last.title}`; }
+</script>
+
+<style>
+  .page { max-width: 1240px; margin: 0 auto; padding: 3rem 24px 0; }
+  .head { max-width: 760px; margin-bottom: 3rem; }
+  h1 { font-size: clamp(2.3rem, 5vw, 3.6rem); margin-bottom: 1rem; }
+  .lead { color: var(--text-2); font-size: 1.08rem; margin-bottom: 1.6rem; }
+  .paths { margin: 4.5rem 0 1rem; }
+  .paths h2 { font-size: 1.9rem; margin-bottom: 1.2rem; }
+  .path-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.2rem 2.4rem; }
+  .path-grid p { margin: 0; color: var(--text-2); font-size: 0.93rem; border-top: 1px solid var(--rule); padding-top: 0.8rem; }
+  .path-grid strong { color: var(--text); display: block; margin-bottom: 0.2rem; }
+  .part { margin-top: 5rem; }
+  .part-head { display: grid; grid-template-columns: 1fr; margin-bottom: 1.4rem; border-bottom: 1px solid var(--rule-2); padding-bottom: 1rem; }
+  .part-head h2 { font-size: clamp(1.8rem, 3.5vw, 2.5rem); }
+  .pnum { color: var(--text-3); }
+  .part-head p { margin: 0.4rem 0 0; color: var(--text-2); }
+  .mod { display: grid; grid-template-columns: minmax(220px, 320px) 1fr; gap: 1rem 2.5rem; padding: 1.5rem 0; border-bottom: 1px solid var(--rule); }
+  .mod h3 { font-size: 1.05rem; margin-bottom: 0.3rem; }
+  .mod h3 a { text-decoration: none; }
+  .mod h3 a:hover { text-decoration: underline; }
+  .mnum { font-family: var(--font-mono); color: var(--text-3); font-weight: 400; margin-right: 0.2rem; }
+  .tag { font-size: 0.86rem; color: var(--text-2); margin: 0 0 0.4rem; }
+  .mmeta { font-size: 0.75rem; color: var(--text-3); margin: 0; font-family: var(--font-mono); }
+  .mmeta :global(.is-complete) { color: var(--token); }
+  .mod-track { padding-top: 0.2rem; }
+  @media (max-width: 800px) { .mod { grid-template-columns: 1fr; } .page { padding: 2rem 16px 0; } }
+</style>

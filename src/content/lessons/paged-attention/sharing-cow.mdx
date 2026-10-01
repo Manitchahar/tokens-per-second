@@ -1,0 +1,222 @@
+---
+title: 'Sharing blocks: prefixes & copy-on-write'
+summary: 'Because blocks are equal and interchangeable, two requests with the same prompt prefix can point at the same physical blocks. One reference count and one rule — copy before you write — turn that into free memory.'
+objectives:
+  - Explain why equal-sized blocks make prefix sharing exact rather than approximate
+  - Describe the prefix walk that finds the longest reusable prefix
+  - State the copy-on-write rule and say when a copy actually happens
+  - Compute the memory saved by a shared system prompt across many concurrent requests
+  - Recognize the workload shape where prefix caching pays and the one where it does nothing
+---
+import SharingCow from '@/components/viz/paged-attention/SharingCow.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every production LLM application has the same request underneath. A 900-token system prompt, a tool definition, a retrieved document — all identical for every single user — followed by 20 tokens that actually differ.
+
+With a per-request KV cache, you compute and store that 900-token prefix once per user, at 128 KiB per token. That is **115 MB of KV cache per concurrent request**, holding data that is byte-identical for all of them.
+
+Because blocks are equal-sized and interchangeable, that duplication is now removable. And once you can share, one extra idea makes it free of copying as well.
+
+<Callout type="real" title="This is automatic prefix caching">
+  Every major engine has this. vLLM calls it automatic prefix caching, on by default since v0.9 (at the time of writing); SGLang calls the same idea RadixAttention, because it stores the cached prefixes in a **radix tree** keyed on token ids rather than in a flat list. Module 10 builds the data structure properly. What matters here is the mechanism underneath: shared blocks, a reference count, and copy-on-write.
+</Callout>
+
+## Why equal blocks make sharing possible
+
+Take two requests whose first 32 tokens are identical. A 32-token prefix is exactly **two blocks** of size 16. So request B can simply be handed the *same two block ids* that A is using. Not a similar block, not a recomputed copy: the identical physical bytes.
+
+This only works because of the equality that the last lesson introduced. With variable-sized chunks, a 32-token prefix might be stored as one 20-token chunk plus a 12-token chunk, and B's prompt has no way to line up with it. Equal blocks mean the prefix matches at block granularity exactly.
+
+<Scrolly>
+  <SharingCow client:visible slot="stage" />
+
+  <Step title="1. Request A alone">
+    A prefills 48 tokens and owns blocks **0, 1, 2** outright. Each block's reference count is 1: exactly one request points at it, so it is freely writable.
+  </Step>
+
+  <Step title="2. Request B, same first 32 tokens">
+    B's prompt begins with A's first 32 tokens, word for word. Storing them again would mean two identical copies of 4 MB of KV cache.
+  </Step>
+
+  <Step title="3. Share the matching blocks">
+    The engine walks B's prompt against what is already cached, matches **32 tokens**, and points B's table at blocks **0 and 1** too. No prefill, no copy, no new memory.
+  </Step>
+
+  <Step title="4. B writes elsewhere">
+    B's prompt then diverges ("Also answer in French"). B gets fresh blocks **5 and 6** and prefill runs only on the unmatched tail. Its blocks 0 and 1 stay read-only.
+  </Step>
+
+  <Step title="5. A third request">
+    Request C shares only the **first block**. Sharing is per block, so a partial match is still a useful match — nothing has to line up perfectly.
+  </Step>
+
+  <Step title="6. Reference counts">
+    Block 0 now has count **3**, block 1 has **2**, blocks 2, 5, 6 and 7 have **1**. This one integer is all the bookkeeping the sharing needs.
+  </Step>
+
+  <Step title="7. End of prompt: copy on write">
+    When a shared block is *not* the last one and its owner needs to write past it, it takes a private copy first. Block 1 becomes block 1′, B writes there, A keeps reading the original.
+  </Step>
+
+  <Step title="8. The saving, measured">
+    A, B and C together hold **9 block references but only 6 distinct blocks**. Three blocks saved, 6.3 MB, and the only copy made was the one forced by a divergence.
+  </Step>
+</Scrolly>
+
+## Copy-on-write, precisely
+
+The rule has exactly one clause:
+
+> **A block with a reference count above one is read-only. To write into it, take a private copy first, decrement nothing (the original's count is untouched), increment the copy's count to one.**
+
+Notice what is *not* in the rule. There is no copying at allocation time, no copying when sharing starts, and no copy when a shared block is merely **read** — which is what attention does, every step, forever. The copy only happens when a request genuinely needs new tokens in a block someone else is using.
+
+<Callout type="intuition" title="Why this is the same rule you already believe in">
+  Copy-on-write is not an inference invention. It is what `fork()` does, what every editor does when you edit a shared file, and what a database does to a parent row you are about to modify. The shared state is cheap to read and free to give away; only the moment of *divergence* costs anything. Inference engines are simply the newest place the idea shows up, and the block is the page.
+</Callout>
+
+Here is the whole thing in Python. Every line of copy-on-write in a paged KV cache is these eleven lines:
+
+```python
+def acquire_write(block_id):
+    if refcount[block_id] == 1:
+        return block_id                      # already private: write straight in
+    # shared: take a private copy, and leave the original alone for the others
+    copy_id = free_list.pop()
+    kv_cache[copy_id] = kv_cache[block_id]   # one block copy, BLOCK_SIZE slots
+    refcount[copy_id] = 1
+    return copy_id                           # the caller's table now points at copy_id
+
+def share(block_id):
+    refcount[block_id] += 1                  # another request now points here
+
+def release(block_id):
+    refcount[block_id] -= 1
+    if refcount[block_id] == 0:
+        free_list.append(block_id)           # free only when nobody points at it
+```
+
+<Callout type="math" title="The saving, for a real system prompt">
+  A 900-token system prompt, 16-token blocks = 57 blocks (912 slots). Requests arriving concurrently all share it.
+
+  | Concurrent requests | KV bytes without sharing | with sharing | saved |
+  |---|---|---|---|
+  | 1 | 115 MB | 115 MB | 0% |
+  | 8 | 921 MB | 230 MB | **75%** |
+  | 32 | 3.7 GB | 470 MB | **87%** |
+  | 64 | 7.4 GB | 585 MB | **92%** |
+
+  With $R$ concurrent requests sharing a prefix of $P$ tokens, memory for the prefix goes from $R \times P \times 128$ KiB to $P \times 128$ KiB. It is a constant, not a per-request cost — so the *marginal* cost of one more request's shared prefix is **zero**.
+
+  Check it at $R = 32$: one 900-token prefix costs about 118 MB, and it costs that whether 2 requests are live or 200. Thirty-two separate copies would be about 3.77 GB. Saving: **92%**.
+</Callout>
+
+## Finding the prefix: the walk
+
+How does the engine know B shares a prefix with A? It keeps the blocks it has already computed, arranged so that a shared prefix is a shared *path*, and walks down that structure comparing token ids.
+
+A flat list cannot do this. If A's blocks are `[0, 1, 2]` and C's are `[0, 7]`, the engine must know that block 0 is genuinely the same 16 tokens in both, not merely the same id by coincidence. Two mechanisms make that true, and engines use both:
+
+1. **Content matching.** The engine caches the **token ids** that produced each block, alongside the KV data. A candidate matches only if its 16 token ids are identical. This is the ground truth.
+2. **A prefix tree.** Blocks are organised in a tree (a radix tree, in SGLang's terminology) where an edge means "this block continues that block". Walking down from the root while token ids match gives the longest shared prefix for free, because the path *is* the prefix.
+
+The walk itself is cheap: comparing 16 integers per block, and it stops at the first mismatch. For a 900-token system prompt, matching 57 blocks is 912 integer comparisons — microseconds — against 900 tokens of prefill that would cost tens of milliseconds.
+
+```python
+def longest_shared_prefix(token_ids, cached_root):
+    """Walk the prefix tree, one block at a time, comparing token ids."""
+    blocks = []
+    node = cached_root
+    for start in range(0, len(token_ids), BLOCK_SIZE):
+        chunk = token_ids[start : start + BLOCK_SIZE]
+        child = node.child_for(chunk)          # exact match on the token ids?
+        if child is None:
+            break                             # first mismatch: prefill starts here
+        blocks.append(child.block_id)         # reuse it
+        node = child
+    return blocks                             # everything after this gets fresh blocks
+```
+
+<Callout type="pitfall" title="Sharing is only valid while the prefix really is identical">
+  Block reuse is sound because the KV of a token depends only on the tokens before it. Change one token at position 500 and the KV of every token after 500 changes too — so the shared prefix can only extend up to that point, and the first mismatching block must be recomputed and made private. This is why "prefix caching" means *exact token-prefix* caching, not "similar prompt" caching, and why an engine cannot reuse a semantically similar but textually different prompt.
+</Callout>
+
+## The bookkeeping is one integer
+
+<Callout type="math" title="Reference count, defined">
+  $$
+  \text{refcount}[b] = \big|\{\text{requests whose block table contains } b\}\big|
+  $$
+  A block is reusable the instant this reaches zero, and writable only while it is exactly one. Both facts are used constantly: the scheduler's eviction logic reads it, and the write path reads it. No other per-block state is needed for correctness.
+</Callout>
+
+There is one subtlety worth knowing: **the last block of a request is special.** A request that has prefilled 40 tokens with block size 16 owns blocks 0 and 1, but only 8 slots of block 1 are filled. If a new request shares only the first 16 tokens, it points at block 0 — fine. But the *partially filled* tail of block 1 cannot be shared, because the sharing mechanism works at block granularity: a partially filled block contains tokens beyond the shared prefix. So a request always shares the blocks before its last, and any write into the last block is private (its count is 1 by construction, because nothing new can attach to it).
+
+## Multi-turn chat: the case where sharing compounds
+
+The system prompt is a constant saving. Multi-turn conversation is better, because the saving **grows with every turn**.
+
+In a chat, turn $n$'s prompt is: system prompt, then turns 1 through $n-1$ verbatim, then the new user message. Every earlier turn is an exact prefix of every later turn. So turn $n$ reuses everything the engine has already computed for turns 1 through $n-1$.
+
+<Callout type="math" title="A conversation of ten turns">
+  Suppose 200 tokens per exchange and a 400-token system prompt, at $B = 16$.
+
+  | Turn | Prompt tokens | Newly computed | Reused |
+  |---|---|---|---|
+  | 1 | 400 + 200 | 600 | 0 |
+  | 2 | 400 + 600 | 200 | 400 |
+  | 3 | 400 + 1,000 | 200 | 800 |
+  | 4 | 400 + 1,400 | 200 | 1,200 |
+  | $\vdots$ | | | |
+  | 10 | 400 + 4,000 | 200 | 3,800 |
+
+  Without sharing, this conversation costs 600 + 800 + … + 4,400 ≈ **25,000 tokens** of prefill. With sharing it costs 600 + 9 × 200 = **2,400**. **About 10× less prefill**, and therefore roughly 10× less TTFT on later turns — which is the latency number your users actually feel.
+
+  The memory saving is similar: at turn 10, 4,400 tokens of context cost 553 MB whether they were computed once or ten times.
+</Callout>
+
+This is why multi-turn chat is the single most prefix-friendly workload in existence, and why any engine that supports chat will enable prefix caching by default. The load balancer in Module 23 exploits the same property from the other side: routing a follow-up turn to the replica that already holds that conversation is a cache hit you did not have to compute.
+
+<Callout type="pitfall" title="Anything that rewrites history breaks the chain">
+  If your application edits or summarizes earlier turns — a memory system that compacts conversation, a safety filter that rewrites the prompt, a retriever that reorders context between turns — the previous turn is no longer a prefix of the next one, and sharing stops at the last untouched point. This is not a bug in the engine; it is a consequence of exact-prefix matching, and it is worth knowing before you build a compaction feature and wonder why your hit rate collapsed.
+</Callout>
+
+## When it pays, and when it does not
+
+| Workload | Shared prefix | Verdict |
+|---|---|---|
+| Chat with a system prompt | 500–2,000 tokens | **Huge.** The prefix is constant per deployment. |
+| Multi-turn chat | whole prior turns | **Huge.** Turns 1..n−1 are a prefix of turn n. |
+| Tool calling / function schemas | schema + tool output | **Large.** Same schemas every call. |
+| RAG with one shared doc | doc chunk | Large, if the doc is a prefix. |
+| Many distinct documents, one user | none | **Zero.** Nothing matches, everything is private. |
+| Single long generation | none | Zero. |
+
+<Callout type="pitfall" title="Two ways to lose the benefit entirely">
+  1. **Anything before the shared prefix varies.** If the user's first message comes *before* the system prompt in your template, or you inject a timestamp or user id near the top, the prefix is no longer a prefix and nothing is reused. Put the varying part last.
+  2. **The cache is being evicted.** Prefix blocks are refcounted like any other block, so under memory pressure an engine is entitled to evict them. If your prefix hit rate is low, watch the engine's prefix-cache hit-rate metric before blaming the mechanism.
+</Callout>
+
+<Callout type="real" title="Where the eviction policy bites">
+  In vLLM, when prefix caching is enabled, cached prefix blocks are kept in the same pool as live blocks and are evicted by an LRU policy when the pool fills. This is a real tuning tension: keeping prefixes helps latency, but those blocks are also capacity you could give to a new request. Some engines let you bound the prefix cache separately from the live pool. At the time of writing this is an active area of work, not a settled answer — measure it on your own workload.
+</Callout>
+
+<KeyNotes>
+  1. Equal-sized blocks make prefix sharing **exact**: a 32-token prefix is exactly two blocks, so a new request can point at the same block ids.
+  2. Sharing is **free at read time** — attention reads shared blocks every step forever and copies nothing.
+  3. **Copy-on-write** is the only safety rule: a block with refcount above 1 is read-only, and a writer takes a private copy first.
+  4. A copy happens only at a genuine divergence block, never at share time and never on read.
+  5. The prefix walk compares block-sized runs of token ids down a prefix tree. 900 tokens = 57 blocks = 912 integer comparisons, against a prefill costing tens of milliseconds.
+  6. A 900-token shared system prompt saves 92% of its memory at 32 concurrent requests, because the marginal cost of one more request's prefix is zero.
+  7. Sharing is only valid for an **exact token prefix**: change one token and every KV value after it changes too.
+  8. Prefix caching pays for constant prefixes (system prompts, multi-turn history, tool schemas) and does nothing for distinct documents per request.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Two requests share a 32-token prefix with a block size of 16. How many blocks can they share?', numeric: true, answer: 2, tolerance: 0, unit: 'blocks', why: '32 tokens is exactly 2 blocks of 16, so the prefix maps onto whole blocks and the second request can point at the same physical ids.' },
+  { q: 'A block has a reference count of 3 and its owner needs to write new tokens into it. What does copy-on-write require?', options: ['Write directly, then bump the counts', 'Copy the block, give the writer the private copy, leave the original for the other two', 'Copy all three blocks', 'Wait until the count reaches one'], answer: 1, why: 'A block with count above one is read-only. The writer gets a private copy (count 1) and the shared original keeps serving the other two requests.' },
+  { q: 'A 900-token system prompt is shared by 32 concurrent requests. Llama-3.1-8B BF16. About how much KV memory does sharing save, in megabytes?', numeric: true, answer: 3650, tolerance: 150, unit: 'MB', why: 'Without sharing: 32 × 900 × 131,072 bytes ≈ 3.77 GB. With sharing: 900 × 131,072 ≈ 118 MB. Saved ≈ 3.65 GB.' },
+  { q: 'Why does a partially filled last block of request A not get shared with request B?', options: ['It is corrupted', 'It contains tokens beyond the shared prefix, so B cannot use it and must copy it', 'Blocks are always private', 'It is faster to recompute'], answer: 1, why: 'Sharing happens at block granularity. A block that is only partly filled from A contains A-specific tokens, so B can only share the whole blocks before it, and must own a private copy of the boundary block.' },
+  { q: 'A user id is injected near the top of the prompt template, before the system prompt. What happens to prefix caching?', options: ['It still works, just with smaller hits', 'It stops working for that workload, because the shared text is no longer a prefix', 'It halves the block size', 'The engine recomputes the system prompt every time'], answer: 1, why: 'Caching matches an exact token prefix. If anything varying comes first, no two requests share a prefix, so the cache can never hit. Put variable content last in the template.' },
+  { q: 'How much does a shared prefix cost in extra memory per additional concurrent request, once at least one request is resident?', numeric: true, answer: 0, tolerance: 0, unit: 'bytes', why: 'The prefix is stored once. Additional requests only increment its reference count, an integer. The marginal cost of a shared prefix is exactly zero.' },
+]}/>
