@@ -83,11 +83,11 @@ $$
 
 | Quantity | Value |
 |---|---|
-| KV bytes/token, Llama-3.1-8B | $2 \times 32 \times 8 \times 128 \times 2 = 128$ KB |
-| Decode step, 8B on H100 @ B=1 | $16$ GB ÷ 3.35 TB/s ≈ 5 ms |
+| KV bytes/token, Llama-3.1-8B | 2 × 32 × 8 × 128 × 2 = 128 KB |
+| Decode step, 8B on H100 @ B=1 | 16 GB ÷ 3.35 TB/s ≈ 5 ms |
 | Llama-3.1-70B weights, BF16 | 70.6e9 × 2 = **141 GB** |
 | Cost, \$2.50/hr @ 8,000 tok/s | ≈ **\$0.09 / M tokens** |
-| Little's law: 4,000 users × 8 s | ≈ **500 in flight** |
+| Little's law: 500 req/s × 8 s | = **4,000 in flight** |
 
 If you forget a number, **derive it** on the whiteboard. Watching you reconstruct it is the point.
 

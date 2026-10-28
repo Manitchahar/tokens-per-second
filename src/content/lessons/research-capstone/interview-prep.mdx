@@ -62,7 +62,7 @@ Inference interviews cluster into a small number of kinds. Each kind has an answ
     - **KV bytes per token** for Llama-3.1-8B: 2 × 32 × 8 × 128 × 2 = 128 KB.
     - **Decode step time**, 8B on an H100 at batch 1: 16 GB ÷ 3.35 TB/s ≈ 5 ms (Module 5).
     - **Cost per million tokens**: at \$2.50/hour and ~8,000 tokens/s, about \$0.09 (Module 25).
-    - **Little's law**: 4,000 users each taking 8 seconds ⇒ about 500 requests in flight (Module 6).
+    - **Little's law**: 500 req/s arrival rate with 8 s latency ⇒ 4,000 requests in flight (Module 6).
 
     If you forget a number, **derive it** on the whiteboard. Watching you reconstruct it from the model shape is the point.
   </Step>
@@ -107,7 +107,7 @@ Keep your harness, your mini-engine, your capstone design and your verdict sheet
   2. Six kinds cover nearly everything: roofline, memory/KV math, batching/scheduling, parallelism, quantization/kernels, cost/capacity. Each maps to a module you finished.
   3. Whiteboard questions are **arithmetic with a story**: state your assumptions, derive, and present the answer as a function of those assumptions.
   4. For a live design question, run the **capstone structure**: SLO first → memory budget → engine, precision and topology → what you rejected and why.
-  5. Know four numbers cold and be able to **derive** them: KV per token (128 KB), decode step (≈ 5 ms on H100), cost (≈ \$0.09 per M), Little's law (4,000 users × 8 s ⇒ 500 in flight).
+  5. Know four numbers cold and be able to **derive** them: KV per token (128 KB), decode step (≈ 5 ms on H100), cost (≈ \$0.09 per M), Little's law (500 req/s × 8 s ⇒ 4,000 in flight).
   6. For debugging, tell the **profiling story**: reproduce, measure the limits, form one hypothesis, test, report the number — and say what you expected before measuring.
   7. If you forget a number, **derive it on the whiteboard**. Watching you reconstruct it is the point.
   8. Pick your direction by the **daily work** you enjoy, then build one real thing in it and write about it. Skill compounds; titles do not.
@@ -116,7 +116,7 @@ Keep your harness, your mini-engine, your capstone design and your verdict sheet
 <Quiz client:visible questions={[
   { q: 'You are asked how many concurrent Llama-3.1-8B streams fit on an 80 GB A100 at 2,048-token contexts. What is the first thing to derive?', options: ['The engine’s max batch size flag', 'KV bytes per token (128 KB), then bytes per stream, then the pool after weights', 'The GPU’s FLOPS', 'The token rate'], answer: 1, why: 'The memory-budget chain is the answer: 128 KB per token × 2,048 tokens ≈ 0.26 GB per stream, and the pool is the GPU memory minus weights and reserve. The batch-size flag is a consequence, not the input.' },
   { q: 'Derive the KV bytes per token for Llama-3.1-8B: 2 (K,V) × 32 layers × 8 KV heads × 128 head dim × 2 bytes. What is it?', numeric: true, answer: 131072, tolerance: 2000, unit: 'bytes', why: '2 × 32 × 8 × 128 × 2 = 131,072 bytes = 128 KB per token.' },
-  { q: 'Little’s law: 4,000 users are each served in an average of 8 seconds. Roughly how many requests are in flight at steady state?', numeric: true, answer: 500, tolerance: 40, unit: 'requests', why: 'In-flight = arrival rate × time = 4000 / 8 = 500 requests in flight at steady state.' },
+  { q: 'Little’s law: arrival rate is 500 requests/s and each request takes an average of 8 seconds. Roughly how many requests are in flight at steady state?', numeric: true, answer: 4000, tolerance: 200, unit: 'requests', why: 'In-flight = arrival rate × time = 500 × 8 = 4,000 requests in flight at steady state.' },
   { q: 'Which is the best answer to “is this workload memory-bound or compute-bound?”', options: ['It depends on the engine', 'Read 16 GB of weights to make one token (≈5 ms at 3.35 TB/s) while the math takes under 1 ms, so it is memory-bound', 'It is compute-bound because GPUs are fast', 'Memory-bound if the batch is large'], answer: 1, why: 'The right answer derives it: decode streams all weights from memory per token, taking milliseconds, while the math for one token uses a small fraction of the tensor cores. Reciting “memory-bound” without the arithmetic earns nothing.' },
   { q: 'You blank on an exact constant during an interview. What is the best move?', options: ['Guess a plausible number', 'Say “I don’t know” and stop', 'State the formula and derive the number on the whiteboard from the model shape', 'Change the subject'], answer: 2, why: 'Deriving from the model shape shows exactly how you think, which is what is being evaluated — and is worth more than a correct number you could not reproduce. Guessing is the only truly bad move.' },
 ]}/>

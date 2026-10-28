@@ -105,10 +105,10 @@ $$
 \text{prefill}_{\text{naive}}(T) = T s + o \frac{T(T + 1)}{2} = \mathcal{O}(T^2)
 $$
 
-By turn 20, uncached prefill reaches 646,000 tokens versus 60,000 cached (a 10.8× gap), asymptotically approaching 2T independent of model parameters.
+By turn 20, uncached prefill reaches 646,000 tokens versus 60,000 cached (a 10.8× gap), asymptotically approaching $T/2$ independent of model parameters.
 
 <Callout type="mentor" title="Check yourself">
-  Why is the uncached-to-cached work ratio in an agent loop approximately 2T independent of model size, and what change to a prompt destroys prefix cache hits?
+  Why is the uncached-to-cached work ratio in an agent loop approximately $T/2$ independent of model size, and what change to a prompt destroys prefix cache hits?
 </Callout>
 
 ## Part 5 · Sizing an RL rollout group and measuring batch draining
@@ -119,7 +119,7 @@ This part exercises [Batch inference & RL rollouts](/learn/specialized-workloads
 You size KV cache per token and per 4,096-token rollout for Qwen2.5-1.5B (28 KB/token), Qwen2.5-7B (56 KB/token), and Llama-3.1-8B (128 KB/token) via $b_{kv} = 2 L H_{kv} D b$. You compute rollouts fitting on a 16 GB T4, then benchmark `decode_step(batch)` from batch 1 to 2,048.
 
 ### Expected output and how to read it
-At 4,096 tokens, Llama-3.1-8B needs 0.54 GB KV per rollout. On 8 H100s (640 GB total), 1,024 rollouts take 550 GB of KV (86% of memory), while weights take 129 GB (3%). Rollout clusters are sized by tokens in flight, not weights.
+At 4,096 tokens, Llama-3.1-8B needs 0.54 GB KV per rollout. On 8 H100s (640 GB total), 1,024 rollouts take 550 GB of KV (86% of memory), while weights take 129 GB (20%). Rollout clusters are sized by tokens in flight, not weights.
 
 On a 16 GB T4, Qwen2.5-1.5B fits roughly 100 rollouts, while an 8B model fits zero without offload or quantization.
 
@@ -149,7 +149,7 @@ At standard channel depths (320 to 640), intensity reaches several hundred FLOP/
 
 In contrast, batch-1 LLM decode reads weights once per token vector, yielding roughly 1 FLOP/byte—deep in the memory-bound zone.
 
-At 512 × 512 (FP16), one 320-channel feature map takes 168 MB. Six live tensors take 1.0 GB per image, while 860M U-Net weights take 1.72 GB total. Activations exceed weights at batch 2: diffusion memory is bounded by activations, not weights.
+At 512 × 512 with 8× downsampling to a 64 × 64 latent (FP16), one 320-channel feature map takes 2.62 MB. Six live tensors take ~15.7 MB per image. Latent compression keeps feature maps compact, avoiding the 168 MB (1.0 GB per image) tax of pixel-space diffusion.
 
 <Callout type="mentor" title="Check yourself">
   Why does spatial filter reuse place 2D convolutions on the compute-bound side of the roofline while autoregressive decode remains memory-bound, and why does diffusion OOM from activations rather than weights?

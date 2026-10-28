@@ -39,7 +39,7 @@ const NUMBERS = [
   { q: 'KV bytes per token, Llama-3.1-8B', a: '2×32×8×128×2 = 128 KB' },
   { q: 'Decode step time, 8B on H100 @ B=1', a: '16 GB ÷ 3.35 TB/s ≈ 5 ms' },
   { q: 'Cost per M tokens, $2.50/hr @ 8k tok/s', a: '≈ $0.09' },
-  { q: 'Little’s law, 4000 users, 8 s each', a: '4000/8 = 500 in flight' },
+  { q: 'Little’s law, 500 req/s, 8 s each', a: '500 × 8 = 4,000 in flight' },
 ];
 
 const TRACKS: { id: Track; label: string; body: string }[] = [

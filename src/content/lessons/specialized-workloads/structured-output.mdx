@@ -134,7 +134,7 @@ $$
 | 3 | 44 | 48% |
 | 5 | 68 | 51% |
 
-As $n \to \infty$ the share approaches $7/12 = 58\%$. **Even in the best case, more than 40% of a tool call is overhead the grammar forced.**
+As $n \to \infty$ the share approaches ${}7/12 = 58\%$. **Even in the best case, more than 40% of a tool call is overhead the grammar forced.**
 
 <Callout type="pitfall" title="Long tool schemas are a latency tax, not a documentation practice">
   That 40% floor is a real cost measured in streamed tokens and in TTFT. A 30-function tool catalogue dumped into the system prompt costs hundreds of tokens of prefill before the model has decided anything. This is Module 10's lesson about prefix caching, applied to prompts: **the tool schema is a prefix**, so cache it and put it first.

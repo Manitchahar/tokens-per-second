@@ -83,7 +83,7 @@ export default function AgentsReasoning() {
         <Label x={12} y={20} tone={2} size={11} bold>The conversation, turn by turn</Label>
         {conv.map((c, i) => {
           const y = 30 + i * 26;
-          const scale = maxCtx / 480;
+          const scale = (st < 2 ? 480 : 280) / maxCtx;
           const fullW = c.ctxAfter * scale;
           const hitW = c.cacheHits * BLOCK * scale;
           return (
