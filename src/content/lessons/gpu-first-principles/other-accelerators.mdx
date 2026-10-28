@@ -1,0 +1,250 @@
+---
+title: 'Beyond NVIDIA: TPUs, Trainium, Groq & other accelerators'
+summary: 'The H100 is one design point, not the only one. Compare the roofs, memory and software of the main alternatives, and learn to judge them on tokens per second per dollar and per watt.'
+objectives:
+  - Explain why specialised accelerators exist, and what each one optimises
+  - Compute a chip’s ridge point and use it to predict decode speed for an 8B model
+  - Work out how many on-chip-memory-limited chips a 70B model needs, and what that buys and costs
+  - Compare CUDA, ROCm, XLA/JAX and Neuron, and separate what changes from what stays
+  - Evaluate an accelerator on tokens/s per dollar and per watt at your own service-level target (SLO)
+---
+import OtherAccelerators from '@/components/viz/gpu/OtherAccelerators.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every number in this module so far has come from an NVIDIA GPU: a T4, an A100, an H100. That is a convenience, not a law. The model you built in **The two speed limits: compute and bandwidth** — bytes divided by bandwidth, FLOPs divided by peak — contains no brand name. Point it at a chip with 80 TB/s of on-chip memory and decode’s floor falls from milliseconds to microseconds.
+
+So why is the H100 still the default? The answer is not “NVIDIA makes better silicon” in the abstract. It is a trade-off you can compute: on-chip memory is tiny and expensive, the software ecosystem is a moat, and a chip that wins when serving one user can lose badly when serving many at once. This lesson gives you the map and the calculator.
+
+## Why build anything other than a GPU?
+
+A GPU is a compromise. It must run graphics, training and inference, support many precisions and shapes, and be programmable by a large community. Generality costs silicon area, power and design effort. An inference-only chip can spend that budget differently.
+
+Inference has two phases: **prefill**, which processes the prompt in parallel, and **decode**, which produces one token at a time. Almost all of the arithmetic is matrix multiplication, and at decode time almost all of the time is spent moving weights. This is the <Term t="memory-wall">memory wall</Term>: compute has improved much faster than the bandwidth that feeds it, so the arithmetic units spend more and more of their lives waiting. A decode step reads every weight once and does roughly one multiply-add per byte, which is why decode sits at the bottom-left of the <Term t="roofline">roofline</Term> you already met.
+
+There are three honest ways to attack that wall.
+
+1. **Put the memory closer to the math.** Build a chip with a large pool of <Term t="sram">SRAM</Term> — the fast, on-chip memory inside a processor — and keep the weights there instead of in <Term t="hbm">HBM</Term> (the GPU’s main memory). This is the SRAM-heavy design, and Groq’s <Term t="lpu">LPU</Term> is the clearest example.
+2. **Build a dedicated matrix engine.** Instead of thousands of general lanes, arrange multiply-accumulate units in a grid that passes data from neighbour to neighbour. This is the <Term t="systolic-array">systolic array</Term> at the heart of a Google <Term t="tpu">TPU</Term>, and it buys enormous reuse without a large cache.
+3. **Cut the cost of a known workload.** If a cloud provider knows the models its customers run, it can build a cheaper chip for exactly those shapes and hide the complexity inside a compiler. AWS’s <Term t="trainium">Trainium and Inferentia</Term> follow this route.
+
+None of these is free. Specialisation means the chip is excellent at the workload it was designed for and awkward at everything else. It also means a new software stack, which is the subject of the last half of this lesson.
+
+<Callout type="intuition" title="A roof is a shape, not a brand">
+  The roofline does not care who made the chip. Give me two numbers — peak FLOP/s and bytes per second — and I can draw the roof, find the ridge, and tell you whether your workload is limited by arithmetic or by memory. The interesting part is that different designs put those two numbers in very different places.
+</Callout>
+
+## The same two limits, a different roof
+
+The visual below reuses the roofline from **The two speed limits: compute and bandwidth**. Both axes are logarithmic, so a slope of 1 on the page means “performance rises in proportion to intensity”. A workload is a point. A chip is a roof.
+
+<Scrolly>
+  <OtherAccelerators client:visible slot="stage" />
+
+  <Step title="1. Two axes, every chip">
+    Horizontal: arithmetic intensity, in FLOPs per byte. Vertical: achieved TFLOP/s. Every accelerator can be drawn here, and every workload lands somewhere on the plane. Nothing about the axes is NVIDIA-specific.
+  </Step>
+
+  <Step title="2. The H100 roof">
+    The rising slope is bandwidth: at 3.35 TB/s, one FLOP per byte buys 3.35 TFLOP/s. The flat top is the compute ceiling, 989 TFLOP/s. They meet at the <Term t="ridge-point">ridge point</Term>, about 295 FLOP/byte.
+  </Step>
+
+  <Step title="3. A very different roof">
+    An SRAM-heavy chip has about 80 TB/s of on-chip bandwidth and 188 TFLOP/s of arithmetic. Its ridge is near **2.4 FLOP/byte**, so the roof is almost all slope. Memory is no longer the scarce resource at low intensity; arithmetic is.
+  </Step>
+
+  <Step title="4. Same workload, different floor">
+    At decode’s one FLOP per byte, the H100 roof allows 3.35 TFLOP/s and the SRAM chip allows 80 — about **24× more**. At prefill’s hundreds of FLOPs per byte the H100’s higher ceiling wins. The roofs cross, and where they cross is the whole argument.
+  </Step>
+
+  <Step title="5. Now the capacity">
+    Llama-3.1-70B in FP16 is **141 GB** of weights. One 192 GB MI300X holds all of it. One SRAM chip holds 230 MB, about a six-hundredth of the model. A roof tells you how fast a chip could read; capacity tells you whether the model fits. The **KV cache** — the per-conversation memory that lets a model avoid recomputing earlier tokens — also has to live somewhere.
+  </Step>
+
+  <Step title="6. The bill for that latency">
+    Divide the model by the chip: 141 GB ÷ 0.23 GB is about **614 chips**. The violet links are the new cost. Every token’s activations must cross them, and every chip is full of weights rather than KV cache, so the batch — the number of requests processed together — must stay small.
+  </Step>
+
+  <Step title="7. What changes, what stays">
+    Kernels, quantisation formats (storing weights in fewer bits), collectives (operations where chips exchange data) and profilers (tools that show where the time goes) change when you switch stacks. The roofline, the KV cache maths, batching and the SLO — the latency target you promise — do not. **The physics is portable; the software is not.**
+  </Step>
+</Scrolly>
+
+## The landscape, at the time of writing
+
+The table below is a map, not a quotation. All numbers are approximate public figures, and every one of them moves with the generation, the precision and the cooling configuration. Use them for intuition; check the current data sheet before buying.
+
+The **Design** column names the kind of chip. A GPU is the general processor you already know. An <Term t="asic">ASIC</Term> — an application-specific integrated circuit — is a chip built for one job. A systolic array is the grid described above; a <Term t="wafer-scale">wafer-scale</Term> engine is one piece of silicon the size of a whole wafer instead of a chip cut from it. A **PFLOP/s** is a thousand TFLOP/s, and a **PB/s** is a thousand TB/s.
+
+| Accelerator | Design | Memory | Bandwidth | Peak FP16/BF16 | Ridge |
+|---|---|---|---|---|---|
+| H100 SXM | GPU | 80 GB HBM3 | 3.35 TB/s | 989 TFLOP/s | ~295 |
+| AMD Instinct MI300X | GPU | 192 GB HBM3 | 5.3 TB/s | 1,307 TFLOP/s | ~247 |
+| AMD Instinct MI325X | GPU | 256 GB HBM3E | ~6.0 TB/s | 1,307 TFLOP/s | ~218 |
+| Google TPU v5p | systolic ASIC | 95 GB HBM | ~2.76 TB/s | 459 TFLOP/s | ~166 |
+| AWS Inferentia2 | ASIC | 32 GB HBM | ~0.82 TB/s | ~190 TFLOP/s | ~232 |
+| AWS Trainium2 | ASIC | ~96 GB HBM | not quoted per chip | — | — |
+| Intel Gaudi 3 | ASIC | 128 GB HBM2e | ~3.7 TB/s | 1,835 TFLOP/s | ~496 |
+| Groq LPU | SRAM ASIC | 230 MB SRAM | ~80 TB/s on-chip | ~188 TFLOP/s | ~2.4 |
+| Cerebras WSE-3 | wafer-scale | 44 GB SRAM | ~21 PB/s on-chip | ~125 PFLOP/s | ~6 |
+
+**AMD Instinct MI300X and MI325X** are GPUs, not ASICs, which matters: they keep a general programming model while offering much more memory than an H100. The MI300X pairs 192 GB of HBM3 with 5.3 TB/s; the MI325X raises that to roughly 256 GB and 6.0 TB/s. For decode, where bytes per second decide everything, the large HBM and high bandwidth are the point. The cost is that you program through <Term t="rocm">ROCm</Term>, AMD’s counterpart to CUDA, rather than CUDA.
+
+**Google’s TPU** is the clearest example of a matrix engine. A systolic array keeps one operand — usually a weight — stationary and pulses activations through a grid of multiply-accumulate units. Each unit passes data to its neighbour, so one loaded number can be reused many times without a big cache. The trade is that the array loves dense, regular matrix shapes and is less comfortable with irregular work. TPU v5p offers about 95 GB of HBM, 2.76 TB/s and 459 TFLOP/s, for a ridge near 166 FLOP/byte — relatively more bandwidth-rich than an H100. TPUs are connected into <Term t="tpu-pod">pods</Term> with a dedicated high-speed interconnect, so a group of chips behaves like one larger machine.
+
+**AWS Trainium and Inferentia** are custom ASICs reached through the <Term t="neuron-sdk">Neuron SDK</Term>. AWS’s pitch is not a peak FLOPS number; it is cost per token inside AWS, with the compiler and runtime handling the mapping. Inferentia2 carries about 32 GB of HBM; Trainium2 roughly 96 GB at the time of writing. The practical constraint is model support: a new architecture, a new quantisation format or an unusual attention variant may not have an optimised Neuron path on day one.
+
+**Intel Gaudi 3** is the other large-HBM challenger: 128 GB of HBM2e, about 3.7 TB/s, and a very high 1,835 TFLOP/s BF16 peak, which puts its ridge near 496. That shape favours compute-heavy prefill more obviously than memory-bound decode. Its software stack, SynapseAI, and its Ethernet-based scale-out are the parts to check before committing.
+
+**Groq’s LPU** is the pure SRAM design. Each chip has about 230 MB of SRAM and roughly 80 TB/s of on-chip bandwidth, with a comparatively modest 188 TFLOP/s of arithmetic. That produces the almost-vertical roof in the visual. It is built for predictable, low-latency token generation, and it pays for that with chip count.
+
+**Cerebras** pushes the same idea to the other extreme: one wafer-scale engine with about 44 GB of SRAM, around 21 PB/s of on-chip bandwidth and a peak near 125 PFLOP/s FP16. One wafer still cannot hold a 70B FP16 model, so large models are split across wafers or streamed from external memory.
+
+**Phone and laptop NPUs** tell the same story at the opposite end of the power scale: a small matrix engine on a chip, optimised for a few watts and a few gigabytes. Module 26, **On-device & edge inference**, covers them properly.
+
+## Apply the two speed limits to any chip
+
+The recipe has not changed. For any accelerator, the <Term t="ridge-point">ridge point</Term> is
+
+$$
+\text{ridge} = \frac{\text{peak FLOP/s}}{\text{bandwidth}}.
+$$
+
+For the MI300X, that is 1307 ÷ 5.3 ≈ 247 FLOP/byte. For the H100 it is 989 ÷ 3.35 ≈ 295. The MI300X has more FLOPs and more bandwidth, but its ridge is lower: it is relatively better supplied with memory, which is exactly what a decode-heavy workload wants.
+
+Decode is <Term t="memory-bound">memory-bound</Term>, so its floor is
+
+$$
+t_{\text{decode}} \ge \frac{\text{weight bytes}}{\text{bandwidth}}.
+$$
+
+Take Llama-3.1-8B in FP16. It has 8.03 billion weights, so the weights occupy 8.03 × 10⁹ × 2 = 16.1 GB. On an H100 at 3.35 TB/s, the floor is 16.1 GB ÷ 3.35 TB/s ≈ 4.8 ms per token, or about 209 tokens/s if the memory system ran at 100% of peak. On an MI300X at 5.3 TB/s, the floor is 16.1 GB ÷ 5.3 TB/s ≈ 3.0 ms, or about 330 tokens/s.
+
+<Callout type="math" title="Worked: the same 8B model on two HBM GPUs">
+  Ignore the KV cache for a moment; at 1,024 tokens it is about 134 MB, under 1% of a 16.1 GB weight read.
+
+  - H100: 16.1 GB ÷ 3.35 TB/s = 4.8 ms → at most 209 tokens/s.
+  - MI300X: 16.1 GB ÷ 5.3 TB/s = 3.0 ms → at most 330 tokens/s.
+  - At a realistic 80% of peak bandwidth: about 167 tokens/s on the H100 and 264 on the MI300X.
+  - The ratio is 5.3 ÷ 3.35 ≈ 1.58, not 1307 ÷ 989 ≈ 1.32. For a memory-bound job, shop on bandwidth.
+
+  These are floors, not benchmarks. Real decode adds kernel launch overhead, sampling, KV reads and imperfect bandwidth utilisation. The point is the ordering, and the fact that you can predict it before renting anything.
+</Callout>
+
+Now do the same for the SRAM chip. Its 230 MB slice is read at 80 TB/s, so one chip’s weight read takes 0.23 GB ÷ 80 TB/s ≈ 2.9 microseconds. To hold the 16.1 GB of an 8B FP16 model you need 16.1 GB ÷ 0.23 GB ≈ 70 chips. If all 70 read their slices in parallel, the weight-read floor is microseconds rather than milliseconds — roughly 1,700× lower than the H100’s 4.8 ms.
+
+That comparison is real, and it is also incomplete. The chips do not work on one isolated matrix; a token’s activations have to move through the pipeline, and every hop adds latency. And the 1,700× figure is a floor on the weight read, not a promise about tokens per second. This is the central lesson of SRAM-heavy designs: **you buy latency with chip count, and you pay for it in communication and concurrency.**
+
+## The SRAM trade-off, in arithmetic
+
+The capacity calculation is the one to carry in your head. Llama-3.1-70B has 70.6 billion weights. In FP16 that is 70.6 × 10⁹ × 2 = 141.2 GB. A 192 GB MI300X holds it with about 51 GB left for the KV cache and workspace. A 230 MB SRAM chip holds 0.23 GB, so the number of chips is
+
+$$
+N = \frac{141.2}{0.23} \approx 614.
+$$
+
+At 8-bit precision the weights are 70.6 GB, so the same design needs about 307 chips; at 4-bit it needs about 153. Quantisation therefore changes the chip count roughly in proportion, which is one reason it matters so much on memory-limited hardware. It also changes quality, and Module 11, **Quantization**, is where you learn to measure that trade rather than assume it.
+
+Each chip holds a slice of the model and reads it at about 80 TB/s. The weight read per chip is microseconds, but the model now spans hundreds of chips. A token’s activations must cross the links between them, the batch is limited by how much SRAM is left after the weights, and a failure anywhere in the chain affects the whole model. Compare the two ends of the design space:
+
+| | One MI300X | SRAM-heavy design |
+|---|---|---|
+| Chips for 70B FP16 | 1 | ~614 |
+| Weight-read floor (8B) | ~3.0 ms | ~2.9 µs per chip, 70 chips in parallel |
+| Batch capacity | Large HBM pool | Small; SRAM is full of weights |
+| New cost | HBM bandwidth | Chip count, links, power, yield |
+
+The SRAM design is not “faster” in general. It is faster at the thing it was built for — a small batch, a short context, and a latency target that a GPU cannot hit — and more expensive at everything else.
+
+At wafer scale the arithmetic repeats: a 44 GB wafer holds 141.2 GB only with 141.2 ÷ 44 ≈ 3.2 wafers, and in practice large models are streamed or partitioned rather than simply “fitting”. The wafer removes the chip-to-chip hop inside one piece of silicon, but it does not repeal the capacity constraint.
+
+## The software moat
+
+A chip is half hardware and half compiler. The mathematics of a transformer is identical on every accelerator: the same matrix multiplies, the same attention, the same KV cache, the same prefill and decode phases. What changes is the path from your Python to the silicon, and that path is where most of the practical pain lives.
+
+NVIDIA’s advantage is not that its silicon is uniquely suited to matrix multiplication. It is that the CUDA ecosystem is mature: cuBLAS and cuDNN for the basic operations, FlashAttention and CUTLASS for the hard ones, TensorRT-LLM, vLLM and SGLang for serving, AWQ/GPTQ/FP8 kernels for quantisation, NCCL for communication and Nsight for profiling. A new chip can have a better roof and still lose because none of that exists yet for your model.
+
+The alternatives each have their own stack:
+
+- **ROCm** is AMD’s CUDA counterpart. PyTorch ships a ROCm build, and `torch.version.hip` tells you which one you are running. Many kernels and serving engines support it at the time of writing, but coverage of the newest quantisation formats and attention variants tends to lag CUDA.
+- **XLA** is the compiler that turns a JAX or PyTorch/XLA graph into TPU code. It fuses operations, chooses layouts and schedules the matrix engine. **JAX** is the Python front end most TPU work is written in. The compiler is powerful, and it is also the thing that decides whether your unusual operation is fast or silently falls back.
+- The **Neuron SDK** is AWS’s compiler and runtime for Trainium and Inferentia. Models are compiled into Neuron graphs, and the supported architecture list is the first thing to check. A model that is not on it may run, but not at the speed the data sheet implies.
+- **SynapseAI** plays the same role for Intel Gaudi, and each startup has its own compiler, runtime and kernel library.
+
+<Callout type="pitfall" title="A port is not a recompile">
+  Moving a model from CUDA to another stack is not a one-line change. A fused kernel may have no optimised equivalent. A quantisation format may be unsupported. An attention variant may fall back to a slow reference implementation. A collective may use a different library with different latency. The model can be numerically correct and still be several times slower than the benchmark you saw.
+
+  The fix is the same as every other performance problem in this course: measure the whole path on your own workload, not the peak number in the announcement.
+</Callout>
+
+What stays the same is substantial, and it is why this course outlives the hardware.
+
+| What changes | What stays |
+|---|---|
+| Kernel libraries and fused operators | The roofline and the ridge point |
+| Quantisation formats and engine backends | Arithmetic intensity decides the bound |
+| Collective library and interconnect topology | KV cache size and bandwidth maths |
+| Profiler, graph capture and debugging tools | Prefill vs decode and batching |
+| Supported dtypes and model architectures | The SLO and goodput you are targeting |
+
+```python
+import torch
+
+print('torch', torch.__version__)
+print('CUDA build', torch.version.cuda)
+print('ROCm build', torch.version.hip)
+print('device', torch.cuda.get_device_name(0))
+```
+
+On a TPU you would be in JAX or PyTorch/XLA instead; on Trainium, in the Neuron SDK. The device call changes, but the questions do not: what are the bytes, what is the bandwidth, what is the batch, and what is the SLO?
+
+## How to evaluate one honestly
+
+The only comparison that matters is your workload, on the software stack you will run, at the SLO you promise. A vendor benchmark that does not state the model, context length, batch size, precision and latency target is not a comparison; it is an advertisement.
+
+Start with **goodput**: the number of requests per second that meet the SLO. Then convert it to the two numbers that decide whether the system is affordable.
+
+$$
+\text{cost per million tokens} = \frac{\text{price per hour}}{\text{tokens/s} \times 3600} \times 10^6
+$$
+
+$$
+\text{tokens/s per watt} = \frac{\text{tokens/s}}{\text{watts}}
+$$
+
+Use the whole system’s price and the whole system’s wall power: host, interconnect, cooling and idle time included. A chip’s thermal design power (TDP) is not the power bill of a rack.
+
+<Callout type="mentor" title="One worked cost, so the formula is not abstract">
+  Suppose a single H100 serves Llama-3.1-8B at 167 tokens/s at 80% of peak bandwidth, on the course’s illustrative \$2.50 per hour rate, and draws about 700 W.
+
+  - Tokens per hour: 167 × 3600 = 601,200, or 0.6012 million.
+  - Cost per million tokens: \$2.50 ÷ 0.6012 ≈ \$4.16.
+  - Tokens/s per watt: 167 ÷ 700 ≈ 0.24.
+
+  Now repeat with the alternative’s measured goodput, its all-in hourly price and its wall power. The arithmetic is identical; only the inputs change. The rate and the wattage here are illustrative and approximate, not a quote.
+</Callout>
+
+Three habits make the comparison honest. First, **fix the workload**: same model, same context distribution, same output length, same concurrency. Second, **fix the SLO**: compare the 95th-percentile time to first token (p95 TTFT) and time per output token (p95 TPOT), not average throughput with no latency bound. Third, **fix the accounting**: include the host, the interconnect, the idle capacity and the software engineering time needed to port. A chip that is 30% faster per token but needs six months of kernel work is not 30% faster this quarter.
+
+Data sheets often quote the largest number the silicon can reach — INT8, sometimes with sparsity, sometimes for a single dense matrix. Decode is memory-bound and usually runs in BF16 or FP16, so that number can be almost irrelevant; prefill is compute-bound, so it matters more there. Always ask which phase, which precision and which batch a number describes.
+
+This is the same discipline you will use in Module 06, **Measure Like a Pro**, especially **SLOs & goodput**, and again in Module 25, **Inference Economics**, especially **Goodput per dollar & choosing GPUs**. The hardware changes; the method does not.
+
+<KeyNotes>
+  1. A GPU is general-purpose. Inference is narrow, so specialised chips trade generality for memory locality, a matrix engine, or a lower cost per token.
+  2. The roofline is brand-neutral: ridge = peak FLOP/s ÷ bandwidth. Approximate ridges: H100 295, MI300X 247, TPU v5p 166, Gaudi 3 496, Groq LPU 2.4 FLOP/byte.
+  3. Decode is bandwidth-bound. Llama-3.1-8B in FP16 is 16.1 GB, so its floor is 4.8 ms on an H100 and 3.0 ms on an MI300X; use the bandwidth ratio (1.58×), not the FLOP ratio (1.32×).
+  4. SRAM-heavy designs move the roof: about 80 TB/s on-chip makes the weight read microseconds, but 230 MB per chip means about 70 chips even for an 8B model.
+  5. Capacity is the bill: Llama-3.1-70B in FP16 is 141 GB, one 192 GB MI300X holds it, and a 230 MB SRAM chip needs about 614 chips; at 8-bit that falls to about 307.
+  6. The same small SRAM that buys latency limits the batch and the KV cache. You are trading throughput and simplicity for a lower floor on one user’s token time.
+  7. Software is the moat: CUDA versus ROCm, XLA/JAX or Neuron changes kernels, quantisation formats, engine backends, collectives and profilers. The roofline, KV cache, batching and SLO stay.
+  8. Evaluate on tokens/s per dollar and per watt at your SLO on your workload, with all-in cost and wall power. At the time of writing the landscape moves fast; re-check the data sheet and the software support before committing.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'An MI300X has a peak of about 1,307 TFLOP/s and 5.3 TB/s of bandwidth. What is its ridge point, in FLOP per byte?', numeric: true, answer: 247, tolerance: 15, unit: 'FLOP/byte', why: 'Ridge = peak FLOP/s ÷ bandwidth = 1307 ÷ 5.3 ≈ 247 FLOP/byte. Below that intensity the chip is memory-bound.' },
+  { q: 'Llama-3.1-8B in FP16 has 16.1 GB of weights. What is the decode floor on an MI300X at 5.3 TB/s, in milliseconds?', numeric: true, answer: 3.0, tolerance: 0.3, unit: 'ms', why: '16.1 × 10⁹ bytes ÷ 5.3 × 10¹² bytes/s = 3.04 ms. That is about 330 tokens/s at 100% of peak bandwidth, before overheads.' },
+  { q: 'A 70B model in FP16 is 141 GB. How many 230 MB SRAM chips are needed just to hold the weights?', numeric: true, answer: 614, tolerance: 30, unit: 'chips', why: '141.2 GB ÷ 0.23 GB ≈ 614 chips. At 8-bit the weights are 70.6 GB, so about 307 chips would do.' },
+  { q: 'Why can an SRAM-heavy chip beat an H100 on decode but lose on prefill?', options: ['It has more FLOP/s than an H100', 'It has far more on-chip bandwidth but a lower compute ceiling and very little capacity', 'It uses lower precision for all work', 'It has a faster network than NVLink'], answer: 1, why: 'Decode is limited by bytes per second, where 80 TB/s of on-chip memory wins. Prefill is compute-bound, where the H100’s 989 TFLOP/s ceiling beats the SRAM chip’s 188 TFLOP/s.' },
+  { q: 'Which of these stays the same when you move a model from CUDA to ROCm, XLA or Neuron?', options: ['The kernel library and fused operators', 'The supported quantisation formats', 'The roofline, KV cache maths and prefill/decode split', 'The collective library and profiler'], answer: 2, why: 'The physics and the model maths are unchanged. Kernels, quantisation formats, engine backends, collectives and profilers are exactly what change with the software stack.' },
+  { q: 'You are choosing between two accelerators for a decode-heavy service. Which comparison is the fairest?', options: ['The higher peak TOPS figure', 'The larger memory capacity alone', 'Tokens/s per dollar and per watt at your SLO on your workload', 'The lower chip price'], answer: 2, why: 'A decode service is judged on goodput that meets its SLO, and on what that goodput costs in money and power. Peak TOPS, capacity or sticker price each capture only one part of the trade.' },
+]} />

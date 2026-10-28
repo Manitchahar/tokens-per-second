@@ -1,0 +1,280 @@
+---
+title: 'RAG, CAG & the serving bill'
+summary: 'Retrieval puts fresh knowledge into the prompt; caching puts stable knowledge into the KV cache. Learn both pipelines end to end, then compute what each one does to TTFT, memory and cost.'
+objectives:
+  - Explain the offline index and online query steps of retrieval-augmented generation
+  - Compute the prompt size, prefill FLOPs, TTFT and KV bytes of a RAG request
+  - Diagnose why retrieved context usually destroys prefix-cache hit rate and fix the prompt shape
+  - Compute the memory of a preloaded knowledge base and how many fit on one 80 GB GPU
+  - Choose between RAG, CAG and a hybrid for a given freshness, latency and size requirement
+---
+import RagVsCag from '@/components/viz/prefill-prefix/RagVsCag.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Your support bot has to answer questions about 400 product manuals. The model has never read them, and it never will: its weights were frozen on the day training ended. Two designs can fix that.
+
+The first searches an index when a question arrives, pulls out the eight most relevant passages, and pastes them into the prompt before the question. That is <Term t="rag">retrieval-augmented generation</Term>, or RAG. The second pastes the whole manual into the prompt once, computes its KV cache once, and reuses that cache for every question. That is <Term t="cag">cache-augmented generation</Term>, or CAG.
+
+Both put text in front of the model. They differ in who pays, when, and how much GPU memory stays occupied between questions. That is a serving question, and this lesson prices it.
+
+## RAG, step by step
+
+RAG is two pipelines that meet at a vector. One runs offline, when documents change. The other runs online, once per question.
+
+### Offline: build the index
+
+1. **Parse.** Turn PDFs, HTML and tickets into plain text. Keep the source name and page number, because an answer without a citation is hard to trust.
+2. **Chunk.** Split the text into passages. <Term t="chunking">Chunking</Term> is the decision that sets the unit of retrieval. A 512-token chunk with a little overlap is a common starting point. Small chunks retrieve precisely but lose surrounding context; large chunks carry more context but blur several topics into one vector.
+3. **Embed.** Send each chunk through an <Term t="embedding-model">embedding model</Term>. This is a separate model from the LLM. It reads text and returns a fixed-length vector, typically 768 to 3,072 numbers, positioned so that passages with similar meaning land near each other. At the time of writing, OpenAI's `text-embedding-3-small` returns 1,536 numbers; the exact width does not change the argument.
+4. **Store.** Put each vector in a <Term t="vector-database">vector database</Term>, together with the chunk text and its metadata. The database builds an index so it can find near neighbours without comparing the question against every vector. Most production indexes are approximate: they give up a tiny amount of recall for a large speedup.
+
+### Online: answer one question
+
+5. **Embed the question** with the *same* embedding model. A different model produces vectors in a different space, and the distances become meaningless.
+6. **Find the nearest chunks.** The standard score is <Term t="cosine-similarity">cosine similarity</Term>: the dot product of the two vectors divided by their lengths.
+
+$$
+\cos(q, c) = \frac{q \cdot c}{\lVert q \rVert \, \lVert c \rVert}
+$$
+
+A tiny worked example makes it concrete. Suppose the question vector is $q = [0.8, 0.6]$, chunk A is $a = [0.9, 0.4]$, and chunk B is $b = [0.1, 1.0]$. The dot products are:
+
+$$
+q \cdot a = 0.8(0.9) + 0.6(0.4) = 0.96, \qquad
+q \cdot b = 0.8(0.1) + 0.6(1.0) = 0.68
+$$
+
+The lengths are $\lVert q \rVert = 1$, $\lVert a \rVert = \sqrt{0.97} = 0.985$, and $\lVert b \rVert = \sqrt{1.01} = 1.005$. So the cosine scores are $\frac{0.96}{0.985} = 0.975$ for A and $\frac{0.68}{1.005} = 0.677$ for B. Chunk A wins. Real vectors are hundreds of times longer, but the arithmetic is the same; the database just does it for millions of chunks at once.
+
+7. **Assemble the prompt.** Put a fixed system prompt first, then the retrieved chunks, then the question. The model sees one long string, not a database.
+8. **Generate.** Prefill the assembled prompt, then decode the answer token by token.
+
+<Callout type="intuition" title="What “nearby” means in an embedding space">
+  An embedding model maps meaning to direction. Two passages about refund windows point in almost the same direction even if one says “30 days” and the other says “one month”. Cosine similarity ignores vector length and compares direction, so a long passage and a short one can still match. The two-dimensional sketch in the visual is a cartoon of a space with hundreds or thousands of dimensions; the neighbourhood idea is the part that transfers.
+</Callout>
+
+## Watch both pipelines
+
+<Scrolly>
+  <RagVsCag client:visible slot="stage" />
+
+  <Step title="1. Documents become chunks">
+    The offline half of RAG parses the knowledge base and splits it into passages. Eight documents become 64 chunks of about 512 tokens each. The chunk, not the document, is the unit that will be retrieved and pasted into a prompt.
+  </Step>
+
+  <Step title="2. Chunks become vectors">
+    A separate embedding model turns each chunk into a vector, and a vector database stores those vectors with the chunk text. The dots are a two-dimensional sketch of a much higher-dimensional space: nearby dots mean similar meaning.
+  </Step>
+
+  <Step title="3. A question lands nearby">
+    The question is embedded with the same model. Its dot lands in the same space, and the database returns the chunks whose vectors are closest by cosine similarity. Here, eight chunks light up.
+  </Step>
+
+  <Step title="4. Assemble the prompt">
+    The eight chunks are pasted after a fixed system prompt and before the question. The prompt is now about 4,300 tokens, and almost all of it is retrieved context. Every one of those tokens must be prefilled.
+  </Step>
+
+  <Step title="5. The next query shares only the system prompt">
+    A different question retrieves different chunks. The system prompt is still byte-identical, so the prefix cache reuses its 150 tokens and stops at the first changed chunk. The hit rate is small, and so is the saving.
+  </Step>
+
+  <Step title="6. CAG preloads once">
+    CAG removes retrieval entirely. The whole 100,000-token knowledge base is prefilled once into one long KV prefix. Every query reuses that prefix and appends only its question, so the per-query prefill is tiny.
+  </Step>
+
+  <Step title="7. The bill, side by side">
+    RAG pays retrieval latency and a long prefill on every query, but keeps memory small and knowledge fresh. CAG pays a large, pinned KV cache per knowledge base, but answers with a few milliseconds of prefill and no search step.
+  </Step>
+</Scrolly>
+
+## The serving bill of RAG
+
+Now take the example apart. The system prompt is 150 tokens, each of the eight chunks is 512 tokens, the question is 30 tokens, and the chat template adds 20. The assembled prompt is:
+
+$$
+n = 150 + 8 \times 512 + 30 + 20 = 4{,}296 \text{ tokens}
+$$
+
+That is 4,096 tokens of retrieved context, or 95% of the prompt. The model does not know which part is “context”; it prefills all of it.
+
+From *Matrix multiply, step by step, and counting FLOPs*, a forward pass costs about twice the parameter count per token. For Llama-3.1-8B, with $P = 8.03 \times 10^9$:
+
+$$
+F_{\text{prefill}} \approx 2 P n
+= 2 \times 8.03 \times 10^9 \times 4{,}296
+= 6.90 \times 10^{13} \text{ FLOP}
+$$
+
+That is about 69 TFLOP. On an H100 with a peak of 989 TFLOP/s dense BF16 and a model FLOPs utilisation (MFU) of 0.55, the time is:
+
+$$
+t_{\text{prefill}} = \frac{6.90 \times 10^{13}}{989 \times 10^{12} \times 0.55}
+= 0.127 \text{ s} = 127 \text{ ms}
+$$
+
+On an A100 80GB, whose peak is about 312 TFLOP/s, the same arithmetic gives $\frac{6.90 \times 10^{13}}{312 \times 10^{12} \times 0.55} = 402$ ms. The GPU choice matters, but the shape of the bill does not.
+
+Why is the compute term the one that wins? Prefill of $n$ tokens uses each weight about $n$ times, so its arithmetic intensity is roughly $n$ FLOP per weight byte. At 4,296 tokens that is 4,296 FLOP/byte. The H100's ridge point, from *The two speed limits: compute and bandwidth*, is $\frac{989 \times 10^{12}}{3.35 \times 10^{12}} \approx 295$ FLOP/byte. The prompt is about fifteen times above the ridge, so it is firmly compute-bound: the weights arrive fast enough, and the tensor cores are the limit.
+
+The KV cache is the other bill. From *Memory math: weights, KV cache & concurrency*, the bytes per token are:
+
+$$
+b_{kv} = 2 L H_{kv} D b
+= 2 \times 32 \times 8 \times 128 \times 2
+= 131{,}072 \text{ bytes per token}
+$$
+
+So the 4,296-token prompt occupies $n \times 131{,}072 = 563$ MB, or about 0.56 GB. That is 3.5% of the 16.06 GB of weights, per in-flight request, and it is freed when the request ends.
+
+<Callout type="math" title="The whole RAG bill in four lines">
+  Prompt: 4,296 tokens. Prefill: 69 TFLOP, about 127 ms on one H100 at 55% MFU, 402 ms on an A100. KV: 0.56 GB for the request. Retrieval, before any of that: an embedding call at roughly 10–50 ms and a vector search at roughly 1–20 ms, so call it 20–70 ms and mark it approximate, because both depend on the service and the index.
+</Callout>
+
+Retrieval latency belongs in TTFT. Time to first token is queueing plus retrieval plus prefill plus sampling the first token. With the numbers above, a RAG request has a TTFT of roughly 150–200 ms before queueing, against roughly 127 ms for the same prompt with no retrieval. The search is not free; it is a second service on the critical path.
+
+Cost follows the GPU seconds. At an illustrative \$2.50 per H100-hour, 0.127 s of prefill costs about \$0.000088, or \$88 per million queries, counting prefill only. Decode, the embedding service and the vector database add their own lines. The point is not the exact price; it is that a 4.3K-token prompt is a real compute purchase, repeated for every question.
+
+## Why RAG hurts prefix caching
+
+*Prefix caching* gave you the rule: a prompt's hidden states depend only on the tokens before them, so an identical prefix produces identical keys and values, and reuse is exact. *RadixAttention, eviction & cache-friendly apps* turned that into a tree of shared blocks and a design rule: stable prefix first, variable tail last, byte-identical or nothing.
+
+A RAG prompt has a stable head and a variable body. The system prompt is identical on every request; the eight retrieved chunks are not. The hit rate is therefore:
+
+$$
+\text{hit rate} = \frac{150}{4{,}296} = 3.5\%
+$$
+
+At 29.5 microseconds per token, reusing 150 tokens saves about 4.4 ms out of 127 ms. The cache is working correctly and is almost useless.
+
+The body varies for three separate reasons, and each one is fixable:
+
+- **Different questions retrieve different chunks.** Nothing can make two unrelated questions share a passage set.
+- **The same chunks arrive in a different order.** A retriever that sorts by floating-point score can flip the order of near-ties from one run to the next. The first changed chunk ends the prefix match, so everything after it is recomputed.
+- **The template changes.** A timestamp, request ID or user ID at the front of the prompt changes byte one. The cache walk stops at block zero.
+
+The practical fixes are application changes, not engine changes:
+
+1. **Put stable content first.** System prompt, tool schemas and fixed instructions go at the front. Per-request metadata goes at the end, after the retrieved context.
+2. **Sort retrieved chunks deterministically.** Sort by document ID, not by a score that can tie. If two queries retrieve the same eight chunks, they now produce the same 4,096-token block.
+3. **Dedupe.** The same chunk retrieved twice wastes 512 tokens and shifts every later position.
+4. **Keep the template byte-identical.** No dates, no UUIDs, no “current user” line in the shared head.
+
+The payoff is large when the set repeats. If the same eight chunks arrive in the same order, the shared prefix is $s = 150 + 4{,}096 = 4{,}246$ tokens, a 98.8% hit rate, and the prefill falls to the 50 tokens of question and template: about 1.5 ms instead of 127 ms.
+
+| What two queries share | Shared tokens | Hit rate | Prefill after reuse |
+|---|---|---|---|
+| Different chunks | 150 | 3.5% | 122 ms |
+| Same chunks, unstable order | 150 | 3.5% | 122 ms |
+| Same chunks, sorted by document ID | 4,246 | 98.8% | 1.5 ms |
+| Same chunks and same question | 4,276 | 99.5% | 0.6 ms |
+
+<Callout type="pitfall" title="The timestamp that costs a hundred milliseconds">
+  A prompt that begins `Request 8f3c… at 2026-10-29T14:02:11Z` is different on every request, even when the question and the retrieved passages are identical. The cache cannot match block one. Move the metadata after the context, or drop it from the prompt entirely and log it beside the request. This is the cheapest latency fix in most RAG systems.
+</Callout>
+
+## CAG: preload the knowledge base
+
+CAG takes the prefix-caching idea to its limit. Instead of retrieving a few chunks per question, put the whole small knowledge base into the context once:
+
+```
+[ fixed instructions ][ the entire knowledge base ][ this question ]
+```
+
+Run prefill once. Store the resulting KV blocks as a prefix. Every later question reuses that prefix and computes only its own question. There is no embedding call, no vector search and no retriever to maintain. The engine is doing exactly what *Prefix caching* described; the prefix just happens to be enormous.
+
+The memory is the price. A 100,000-token prefix on Llama-3.1-8B in FP16 uses:
+
+$$
+100{,}000 \times 131{,}072 = 13.1 \times 10^9 \text{ bytes} = 13.1 \text{ GB}
+$$
+
+That is 12.2 GiB, and it stays resident for as long as the prefix is cached. On an 80 GB H100, with 16.06 GB of weights and a 4% workspace:
+
+$$
+\text{free for KV} = (80 - 16.06 - 3.2) \times 0.9 = 54.7 \text{ GB}
+$$
+
+$$
+\frac{54.7}{13.1} = 4.2
+$$
+
+So **four** such prefixes fit, using 52.4 GB and leaving about 2.3 GB for the questions' growing KV. In practice you might run three and keep the fourth slot as headroom for a burst of concurrency; the arithmetic is the same either way. A 500,000-token knowledge base would need 65.5 GB, which does not fit beside the weights on one 80 GB card, and it also exceeds Llama-3.1-8B's 128K context window.
+
+Per-query prefill is almost nothing. A 30-token question costs $t = 30 \times 29.5\ \mu\text{s} = 0.9$ ms of compute, plus roughly 1.5–2 ms of fixed per-step overhead. TTFT is about 3 ms, with no retrieval service in front of it.
+
+The costs are elsewhere:
+
+- **Freshness.** Changing one document invalidates the prefix. Rebuilding a 100K-token prefix costs at least $t = 100{,}000 \times 29.5\ \mu\text{s} = 2.95$ s of GPU for the weight matmuls alone. At this length attention's quadratic term is no longer small: causal attention adds roughly $2 n^2 d$ FLOPs per layer, about 2.6 PFLOP over 32 layers, so the real rebuild is closer to **8 s** on one H100. If the knowledge base changes hourly, that is a rounding error; if it changes on every request, CAG is the wrong design.
+- **Size.** The knowledge base must fit both the context window and the KV budget. A 100K-token base is comfortable on an 8B model with 128K context; a 500K-token base is not.
+- **Multi-tenancy.** One prefix per tenant or per knowledge base. With four slots, a fifth tenant evicts one, and the evicted tenant's next query pays the full rebuild, about 8 s. This is *RadixAttention*'s eviction rule meeting a very expensive leaf: shared prefixes survive pressure, but only until the whole subtree is cold.
+- **Quality.** Long-context accuracy is not flat. Models tend to use the beginning and the end of a long context better than the middle, which *What breaks at long context* in Module 20 covers in detail. CAG removes retrieval errors and replaces them with placement and overflow errors.
+
+<Callout type="mentor" title="When to reach for which">
+  Use **CAG** when the knowledge base is small enough to fit, stable for hours or days, and the workload is latency- or throughput-sensitive: product documentation, a policy manual, a fixed codebase, a tenant's contract set. Use **RAG** when the corpus is large, changes often, is per-user, or needs citations and access control at the chunk level. Use **both** when a stable core answers most questions and a long tail needs fresh retrieval: CAG the core, RAG the tail, and keep the system prompt identical in both paths.
+</Callout>
+
+## RAG vs CAG, in one table
+
+| | RAG | CAG |
+|---|---|---|
+| **TTFT** | about 150–200 ms: 20–70 ms retrieval plus 127 ms prefill | about 3 ms: 0.9 ms prefill plus overhead |
+| **Cost per query** | 4,296-token prefill plus retrieval service | 30-token prefill; the 13.1 GB prefix is paid once |
+| **Freshness** | fresh: re-index the changed chunk | stale until the prefix is rebuilt (about 8 s per 100K tokens) |
+| **Knowledge-base size** | effectively unbounded; the vector database holds it | bounded by context window and KV memory; four 100K prefixes per 80 GB |
+| **Failure mode** | bad retrieval: the right passage was never fetched | context overflow, or the answer buried in the middle |
+| **Multi-tenant eviction** | trivial: each request owns its KV and frees it | four prefixes per card; a fifth tenant forces an ~8 s rebuild |
+
+The table is a set of trade-offs, not a verdict. RAG is a quality-and-freshness tool that happens to be prefill-heavy. CAG is a serving-efficiency tool that happens to be memory-heavy. Most production systems end up with a hybrid because those two pressures usually arrive together.
+
+## The hybrid, and the frontier
+
+A useful default: keep the stable core in a CAG prefix and retrieve only what changes. A support product might preload 60,000 tokens of product documentation and policy, then retrieve eight fresh ticket chunks per question. The stable 60K is prefilled once; the ticket chunks are prefilled per query; the system prompt is shared by both paths. You get CAG's latency for the common case and RAG's freshness for the long tail.
+
+There is one more idea worth knowing, because it breaks the assumption this whole lesson rests on. Prefix caching only reuses a *prefix*. Retrieved chunks are not a prefix: they arrive in a different order on every query, so their KV cannot be reused by an ordinary cache. **CacheBlend-style selective recompute** attacks exactly that. It stores KV for individual chunks, reuses it wherever the chunk appears, and recomputes a small fraction of tokens to restore the cross-attention that the reuse missed. At the time of writing this is a research direction with prototype implementations, not a default feature of every engine. It points at the same future as *Tiered KV: CPU, SSD & remote caches* in Module 20: a large CAG prefix need not live entirely on the GPU, and a retrieved chunk need not be recomputed from scratch.
+
+At the time of writing, vLLM and SGLang both implement prefix caching at block granularity, with SGLang's RadixAttention organising the cache as a tree. A CAG workload is therefore mostly a prompt-shape decision plus a memory-budget decision, not a new engine feature: make the knowledge base the prefix, keep it byte-identical, and reserve enough KV memory for it. The engine-specific knobs and defaults move; the arithmetic in this lesson does not.
+
+```python
+# The bill for the RAG example, and the CAG alternative.
+P = 8.03e9              # Llama-3.1-8B parameters
+FLOPS = 989e12          # H100 dense BF16, FLOP/s
+MFU = 0.55
+KV_PER_TOKEN = 2 * 32 * 8 * 128 * 2   # 131,072 bytes
+
+sys, chunk, k, q, tmpl = 150, 512, 8, 30, 20
+prompt = sys + k * chunk + q + tmpl
+
+flops = 2 * P * prompt
+ttft = flops / (FLOPS * MFU)
+kv = prompt * KV_PER_TOKEN
+
+print(f"prompt      {prompt:,} tokens")
+print(f"prefill     {flops/1e12:.0f} TFLOP, {ttft*1000:.0f} ms")
+print(f"KV          {kv/1e9:.2f} GB")
+print(f"hit rate    {sys/prompt*100:.1f}% if only the system prompt is shared")
+
+kb = 100_000
+cag_kv = kb * KV_PER_TOKEN
+free = (80e9 - 16.06e9 - 0.04 * 80e9) * 0.9
+print(f"CAG prefix  {cag_kv/1e9:.1f} GB, {free/cag_kv:.1f} prefixes fit")
+```
+
+<KeyNotes>
+  1. RAG is an offline index plus an online query: chunk, embed, store, then embed the question, find nearest chunks by cosine similarity, assemble a prompt and generate.
+  2. A prompt of 8 chunks × 512 tokens plus a 150-token system prompt and 50 tokens of question and template is 4,296 tokens; 95% of it is retrieved context.
+  3. Prefill costs $F = 2Pn$ FLOP, so the 4,296-token prompt is 69 TFLOP: about 127 ms on an H100 at 55% MFU, 402 ms on an A100.
+  4. Llama-3.1-8B stores 131,072 bytes of KV per token, so that prompt holds 0.56 GB of KV for the life of the request.
+  5. Retrieval is part of TTFT: an embedding call plus a vector search adds roughly 20–70 ms, approximate and service-dependent, before prefill starts.
+  6. RAG usually gets a tiny prefix-cache hit because only the system prompt is stable. Sort chunks by document ID, dedupe, keep the template fixed, and put stable content first.
+  7. CAG prefills a whole small knowledge base once: 100K tokens is 13.1 GB of KV, and four such prefixes fit beside the weights on an 80 GB GPU. Per-query prefill is about 0.9 ms.
+  8. CAG trades freshness and memory for latency; RAG trades latency and retrieval complexity for freshness and unbounded corpus size. The hybrid keeps a stable core in CAG and retrieves the changing tail.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A RAG prompt is 4,296 tokens for Llama-3.1-8B. Using 2 × parameters × tokens, roughly how many FLOPs does its prefill cost?', numeric: true, answer: 69, tolerance: 6, unit: 'TFLOP', why: '2 × 8.03e9 × 4,296 = 6.90e13 FLOP = 69 TFLOP. Divide by 989e12 × 0.55 to get about 127 ms on one H100.' },
+  { q: 'Llama-3.1-8B stores 131,072 bytes of KV per token. How much KV does a 4,296-token RAG prompt occupy?', numeric: true, answer: 563, tolerance: 35, unit: 'MB', why: '4,296 × 131,072 = 563,183,616 bytes ≈ 563 MB, or 0.56 GB. It is freed when the request finishes, unlike a CAG prefix.' },
+  { q: 'A 100,000-token CAG prefix on Llama-3.1-8B in FP16 occupies how many GB of KV cache?', numeric: true, answer: 13.1, tolerance: 0.8, unit: 'GB', why: '100,000 × 131,072 = 13.1072e9 bytes = 13.1 GB (12.2 GiB). That is the memory that must stay resident for the prefix to be reusable.' },
+  { q: 'On an 80 GB GPU, after 16.06 GB of weights, a 4% workspace and 10% headroom, how many 13.1 GB CAG prefixes fit?', numeric: true, answer: 4, tolerance: 0, unit: 'prefixes', why: 'Free = (80 − 16.06 − 3.2) × 0.9 = 54.7 GB. 54.7 ÷ 13.1 = 4.2, so 4 whole prefixes fit, using 52.4 GB and leaving about 2.3 GB.' },
+  { q: 'A RAG service retrieves the same documents for similar questions but has a 3% prefix-cache hit rate. What is the most likely cause?', options: ['The KV blocks are too small', 'The retriever returns chunks in an unstable order, so the assembled prompt differs after the system prompt', 'The model is too large for the GPU', 'The embedding model returns too many dimensions'], answer: 1, why: 'A prefix hit needs the same tokens at the same positions. If score ties or an unstable sort change the chunk order, the cache walk stops at the first changed block, leaving only the system prompt reusable.' },
+  { q: 'Which workload is the worst fit for CAG?', options: ['A fixed 60K-token product manual answering support questions all day', 'A tenant’s contract set that changes once a month', 'A knowledge base that changes on every request and must be fresh', 'A policy handbook with high query volume and a tight TTFT target'], answer: 2, why: 'Every change invalidates the 13.1 GB prefix, and rebuilding 100K tokens costs about 2.95 s of GPU. CAG rewards stable knowledge; a corpus that changes per request is RAG territory.' },
+]} />

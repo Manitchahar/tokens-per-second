@@ -96,6 +96,28 @@ export const terms: Record<string, GlossaryEntry> = {
     lesson: 'economics/capacity-planning',
   },
 
+  // ── Module 25.4 · Managed APIs, cloud platforms & build vs buy
+  'managed-api': {
+    term: 'Managed API',
+    def: 'A serving option in which the provider owns the model, GPUs, engine, batching, caching, autoscaling and on-call rota, and you call an HTTP endpoint and pay per token. It is the least-control, least-work end of the build-versus-buy spectrum: you cannot change kernels, KV reuse policies, routing or the weights.',
+    lesson: 'economics/build-vs-buy',
+  },
+  'byo-container': {
+    term: 'BYO container',
+    def: 'Bring-your-own-container: a serving contract in which you supply an image and the platform runs it. The image must expose an HTTP server on the port the platform routes to, a readiness endpoint that returns 200 only after warm-up, an invocation endpoint, weights read from a mounted path, and a clean shutdown. The platform supplies the cluster and endpoint; everything inside the image is yours.',
+    lesson: 'economics/build-vs-buy',
+  },
+  tco: {
+    term: 'Total cost of ownership (TCO)',
+    def: 'The full cost of running a system: GPU-hours multiplied by the number of cards kept warm, plus on-call engineers, monitoring, spare capacity, failed hardware, storage and egress. It is not the hourly GPU rate, the tokens/s on a benchmark or the price of one card. TCO is the number that must be compared with a per-token API bill.',
+    lesson: 'economics/build-vs-buy',
+  },
+  'crossover-volume': {
+    term: 'Crossover volume',
+    def: 'The daily output-token volume at which a per-token API bill equals the total monthly cost of self-hosting: V* = O × 10^6 / (30.42 × (c_api − c_self)), where O is monthly operations and c_self is the self-hosted marginal cost per million. Below it the API is cheaper because the fixed bill dominates; above it the self-hosted curve flattens and wins. Lower average utilisation raises c_self and pushes the crossover to the right, and far enough down it removes the crossover entirely.',
+    lesson: 'economics/build-vs-buy',
+  },
+
   // ── Module 25.P · Project: the cheapest system that meets the SLO
   'cheapest-system-that-meets-slo': {
     term: 'Cheapest system that meets the SLO',

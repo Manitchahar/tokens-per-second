@@ -146,7 +146,68 @@ Worked: 1,800 tok/s × 82% good at \$2.50/h → 1,476 good tok/s → **≈ 2.1 M
 - [ ] Is the build/rebuild cost of an AOT engine in the comparison?
 - [ ] Is the top weight stress-tested, and is a close result reported as a close result?
 
+## Multi-model serving & Triton Inference Server
+
+**When it wins:** many small models, each a few percent busy, with a long tail. **When it loses:** a model that fills a card, a strict SLO on cold models, or per-tenant isolation.
+
+$$
+\text{GPUs needed} = \text{models} \times \text{utilisation per model}, \qquad
+\text{monthly cost} = \text{GPUs} \times \text{price per hour} \times 730
+$$
+
+Worked: 20 models at 3% compute = 0.6 GPU of work. 20 L4s at ≈ \$0.80/h = \$16/h ≈ \$11,680/month; 2 L4s = \$1.60/h ≈ \$1,168/month. Saving ≈ **\$10,500/month**.
+
+$$
+\text{usable VRAM} = \text{GPUs} \times \text{mem} \times (1 - \text{reserve}), \qquad
+\text{resident models} = \text{fit by size, not by count}
+$$
+
+**Three tiers of a model cache:**
+
+| Tier | Hit / miss | What it costs |
+|---|---|---|
+| GPU VRAM | cache hit | ≈ 0 s |
+| CPU RAM | warm swap | one PCIe copy |
+| Disk / object store | cold load | disk read **plus** PCIe copy |
+
+$$
+t_{\text{load}} = \frac{\text{bytes}}{\text{bandwidth}}, \qquad
+t_{\text{cold}} = \frac{B}{b_{\text{disk}}} + \frac{B}{b_{\text{PCIe}}}
+$$
+
+- 14 GB (7B FP16), 1 GB/s disk, 25 GB/s PCIe: **14 s + 0.56 s ≈ 14.6 s cold**, **0.56 s warm**, **0 s hot**.
+- Cold is ≈ **26×** a warm swap. Quantization shrinks the bytes and therefore the load: 4-bit 7B ≈ 3.5 GB ≈ 3.5 s cold.
+- **LRU evicts the oldest request first**, not the least valuable model. Report p99 including misses, never the hit rate alone.
+- **Router rule 1:** send the request to a host that already has the weights. **Rule 2:** when none does, choose by memory headroom and eviction cost, and make the load visible.
+- Prefer a host with the model resident over the least-loaded host. A cache miss is a 14-second detour, not a balancing opportunity.
+
+**Triton Inference Server** (not the kernel language from Module 13):
+
+```text
+model_repository/
+├── reranker/
+│   ├── config.pbtxt
+│   └── 1/
+│       └── model.onnx
+└── llama-8b/
+    ├── config.pbtxt
+    └── 1/
+```
+
+| `config.pbtxt` key | What it does |
+|---|---|
+| `platform` / `backend` | picks TensorRT, ONNX Runtime, PyTorch, Python, vLLM or TensorRT-LLM |
+| `max_batch_size` | turns on batching; first dim becomes the batch dim (`-1` in `dims`) |
+| `dynamic_batching` | `preferred_batch_size`, `max_queue_delay_microseconds` |
+| `instance_group` | copies of the model and whether they run on GPU |
+| `ensemble_scheduling` | pipeline of models inside one server request |
+
+- Run with `--model-control-mode=explicit` to load/unload yourself:
+  `POST /v2/repository/models/<name>/load` and `/unload`.
+- Inference: `POST /v2/models/<name>/infer`. Defaults at the time of writing: HTTP **8000**, gRPC **8001**, metrics **8002**.
+- Triton gives you the backend, batching and lifecycle primitives. **Your control plane owns the cache policy, the router and the replica counts.**
+
 ## Module order
 
-- 17.1 fair-comparison → 17.2 engines-compared → 17.P project-engine-matrix
+- 17.1 fair-comparison → 17.2 engines-compared → 17.3 multi-model-triton → 17.P project-engine-matrix
 - Next: **Module 18 Multi-GPU Parallelism** — the models your derived column could not fit on one card.

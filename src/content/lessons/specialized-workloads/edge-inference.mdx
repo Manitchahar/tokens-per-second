@@ -1,0 +1,297 @@
+---
+title: 'On-device & edge inference'
+summary: 'Running the model on the user’s own phone changes every constant in the arithmetic: a few gigabytes of RAM, tens of gigabytes per second of bandwidth, a battery for a power budget and a fanless chassis for a thermal limit. Decode is still bandwidth-bound, so compression becomes a prerequisite rather than an optimisation, and accelerator TOPS numbers stop predicting tokens per second.'
+objectives:
+  - Explain what on-device serving buys and what it costs
+  - Trace a trained checkpoint through conversion, a device runtime and an app wrapper
+  - Compute tokens per second on a phone from bandwidth and bytes per weight
+  - Budget an 8 GB phone between the OS, the app, the weights and the KV cache
+  - Explain why NPU TOPS does not translate into decode speed, and when to escalate to the cloud
+---
+import EdgeInference from '@/components/viz/specialized-workloads/EdgeInference.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A flagship phone has 8 or 12 GB of memory, a bus that moves roughly 50 to 70 GB/s, and no fan. An H100 has 80 GB of memory, a bus that moves 3.35 TB/s, and a heatsink the size of a laptop. The gap is about fifty times in bandwidth and ten times in capacity, and yet a 3-billion-parameter model at 4 bits fits on the phone and talks at about twenty tokens a second.
+
+That twenty is not a published benchmark. It is one division, the same one from *The two speed limits: compute and bandwidth*: read the weights, produce a token, divide bytes by bandwidth. The machine changed; the rule did not.
+
+## Why a model would live on the device
+
+<Term t="edge-inference">On-device serving</Term> means the model runs on the user's hardware — a phone, a laptop, a camera, a car — instead of in a datacenter. Four arguments are usually given for it.
+
+**Latency without a network round trip.** A cloud request crosses a network, which costs tens of milliseconds each way and varies with tunnels, congestion and provider queues. A local model has no round trip at all. For a wake word or a camera filter, where the job is a few milliseconds of work, removing the network is the entire win.
+
+**Privacy and data locality.** Raw audio, photographs, biometrics and health data never leave the device — sometimes a product promise, sometimes a legal requirement.
+
+**Offline operation.** A model on the device keeps working with the radio off — aircraft, factories, remote sensors, cars.
+
+**Cost moved to the user.** Every token generated locally is one you do not pay a provider for. The marginal cost becomes an app download, and the electricity bill belongs to somebody else.
+
+Now the other column.
+
+**Memory.** A phone's 8 GB is shared with the operating system and every other app, and the KV cache lives in the same fraction as the weights.
+
+**Battery and heat.** Sustained inference draws watts, and there is no fan. A chip at full clock for a minute gets hot, and a hot chip slows down.
+
+**Fragmented hardware and rollout.** Two phones from the same year have different accelerators and different operator support, and every model change is an app-store release to a hundred million devices.
+
+<Callout type="mentor" title="The honest version of the latency argument">
+  For a 3B language model the phone's own prefill can take hundreds of milliseconds, longer than the network round trip it was supposed to avoid. On-device does not beat a warm datacenter on raw speed for a long prompt. What it buys is privacy, offline operation, marginal cost, and a tail latency that does not depend on somebody else's queue. Keep those four separate from "it is faster", because only the last is usually false.
+</Callout>
+
+## The stack: a file, a runtime, a wrapper
+
+A cloud deployment ships a container. A device deployment ships three things, and confusing them wastes weeks.
+
+**The model file.** The checkpoint is converted into a format a device runtime can load: GGUF for llama.cpp, ONNX for ONNX Runtime, a `.tflite` file for <Term t="device-runtime">LiteRT</Term> (the runtime formerly called TensorFlow Lite, at the time of writing), a `.mlpackage` for Core ML, a `.pte` for ExecuTorch. The format fixes the quantization scheme, the tensor layouts, and which operations exist at all.
+
+**The runtime.** The runtime sits between that file and the silicon. It chooses kernels, schedules work across the CPU, GPU and NPU, and on most mobile runtimes supports *delegates*: components that hand a whole subgraph to a specialised accelerator. LiteRT, ONNX Runtime, Core ML, ExecuTorch and llama.cpp do not support the same operations.
+
+**The app wrapper.** Your code. It tokenizes, calls the runtime, detokenizes, streams partial output, and owns the lifecycle: when to load the model, when to free it, what to do when the operating system asks for memory back.
+
+Conversion is a compiler, so it has compiler problems: operators with no implementation on the target, fusions that change numerics, layouts that force a transpose at every layer boundary.
+
+<Callout type="pitfall" title="Validate numerics after conversion, not before">
+  A converted model that loads and produces fluent text can still be wrong. The failure is quiet: one operator falls back to a slower path with different rounding, or a fused activation loses a little precision, and the damage shows up on rare tokens, long contexts, or one language. Run the same fixed prompt set through the original checkpoint and the device build and compare logits: top-1 agreement per position, maximum absolute logit difference, and your own task metric. Anything that moves the task metric is a blocker.
+</Callout>
+
+```python
+# Convert once, on a workstation. Ship the artifact, never the checkpoint.
+# llama.cpp's converter writes a single GGUF file at a chosen quantization.
+subprocess.run([
+    "python", "convert_hf_to_gguf.py", "Llama-3.2-3B-Instruct",
+    "--outfile", "llama32-3b-q4_k_m.gguf",
+    "--outtype", "q4_k_m",
+], check=True)
+```
+
+```python
+# Numeric validation: the same prompts, two builds, one comparison.
+ref = logits_from_checkpoint(prompts)     # BF16, on the training machine
+dev = logits_from_device(prompts)         # 4-bit, on the target phone
+print("top-1 agreement", (ref.argmax(-1) == dev.argmax(-1)).float().mean())
+print("max |delta logit|", (ref - dev).abs().max())
+print("task metric", score(dev))          # the only number that decides
+```
+
+## The decode arithmetic, on a phone
+
+<Scrolly>
+  <EdgeInference client:visible slot="stage" />
+
+  <Step title="1. A phone is a whole computer with a budget">
+    The sticker says 8 GB, but the OS and other apps are already resident. **What is left for weights and KV cache is a fraction of it** — and that fraction decides which models are possible.
+  </Step>
+
+  <Step title="2. The stack: a file, a runtime, a wrapper">
+    A runtime-specific model file, a runtime that maps it onto this chip, and an app wrapper that owns input, output and lifecycle. **Three layers, and only the middle one knows hardware.**
+  </Step>
+
+  <Step title="3. Decode is a pipe from memory to math">
+    Every token reads every weight once, so step time is bytes divided by bandwidth and the compute units wait. **The pipe is the constraint**, only narrower than a GPU's.
+  </Step>
+
+  <Step title="4. Swap 16-bit weights for 4-bit">
+    A quarter of the bytes moves a quarter of the data per token, so tokens per second rise by roughly the same factor. **Compression is what makes the model run at all.**
+  </Step>
+
+  <Step title="5. Sustained load heats the chip">
+    A fanless chassis cannot hold burst clocks. After tens of seconds the clock and the achieved bandwidth drop, and so does tokens per second. **The first ten seconds are not what the user gets.**
+  </Step>
+
+  <Step title="6. Hard requests go to the cloud">
+    The phone keeps what it can answer and escalates the rest. Network, battery, temperature, confidence and request size are the routing signals. **The violet arrow is a cost you choose to pay.**
+  </Step>
+</Scrolly>
+
+The derivation is the one from *Prefill vs decode: two different workloads*, with new constants. For one sequence decoding alone, a step reads every weight once:
+
+$$
+t_{\text{step}} \approx \frac{P \cdot b_w}{\text{BW} \times \eta}, \qquad \text{tokens/s} \approx \frac{\text{BW} \times \eta}{P \cdot b_w}
+$$
+
+where $P$ is parameter count, $b_w$ bytes per weight, $\text{BW}$ peak bandwidth and $\eta$ the fraction achieved.
+
+Start with the bandwidth. A phone's memory is LPDDR5X on a 64-bit bus; at 8,533 million transfers per second and 8 bytes per transfer:
+
+$$
+8{,}533 \times 10^{6} \times 8 = \boxed{68.3 \text{ GB/s}}
+$$
+
+An older LPDDR5 part at 6,400 MT/s gives 51.2 GB/s, which is the bottom of the range. A laptop uses the same memory on a wider bus: 128 bits is 136.5 GB/s, 256 bits is 273 GB/s, and the fastest laptop parts quoted at the time of writing reach about 400 GB/s.
+
+Now the model. Llama-3.2-3B has 3.21 billion parameters. At 16 bits each that is:
+
+$$
+3.21 \times 10^{9} \times 2 = 6.42 \text{ GB}
+$$
+
+At 4 bits the naive answer is 1.6 GB, but a real file is about **4.5 bits per weight** once per-block scales and minimums are stored, or 0.5625 bytes:
+
+$$
+3.21 \times 10^{9} \times 0.5625 = \boxed{1.81 \text{ GB}}
+$$
+
+That is where the "1.5 to 2 GB for a 3B at 4-bit" rule of thumb comes from. Now divide, at 60 GB/s and 60% efficiency:
+
+$$
+\text{tokens/s} = \frac{60 \times 0.6}{1.81} = \boxed{19.9}
+$$
+
+About twenty tokens a second. At 16 bits the same model would move 6.42 GB per token and give 5.6 tokens a second. On a laptop at 200 GB/s the 4-bit model gives 66.
+
+| device | bandwidth (approx.) | 3B at 16-bit | 3B at 4-bit |
+|---|---|---|---|
+| phone | 50–70 GB/s | 5–7 tok/s, and does not fit | **18–24 tok/s** |
+| laptop, 128-bit | ~136 GB/s | 13 tok/s | 45 tok/s |
+| laptop, 256-bit | ~273 GB/s | 26 tok/s | 90 tok/s |
+
+<Callout type="math" title="Why the bytes per weight is 4.5 and not 4">
+  Quantization is not free storage. A 4-bit format stores groups of weights with a shared scale, and often a shared minimum, in higher precision. Take a group of 32 weights at 4 bits: 128 bits of payload. One FP16 scale is another 16 bits, so the group is 144 bits, or 4.5 bits per weight. Group size 128 would bring it to 4.125, and a format with both a scale and a minimum at group size 32 lands near 5.
+
+  **The overhead is a function of group size, and it is the first thing to check when a "4-bit" file is bigger than you calculated.**
+</Callout>
+
+## Does it fit? The RAM budget
+
+Speed is the second question. The first is whether the model fits, and on a phone the answer is a budget with four line items.
+
+An 8 GB phone, approximate: the operating system holds about 3 GB, this app and its runtime about 1.5 GB, leaving **3.5 GB** for the model. A 3B at 4 bits needs 1.81 GB of weights, and the KV cache needs its own space. For Llama-3.2-3B — 28 layers, 8 KV heads of 128 dimensions, 16-bit cache — the bytes per token are:
+
+$$
+2 \times 28 \times 8 \times 128 \times 2 = 114{,}688 \text{ bytes} \approx 112 \text{ KB}
+$$
+
+At 2,048 tokens that is 2,048 × 112 KB = 229 MB, so the model occupies 2.04 GB and leaves 1.46 GB spare. At 8,192 tokens the cache alone is 918 MB and the spare shrinks to 0.77 GB. **Context length is a memory dial.**
+
+The same 3B at 16 bits needs 6.42 GB, so with the OS, the app and a 2K KV cache the requirement is 11.2 GB — 3.2 GB more than the phone has. It does not fit at all. A 12 GB phone leaves 7.5 GB and fits the weights with 1.1 GB to spare.
+
+| phone | free for the model | 3B 16-bit | 3B 4-bit + 2K KV |
+|---|---|---|---|
+| 8 GB | ~3.5 GB | does not fit | fits, 1.4 GB spare |
+| 12 GB | ~7.5 GB | fits, 1.1 GB spare | fits, 5.4 GB spare |
+
+## Compression is a prerequisite, not an optimisation
+
+On a GPU, quantization is a trade you make after the model works. On a phone it is the reason the model exists on the device at all.
+
+Three levers, in the order they are usually pulled.
+
+**Fewer bits per weight.** 4-bit is the default on the edge. Decode is bandwidth-bound, so the gain is bytes moved per token, and it is close to linear. The edge twist is that dequantization now competes with a very small amount of real work, so a badly chosen group size can cost a measurable slice of the speed you just bought.
+
+**A smaller model.** A 1B at 4 bits is 0.87 GB and runs at about 40 tokens a second on the same phone. Most on-device deployments are decided here, not in the quantizer.
+
+**Distillation.** Training a small model to imitate a large one is how the good small models got good, and it is the only lever that improves quality and size together.
+
+Fix the memory budget first — 3.5 GB minus the KV cache you want — then spend it on the largest model at the lowest precision that passes evaluation. The other order is how teams ship a model that is fast and wrong.
+
+## The chip is not one thing
+
+A phone system on a chip contains a CPU, a GPU, and one or more <Term t="npu">NPUs</Term> — arrays of small multiply-accumulate engines built for low-precision matrix math — plus often a DSP and an image processor. The runtime chooses the accelerator per operation, not you.
+
+NPUs are marketed in TOPS: trillions of operations per second, usually at 8-bit integer precision. Because a phone has a power budget, the more informative number is <Term t="tops-per-watt">TOPS per watt</Term>. A datacenter part is judged on peak throughput; a phone is judged on efficiency, because the battery and the chassis are the product.
+
+Here is the trap. One token of the 3B model needs about two operations per parameter:
+
+$$
+2 \times 3.21 \times 10^{9} = 6.4 \text{ GFLOP per token}
+$$
+
+Suppose the NPU is rated at 30 TOPS and you get 30% of it, so 9 TOP/s:
+
+$$
+\frac{6.4 \times 10^{9}}{9 \times 10^{12}} = \boxed{0.7 \text{ ms}}
+$$
+
+The memory time is 50 ms. The NPU is busy for about **1.4% of the step**, and doubling its TOPS would change nothing.
+
+**TOPS is a prefill number.** The 0.7 ms above is *decode*, where one token's arithmetic is tiny next to the weight read. Prefill is the opposite: 500 prompt tokens is 500 times the arithmetic, so 500 × 6.4 GFLOP = 3.2 TFLOP at 9 TOP/s is **357 ms**. That is why a phone streams at twenty tokens a second and still takes a third of a second to start.
+
+This is also why <Term t="heterogeneous-compute">heterogeneous compute</Term> is a partitioning problem. A crossing between units costs a fixed synchronisation — tens of microseconds, varying by platform — plus a copy of whatever tensor moves, and the tensor is usually tiny (4,096 values in 16-bit is 8 KB). **The fixed latency is the cost.** Cross twice per block and a 28-layer model pays 56 crossings; at 30 µs each that is 1.7 ms of a 50 ms step, about 3%. Cross once per operator at ten per block and you pay 28 ms — more than half the step, spent waiting.
+
+The rule: **partition at block boundaries, and never let one unsupported operator sit in the middle of every block.**
+
+## Heat is a scheduling problem
+
+A datacenter GPU that gets hot spins its fans faster. A phone has nowhere to put the heat, so it lowers its clock. This is <Term t="thermal-throttling">thermal throttling</Term>, not a fault — the normal steady state of a fanless device under load.
+
+The distinction that matters is **burst versus sustained**. A phone SoC draws high power for seconds to tens of seconds, then settles. When the clock drops the memory clock usually drops too, and the achieved bandwidth with it. At 55% of burst clock:
+
+$$
+\text{tokens/s} = \frac{60 \times 0.6 \times 0.55}{1.81} = \boxed{10.9}
+$$
+
+Twenty tokens a second becomes eleven, and the user experiences the second number. A ten-second benchmark measures the burst; a minute-long run that reports the last twenty seconds measures the device.
+
+Three practical rules:
+
+1. **Run for at least a minute of continuous generation**, and report the time series, not one average. The shape is the finding.
+2. **Report first-minute and steady-state separately.** Both are real; they answer different questions.
+3. **Record the ambient and the case.** A phone on a desk and a phone in a pocket are different machines.
+
+A thermal-aware scheduler responds to the same signal: near the limit it can switch to a smaller model, cap the answer length, or move work to a cooler core. That trades peak for stability, which is the right trade on a device somebody is holding.
+
+<Callout type="real" title="Where the watts go">
+  Moving bytes costs energy. LPDDR5 read energy is on the order of a few picojoules per bit — call it 5 pJ/bit, approximate and process-dependent. At 36 GB/s that is 288 billion bits per second, so the memory traffic alone is about **1.4 W**, before the compute units draw anything. A phone battery holds tens of watt-hours, so an hour of continuous generation is a serious fraction of it. **On the edge, tokens per second and tokens per joule are the same conversation.**
+</Callout>
+
+## Edge and cloud together
+
+Almost no real product chooses one side. The pattern is <Term t="edge-cloud-split">edge-cloud split</Term>: the device answers what it can and escalates the rest; the engineering is the routing rule.
+
+Five signals are worth having, and each maps to a different failure:
+
+| signal | what it tells you | what it should change |
+|---|---|---|
+| network | round-trip time, throughput, metered or not | escalate when the round trip is short and the link is cheap |
+| battery | charge level, charging state | stay local when low; escalate when plugged in |
+| temperature | throttling state, skin temperature | escalate when the device is already hot |
+| confidence | top-1 probability, entropy, failed schema check | escalate when the local model is unsure |
+| request size | prompt tokens, expected output tokens | escalate long prompts, keep short ones |
+
+The last one deserves the arithmetic, because it is the one people get backwards. On-device, a 500-token prompt costs about 357 ms of prefill plus decode. In the cloud the same prompt on an H100 costs about 6.5 ms of prefill, plus a 30 ms round trip, plus the provider's queueing. So for a long prompt the cloud wins on time to first token **because its compute is faster, not because the network is short**.
+
+Flip it around: a 20-token intent classification on a 1B model is a few milliseconds of device work, while a round trip is 30 ms before the server has done anything. There the network is the whole cost.
+
+```python
+def route(req, device):
+    # Cheap, local, private: answer here.
+    if req.prompt_tokens < 64 and device.confidence > 0.8:
+        return "device"
+    # The device cannot do this well, or is in no state to try.
+    if device.throttled or device.battery < 0.15:
+        return "cloud"
+    if req.prompt_tokens > 2000 or req.wants_reasoning:
+        return "cloud"
+    return "device"
+```
+
+## Sizing an on-device deployment
+
+| decision | default | when to change |
+|---|---|---|
+| model size | the largest that fits the free-RAM budget | shrink when the KV cache needs the room |
+| weight precision | 4-bit | 8-bit only if evaluation demands it |
+| KV precision | 8-bit | 16-bit for long-context quality |
+| context cap | 2K–4K tokens | raise only with a measured memory budget |
+| benchmark | 60 s continuous, report the tail | never report a 10 s burst as the product |
+
+<KeyNotes>
+  1. On-device serving buys privacy, offline operation, marginal cost and tail latency without somebody else's queue — but not raw speed, because a phone's prefill is slower than a network round trip.
+  2. The device stack is three layers: a converted model file (GGUF, ONNX, LiteRT, Core ML, ExecuTorch), a runtime that maps it onto the silicon, and an app wrapper that owns input, output and lifecycle.
+  3. Decode is still $t = P b_w / (\text{BW}\,\eta)$. A 3B model at 4.5 bits per weight is 1.81 GB, and 60 GB/s at 60% efficiency gives **about 20 tokens a second**.
+  4. A 4-bit file is about 4.5 bits per weight, not 4.0, because block scales and minimums are stored too — a function of group size, and the first thing to check when a file is bigger than calculated.
+  5. The RAM budget is OS + app + weights + KV cache. On an 8 GB phone roughly 3.5 GB is available, so a 3B at 4-bit fits with 1.4 GB spare and the same model at 16-bit does not fit at all.
+  6. NPU TOPS does not predict decode speed: 6.4 GFLOP per token against 9 TOP/s is 0.7 ms, versus 50 ms of memory time. TOPS predicts **prefill**, which is why a phone streams quickly and still takes a third of a second to start.
+  7. Thermal throttling is the steady state, not a fault: at 55% of burst clock the same model gives 11 tokens a second, so a benchmark must run for a minute and report the sustained tail.
+  8. Edge-cloud split is a routing decision over network, battery, temperature, confidence and request size — and the break-even is driven by compute, not by the network hop.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A 3B model is stored at 4.5 bits per weight. How large is the weight file, in GB?', numeric: true, answer: 1.8, tolerance: 0.15, unit: 'GB', why: '3.21e9 parameters x 4.5/8 bytes = 3.21e9 x 0.5625 = 1.81 GB. The naive 4-bit answer of 1.6 GB forgets the block scales; the real file is about 4.5 bits per weight.' },
+  { q: 'A phone has 60 GB/s of memory bandwidth and achieves 60% of it. The weights are 1.81 GB. What decode speed does that give, in tokens per second?', numeric: true, answer: 20, tolerance: 3, unit: 'tok/s', why: '60 x 0.6 = 36 GB/s achieved. 1.81 GB / 36 GB/s = 50 ms per token, so 20 tokens per second. This is the bandwidth-bound decode rule with the phone constants substituted in.' },
+  { q: 'A model has 28 layers, 8 KV heads of 128 dimensions and a 16-bit KV cache. How many KB does one token of context cost?', numeric: true, answer: 112, tolerance: 8, unit: 'KB', why: '2 (K and V) x 28 layers x 8 heads x 128 dims x 2 bytes = 114,688 bytes, about 112 KB. At 2,048 tokens that is 229 MB of the phone budget; at 8,192 it is 918 MB.' },
+  { q: 'Prefill of 500 tokens on a 3B model needs about 3.2 TFLOP. At an effective 9 TOP/s, how long does prefill take, in ms?', numeric: true, answer: 357, tolerance: 60, unit: 'ms', why: '3.21e12 / 9e12 = 0.357 s. Prefill is compute-bound, so this is where the NPU rating actually matters — unlike decode, where the same NPU is busy about 1.4% of the time.' },
+  { q: 'Why does a higher NPU TOPS rating usually not make decode faster on a phone?', options: ['NPUs cannot run transformer layers', 'Decode reads every weight once per token, so the step is bound by memory bandwidth and the compute units are mostly idle', 'TOPS is measured at a different clock and cannot be compared', 'Decode runs on the CPU by design'], answer: 1, why: 'One token of a 3B model is about 6.4 GFLOP. At an effective 9 TOP/s that is 0.7 ms, against 50 ms of memory time — the NPU is busy for roughly 1.4% of the step. TOPS predicts prefill, not decode.' },
+  { q: 'A benchmark reports 20 tokens per second from a ten-second run on a phone. What is the most likely problem?', options: ['The model was not quantized', 'Ten seconds measures the burst clock; sustained generation throttles and the user sees a lower rate', 'The KV cache was too small to matter', 'The network round trip was included by mistake'], answer: 1, why: 'A fanless device holds a high clock for a short window, then settles. At 55% of the burst clock the same 3B model gives about 11 tokens per second. Run for at least a minute and report the steady-state tail separately from the first seconds.' },
+]} />

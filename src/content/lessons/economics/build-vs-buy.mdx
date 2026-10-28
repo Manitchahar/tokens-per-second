@@ -1,0 +1,280 @@
+---
+title: 'Managed APIs, cloud platforms & build vs buy'
+summary: 'The real choice is not build or buy but which of six rungs to stand on. This lesson maps the rungs, the container contract behind them, and the arithmetic that tells you when a per-token bill becomes more expensive than a GPU you keep warm.'
+objectives:
+  - Place a serving choice on the six-rung spectrum from a pay-per-token API to a stack you operate yourself
+  - Explain the contract a managed platform expects from a bring-your-own container, and what it will never let you change
+  - Derive the crossover volume between a pay-per-token API and a self-hosted GPU, including idle time and hidden operating costs
+  - Choose an option for a prototype, a regulated enterprise, a steady high-volume workload and a spiky low-volume one
+  - Map the seven-layer serving architecture to the course and say which layers each rung removes from your desk
+---
+
+import BuildVsBuy from '@/components/viz/economics/BuildVsBuy.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have just spent a module learning to price a token and size a fleet. It would be easy to conclude that the right answer is always "build the cheapest system that meets the SLO". It is not.
+
+Most teams never build everything. They call an API, or deploy an open model to somebody else's endpoint, or put their own weights inside a provider's container. The interesting engineering question is not **build or buy**. It is **which part of the stack should be yours**, for this workload, at this volume, under these constraints.
+
+That question has a shape. It is a ladder of six rungs, and each rung hands a different set of layers to somebody else. This lesson walks the ladder, then does the arithmetic that decides where to stop.
+
+## The choice is a ladder, not a switch
+
+A <Term t="managed-api">fully managed foundation-model API</Term> is the leftmost rung. The provider owns the model, the GPUs, the engine, the batching policy and the on-call rota. You own an HTTP call and a bill quoted per token.
+
+At the other end, you own everything: the fleet, the engine, the kernels, the router, the autoscaler, the dashboards and the pager. Everything this course teaches lives on that end. Most production systems sit somewhere in between, and the useful question is which rung pays for itself.
+
+| Rung | What you control | What the provider hides | What you cannot do | How you pay |
+|---|---|---|---|---|
+| 1 · Foundation-model API | The prompt, the model choice, the application | Batching, prefix cache, autoscaling, cold starts | Change kernels, KV reuse policies, routing or weights | Per token |
+| 2 · One-click open-model endpoint | Model, instance type, a few environment settings | Container internals, engine defaults, autoscaling | Change batching policy, payload schema, CUDA version | Per instance-hour |
+| 3 · Bring your own weights | The model file and its version | Engine internals, kernel choice, KV policy, scaling | Change kernels or KV reuse policies; the contract is fixed | Per instance-hour |
+| 4 · Bring your own inference code | Model plus loading and request logic | Base image, drivers, cluster scaling, cold starts | Replace kernels inside the base image or change the HTTP contract | Per instance-hour |
+| 5 · Bring your own serving image | Model, engine, kernels, KV policy, batching inside the image | Cluster, node autoscaling, endpoint routing | Change the provider's routing and autoscaling contract | Per instance-hour plus storage |
+| 6 · Build your own infrastructure | All seven layers | Nothing | Nothing technical; you can run out of time or money | GPU-hours, people, failures |
+
+At the time of writing, services such as Amazon Bedrock / SageMaker, Google Vertex AI and Azure AI offer versions of rungs 1 to 5. The names and exact feature sets move; treat them as examples of the pattern, not as a recommendation. Rung 6 is the rest of this course.
+
+<Callout type="intuition" title="You are always buying a contract">
+  Even "build" is a contract: with your own team. The question is not whether somebody is on call, but whose pager rings and what they are allowed to change.
+
+  A managed rung sells you a narrow contract with a predictable unit price. A self-hosted rung sells you a wide contract with a lower marginal price and a much larger fixed cost. The next sections are about reading both contracts before signing.
+</Callout>
+
+<Scrolly>
+  <BuildVsBuy client:visible slot="stage" />
+
+  <Step title="1. Six stations on one axis">
+    The horizontal axis runs from least control and least work on the left to most control and most work on the right. Each station is a different division of the same seven layers.
+
+    The boxes are the layers, from the public API at the top to the model and its weights at the bottom. Amber means the work is yours; hatched grey means it belongs to the provider. Moving right fills more boxes.
+  </Step>
+
+  <Step title="2. Model as a service">
+    At rung 1 the provider owns all seven layers. You send tokens and receive tokens, and the endpoint hides the entire serving problem: batching, prefix caching, autoscaling, cold starts and the GPU fleet.
+
+    That is why the unit price is per token and the fixed cost is zero. It is also why you cannot change the batching policy, write a kernel, reuse a KV prefix differently or choose where a request is routed.
+  </Step>
+
+  <Step title="3. One click, their runtime">
+    Rung 2 lets you pick a model from a catalogue and an instance type to run it on. The provider still owns the container, the engine and most of the scaling policy.
+
+    You gain a model choice and a predictable hourly bill. You do not gain the knobs that decide throughput: the batching defaults, the context limit and the kernel selection are still set for you.
+  </Step>
+
+  <Step title="4. Your weights, their container">
+    Rung 3 moves exactly one layer: the model. You bring a checkpoint the catalogue does not have, and the platform runs it in a container it controls.
+
+    This is the first rung that can serve a fine-tune or a proprietary model. The price is still hourly, but the engine, kernels, KV policy and HTTP contract remain the provider's, so the customisation stops at the weights.
+  </Step>
+
+  <Step title="5. Your code, their container">
+    Rung 4 moves the model and part of core inference. You write the loading and request logic, so you can preprocess inputs, postprocess outputs and change how a batch is formed.
+
+    The base image, drivers, HTTP contract and cluster are still theirs. You have bought flexibility inside a box, not control of the box.
+  </Step>
+
+  <Step title="6. Your image, their cluster">
+    Rung 5 moves model, core inference and model optimisation inside your container. You can choose the engine, write custom kernels, set KV reuse policies and tune batching — everything inside the image is yours.
+
+    The provider still runs the cluster, the node autoscaler and the endpoint. You have not escaped the platform's routing contract, but you have escaped its inference stack.
+  </Step>
+
+  <Step title="7. Build the whole stack">
+    Rung 6 fills all seven boxes. You own capacity planning, routing, health checks, autoscaling, kernels, KV policy and the pager.
+
+    The marginal cost of a token can be the lowest of any rung, because you are not paying a per-token margin. The fixed cost is also the highest, and it arrives whether traffic does or not.
+  </Step>
+
+  <Step title="8. The crossover, and what moves it">
+    Per-token pricing is a straight line through the origin. A self-hosted GPU is a fixed monthly bill that flattens as volume grows. Where the two lines cross is the <Term t="crossover-volume">crossover volume</Term>.
+
+    Move the utilisation slider. Lower average utilisation — overnight idle time, or headroom bought for a peak — raises the self-hosted curve and pushes the crossover to the right. Push it far enough and the curve never crosses the API line at all.
+  </Step>
+</Scrolly>
+
+## The contract a managed platform expects
+
+Rung 5 is where most "build" teams actually land: they do not buy GPUs, they bring a container. The platform treats that container as a black box with a small contract. A <Term t="byo-container">bring-your-own-container (BYO container)</Term> usually has to provide:
+
+| Contract item | What it means | What goes wrong if you ignore it |
+|---|---|---|
+| An HTTP server on the port the platform routes to | The platform forwards traffic to a known port, often 8080 | The endpoint is healthy but unreachable |
+| A health or readiness endpoint | A GET that returns 200 only when weights are loaded and a warm-up request has succeeded | The first real requests hit a server that is still loading |
+| An invocation endpoint | A POST that accepts the platform's request schema and returns JSON or a stream | The platform can call you, but cannot understand the answer |
+| Weights on a mounted path | The model artifacts arrive at a mount such as `/opt/ml/model`, not baked into the image | Every model version needs a new image |
+| A clean start and stop | Start inside the platform's timeout, log to stdout, exit on SIGTERM | Cold starts time out; deploys drop requests |
+
+This is exactly the material in **Warm-up, health checks & graceful shutdown**, moved one level up. A readiness check is not decoration: the platform uses it to decide whether to route traffic to your replica or restart it. Return 200 before the weights are loaded and the platform will send users to a server that cannot serve them. Fail readiness because the queue is long and the platform may kill a replica that is merely busy. Those are different signals and should be different endpoints.
+
+One common contract at the time of writing uses a GET `/ping` for health and a POST `/invocations` for work. Other platforms use different paths. The shape is stable; the names are not, so read the platform's documentation before you build the image.
+
+```python
+# The shape of a BYO-container contract, not a complete server.
+from fastapi import FastAPI, Request, Response
+
+app = FastAPI()
+READY = False
+
+@app.get("/ping")
+def ping():
+    # 503 while loading; 200 only after a successful warm-up
+    return Response(status_code=200 if READY else 503)
+
+@app.post("/invocations")
+async def invoke(request: Request):
+    body = await request.json()
+    return {"output": await generate(body["prompt"])}
+```
+
+<Callout type="real" title="What the platform is really testing">
+  The health check is a test of your startup sequence, not of the GPU. If your image downloads a 16 GB checkpoint on every boot, the platform sees a long cold start and may time out before your first token.
+
+  Mount the weights, load them once, warm the kernels, then flip readiness. That is the same sequence you built in **Packaging, weights & cold starts**, and it is the difference between a rung-5 deployment that behaves like a service and one that behaves like a demo.
+</Callout>
+
+## The crossover arithmetic
+
+The comparison that matters is <Term t="tco">total cost of ownership (TCO)</Term>, not the hourly GPU rate and not the per-token headline. TCO includes the GPU you rent, the people who keep it alive, the monitoring, the spare capacity and the failures.
+
+Start with the marginal cost of a self-hosted token. Let $p$ be dollars per GPU-hour, $G$ the output tokens per second you measured at your SLO, and $u$ the average utilisation over the month. One hour of GPU time produces $u \times G \times 3600$ useful tokens, so:
+
+$$
+c_{\text{self}} = \frac{p/3600}{G \times u} \times 10^6
+$$
+
+That is dollars per million output tokens, before the fixed operating cost. Now add a monthly operations line $O$ — on-call, monitoring, a failed-GPU reserve — and let $V$ be daily output tokens. A month is about 30.42 days, so monthly tokens are $V \times 30.42$:
+
+$$
+c_{\text{self}}(V) = \frac{p \times 10^6}{3600\,G\,u} + \frac{O \times 10^6}{30.42\,V}
+$$
+
+The API charges a constant $c_{\text{api}}$ per million. Set the two monthly bills equal and solve for the daily volume:
+
+$$
+\frac{30.42\,V}{10^6}\,c_{\text{api}} = O + \frac{30.42\,V}{10^6}\,c_{\text{self}}
+\quad\Longrightarrow\quad
+V^* = \frac{O \times 10^6}{30.42\,(c_{\text{api}} - c_{\text{self}})}
+$$
+
+That $V^*$ is the crossover volume. Below it the fixed bill dominates and the API is cheaper; above it the API's per-token line keeps rising while the self-hosted curve flattens.
+
+<Callout type="math" title="Worked: an illustrative crossover at 60% utilisation">
+  Use placeholder prices, clearly illustrative: an H100 at **\$2.50/hour**, a measured **4,603 output tokens/s** at the SLO (the same fixed job as **Goodput per dollar & choosing GPUs**), an API at **\$0.60 per million output tokens**, and **\$1,800/month** of operating cost.
+
+  - Price of a GPU-second: $\$2.50 / 3600 = \$0.000694$.
+  - Useful tokens per second at $u = 0.60$: 4,603 × 0.60 = 2,762.
+  - Marginal cost: $\$0.000694 / 2762 \times 10^6 = \$0.251$ per million.
+  - Gap to the API: $\$0.60 - \$0.251 = \$0.349$.
+  - Crossover: 1,800 × 10^6 / (30.42 × 0.349) ≈ 170 million tokens per day.
+
+  At 170M tokens/day, the monthly bill is about \$3,100 either way. One rung is not cheaper in general; it is cheaper **above a volume**, and that volume is what you compute.
+</Callout>
+
+The utilisation number is doing a lot of work. It is the same quantity as in **Capacity planning & headroom**, where you learned that a fleet runs at 50–70% on purpose so the queue has somewhere to go. Here it enters the cost directly.
+
+| Average utilisation | Effective tokens/s | Marginal \$/M | Crossover (M tokens/day) |
+|---|---|---|---|
+| 100% | 4,603 | 0.151 | 132 |
+| 80% | 3,682 | 0.189 | 144 |
+| 60% | 2,762 | 0.251 | 170 |
+| 40% | 1,841 | 0.377 | 265 |
+| 30% | 1,381 | 0.503 | 609 |
+| 25% | 1,151 | 0.604 | none — above the API |
+
+*(Illustrative arithmetic. The GPU rate, goodput and API price are placeholders, not vendor quotes.)*
+
+Two things fall out of that table. First, **headroom is not free**: dropping from 80% to 60% utilisation moves the crossover from 144M to 170M tokens/day, because the same fixed bill now buys fewer useful tokens. Second, there is a floor. At 25% average utilisation the marginal cost alone is above the API, so no volume can rescue self-hosting. The fixed bill is not the only problem; the GPU is simply idle too much of the time.
+
+Idle hours are the extreme version. A service that fills eight hours a day at 60% of capacity has a monthly average of about 20%, not 60%. At that average the marginal cost is roughly \$0.75/M, above the \$0.60 API, so the crossover disappears. A spiky workload is exactly the workload that punishes a fixed fleet.
+
+The operating line is just as real. In the worked example, \$1,800/month is about \$1,500 for a tenth of a loaded on-call engineer, \$150 for monitoring, logging and storage, and \$150 as a reserve for a failed GPU. Those are illustrative, not a quote. If you keep a warm spare GPU, add its full monthly rate and the crossover roughly doubles. A failed card is not only hardware: it is a replacement lead time, a drain, and a fleet running with less headroom.
+
+<Callout type="pitfall" title="The sticker price is not the TCO">
+  Three numbers get mistaken for the cost of self-hosting: the hourly GPU rate, the tokens/s on a benchmark, and the price of one card. None of them is the bill.
+
+  The bill is GPU-hours **times the number of cards you must keep warm**, plus people, monitoring, spare capacity, storage, egress and the cost of the failures you did not plan for. A self-hosted token can be cheaper than an API token and still be more expensive per month, because you bought the machine before the traffic arrived.
+</Callout>
+
+This is also the same **step-function bill** from **Capacity planning & headroom**. The smooth curve above is the planning approximation; the real invoice jumps when you cross a card boundary, and it does not jump back down when traffic falls.
+
+## The non-cost reasons
+
+Cost is often not the deciding argument. These are the ones that usually are:
+
+- **Data governance and privacy.** If prompts contain customer records, source code or health data, "the provider's servers" may be an unacceptable answer regardless of price. Rungs 3–5 inside your own cloud account, or rung 6 in a private cluster, keep the data path under your control.
+- **Latency control.** A provider adds a network hop, a shared queue and a batching policy you cannot see. If your SLO is tight, owning the engine and the KV policy is how you remove those unknowns.
+- **Custom models and fine-tunes.** A catalogue serves the models in the catalogue. A proprietary architecture, a full fine-tune or a custom tokenizer may need rung 3 or higher.
+- **Vendor lock-in.** API shapes, model deprecations and prices change. Owning the weights and the container keeps the option to move; a prompt built around one vendor's quirks does not.
+- **Rate limits and quotas.** A managed service can throttle you at the moment you succeed. A self-hosted fleet cannot throttle you, but it also cannot absorb a spike you did not buy capacity for.
+- **Compliance and audit.** Residency, network isolation, model-version pinning and audit trails may require controls a managed endpoint does not expose. This is a legal requirement, not an engineering preference.
+
+**The cheapest rung can be the wrong rung.** A regulated bank and a weekend prototype can run the same model and still choose opposite rungs. The bank is not paying for tokens; it is paying for a data path it can defend to an auditor.
+
+Write the non-cost constraints down before doing the arithmetic. A constraint that eliminates a rung is not a score to be traded against price.
+
+## A decision table
+
+| Situation | Start at | Why |
+|---|---|---|
+| Prototype, unknown demand | Rung 1 or 2 | Zero fixed cost, fastest path to a real request, and the provider absorbs idle time |
+| Regulated enterprise | Rung 3–5 in a private network, or rung 6 if the controls require it | Data residency, audit and isolation usually beat a per-token saving |
+| High-volume, steady workload | Rung 5 or 6 | The crossover is passed; custom kernels, KV policy and committed capacity pay for themselves |
+| Spiky, low-volume workload | Rung 1 or 2 | You would be paying for a GPU during the silence; the provider pools that risk across customers |
+
+A short decision tree:
+
+1. **Can a provider model meet the quality, latency and compliance bar?** If no, go to rung 5 or 6.
+2. **Is the volume comfortably below the crossover?** If yes, stay at rung 1 or 2 and revisit when traffic changes.
+3. **Do you need custom kernels, KV reuse policies or routing?** If yes, rung 5 or 6. If no, rung 3 or 4 is usually enough.
+4. **Is the workload spiky?** If yes, keep the provider's elastic capacity and do not commit to a fleet. If no, commit and tune.
+
+## The seven-layer map
+
+The enterprise serving stack is easier to reason about as seven layers. Each one is taught somewhere in this course, and each rung is a decision about which layers you keep.
+
+| Layer | What it does | Where the course teaches it | Rung 1 | Rung 5 | Rung 6 |
+|---|---|---|---|---|---|
+| Public API | Auth, quotas, rate limits, request routing | Routing, Autoscaling & Orchestration; Observability, Reliability & Security | provider | provider | you |
+| Resource management | Capacity, GPU pools, cost allocation | Inference Economics; Autoscaling on the right signals | provider | provider | you |
+| Model selection | Chooses the model, routes between models, speculates | Routing, Autoscaling & Orchestration; The Engine Landscape | provider | provider | you |
+| Distributed serving | Tensor/pipeline parallelism, KV transfer, cache-aware routing | Multi-GPU Parallelism; Long Context & Tiered KV; Prefill/Decode Disaggregation | provider | provider | you |
+| Core inference | The engine, scheduler, attention kernels, HTTP server | A Real Engine: vLLM; The Engine Landscape | provider | you | you |
+| Model optimisation | Quantization, prefix caching, speculative decoding | Prefill & Prefix Optimization; Quantization; Attention Optimization; Speculative Decoding | provider | you | you |
+| Model | Weights, tokenizer, version, adapters | Run Your First LLM; From Neurons to Transformers | provider | you | you |
+
+Rung 3 leaves only the model with you. Rung 4 leaves the model and part of core inference. Rung 5 leaves the bottom three layers. Rung 6 leaves all seven. That is the whole ladder in one table: every rung is a different answer to "which layers do I want to own?"
+
+Use the map in vendor conversations. When somebody says "we do caching", ask which layer and which cache: prefix caching in model optimisation, KV-cache-aware routing in distributed serving, or a CDN in the public API are three different products. When somebody says "we autoscale", ask whether it is the cluster, the model endpoint or the request queue.
+
+## Why knowing how to build still matters
+
+Even if you never build rung 6, the earlier modules are what let you buy well.
+
+**You can read the provider's limits.** You recognise that a "context length" claim is a KV-memory claim, that a "tokens/s" number depends on batch size and prompt shape, and that a "cold start" is a weight-loading and warm-up problem. A vendor's feature list stops being magic and becomes a set of knobs you can place on the seven-layer map.
+
+**You can benchmark fairly.** Use the harness discipline from **Measure Like a Pro**: the same workload, the same SLO, the same warm-up and the same length distribution. A provider's headline throughput measured at batch 1 on short prompts is not evidence about your traffic. Price the work that met the SLO, as in **Goodput per dollar & choosing GPUs**.
+
+**You know when to switch.** The crossover is not permanent. Prices change, utilisation changes, a new model changes the goodput, and a compliance requirement can eliminate a rung overnight. Keep a stable API and shared telemetry so moving one rung is an engineering project, not a rewrite.
+
+That is the real lesson of the ladder. The goal is not to reach the rightmost rung. The goal is to know what each rung costs, what it hides, and what would have to change for you to move.
+
+<KeyNotes>
+  1. The choice is a **six-rung ladder**, not a binary: foundation-model API, one-click open model, bring your own weights, bring your own code, bring your own image, build the stack.
+  2. The further right you go, the more layers you own and the more work you take on. Rung 1 owns none of the seven layers; rung 6 owns all of them.
+  3. A managed platform hides **batching, caching, autoscaling and cold starts**. That is convenient, and it is also the list of things you cannot tune.
+  4. A BYO container is a small contract: a port, a readiness endpoint, an invocation endpoint, weights on a mounted path and a clean shutdown. It is **Warm-up, health checks & graceful shutdown** in container form.
+  5. Self-hosted cost per million is $\frac{p/3600}{G \times u} \times 10^6$, plus fixed operations spread over volume. Utilisation is not a detail; it is in the denominator.
+  6. The **crossover volume** is $V^* = O \times 10^6 / (30.42(c_{\text{api}} - c_{\text{self}}))$. In the illustrative example it is about 170M tokens/day at 60% utilisation.
+  7. Idle hours and headroom move the crossover right, and at low enough utilisation they remove it: the marginal self-hosted token costs more than the API before any fixed cost is counted.
+  8. Non-cost constraints — governance, latency, custom models, lock-in, rate limits, compliance — can eliminate a rung before price gets a vote. Write them down first.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Using the illustrative numbers in this lesson — a \$2.50/hour GPU, 4,603 output tokens/s, 60% average utilisation, a \$0.60/M API and \$1,800/month of operations — what is the crossover volume, in millions of tokens per day?', numeric: true, answer: 170, tolerance: 8, unit: 'M tokens/day', why: 'Marginal self-hosted cost is (2.50/3600) ÷ (4603 × 0.60) × 1e6 ≈ \$0.251/M. The gap to the API is \$0.349/M. Crossover = 1,800 × 1e6 / (30.42 × 0.349) ≈ 170M tokens/day. Below it the fixed bill dominates; above it the API line keeps rising and the self-hosted curve flattens.' },
+  { q: 'At 40% average utilisation, what is the marginal self-hosted cost per million output tokens, using the same illustrative GPU rate and goodput?', numeric: true, answer: 0.38, tolerance: 0.03, unit: 'USD', why: 'c_self = (2.50/3600) ÷ (4603 × 0.40) × 1e6 = 0.000694 ÷ 1841 × 1e6 ≈ \$0.377/M. Lower utilisation raises the cost per useful token because the fixed GPU bill is spread over fewer busy seconds.' },
+  { q: 'Which rung lets you choose custom kernels and KV reuse policies inside your own container while the provider still runs the cluster?', options: ['Rung 1, the foundation-model API', 'Rung 3, bring your own weights', 'Rung 5, bring your own serving image', 'Rung 2, one-click deployment'], answer: 2, why: 'Rung 5 puts the model, engine, kernels and KV policy inside your image. Rung 3 only moves the weights; rung 4 moves some inference code but keeps the provider base image and HTTP contract. Rung 5 is the first rung that lets you control the inference stack itself.' },
+  { q: 'A BYO container returns 200 from its readiness endpoint as soon as the process starts, before the weights finish loading. What is the likely consequence?', options: ['Nothing — readiness is only a formality', 'The platform routes real requests to a server that cannot serve them, so early requests fail', 'The platform automatically waits for the first token', 'The model loads faster'], answer: 1, why: 'The platform uses readiness to decide where to send traffic. Reporting ready before warm-up means the first users arrive during loading and see errors or timeouts. The readiness gate should flip only after the weights are loaded and a warm-up request has succeeded, exactly as in Warm-up, health checks & graceful shutdown.' },
+  { q: 'Which workload is the worst fit for committing to a self-hosted GPU fleet?', options: ['A steady 24/7 service at 70% utilisation', 'A high-volume chat product with predictable daily traffic', 'A spiky prototype with a few busy minutes a day and silence overnight', 'A regulated service that must keep data in its own VPC'], answer: 2, why: 'A spiky low-volume workload pays for the GPU during the silence. Its monthly average utilisation is low, which raises the marginal cost per token and pushes the crossover beyond the traffic it actually has. The regulated case may still choose self-hosting for non-cost reasons, but the spiky prototype has neither volume nor a compliance reason.' },
+  { q: 'Which of these is a non-cost reason to choose a more self-hosted rung?', options: ['The GPU is on sale', 'The provider has a lower per-token price', 'Prompts contain data that cannot leave your VPC', 'The provider offers a larger model catalogue'], answer: 2, why: 'Data governance is a hard constraint, not a price comparison. If prompts cannot leave your network, a managed API is eliminated regardless of its per-token price. The other options are either cost arguments or reasons to stay managed.' },
+]} />

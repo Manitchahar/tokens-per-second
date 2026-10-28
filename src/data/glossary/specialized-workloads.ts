@@ -77,7 +77,43 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Feeding several crops of an image and pooling features so that higher image detail does not inflate the token count — as in LLaVA-1.6, which sees four crops yet still emits 576 tokens. It decouples image detail from context cost, trading extra vision-tower FLOPs for a bounded KV footprint.',
     lesson: 'specialized-workloads/multimodal',
   },
-  // ── 4 · agents & reasoning ──
+  // ── 4 · on-device & edge ──
+  'edge-inference': {
+    term: 'Edge inference (on-device serving)',
+    def: 'Running the model on the user’s own hardware — a phone, a laptop, a camera, a car — instead of a datacenter. It removes the network round trip and keeps raw data local, at the price of a few gigabytes of shared RAM, a battery power budget, a fanless thermal limit and hardware you do not control. Decode is still bandwidth-bound, so bytes per weight decide tokens per second.',
+    lesson: 'specialized-workloads/edge-inference',
+  },
+  'device-runtime': {
+    term: 'Device runtime',
+    def: 'The software layer between a converted model file and the device’s silicon — llama.cpp, ONNX Runtime, LiteRT, Core ML or ExecuTorch at the time of writing. It chooses kernels, schedules work across CPU, GPU and NPU, and on mobile platforms can hand whole subgraphs to an accelerator through a delegate. Operator coverage is the usual source of surprises: one unsupported operation can force a fallback that costs more than the accelerator saved.',
+    lesson: 'specialized-workloads/edge-inference',
+  },
+  npu: {
+    term: 'NPU (neural processing unit)',
+    def: 'An accelerator inside a phone or laptop system on a chip, built from many small multiply-accumulate engines for low-precision matrix math. It is fast at dense 8-bit or 4-bit work, which makes it useful for prefill, and it is mostly idle during decode because decode is limited by memory bandwidth rather than arithmetic.',
+    lesson: 'specialized-workloads/edge-inference',
+  },
+  'tops-per-watt': {
+    term: 'TOPS and TOPS/W',
+    def: 'TOPS counts trillions of operations per second, usually at 8-bit integer precision; TOPS per watt divides that by the power it costs to sustain. On a phone the ratio is the more honest number, because the chassis has to remove the heat. Neither predicts decode speed: a 3B model needs about 6.4 GFLOP per token, which an NPU finishes in under a millisecond while the weight read takes tens of milliseconds.',
+    lesson: 'specialized-workloads/edge-inference',
+  },
+  'thermal-throttling': {
+    term: 'Thermal throttling',
+    def: 'A fanless device lowering its clock when it gets hot, which usually lowers the memory clock and the achieved bandwidth with it. It is the normal steady state under sustained load, not a fault: at 55% of the burst clock a phone that gave 20 tokens per second gives about 11. It is why on-device benchmarks must run for at least a minute and report the sustained tail separately from the first seconds.',
+    lesson: 'specialized-workloads/edge-inference',
+  },
+  'edge-cloud-split': {
+    term: 'Edge-cloud split',
+    def: 'A deployment in which a small model answers on the device and escalates hard requests to a larger cloud model. The engineering is the routing rule, driven by network round-trip time, battery, temperature, model confidence and request size. The break-even is usually decided by compute rather than by the network hop: a long prompt prefills far faster in the cloud, while a tiny intent classification is dominated by the round trip.',
+    lesson: 'specialized-workloads/edge-inference',
+  },
+  'heterogeneous-compute': {
+    term: 'Heterogeneous compute',
+    def: 'Splitting a model’s graph across a CPU, GPU and NPU inside one device. Each crossing between units costs a fixed synchronisation plus a copy of whatever tensor moves, so the partition matters more than the hardware: crossing twice per block is a few percent of a decode step, while crossing per operator can cost more than the step itself.',
+    lesson: 'specialized-workloads/edge-inference',
+  },
+  // ── 5 · agents & reasoning ──
   'reasoning-trace': {
     term: 'Reasoning trace',
     def: 'The chain-of-thought tokens a reasoning model emits before its answer. Because the trace stays in the context, a long one slows itself down (decode is memory-bound and the KV grows each step) and makes a multi-turn conversation progressively more expensive.',
@@ -93,7 +129,7 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The fraction of a request’s prompt tokens whose KV is already cached. Multi-turn chat and tool loops are near-perfect reuse (each turn only appends), but a timestamp, request ID, or non-deterministic tool result in the prefix collapses it to zero — and a zero hit rate cannot be fixed by a better eviction policy.',
     lesson: 'specialized-workloads/agents-reasoning',
   },
-  // ── 5 · batch & RL ──
+  // ── 6 · batch & RL ──
   rollout: {
     term: 'Rollout',
     def: 'One complete generation from a policy during reinforcement learning — prompt, generated tokens, and often a reward computation, held in memory until the whole group finishes. One optimisation step needs thousands at once, which is why rollout generation is sized by tokens in flight rather than by model size.',
@@ -114,7 +150,7 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The situation in a rollout group where sequences finish at very different times, so the batch steadily drains instead of staying full. It is the opposite of continuous batching in serving, and it means both that peak memory is the group size and that the tail runs at reduced throughput.',
     lesson: 'specialized-workloads/batch-rl-rollouts',
   },
-  // ── 6 · diffusion ──
+  // ── 7 · diffusion ──
   latent: {
     term: 'Latent',
     def: 'The compact representation a diffusion model actually works on — a 512x512 image becomes 4x64x64 = 16,384 values after an 8x downsample. Every denoising step runs on the latent; full-resolution pixels appear only at the final VAE decode.',

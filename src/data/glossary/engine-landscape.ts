@@ -129,4 +129,41 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Tokens per second that met your SLO, divided by what you paid per second to produce them. It is the single number that decides between two engines that both work, because it is the only one that prices the latency you promised rather than the speed you achieved.',
     lesson: 'engine-landscape/project-engine-matrix',
   },
+
+  // ── Module 17.3 · Multi-model serving & Triton Inference Server
+  'multi-model-serving': {
+    term: 'Multi-model serving',
+    def: 'Hosting many models in one server and sharing its GPUs, CPU and memory between them, instead of giving every model its own container and card. Models are loaded on demand and unloaded when they are cold, so the fleet is sized to the working set rather than to the catalogue. It wins when many models are small and unevenly used.',
+    lesson: 'engine-landscape/multi-model-triton',
+  },
+  'model-cache': {
+    term: 'Model cache',
+    def: 'The tiered store that decides which models are resident in GPU memory, which are staged in CPU RAM and which remain on disk. A hit costs nothing, a warm swap copies weights over PCIe, and a cold load reads them from storage first. Its eviction policy — usually LRU — is what turns a fixed GPU budget into an apparently larger catalogue.',
+    lesson: 'engine-landscape/multi-model-triton',
+  },
+  'model-swap': {
+    term: 'Model swap',
+    def: 'Moving a model into GPU memory so it can answer a request. A warm swap copies staged weights from CPU RAM over PCIe, around half a second for a 14 GB model; a cold swap also reads them from disk first, which can take ten seconds or more. Every cache miss pays one, and the cost lands in the request that missed.',
+    lesson: 'engine-landscape/multi-model-triton',
+  },
+  'lru-eviction': {
+    term: 'LRU eviction',
+    def: 'Removing the model that has gone longest without a request when GPU memory is needed. Least-recently-used is a heuristic: it assumes the recent past predicts the near future, which usually holds for chat traffic and often fails for bursty or scheduled workloads. It is the default policy of most model caches precisely because it is cheap and usually right.',
+    lesson: 'engine-landscape/multi-model-triton',
+  },
+  'model-router': {
+    term: 'Model router',
+    def: 'The front door of a multi-model service: it maps each model name to the hosts that have it loaded, tracks a replica count per model, and chooses a host for every request. It prefers a host with the weights already resident, and when none exists it picks where the load is cheapest. Without it, a shared pool cannot tell a cache hit from a cold start.',
+    lesson: 'engine-landscape/multi-model-triton',
+  },
+  'triton-inference-server': {
+    term: 'Triton Inference Server',
+    def: 'NVIDIA\'s open-source model server: it loads models from a versioned model repository, runs each through a pluggable backend (TensorRT, ONNX Runtime, PyTorch, Python, vLLM, TensorRT-LLM), batches requests, and exposes inference and model-management APIs over HTTP and gRPC. It is not the Triton kernel language from Module 13; the shared name is a coincidence.',
+    lesson: 'engine-landscape/multi-model-triton',
+  },
+  'model-repository': {
+    term: 'Model repository',
+    def: 'The directory layout a model server reads: one folder per model, one numbered folder per version inside it, and a config.pbtxt at the model root describing the backend, inputs, outputs, batching and instance placement. The folder name is the model name, so the filesystem itself is part of the API.',
+    lesson: 'engine-landscape/multi-model-triton',
+  },
 };

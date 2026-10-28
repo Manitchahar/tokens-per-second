@@ -1,0 +1,345 @@
+---
+title: 'Multi-model serving & Triton Inference Server'
+summary: 'Most GPU fleets serve many small models, not one huge one. This lesson derives when packing those models onto shared GPUs pays, what a cold model costs in seconds, and how a router plus Triton Inference Server makes one shared pool behave like a single service.'
+objectives:
+  - Explain why one model per server stops being economical once a product has many small models
+  - Compute the utilisation and dollar cost of dedicated cards versus a packed pool
+  - Derive cache-hit, warm-swap and cold-load latency from model bytes and bandwidth
+  - Describe how a router maps model names to hosts and replica counts, and why LRU eviction needs that map
+  - Read a Triton model repository and a config.pbtxt, and name the backend each model uses
+  - Choose between a cost-optimised and a latency-optimised multi-model design for a stated workload
+---
+import MultiModelServer from '@/components/viz/engine-landscape/MultiModelServer.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Module 04 put one model behind one HTTP server; Module 09 ran that pattern properly with vLLM. One process, one model, one GPU. It is the right default, and what almost every tutorial shows.
+
+Then the product grows. Search wants an embedding model, support a reranker, someone ships a spam classifier, three customers pay for their own fine-tune, and the experiments team keeps two checkpoints for an A/B test. None is large. Almost none is busy. But each arrives with a request for its own server, and you pay for a fleet in which every card is mostly idle.
+
+<Term t="multi-model-serving">Multi-model serving</Term> is the alternative: many models share one server and its GPUs, and models move between fast and slow memory as traffic demands. It is also the difference between a simple service and one with a cache, eviction policy and router.
+
+<Callout type="mentor" title="This is the lesson where serving stops being about the model">
+  Everything so far has been about making one model fast. This lesson is about the layer above: which model should be resident, which should wait, and where a request should go. The kernels do not change. What changes is the answer to **"is the model here yet?"** — and that answer can cost fifteen seconds.
+</Callout>
+
+## Twenty models, twenty idle GPUs
+
+A team owns twenty small models: embeddings, rerankers, classifiers and per-customer fine-tunes. Each fits on a 24 GB L4 and receives a modest trickle of traffic. The safe design gives every model its own container and GPU. Every request finds its model loaded, and almost every card is wasted.
+
+Waste has two sources. The first is **compute**. Suppose each model is busy about 3% of the time, realistic for bursty traffic averaged over a day. Twenty add up to 60% of one GPU's compute: less than one card's work, spread over twenty cards.
+
+The second is **memory**. Each card holds one set of weights and little else, so you pay for capacity you never use: the packaging unit is the GPU, not the model.
+
+<Scrolly>
+  <MultiModelServer client:visible slot="stage" />
+
+  <Step title="1. Twenty models, twenty GPUs">
+    Twenty cards, one model each, loaded all the time. A sliver of blue memory, a sliver of amber compute, and a large hatched remainder: capacity you pay for and do not use.
+  </Step>
+
+  <Step title="2. Pack them into one pool">
+    The same twenty models now share two GPUs: seven per card, plus a second copy of hot model M07. Weights total 35.5 GB of a 43.2 GB usable pool. **A resident model's speed did not change** — same weights, kernels and decode step. Only the packaging changed.
+  </Step>
+
+  <Step title="3. Three tiers appear">
+    A shared model can be resident in GPU memory, staged in CPU RAM, or stored on disk. This is a <Term t="model-cache">model cache</Term> whose tiers trade cost per byte against time to first token. A model is no longer "deployed" or "not deployed"; it is hot, warm or cold.
+  </Step>
+
+  <Step title="4. A cold model has a price">
+    A cache hit is free. A warm swap — a <Term t="model-swap">model swap</Term> from CPU RAM — copies weights over PCIe; a cold load reads them from disk first. For a 14 GB model that is roughly half a second against fifteen, and the gap is why routing exists.
+  </Step>
+
+  <Step title="5. The pool is full, so LRU evicts">
+    A request for M18 needs 14 GB the pool lacks. The cache evicts the model longest without a request, starting with M03, then M08, then M10, and keeps going until the new one fits. **Least recently used is a policy, not a prophecy**: a model about to become busy can be evicted just before it is needed.
+  </Step>
+
+  <Step title="6. The router decides who pays">
+    The front door maps a model name to hosts that already hold it, plus a replica count. M07 has two replicas and can go to either card. M18 has none, so its request must reach a host that can load it — and that host pays the cold load. Without this map, packing turns every request into a gamble.
+  </Step>
+</Scrolly>
+
+## The arithmetic of packing
+
+Take twenty L4s at an approximate on-demand price of \$0.80 per GPU-hour.
+
+$$
+20 \times 0.80 = 16.00\ \text{per hour}, \qquad 2 \times 0.80 = 1.60\ \text{per hour}
+$$
+
+At 730 hours in a month:
+
+$$
+(20 - 2) \times 0.80 \times 730 = 10{,}512
+$$
+
+About **\$10,500 a month** for the same models and aggregate compute. The ratio is the lesson. You are not making models faster; you are stopping the packaging from charging twenty times for one card's work.
+
+| Design | GPUs | \$/hour | \$/month | Compute used |
+|---|---|---|---|---|
+| One model per GPU | 20 | \$16.00 | \$11,680 | about 0.6 GPU |
+| Packed pool, cache on demand | 2 | \$1.60 | \$1,168 | about 0.6 GPU |
+
+Packing works only because the models are **small relative to the card** and their traffic is **low and uneven**. A model that fills a card has nothing to share; a model that is busy all the time has no idle capacity to lend. The interesting case is the long tail: many models, each unimportant, collectively expensive.
+
+<Callout type="math" title="Utilisation is a fraction, and the denominator is a bill">
+  Twenty models at 3% compute each is $N_{\text{used}} = 20 \times 0.03 = 0.6$ GPU-equivalents. On two cards, average compute utilisation rises to about 30% per card — still not busy, but ten times less wasteful per dollar.
+
+  What did **not** happen: no kernel got faster and no model got smaller. The gain is entirely in the denominator of the cost fraction. Multi-model serving is an infrastructure decision before it is an inference optimisation.
+</Callout>
+
+## Three tiers and a cache
+
+A model cache resembles the KV cache from Module 05, except the unit is a whole set of weights, not key/value vectors.
+
+| Tier | What lives there | Capacity here | Time before the first token |
+|---|---|---|---|
+| **GPU memory** | resident weights, KV cache, workspace | 43.2 GB usable across two 24 GB L4s | effectively zero |
+| **CPU RAM** | staged weights | host memory, often 128 GB or more | one PCIe copy |
+| **Disk / object store** | every model file, the source of truth | effectively unbounded | disk read plus PCIe copy |
+
+The cache is not a folder but a policy with three questions. Is the model resident? Serve it. Is it staged in CPU RAM? Copy it to a GPU and serve it. Otherwise, where is it on disk, and what must be evicted to make room?
+
+GPU memory is the scarce tier. A 24 GB card does not give 24 GB to models: CUDA context, activations, workspace and KV cache take a cut. Reserving 10% leaves 21.6 GB per card, 43.2 GB for the pair:
+
+$$
+\text{usable} = 2 \times 24 \times 0.9 = 43.2\ \text{GB}
+$$
+
+Our twenty models total 69.5 GB, so thirteen fit, plus a second copy of the hot model:
+
+$$
+\text{fits} = 35.5\ \text{GB of weights} \le 43.2\ \text{GB usable}
+$$
+
+Thirteen of twenty is a **65% hit rate** if requests were uniform. They never are: a few models take most of the traffic, so the real hit rate is usually higher — which is why the cache works. You are not trying to hold everything, only the part that is asked for.
+
+<Callout type="pitfall" title="Eviction is not free, and it is not invisible">
+  Every eviction converts a future hit into a future cold load. If the evicted model is requested again soon, you pay twice: once to make room, once to bring it back. That is why <Term t="lru-eviction">LRU eviction</Term> is **a heuristic rather than an optimum** — it assumes the recent past predicts the near future, true for chat traffic, often false for scheduled batches.
+
+  The honest metric is the latency distribution, including misses, not hit rate alone. A cache with 95% hits and a 15-second p99 is worse for an interactive product than one with 80% hits and a 1-second p99.
+</Callout>
+
+## Deriving a load time from bandwidth
+
+A model has a size; a path has a bandwidth. Time is size divided by bandwidth:
+
+$$
+t_{\text{load}} = \frac{\text{bytes}}{\text{bandwidth}}
+$$
+
+Take a 7B model in FP16: weights are parameter count times bytes per parameter.
+
+$$
+7 \times 10^9 \times 2 = 14\ \text{GB}
+$$
+
+A modest disk or object-store read delivers roughly 1 GB/s; a PCIe Gen4 x16 copy achieves roughly 25 GB/s against a 32 GB/s theoretical peak. Both are approximate and vary with the machine.
+
+$$
+t_{\text{disk}} = \frac{14}{1} = 14\ \text{s}, \qquad t_{\text{pcie}} = \frac{14}{25} = 0.56\ \text{s}
+$$
+
+| Where the model is | What happens | Time |
+|---|---|---|
+| GPU memory (hit) | nothing is copied | ≈ 0 s |
+| CPU RAM (warm) | one PCIe copy | ≈ 0.56 s |
+| Disk (cold) | disk read, then PCIe copy | ≈ 14.6 s |
+
+The cold load is about **26 times** slower than the warm swap, which is already visible to a user. Packing is cheap; **packing models that might be cold is expensive in the dimension users notice**.
+
+```python
+def load_seconds(gb: float, disk_gbps: float = 1.0, pcie_gbps: float = 25.0, staged: bool = False) -> float:
+    """Approximate time to make a model resident. Bandwidths are approximate."""
+    disk = 0.0 if staged else gb / disk_gbps
+    pcie = gb / pcie_gbps
+    return disk + pcie
+
+
+load_seconds(14)               # 14.56 s, cold from disk
+load_seconds(14, staged=True)  # 0.56 s, warm from CPU RAM
+```
+
+Two refinements. **Quantization shortens the load** by shrinking the bytes: the same 7B model in 4-bit is about 3.5 GB, so a cold load falls to roughly 3.5 seconds at 1 GB/s — a real benefit from Module 11 unrelated to decode speed. And **the disk path is the slow one**, so staging in CPU RAM buys a 26× improvement with RAM you already have.
+
+## Routing: the front door
+
+A pool of servers with independent caches is not a service until something maps requests to hosts. That something is a <Term t="model-router">model router</Term>, and it needs three pieces of state:
+
+- **A model-to-host map.** Which hosts currently hold model M? This is the router's view of every cache in the fleet.
+- **A replica count per model.** The hot model M07 gets two copies; a rarely used classifier gets one, or none until it is requested.
+- **A placement policy.** When a new replica is needed, which host receives it? <Term t="bin-packing">Bin-packing</Term> by memory: use the fewest cards that hold the models, leaving room for KV cache and workspace.
+
+The rule is simple but hard to get right: **send the request to a host that already has the model**. If none does, load on a host with room or evict something on a host without. The second is sometimes correct — the evicted model may be colder — but it should be an explicit policy decision.
+
+```python
+ROUTES = {
+    "M07": ["gpu-a", "gpu-b"],   # hot: two replicas
+    "M04": ["gpu-a"],            # one replica, already resident
+}
+
+def choose_host(model: str, hosts: dict[str, set[str]]) -> str | None:
+    """Prefer a host that already has the weights. Never guess silently."""
+    for host in ROUTES.get(model, []):
+        if model in hosts.get(host, set()):
+            return host
+    return None  # a cache miss: the caller must load, or wait
+```
+
+Two failure modes follow. **Routing to a host without the model** turns a hit into a cold load and can add fifteen seconds to a request that looked healthy in the average. **Scaling a hot model** means copying weights and updating the map; until that finishes, the new replica is cold too.
+
+Per-model replica counts make a shared pool behave like a fleet. Steady demand gets pinned replicas; a long-tail model gets zero until the first request, then one while hot. The router is where autoscaling becomes model-aware (Module 23).
+
+## NVIDIA Triton Inference Server
+
+First, the name collision. <Term t="triton-inference-server">Triton Inference Server</Term> is **not** the Triton kernel language from Module 13. The kernel language compiles GPU kernels from Python; the inference server is a C++ web service that hosts models. They share a name and nothing else. When someone says "we run Triton", ask which one.
+
+Triton does the repetitive part of multi-model serving: it loads models, selects a backend, batches requests, exposes HTTP and gRPC, and reports metrics. It expects a <Term t="model-repository">model repository</Term>, one directory per model and one per version:
+
+```text
+model_repository/
+├── reranker/
+│   ├── config.pbtxt
+│   └── 1/
+│       └── model.onnx
+├── embeddings/
+│   ├── config.pbtxt
+│   └── 1/
+│       └── model.onnx
+└── llama-8b/
+    ├── config.pbtxt
+    └── 1/
+        └── (backend-specific files)
+```
+
+The directory name is the model name; the numeric directory is the version. `config.pbtxt` names the backend, inputs, outputs, batching and instance placement. A realistic small-model config:
+
+```text
+name: "reranker"
+platform: "onnxruntime_onnx"
+max_batch_size: 32
+
+input [
+  { name: "input_ids"  data_type: TYPE_INT64  dims: [ -1 ] },
+  { name: "attention_mask"  data_type: TYPE_INT64  dims: [ -1 ] }
+]
+output [
+  { name: "logits"  data_type: TYPE_FP32  dims: [ -1, 1 ] }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 4, 8, 16 ]
+  max_queue_delay_microseconds: 2000
+}
+
+instance_group [
+  { count: 1  kind: KIND_GPU }
+]
+```
+
+- **`platform`** picks the backend. `onnxruntime_onnx` runs an ONNX file; TensorRT, PyTorch, Python and the LLM backends are selected the same way. Triton also ships vLLM and TensorRT-LLM backends for generation.
+- **`max_batch_size`** enables batching: each input's first dimension becomes the batch dimension, so `dims: [ -1 ]` means one variable-length sequence per batch entry.
+- **`dynamic_batching`** is continuous batching's cousin for small models: Triton holds requests for up to `max_queue_delay_microseconds` to form a fuller batch; two milliseconds is a common compromise.
+- **`instance_group`** says how many copies to run and on what device; two on one GPU can overlap compute and memory traffic.
+
+For an LLM the config is shorter: the backend owns the hard part. With the vLLM backend, `config.pbtxt` mostly names the backend, and the engine settings live in a `model.json` beside the weights in the version folder:
+
+```text
+# llama-8b/config.pbtxt
+backend: "vllm"
+instance_group [
+  { count: 1  kind: KIND_MODEL }
+]
+```
+
+```json
+// llama-8b/1/model.json
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "gpu_memory_utilization": 0.9,
+  "max_model_len": 8192
+}
+```
+
+The keys in `model.json` are vLLM's own engine arguments, the same ones you passed on the command line in Module 09. Triton does not batch these requests itself: vLLM's continuous batching does. `KIND_MODEL` tells Triton the backend manages its own GPU placement. Exact keys move between releases, so treat this as a shape and check the docs for your version. One repository, config language and HTTP API can host a 50 MB classifier and an 8B LLM.
+
+### Control modes and the API
+
+Triton exposes two APIs. The **inference API** is what your application calls:
+
+```bash
+curl -X POST http://localhost:8000/v2/models/reranker/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"inputs":[
+    {"name":"input_ids","shape":[1,8],"datatype":"INT64","data":[101,2023,2003,1037,4937,999,102,0]},
+    {"name":"attention_mask","shape":[1,8],"datatype":"INT64","data":[1,1,1,1,1,1,1,1]}
+  ]}'
+```
+
+The **model management API** is what your control plane calls. With `--model-control-mode=explicit`, Triton loads only what you tell it to:
+
+```bash
+curl -X POST http://localhost:8000/v2/repository/models/reranker/load
+curl -X POST http://localhost:8000/v2/repository/models/reranker/unload
+```
+
+That division of labour makes Triton a multi-model server, not a model folder. Triton provides the backend, batching and lifecycle primitives. **Your service provides the policy**: when to load, what to evict, which host gets the request. Triton holds a model until you unload it; it does not know M18 has been idle for two hours or that the card is 94% full. A model server should be excellent at running models; a control plane at deciding which run.
+
+Two more pieces matter. **Ensembles** run a pipeline — tokenize, embed, rerank, generate — with intermediate tensors passed inside the server rather than over the network. The defaults are **HTTP on 8000, gRPC on 8001 and Prometheus metrics on 8002**, which is how you find out one model is taking all the traffic.
+
+## Two reference designs
+
+**Cost-optimised.** Pack as many models as fit, load on demand, evict by LRU, and accept that a cold model pays a load. Route to a host that already holds it. This design is reactive: it discovers demand from requests and adjusts afterwards. It suits long-tail traffic, per-customer fine-tunes and scheduled jobs; its weaknesses are cold-start latency and hot-model scaling, because every instance has an independent cache.
+
+**Latency-optimised.** Give each model, or each hot model, a dedicated pool that is always on. Provision before traffic arrives, keep the routing map warm, and never pay a load in the request path. It is simple to scale per model but expensive: you overprovision cold models and lose the sharing that made the long tail cheap.
+
+Most platforms mix: pin the few models that carry most of the traffic, pack the long tail behind a cache, and make the router aware of which is which.
+
+| Situation | Does multi-model win? | Why |
+|---|---|---|
+| Many small models, each a few percent busy | **Yes** | weights are small, idle capacity is large |
+| Per-customer fine-tunes with a long tail | **Yes, with a cache and router** | only a fraction are hot at once |
+| Embedding, reranker and classifier in one pipeline | **Yes** | small models co-locate, and an ensemble removes network hops |
+| One 70B chat model on its own node | **No** | the weights fill the node |
+| Strict TTFT SLO on every model, including cold ones | **No, unless pinned** | a 14 GB cold load is seconds, not milliseconds |
+| Noisy neighbours with different latency targets | **Careful** | co-location couples their tails |
+| Per-tenant security or compliance isolation | **No** | shared processes and memory are what you are avoiding |
+
+Three surprises follow. The average can look fine while the p99 does not: a cold load affects few requests, so it barely moves the mean and dominates the tail. Caches are per host, so identical requests can land on hosts with different histories. And a hot model is a scaling problem, not a packing problem.
+
+## Where LLMs fit
+
+A 70B model in BF16 is:
+
+$$
+70.6 \times 10^9 \times 2 = 141\ \text{GB}
+$$
+
+That is larger than an 80 GB H100 and leaves no room for KV cache on a 141 GB H200. Such a model is a **node-level** deployment: tensor parallelism across GPUs, one model, no sharing. Multi-model serving has nothing to offer it.
+
+The LLM cases that fit are small or adapter-shaped. **Small language models** from 0.5B to 8B — classifiers, routers, extractors, draft models — are exactly the "many small models" case. **Multi-LoRA** is the LLM-native version: one base model in GPU memory, many small adapters loaded and swapped per request. The adapter is megabytes, not gigabytes, so the cache is cheap and the hit rate high (Module 26). **Prefix-aware routing** is the sibling problem — route by which host already holds the matching KV prefix (Module 23).
+
+Module 22 covers cold starts, warm-up, health checks and safe rollouts for one model. The multi-model view adds one question: *which* model is cold, and who pays?
+
+<Callout type="recap" title="The one-sentence version">
+  Multi-model serving pays when many small, unevenly used models share a few GPUs, and it costs a three-tier cache, an eviction policy, and a router that knows which host holds which model — while Triton supplies the backends, batching and load/unload API for that control plane.
+</Callout>
+
+<KeyNotes>
+  1. **One model per server stops scaling at the long tail.** Twenty small models on twenty GPUs use about 0.6 GPU of compute and cost about \$16 an hour; packing onto two costs about \$1.60 and changes no kernel.
+  2. **Memory, not compute, limits packing.** A 24 GB card gives roughly 21.6 GB to weights after reserve, so models per card is a division problem.
+  3. A **model cache** has three tiers: GPU (hit, about zero), CPU RAM (warm, one PCIe copy) and disk (cold, read plus copy). The tier decides the largest term in time to first token.
+  4. **Load time is bytes divided by bandwidth.** A 14 GB model takes about 14 s from a 1 GB/s disk, 0.56 s over 25 GB/s PCIe, and 14.6 s cold — 26 times the warm swap.
+  5. **LRU eviction is a heuristic**, assuming the recent past predicts the near future — true for chat, often false for scheduled work. Report the latency distribution including misses.
+  6. A **model router** holds the model-to-host map, per-model replica counts and placement policy. First send to a host that already has the weights; then make the miss path explicit.
+  7. **Triton Inference Server** is not the Triton kernel language. It is a model server: versioned repository, `config.pbtxt`, pluggable backends, dynamic batching, explicit load/unload, ensembles and HTTP/gRPC.
+  8. **Cost-optimised** designs pack and accept cold loads; **latency-optimised** designs pin and overprovision. Most platforms pin hot models and pack the long tail — and a 70B model belongs in neither camp, because it fills the node.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Twenty L4s at an approximate \$0.80 per GPU-hour serve twenty small models. Packing the same models onto two L4s saves about how much per month, at 730 hours?', numeric: true, answer: 10512, tolerance: 700, unit: 'dollars', why: 'Dedicated: 20 x 0.80 x 730 = 11,680 dollars. Packed: 2 x 0.80 x 730 = 1,168 dollars. Saving = 18 x 0.80 x 730 = 10,512 dollars. The exact price is approximate; the 10x ratio is the point.' },
+  { q: 'A 14 GB model is cold on disk. At an approximate 1 GB/s disk read and a 25 GB/s PCIe copy, what is the cold-load time in seconds?', numeric: true, answer: 14.56, tolerance: 0.7, unit: 's', why: 'Disk: 14 / 1 = 14 s. PCIe: 14 / 25 = 0.56 s. Total = 14.56 s. The disk read dominates, which is why staging in CPU RAM buys most of the improvement.' },
+  { q: 'The same 14 GB model is staged in CPU RAM. About how long does the warm swap take, in seconds?', numeric: true, answer: 0.56, tolerance: 0.06, unit: 's', why: 'Only the PCIe copy remains: 14 GB / 25 GB/s = 0.56 s. A cache hit is about zero; a cold load adds the disk read in front of this.' },
+  { q: 'A request arrives for a model that is not resident on any host. What should the router do first?', options: ['Return an error, because the model is not deployed', 'Load the model on a random host to spread the work', 'Choose a host using the placement policy, then trigger a load there and account for the cold-load latency', 'Retry the request until the model appears'], answer: 2, why: 'A miss is not an error; it is a load. The router must pick the host by memory headroom and eviction cost, trigger the load, and make the resulting latency visible rather than hiding it in an average.' },
+  { q: 'Why is LRU a heuristic rather than an optimal eviction policy?', options: ['Because it is too expensive to compute', 'Because it assumes the recent past predicts the near future, which fails when a model that has been idle becomes busy again', 'Because it evicts the most recently used model', 'Because it only works for LLMs'], answer: 1, why: 'LRU is optimal only for a specific access pattern. With bursty or scheduled traffic, the least recently used model can be the next one requested, so the policy converts a future hit into a cold load. The cost shows up in the tail, not the mean.' },
+  { q: 'Which statement about Triton Inference Server is correct?', options: ['It is the same project as the Triton kernel language from Module 13', 'It runs one model per process and has no model management API', 'It serves models from a versioned model repository, with a config.pbtxt per model, pluggable backends, dynamic batching and explicit load/unload', 'It replaces the need for a router and an eviction policy'], answer: 2, why: 'Triton Inference Server is a model server, unrelated to the Triton kernel language. It provides the model repository, config, backends, batching and lifecycle APIs. The cache policy and the routing map remain your control plane’s job.' },
+]} />

@@ -125,7 +125,63 @@ Model changes · precision changes · prompt/output length distribution shifts �
 5. Report the fleet as **floor + committed + headroom reason + scaling trigger**.
 6. Ship a **sensitivity section with thresholds**. A decision without one is a preference.
 
+## Managed APIs, cloud platforms & build vs buy
+
+**Six rungs, least control to most:** (1) foundation-model API → (2) one-click open-model endpoint → (3) bring your own weights → (4) bring your own code → (5) bring your own image → (6) build your own stack.
+
+| Rung | You own | Provider hides | You pay |
+|---|---|---|---|
+| 1 API | nothing | batching, cache, autoscaling, cold starts | per token |
+| 2 One-click | model + instance choice | container, engine, scaling defaults | per instance-hour |
+| 3 BYO weights | model | engine, kernels, KV policy, scaling | per instance-hour |
+| 4 BYO code | model + request logic | base image, drivers, cluster | per instance-hour |
+| 5 BYO image | model + engine + kernels + KV policy | cluster, node autoscaling, endpoint routing | instance-hour + storage |
+| 6 Build | all seven layers | nothing | GPU-hours + people + failures |
+
+**BYO-container contract:** HTTP server on the routed port · readiness endpoint returns 200 only after weights load and warm-up · invocation endpoint accepts the request schema · weights on a mounted path, not in the image · clean SIGTERM shutdown. Tie to **Warm-up, health checks & graceful shutdown**.
+
+**Self-hosted marginal cost per million output tokens:**
+
+$$
+c_{\text{self}} = \frac{p/3600}{G \times u} \times 10^6
+$$
+
+$p$ = \$/GPU-hour · $G$ = measured output tok/s at the SLO · $u$ = average utilisation over the month (idle hours included).
+
+**With fixed operations $O$ per month and $V$ daily tokens:**
+
+$$
+c_{\text{self}}(V) = \frac{p \times 10^6}{3600\,G\,u} + \frac{O \times 10^6}{30.42\,V}
+\qquad
+V^* = \frac{O \times 10^6}{30.42\,(c_{\text{api}} - c_{\text{self}})}
+$$
+
+**Illustrative worked example:** \$2.50/GPU-hour, 4,603 tok/s, 60% utilisation, \$0.60/M API, \$1,800/month ops.
+
+- Marginal: \$0.000694/s ÷ 2,762 tok/s × 1e6 = **\$0.251/M**.
+- Gap: \$0.60 − \$0.251 = \$0.349.
+- Crossover: 1,800 × 1e6 ÷ (30.42 × 0.349) ≈ **170M tokens/day**.
+
+| Average $u$ | tok/s | Marginal \$/M | Crossover M/day |
+|---|---|---|---|
+| 100% | 4,603 | 0.151 | 132 |
+| 80% | 3,682 | 0.189 | 144 |
+| 60% | 2,762 | 0.251 | 170 |
+| 40% | 1,841 | 0.377 | 265 |
+| 30% | 1,381 | 0.503 | 609 |
+| 25% | 1,151 | 0.604 | none |
+
+**Rules of thumb**
+
+- **Headroom and idle hours push the crossover right.** At 25% average utilisation the marginal self-hosted token is already above a \$0.60/M API, so no volume wins.
+- **TCO is the bill:** GPU-hours × cards kept warm + on-call + monitoring + spare/failed GPUs + storage/egress. A warm spare roughly doubles the fixed line.
+- **The real bill is a step function** of card count (Module 25.3), not the smooth curve used for planning.
+- **Non-cost filters first:** governance/privacy, latency control, custom models/fine-tunes, lock-in, rate limits, compliance. A hard constraint eliminates a rung; it is not a score.
+- **Decision defaults:** prototype → rung 1–2; regulated enterprise → rung 3–5 in a private network (or 6); steady high volume → rung 5–6; spiky low volume → rung 1–2.
+- **Seven layers:** public API (M23/M24) · resource management (M25/M23) · model selection (M23/M17) · distributed serving (M18/M20/M21) · core inference (M09/M17) · model optimisation (M10/M11/M14/M16) · model (M04). Rung 1 takes all seven; rung 3 leaves the model; rung 5 leaves the bottom three; rung 6 leaves all seven to you.
+- **Why build still matters:** read the provider's limits, benchmark on your workload at your SLO, and recompute the crossover when prices, utilisation, model or compliance change.
+
 ## Module order
 
-- 25.1 cost-per-token → 25.2 goodput-per-dollar → 25.3 capacity-planning → 25.P project-cheapest-system
+- 25.1 cost-per-token → 25.2 goodput-per-dollar → 25.3 capacity-planning → 25.4 build-vs-buy → 25.P project-cheapest-system
 - Next: **Module 26 Specialized Workloads** — agents, reasoning, multi-LoRA and multimodal change the *workload*, not the method. The identity holds; the inputs move.

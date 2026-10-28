@@ -154,6 +154,119 @@ for seq in decoders:
 | Users at 32k ctx | ~14 |
 | KV at 128k ctx | 16 GiB per request |
 
+## RAG, CAG & the serving bill
+
+### RAG in one line
+
+Chunk documents → embed each chunk → store vectors → embed the question → cosine search → paste the top-k chunks into the prompt → prefill and generate.
+
+| Step | What it costs | Where it runs |
+|---|---|---|
+| Parse + chunk | one-time CPU | offline |
+| Embed chunks | one embedding call per chunk, batched | offline |
+| Vector search | roughly 1–20 ms (approximate) | online, per query |
+| Embed question | roughly 10–50 ms (approximate) | online, per query |
+| Prefill the assembled prompt | compute, linear in prompt tokens | online, per query |
+
+Cosine similarity:
+
+$$
+\cos(q, c) = \frac{q \cdot c}{\lVert q \rVert \, \lVert c \rVert}
+$$
+
+### The RAG prompt and its bill
+
+For a 150-token system prompt, 8 chunks of 512 tokens, a 30-token question and 20 tokens of template:
+
+$$
+n = 150 + 8 \times 512 + 30 + 20 = 4{,}296 \text{ tokens}
+$$
+
+$$
+F_{\text{prefill}} \approx 2Pn = 2 \times 8.03\times10^9 \times 4{,}296 = 6.90\times10^{13} \text{ FLOP} = 69 \text{ TFLOP}
+$$
+
+$$
+t_{\text{prefill}} = \frac{F}{\text{peak FLOP/s} \times \text{MFU}}
+= \frac{6.90\times10^{13}}{989\times10^{12} \times 0.55} = 127 \text{ ms on H100}
+$$
+
+On an A100 80GB (312 TFLOP/s peak), the same prompt takes about **402 ms**.
+
+KV for the same prompt:
+
+$$
+b_{kv} = 2 L H_{kv} D b = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072 \text{ bytes/token}
+$$
+
+$$
+4{,}296 \times 131{,}072 = 563 \text{ MB} \approx 0.56 \text{ GB}
+$$
+
+The non-queueing part of TTFT is retrieval (20–70 ms approximate) + prefill (127 ms) + first-token sampling ≈ **150–200 ms**.
+
+At an illustrative \$2.50 per H100-hour, prefill alone is about \$0.000088 per query, or **\$88 per million queries**.
+
+### Why RAG usually misses the prefix cache
+
+Only the system prompt is byte-identical between queries:
+
+$$
+\text{hit rate} = \frac{150}{4{,}296} = 3.5\%, \qquad
+\text{saving} = 150 \times 29.5\ \mu\text{s} = 4.4 \text{ ms}
+$$
+
+| What two queries share | Hit rate | Prefill after reuse |
+|---|---|---|
+| Different chunks | 3.5% | 122 ms |
+| Same chunks, unstable order | 3.5% | 122 ms |
+| Same chunks, sorted by document ID | 98.8% | 1.5 ms |
+| Same chunks and same question | 99.5% | 0.6 ms |
+
+Rules: stable content first; sort chunks by document ID; dedupe; keep the template byte-identical; put timestamps and request IDs after the context, never at the front.
+
+### CAG memory math
+
+Preload the whole knowledge base as one prefix, compute its KV once, reuse it for every query:
+
+$$
+100{,}000 \text{ tokens} \times 131{,}072 \text{ bytes/token} = 13.1 \text{ GB} \quad (12.2 \text{ GiB})
+$$
+
+On an 80 GB H100, Llama-3.1-8B in FP16:
+
+$$
+\text{free for KV} = (80 - 16.06 - 3.2) \times 0.9 = 54.7 \text{ GB}
+$$
+
+$$
+\frac{54.7}{13.1} = 4.2 \quad\Longrightarrow\quad 4 \text{ prefixes}
+$$
+
+Four prefixes use 52.4 GB and leave about 2.3 GB for the questions' growing KV.
+
+| CAG quantity | Value |
+|---|---|
+| Prefill per 30-token question | 0.9 ms + ~1.5–2 ms overhead ≈ 3 ms TTFT |
+| Rebuild a 100K prefix | ≈ 3 s of weight matmuls + ≈ 5 s of attention ≈ 8 s (H100) |
+| 500K-token prefix | 65.5 GB — does not fit, and exceeds a 128K context |
+| Prefixes per 80 GB card | 4 (3 if you keep concurrency headroom) |
+
+### RAG vs CAG
+
+| | RAG | CAG |
+|---|---|---|
+| TTFT | 150–200 ms | ≈3 ms |
+| Cost per query | 4,296-token prefill + retrieval service | 30-token prefill; 13.1 GB paid once |
+| Freshness | fresh per query | stale until an ~8 s rebuild |
+| KB size | unbounded (vector DB) | bounded by context + KV memory |
+| Failure mode | bad retrieval | overflow / lost in the middle |
+| Multi-tenant | per-request KV, trivial | 4 prefixes; eviction ≈ 8 s |
+
+**Choose CAG** for small, stable, high-QPS knowledge. **Choose RAG** for large, fresh, per-user or citation-heavy corpora. **Hybrid:** CAG the stable core, RAG the changing tail, share the system prompt.
+
+Frontier, at the time of writing: CacheBlend-style selective recompute reuses KV for retrieved chunks that are not a prefix, recomputing a small fraction of tokens to restore cross-attention. Module 20's tiered KV moves large CAG prefixes off the GPU.
+
 ## The three sentences
 
 1. Long prompts block everyone because a step is prefill **or** decode — chunk it to about one decode step.

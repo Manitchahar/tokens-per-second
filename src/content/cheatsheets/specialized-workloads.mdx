@@ -13,6 +13,7 @@ Six workloads that break the defaults the rest of the course taught you. Each on
 | agents / reasoning | growing prefix | **prefix cache** | decode | quadratic prefill |
 | RL rollouts | thousands of whole sequences | none | KV memory | sizing by parameters |
 | diffusion | whole image, ×20–50 | feature cache | **compute** | thinking it is memory-bound |
+| edge / on-device | token, bandwidth-bound | KV cache | **memory bandwidth** | quoting TOPS as if it predicted decode |
 
 ## 1 · Structured output
 
@@ -189,7 +190,54 @@ $$
 - Feature caching retains 15–35% of compute, **lossy** (unlike prefix caching).
 - Per-image latency is **flat in batch** → run the largest batch that fits. No latency/throughput trade-off.
 
-## The six sentences
+## 7 · On-device & edge inference
+
+$$
+\text{tokens/s} \approx \frac{\text{BW} \times \eta}{P \cdot b_w}
+\qquad
+t_{\text{step}} = \frac{P \cdot b_w}{\text{BW} \times \eta}
+$$
+
+Bandwidth from the bus, not from a brochure: LPDDR5X at 8,533 MT/s on a 64-bit bus is 8,533 × 8 bytes = 68.3 GB/s; LPDDR5-6400 gives 51.2 GB/s.
+
+| device | bus | bandwidth (approx.) | 3B 16-bit | 3B 4-bit |
+|---|---|---|---|---|
+| phone | 64-bit LPDDR5X | 50–70 GB/s | 5–7 tok/s, does not fit | **18–24 tok/s** |
+| laptop | 128-bit | ~136 GB/s | 13 tok/s | 45 tok/s |
+| laptop | 256-bit | ~273 GB/s | 26 tok/s | 90 tok/s |
+
+Worked: 3B at 4.5 bits per weight is 3.21B × 0.5625 bytes = 1.81 GB. At 60 GB/s and $\eta = 0.6$: 36 ÷ 1.81 = 20 tok/s, or 50 ms per token.
+
+$$
+\text{bytes per weight} = \frac{\text{payload} + \text{scale}}{\text{group}} = \frac{128 + 16}{32}\text{ bits} = 4.5
+$$
+
+| item | 8 GB phone | 12 GB phone |
+|---|---|---|
+| OS | ~3.0 GB | ~3.0 GB |
+| app + runtime | ~1.5 GB | ~1.5 GB |
+| free for the model | **~3.5 GB** | **~7.5 GB** |
+| 3B 4-bit + 2K KV | 2.04 GB, fits | fits |
+| 3B 16-bit + 2K KV | 6.66 GB, **does not fit** | 6.66 GB, fits |
+
+$$
+\text{KV/token} = 2 L H_{kv} D b
+$$
+
+Llama-3.2-3B (28 layers, 8 KV heads × 128, 16-bit): 112 KB/token → 229 MB at 2K, 918 MB at 8K.
+
+NPU arithmetic: one token costs $2P$, which is 6.4 GFLOP. At an effective 9 TOP/s that is 0.7 ms, against 50 ms of memory time — the NPU is busy **1.4%** of the step. Prefill of 500 tokens is 3.2 TFLOP → **357 ms**, which is where TOPS finally matters.
+
+Thermal: at 55% of burst clock, 60 × 0.6 × 0.55 ÷ 1.81 = 11 tok/s. Twenty becomes eleven.
+
+Heterogeneous crossings: 28 layers × 2 crossings × 30 µs = 1.7 ms (3% of a step). Cross per operator (10 per block) and it is 28 ms — more than half the step.
+
+- **On the edge, compression is a prerequisite, not an optimisation.** 4-bit weights, a smaller model, distillation, in that order.
+- **TOPS is a prefill number.** Decode is bandwidth-bound; a bigger NPU does not move tokens.
+- **Benchmark for 60 s**, report the sustained tail and the first seconds separately.
+- Routing signals: network, battery, temperature, confidence, request size. Long prompt → cloud on *compute*, short intent → device on *round trip*.
+
+## The seven sentences
 
 1. **Structured output** adds no tokens and no forward passes — one mask per step. It is a type system, not a security boundary, and more than 40% of a tool call is grammar-forced scaffolding.
 2. **Multi-LoRA** makes a tenant cost tens of megabytes against a 16 GB base, but adapter count per step is really batch size, and the memory table hides that tax.
@@ -197,3 +245,4 @@ $$
 4. **Agents and reasoning** are a growing prefix with perfect reuse; without a cache prefill is $O(T^2)$, and at batch 1 a long trace is a trap because the weight read dominates everything.
 5. **RL rollouts** are sized by tokens in flight, not parameters — KV is 86% of the cluster and peak occupancy is the group size.
 6. **Diffusion** is compute-bound at ~2% of peak bandwidth, which inverts every purchasing intuition from the rest of the course, and its memory is activations rather than weights.
+7. **On-device** serving is the same bandwidth-bound decode on a machine with a tenth of the memory and a fiftieth of the bandwidth, which is why 4-bit is a prerequisite, why TOPS predicts prefill rather than decode, and why the router — not the model — is the interesting part.

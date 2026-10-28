@@ -57,4 +57,34 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'A prompt shaped for prefix reuse: long byte-identical stable prefix first, short variable tail last, retrieved documents sorted deterministically, and no per-request timestamp or ID in front.',
     lesson: 'prefill-prefix/radix-attention',
   },
+  rag: {
+    term: 'RAG (retrieval-augmented generation)',
+    def: 'Answering a question by first searching an index for relevant passages and pasting them into the prompt before the question. The model’s weights stay frozen; freshness comes from the retrieved text, and the cost is a long, mostly context-filled prefill on every query.',
+    lesson: 'prefill-prefix/rag-cag',
+  },
+  cag: {
+    term: 'CAG (cache-augmented generation)',
+    def: 'Preloading a small knowledge base into the context once, computing its KV cache once, and reusing that KV prefix for every query. There is no retrieval step; the trade is a large resident KV cache and stale knowledge until the prefix is rebuilt.',
+    lesson: 'prefill-prefix/rag-cag',
+  },
+  'embedding-model': {
+    term: 'Embedding model',
+    def: 'A model separate from the LLM that maps text to a fixed-length vector positioned so that similar meanings land near each other. The same embedding model must be used for the documents and the question, or the distances are meaningless.',
+    lesson: 'prefill-prefix/rag-cag',
+  },
+  'vector-database': {
+    term: 'Vector database',
+    def: 'A store for embedding vectors plus the chunk text and metadata, with an index that finds near neighbours without scanning every vector. Production indexes are usually approximate: a small recall loss in exchange for a large search speedup.',
+    lesson: 'prefill-prefix/rag-cag',
+  },
+  chunking: {
+    term: 'Chunking',
+    def: 'Splitting documents into passages before embedding and indexing. The chunk is the unit of retrieval: small chunks retrieve precisely but lose context, large chunks carry context but blur topics, and about 512 tokens is a common starting point.',
+    lesson: 'prefill-prefix/rag-cag',
+  },
+  'cosine-similarity': {
+    term: 'Cosine similarity',
+    def: 'The dot product of two vectors divided by their lengths, so it compares direction and ignores magnitude. Used to rank chunks against a question; scores near 1 mean similar direction, scores near 0 mean unrelated.',
+    lesson: 'prefill-prefix/rag-cag',
+  },
 };
