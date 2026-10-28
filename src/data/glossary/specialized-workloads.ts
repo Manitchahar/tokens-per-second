@@ -150,6 +150,21 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The situation in a rollout group where sequences finish at very different times, so the batch steadily drains instead of staying full. It is the opposite of continuous batching in serving, and it means both that peak memory is the group size and that the tail runs at reduced throughput.',
     lesson: 'specialized-workloads/batch-rl-rollouts',
   },
+  'fp-non-associativity': {
+    term: 'Non-associativity (floating point)',
+    def: 'In exact arithmetic the grouping of a sum does not matter; in floating point every addition rounds to the nearest representable number, so it does. In FP16, 1 + 0.0005 + 0.0005 gives 1.001953 one way and 1.000977 the other — one unit in the last place, about 0.1% — because the grid just above 1.0 is spaced 0.000977 apart. BF16’s grid is eight times coarser. It is the root cause of batch-dependent outputs.',
+    lesson: 'specialized-workloads/batch-rl-rollouts',
+  },
+  'batch-invariant': {
+    term: 'Batch-invariant kernels',
+    def: 'Kernels whose summation order for a token does not depend on the batch it is travelling in, so the same prompt yields the same logits at batch 1 and at batch 64. Proposed and implemented by some serving engines at the time of writing; a fixed reduction gives up the fastest split for each shape, which costs throughput, and it is the price of a reproducible rollout.',
+    lesson: 'specialized-workloads/batch-rl-rollouts',
+  },
+  'importance-ratio': {
+    term: 'Importance ratio',
+    def: 'The correction factor between generating with one policy and scoring with another: r = exp(log π_trainer − log π_engine) for a sampled token. A log-probability gap of δ moves it by about (1 + δ). A one-off gap is harmless, but a systematic one biases every update, and a large one lands outside the clipping range and discards the sample.',
+    lesson: 'specialized-workloads/batch-rl-rollouts',
+  },
   // ── 7 · diffusion ──
   latent: {
     term: 'Latent',

@@ -216,17 +216,73 @@ Two things will surprise you. **Unpinned memory is dramatically slower** than pi
   5. **Measure** the achieved bandwidth of each tier in your own process, and put the crossover number in a comment next to the threshold you set.
 </Callout>
 
+## Doing it: LMCache with vLLM
+
+This is what the arithmetic looks like as a running server, and how to measure it.
+
+<Term t="lmcache">LMCache</Term> is an open-source KV cache layer that runs alongside the model server. It holds KV blocks somewhere other than GPU memory — host RAM, a local disk, or a remote store — and hands them back when a request can use them. Blocks are identified by the tokens they were computed from, so one request's blocks can serve another request on the same engine, or another engine instance sharing the same store.
+
+It plugs into vLLM through a <Term t="kv-connector">KV connector</Term>. The engine keeps its paged pool and, at block boundaries, asks the connector to save a block or to find one. The connector is named in a JSON blob at startup, together with the role it should play: store only, load only, or both.
+
+```bash
+# Shape of a vLLM + LMCache launch. Names and defaults move between
+# releases — check the LMCache and vLLM docs at the time of writing.
+export LMCACHE_LOCAL_CPU=True
+export LMCACHE_MAX_LOCAL_CPU_SIZE=200.0     # GB of host RAM lent to the cache
+export LMCACHE_CHUNK_SIZE=2048              # tokens per reusable chunk
+# export LMCACHE_LOCAL_DISK="kv_cache/"      # add a disk tier
+# export LMCACHE_MAX_LOCAL_DISK_SIZE=500.0
+
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --max-model-len 32768 \
+  --kv-transfer-config '{"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both"}'
+```
+
+Every name in that block — the connector class, the environment variables, the JSON keys — is version-specific, so check the LMCache and vLLM documentation at the time of writing.
+
+The two knobs that price the system are chunk size and capacity. **Chunk size** is the unit of reuse: too large and a request sharing 1,500 tokens with a cached document gets nothing; too small and the per-chunk bookkeeping — hashing, lookup, transfer — grows faster than the hit rate. **Capacity** is how much slower memory you lend. The rest is plumbing.
+
+**How much fits.** One token of Llama-3.1-8B KV is 131,072 bytes, so 200 GB of host RAM holds
+
+$$
+\frac{200 \times 10^9}{131{,}072} \approx 1{,}530{,}000 \text{ tokens}
+$$
+
+which at 32,768 tokens per conversation is about **46 conversations**. The H100 KV budget from the previous lesson is 54.7 GB — 417,000 tokens, or 12 conversations at that length. The CPU tier is roughly **3.7× the capacity of the GPU**, using memory you have already paid for.
+
+**What it costs to reload.** The prefix worth counting is one you would otherwise prefill. A 32,768-token prefix is 4.29 GB of KV. At an approximate 25 GB/s — a plausible PCIe-class figure — that arrives in **172 ms**. Recomputing it costs $P \cdot 2 \cdot T = 8.03\times10^9 \times 2 \times 32{,}768 \approx 526$ TFLOP, which on an H100 at 55% MFU, or 544 TFLOP/s, is **0.97 s** for the weight matmuls alone. At 32K tokens attention is no longer negligible: causal attention adds roughly $2T^2 d$ FLOPs per layer, about 280 TFLOP over 32 layers, so a full recompute is closer to 1.5 s. The table keeps the conservative matmul-only figure.
+
+| Path for a 32,768-token prefix (4.29 GB) | Time |
+|---|---|
+| Fetch at 55 GB/s (PCIe 5.0 class) | 78 ms |
+| Fetch at 25 GB/s | **172 ms** |
+| Fetch at 7 GB/s (NVMe) | 614 ms |
+| Recompute: 526 TFLOP at 55% MFU | **0.97 s** |
+| Fetch at 1.25 GB/s (10 GbE) | 3.4 s |
+
+This is the same crossover as before, and the prefix length never enters it. Fetching $T$ tokens over bandwidth $BW$ takes $T \cdot b_{kv} / BW$; recomputing them takes $T \cdot t_{\text{recompute}}$; the $T$ cancels, leaving $BW = b_{kv} / t_{\text{recompute}} \approx 4.4$ GB/s. A 25 GB/s link is 5.7× above that line, and the reload is 5.7× faster than the recompute. The only new thing is *where you feel it*: during decode, 29.5 µs of recompute per token hides in idle tensor cores, but a reload happens before the first token, so it is pure TTFT. Offload is a latency trade, not a free lunch; at the crossover it is exactly a wash.
+
+<Callout type="pitfall" title="A warm run is not a result">
+  The common mistake is to run the workload twice, quote the second run's time-to-first-token, and stop. A cache layer is slower than no cache layer when nothing hits — you pay for lookups and transfers that find nothing — so the *cold* pass is the control and has to sit in the report next to the warm one.
+
+  Report the pair with the hit rate beside it: a warm TTFT of one second at a 90% hit rate and one second at a 10% hit rate are different systems wearing the same number. Then repeat the warm pass five requests at a time. That is when live requests compete for GPU memory, and when the extra tier earns its keep.
+</Callout>
+
+**The protocol, in full.** Run the same conversation or shared-document workload twice, in the same order, in one process: cold from an empty cache, then warm with the tier populated. For each pass record the hit rate the engine reports and TTFT at p50 and p99. The claim under test is not "the cache is faster" but "at this reuse, this hit rate buys this much TTFT without worsening the p99" — and a p99 that lags the p50 means misses are queueing behind transfers.
+
+**When it loses.** Three conditions. Low reuse: if every prompt is unique, every lookup misses and you have bought only overhead. Short prompts: a 500-token prefix is about 66 MB, which prefill recomputes in roughly 15 ms — less than the round trip to a slower tier. Slow storage: below the crossover bandwidth no hit rate can save you, because the bytes still have to arrive.
+
+Two ideas from the research frontier, at the time of writing, attack those limits. **CacheGen** compresses the KV blocks themselves before they travel, encoding them into a more compact bitstream based on their distribution, so a reload moves fewer bytes and a slow tier behaves like a faster one; the price is encode and decode work, and a quality question you have to measure. **CacheBlend** attacks the prefix-only assumption. A retrieval pipeline concatenates chunks that are not prefixes of one another, so a strict prefix cache misses on all of them; CacheBlend reuses their stored KV and selectively recomputes a small, tunable fraction, because attention mixes information across chunk boundaries and naively concatenating independent caches would discard those cross-chunk interactions. Both are the trade this lesson keeps making: spend a little arithmetic to avoid moving bytes.
+
 <KeyNotes>
   1. The KV cache is **derived data** — every byte can be recomputed from the prompt. That is what makes it the one thing in a transformer that can live on a cheap tier.
-  2. Four tiers, ~2,700× apart: HBM 3.35 TB/s, host DRAM over PCIe 55 GB/s, NVMe 7 GB/s, a remote node on 10 GbE 1.25 GB/s.
-  3. One token of KV is 131,072 bytes for 8B: 39 ns from HBM, 2.4 µs over PCIe, 19 µs from NVMe, 105 µs across 10 GbE.
-  4. Recomputing it costs 2P FLOPs, about **29.5 µs** on an H100 — and decode is memory-bound, so the tensor cores are ~95% idle while that happens. Recompute is cheap because it spends the idle resource.
-  5. The break-even bandwidth is $b_{kv} / t_{\text{recompute}} \approx$ **4.4 GB/s** for 8B, and it *falls* as the model grows — bigger models tolerate slower storage.
-  6. PCIe always wins, NVMe wins above a few billion parameters, and **10 GbE loses to recompute**. Use 25–100 GbE or do not bother.
-  7. The per-step budget is `streamed bytes ≤ tier bandwidth × weight-read time`: 330 MB per step over PCIe on an H100, if you want zero added latency.
-  8. Keep a **resident window** of the most recent tokens in GPU memory and stream only the tail. Streaming the whole cache every step is the failure mode that makes tiered KV look impossible.
-  9. Tiered KV buys **capacity, not speed** — and it is free only where the latency lands somewhere attention does not care about.
-  10. The silent hazards: transfer/compute races, RoPE positions not travelling with the cache, quantization scales left behind, and unpinned host memory. Plus backpressure, or a traffic spike becomes an outage.
+  2. Four tiers, ~2,700× apart, and one token of KV is 131,072 bytes for 8B: 39 ns from HBM, 2.4 µs over PCIe, 19 µs from NVMe, 105 µs across 10 GbE.
+  3. Recomputing it costs 2P FLOPs, about **29.5 µs** on an H100 — and decode is memory-bound, so the tensor cores are ~95% idle while that happens. Recompute is cheap because it spends the idle resource.
+  4. The break-even bandwidth is $b_{kv} / t_{\text{recompute}} \approx$ **4.4 GB/s** for 8B, and it falls as the model grows. So PCIe always wins, NVMe wins above a few billion parameters, and 10 GbE loses to recompute — use 25–100 GbE or do not bother.
+  5. Keep a **resident window** of the most recent tokens in GPU memory and stream only the tail, inside the per-step budget of tier bandwidth × weight-read time — 330 MB per step over PCIe on an H100.
+  6. Tiered KV buys **capacity, not speed** — and it is free only where the latency lands somewhere attention does not care about.
+  7. The silent hazards: transfer/compute races, RoPE positions not travelling with the cache, quantization scales left behind, unpinned host memory, and no backpressure on a slow tier.
+  8. In practice it is one connector plus a chunk size and a capacity: 200 GB of host RAM is about **1.53 million tokens** of 8B KV, and reloading a 32,768-token prefix is 172 ms at 25 GB/s against 0.97 s of prefill. Benchmark cold then warm, report hit rate with TTFT p50 and p99, and expect it to lose on low reuse, short prompts, and storage below 4.4 GB/s.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -236,4 +292,5 @@ Two things will surprise you. **Unpinned memory is dramatically slower** than pi
   { q: 'Llama-3.1-70B has 327,680 bytes of KV per token and costs about 258 µs to recompute on one H100. Its break-even bandwidth is roughly how much?', numeric: true, answer: 1.3, tolerance: 0.2, unit: 'GB/s', why: '327,680 ÷ 258e-6 = 1.27 GB/s. Compare 4.4 GB/s for 8B: bigger models tolerate slower storage, because they have both more bytes per token to amortise and more idle arithmetic to spend. Small models like Qwen2.5-0.5B sit at the opposite extreme, around 6.9 GB/s.' },
   { q: 'Which failure is the most dangerous when offloading KV cache to host memory, and why?', options: ['Slow first-byte latency, because it shows up as extra TTFT', 'A transfer/compute race, because a block overwritten mid-read silently corrupts the answer with no error', 'Higher memory usage on the host, because it exhausts the machine’s RAM', 'The loss of the prefix-cache hit rate, because it wastes compute on prefill'], answer: 1, why: 'Latency and host memory are visible and bounded. A race between a block being written for the next step and being read for the current one produces plausible-looking garbage — no crash, no log line, wrong answer. Fix it with double buffering or a per-step fence on every buffer.' },
   { q: 'What does tiered KV actually buy you?', options: ['Faster decode for long contexts, because the cache is bigger', 'Capacity: far more total context and more conversations than HBM could hold, bought with latency', 'Lower prefill cost, because cold blocks can be fetched in parallel', 'Better quality, because more context is always used well'], answer: 1, why: 'The bytes still have to arrive, and at 8× less bandwidth they arrive 8× slower. What changes is how many conversations you can hold — three 128K conversations becomes dozens — and the gain is free only where the latency lands where attention does not care. Recall lost-in-the-middle: more context is not automatically better quality.' },
+  { q: 'A server lends LMCache 200 GB of host RAM for Llama-3.1-8B KV at 131,072 bytes per token. How many tokens of cache is that?', numeric: true, answer: 1530000, tolerance: 100000, unit: 'tokens', why: '200 × 10^9 ÷ 131,072 ≈ 1.53 million tokens. At 32,768 tokens per conversation that is about 46 conversations, against 12 in the 54.7 GB of KV budget an H100 has left — roughly 3.7× the card. Reloading a 32K prefix costs 4.29 GB ÷ 25 GB/s ≈ 172 ms, against about 0.97 s to prefill it.' },
 ]} />

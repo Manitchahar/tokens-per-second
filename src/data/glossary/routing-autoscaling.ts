@@ -142,4 +142,44 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Deciding which requests to accept, queue or reject when a replica runs out of KV memory. Whether a fleet sheds load or simply grows an unbounded queue is a deliberate choice, and the queue is where p99 goes to die.',
     lesson: 'routing-autoscaling/lab-hold-the-slo',
   },
+  'exact-match-cache': {
+    term: 'Exact-match response cache',
+    def: 'A cache that stores a finished answer under a hash of the normalised request — model and version, template, system prompt, tools, sampling settings, locale and tenant. A hit returns the stored response with no prefill and no decode, but any volatile field in the key turns every request into a miss.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
+  'semantic-cache': {
+    term: 'Semantic cache',
+    def: 'A cache that stores a question embedding and its answer, then returns that answer when a new question is close enough in embedding space. It can match different wordings, and it saves the whole LLM call — but an approximate match can return a confident answer to a different question.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
+  'false-hit': {
+    term: 'False hit',
+    def: 'A semantic-cache hit whose stored answer is wrong for the new request. It costs the wrong-answer penalty rather than saving a call, which is why a cache is tuned for precision among hits, not for the highest possible hit rate.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
+  'similarity-threshold': {
+    term: 'Similarity threshold',
+    def: 'The minimum cosine similarity at which a stored question is considered a match. Lowering it widens the match region and raises the hit rate, but also raises the false-hit rate; the right value comes from a labelled evaluation set and the economics of a wrong answer, not from a universal constant.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
+  'pii-masking': {
+    term: 'PII masking',
+    def: 'Replacing personally identifiable information — names, emails, phone numbers, card and account numbers — with stable placeholders before text is embedded, cached or logged. A named-entity model plus regular expressions is the usual tool; the raw value must never reach the vector index or the stored answer.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
+  'cache-scoping': {
+    term: 'Cache scoping',
+    def: 'Putting every dimension that changes the answer into the cache key or the search filter: tenant, locale, model and model version, prompt template, embedding model, tool permissions and index version. Tenant isolation must happen inside the vector search, not as a cleanup afterwards.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
+  'semantic-routing': {
+    term: 'Semantic routing',
+    def: 'Using an embedding or a small classifier to score a request and choose which model or mode serves it — a small model for easy queries, a large model or reasoning mode for hard ones. It sits above replica-level routing: this decision is which model, not which copy of one model.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
+  'shadow-mode': {
+    term: 'Shadow mode',
+    def: 'Running a new cache or router on real traffic while still serving the normal answer, logging what the new component would have done. It exposes would-be hits and would-be false hits with no user impact, and it is the cheapest way to earn the right to turn the component on.',
+    lesson: 'routing-autoscaling/semantic-caching',
+  },
 };

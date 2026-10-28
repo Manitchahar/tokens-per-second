@@ -187,15 +187,74 @@ class GroupedAttention(torch.nn.Module):
   In the module notebook, load a GQA model and an MHA-era model, print `config.num_attention_heads` and `config.num_key_value_heads` for each, and compute the KV bytes per token from the formula above. Then run one decode step on both at the same context length and time it. If the models differ in size the timing will not be clean — which is itself the lesson: **compare the formula, not the clock, when the models differ.**
 </Callout>
 
+## Beyond GQA: latent attention and sliding windows
+
+GQA shrinks the cache by sharing KV heads. Two later ideas attack the same bytes differently: MLA changes **what** is stored, and sliding windows change **how much history** is stored.
+
+### Multi-head latent attention
+
+<Term t="mla">Multi-head latent attention (MLA)</Term> was introduced with DeepSeek-V2 and used in DeepSeek-V3. Instead of caching a full key and value per KV head, the layer caches **one small compressed vector per token per layer** — a latent — and rebuilds K and V from it with learned up-projections.
+
+A down-projection — one learned matrix that shrinks the hidden state — turns it into a short latent. DeepSeek-V3 uses 512 numbers for it. Each attention head then gets its own K and V by multiplying that same latent with its own up-projection. The difference from MQA and GQA is that those share **identical** keys and values; MLA gives every head its own K and V again, but stores a shared *code* from which all of them are derived.
+
+The separate 64-number key exists because RoPE rotates keys by an angle that depends on position. A rotation does not survive the up-projection, so position must be applied to something stored explicitly, not reconstructed.
+
+In bytes: take the Llama-3.1-8B shapes for the three older styles, and DeepSeek-V3's published latent size at the time of writing:
+
+| Style | Cached per token per layer | Values/layer | Bytes/token (whole model) | At 32K |
+|---|---|---|---|---|
+| MHA | K and V for 32 KV heads | 8,192 | 512 KiB | 16.0 GiB |
+| MQA | K and V for 1 KV head | 256 | 16 KiB | 512 MiB |
+| GQA | K and V for 8 KV heads | 2,048 | 128 KiB | 4.0 GiB |
+| MLA (DeepSeek-V3, approx.) | 512 latent + 64 RoPE key | 576 | **68.6 KiB** | **2.14 GiB** |
+
+MLA arithmetic: 512 + 64 = 576 values per token per layer; times 2 bytes is 1,152 bytes; times 61 layers is 70,272 bytes, or 68.6 KiB per token. At 32K context that is 32,768 × 70,272 ≈ 2.14 GiB per sequence.
+
+The last row is not an 8B-sized model with a smaller cache: DeepSeek-V3 is a 671B-parameter model with 61 layers, roughly 80× Llama-3.1-8B. The point is that a model that large runs a per-token cache **about half** of Llama-3.1-8B's.
+
+### Why MLA costs extra compute
+
+Reconstructing K and V is real work. For DeepSeek-V3, a token needs 128 heads × 128 numbers for K and the same for V — 32,768 values per layer. In BF16 that is 64 KiB per layer, or about 3.7 MiB per token across 61 layers, roughly **55×** the 68.6 KiB cache it came from. Writing and re-reading those tensors would cost more bandwidth than MLA saved.
+
+<Callout type="intuition" title="Absorb the up-projection into the projections around it">
+  The score a query computes against a reconstructed key is $\mathbf{q} \cdot (W_{UK}\mathbf{c})$. A dot product can be regrouped: it equals $(W_{UK}^\top \mathbf{q}) \cdot \mathbf{c}$. So project the query **down** into the latent space at load time, by folding $W_{UK}^\top$ into $W_Q$. The decode kernel then scores a short query against the cached code and never builds a key.
+
+  The same trick works on the output side: the weighted sum of the value vectors equals $W_{UV}$ times the weighted sum of the latents, so $W_{UV}$ folds into $W_O$. Attention runs entirely in the small latent space.
+</Callout>
+
+That folding is called <Term t="weight-absorption">weight absorption</Term>. It turns MLA's extra compute into a one-time cost at load time, which is why an MLA model keeps its small cache *and* decodes cheaply. At the time of writing, engines that support MLA use it; the decoupled key is stored because RoPE must be applied to it as each token is cached.
+
+### Sliding-window attention
+
+<Term t="sliding-window-attention">Sliding-window attention</Term> takes the other route: keep ordinary K and V, but only for a fixed number of recent tokens. In a local layer, token $i$ attends to tokens $i-W+1$ through $i$; anything older is masked exactly like the future, and its cache entry can be thrown away.
+
+The saving is a hard cap. For Llama-3.1-8B shapes each layer stores 4 KiB per token (2 × 8 KV heads × 128 × 2 bytes). At 32K context:
+
+- **All 32 layers full-context:** 32 × 32,768 × 4 KiB = 4.0 GiB.
+- **All 32 layers local, W = 4,096:** 32 × 4,096 × 4 KiB = 512 MiB — eight times less.
+- **Hybrid, one full-context layer in four:** 8 full-context layers hold 8 × 128 MiB = 1.0 GiB, and 24 local layers hold 24 × 16 MiB = 384 MiB. Total **1.375 GiB**, 2.9× less than the 4.0 GiB above.
+
+The same factor applies to prefill compute: a local token compares itself with $W$ keys instead of $T$, so attention FLOPs in those layers fall by $W/T = 4{,}096/32{,}768 = 1/8$. The 8-full-context/24-local mix gives
+
+$$
+\frac{8T^2 + 24TW}{32T^2} = \frac{8 + 24/8}{32} \approx 0.34
+$$
+
+so compute falls by the same 2.9×. Bytes and comparisons scale together, so the savings match.
+
+The trade-off is reach. A local layer cannot compare token 1 with token 30,000; information must travel through the tokens in between, like a message passed along a chain. Stacking 32 local layers gives a theoretical reach of 32 × 4,096 tokens, but in practice the signal degrades. Hybrids keep a few global layers — which see the whole context — for direct long-range links and exact recall. Gemma 2 alternated 4,096-token local and global layers; Gemma 3 uses several 1,024-token local layers per global layer; Mistral 7B applied a 4,096-token window everywhere. The configurations at the time of writing differ; the pattern does not: pay full price only where long-range mixing is worth it.
+
+Sliding windows cap a *layer*, not a model. When the context grows past what a handful of global layers can carry, the remaining cache is still linear in $T$ — which is exactly where Module 20 (long context) picks up.
+
 <KeyNotes>
   1. **head_dim = hidden / heads**, and it stays at **128** as models grow. Llama-3.1-8B: 4096 / 32 = 128. Qwen2.5-0.5B is the exception at 64.
   2. Heads run **in parallel** as a batched matmul, not sequentially. 32 heads cost nearly the same wall-clock time as one; only the weights are extra, and attention is 16.7% of Llama-3.1-8B.
   3. Keys and values are a **shared resource**; nothing requires $n_{kv} = n_q$. **MHA** = 32/32, **MQA** = 32/1, **GQA** = 32/8.
   4. **$B_{KV} = 2 \times L \times n_{kv} \times d_h \times b$ bytes per token.** Five factors. Read `num_key_value_heads` from the config, never assume it equals `num_attention_heads`.
-  5. Per token: Qwen2.5-0.5B 12 KiB · Llama-3.2-3B 112 KiB · Llama-3.1-8B 128 KiB · Qwen2.5-32B 256 KiB · Llama-3.1-70B 320 KiB.
-  6. **Qwen2.5-32B has a smaller KV cache per token than Llama-3.1-70B** (256 vs 320 KiB) despite half the parameters — fewer layers' worth of growth beats more parameters.
-  7. Llama-2-7B (MHA, 32 KV heads) costs 512 KiB/token, 4× Llama-3.1-8B. At 32K context that is 16.0 GiB per sequence instead of 4.0 GiB: about 15 users instead of 3 on the same GPU.
-  8. **GQA saves bytes, not FLOPs.** Attention arithmetic is $F = 2T^2d_{\text{model}}$ regardless of head sharing; what shrinks is KV storage, KV read bandwidth and KV write bandwidth.
+  5. Per token: Qwen2.5-0.5B 12 KiB · Llama-3.2-3B 112 KiB · Llama-3.1-8B 128 KiB · Qwen2.5-32B 256 KiB · Llama-3.1-70B 320 KiB. **Qwen2.5-32B holds less than Llama-3.1-70B (256 vs 320 KiB) despite half the parameters** — layers and KV heads decide this, not parameter count.
+  6. Llama-2-7B (MHA, 32 KV heads) costs 512 KiB/token, 4× Llama-3.1-8B. At 32K context that is 16.0 GiB per sequence instead of 4.0 GiB: about 15 users instead of 3 on the same GPU.
+  7. **GQA saves bytes, not FLOPs.** Attention arithmetic is $F = 2T^2d_{\text{model}}$ regardless of head sharing; what shrinks is KV storage, KV read bandwidth and KV write bandwidth.
+  8. **MLA** caches one latent per token per layer and rebuilds K and V; DeepSeek-V3 keeps 512 + 64 values across 61 layers ≈ 68.6 KiB/token, about half of Llama-3.1-8B's cache. Engines **absorb** the up-projections into the query and output weights so decode never materialises K or V. **Sliding-window** layers cap their cache at $W$ tokens; with W = 4,096 at 32K context, a 24-local/8-global hybrid needs 1.375 GiB instead of 4.0 GiB.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -205,4 +264,5 @@ class GroupedAttention(torch.nn.Module):
   { q: 'Grouped-query attention shrinks the KV cache. What does it not change?', options: ['The number of FLOPs attention performs', 'The KV cache size per token', 'The bytes read per decode step', 'The number of query heads'], answer: 0, why: 'Every query head still scores against every key, so the attention arithmetic 2·T²·d_model is unchanged. GQA is purely a byte reduction: storage, KV reads and KV writes.' },
   { q: 'A model has hidden size 5,120 and 40 attention heads. What is its head_dim?', numeric: true, answer: 128, tolerance: 0, why: '5,120 / 40 = 128. Head dim is held at 128 across most modern models — Llama-3.1-8B is 4096/32, Llama-3.1-70B is 8192/64 — so RoPE frequencies and softmax statistics stay comparable.' },
   { q: 'Llama-3.1-8B, 32K context, BF16. How much KV cache does one sequence hold, in GiB?', numeric: true, answer: 4, tolerance: 0.15, unit: 'GiB', why: '32,768 tokens × 131,072 bytes = 4,294,967,296 bytes = 4.0 GiB. The same sequence under Llama-2-7B-style MHA would need 16.0 GiB.' },
+  { q: 'DeepSeek-V3 caches 512 latent values plus a 64-number RoPE key per token per layer, in BF16, across 61 layers. How many KiB of KV cache is that per token?', numeric: true, answer: 68.6, tolerance: 1.5, unit: 'KiB', why: '512 + 64 = 576 values; × 2 bytes = 1,152 bytes per layer; × 61 layers = 70,272 bytes. 70,272 ÷ 1,024 = 68.6 KiB per token — about half of Llama-3.1-8B’s 128 KiB, from a model roughly 80× larger.' },
 ] } />

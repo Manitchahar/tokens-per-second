@@ -162,4 +162,64 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Throughput counting only requests that met the SLO after quantization. A scheme can raise raw tokens/second while lowering goodput if quality slips enough to change task completion.',
     lesson: 'quantization/measure-quality',
   },
+  'distillation': {
+    term: 'Distillation',
+    def: 'Training a smaller student model to reproduce a larger teacher model’s behaviour, either by matching its probability distribution at every token or by fine-tuning on text the teacher generated. It produces a new model, not a compressed copy of the old one.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'teacher-student': {
+    term: 'Teacher and student',
+    def: 'In distillation, the big model that supplies the targets (the teacher) and the small model being trained (the student). The student has its own architecture and its own weights; only the behaviour is copied.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'hard-label': {
+    term: 'Hard label',
+    def: 'The single correct next token in a training example — a probability vector with a 1 on one token and zeros everywhere else. It says nothing about how plausible the other candidates were.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'soft-label': {
+    term: 'Soft label',
+    def: 'The teacher’s full probability distribution over the next token, not just its argmax. The shape of the distribution — Paris 0.84, Lyon 0.11, Marseille 0.04 — is the extra signal that makes distillation work.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'distillation-temperature': {
+    term: 'Distillation temperature',
+    def: 'The number T that divides the teacher’s logits before softmax. Raising it flattens the distribution so the small probabilities become visible to the loss; the gradient then shrinks as 1/T², which is why implementations multiply the soft loss by T².',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'kl-divergence': {
+    term: 'KL divergence',
+    def: 'A measure of how much one probability distribution differs from another, Σ q log(q/p). Soft-label distillation minimises the KL between teacher and student, because the teacher’s own entropy is a constant the student cannot change.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'sequence-level-distillation': {
+    term: 'Sequence-level distillation',
+    def: 'Distilling from text rather than logits: generate responses with the teacher, filter them, then fine-tune the student on the prompt–response pairs. It needs the teacher’s outputs but not its weights.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'pruning': {
+    term: 'Pruning',
+    def: 'Removing weights from a trained model — individually, in a fixed 2:4 pattern, or by deleting whole heads or layers. Only removal that changes the matrix’s shape, or is stored compressed and run on sparse hardware, saves any time.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'unstructured-pruning': {
+    term: 'Unstructured pruning',
+    def: 'Setting individual weights to zero wherever they matter least. The matrix keeps its shape, so dense kernels still read and multiply the zeros — no speedup without compressed storage and a sparse kernel.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'semi-structured-sparsity': {
+    term: '2:4 semi-structured sparsity',
+    def: 'Exactly two non-zero weights in every group of four — a pattern NVIDIA’s sparse tensor cores can skip from Ampere onwards. Up to 2× the peak math, so it helps compute-bound prefill, not bandwidth-bound decode.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'structured-pruning': {
+    term: 'Structured pruning',
+    def: 'Deleting whole attention heads, channels or layers so the matrices genuinely shrink. The only pruning that reliably speeds up decode on ordinary dense kernels, and the one with the largest quality cost per weight removed.',
+    lesson: 'quantization/distillation-pruning',
+  },
+  'recovery-fine-tuning': {
+    term: 'Recovery fine-tuning',
+    def: 'Continuing training after pruning so the surviving weights adapt to the ones that were deleted. Without it a pruned model is usually broken; with it most of the quality comes back, at the cost of a training run.',
+    lesson: 'quantization/distillation-pruning',
+  },
 };

@@ -152,6 +152,17 @@ Decode throughput, 8B on one H100 at 4,096 context:
 - Batch drains → tail runs at ~¼ peak throughput (that is the batch-8 regime).
 - **Cap generation at ~75% of context**, leaving 25% for the reward pass. No cap → the run wedges.
 
+Determinism, which is part of the spec rather than a tuning knob:
+
+$$
+r = \exp\left(\log \pi_{\text{trainer}} - \log \pi_{\text{engine}}\right)
+$$
+
+- FP addition is **not associative**. FP16, grid just above 1.0 spaced 0.000977: (1 + 0.0005) + 0.0005 = 1.001953 but 1 + (0.0005 + 0.0005) = 1.000977. Exact answer 1.001 — one grid step, ~0.1%. BF16 spacing is 0.0078, eight times coarser.
+- Batch size, chunked prefill and kernel choice change the summation tree, so the last bits of a logit depend on who else was in the batch. A near-tie flips the argmax and the rollout **jumps** to a different sequence.
+- Contract: fixed seeds; recorded engine and attention/GEMM kernel versions, dtypes and the batch-invariant flag; a batch-shape test (batch 1 vs 64 — tokens exact, log-prob diff within tolerance); and the engine-versus-trainer log-prob gap logged every step (mean and max).
+- A log-prob gap δ moves the importance ratio by about (1 + δ). Systematic gaps bias every update; large ones fall outside the clip and discard the sample.
+
 ## 6 · Diffusion inference
 
 $$
@@ -243,6 +254,6 @@ Heterogeneous crossings: 28 layers × 2 crossings × 30 µs = 1.7 ms (3% of a st
 2. **Multi-LoRA** makes a tenant cost tens of megabytes against a 16 GB base, but adapter count per step is really batch size, and the memory table hides that tax.
 3. **Multimodal** is a 576-token prefill with a second model in front; resolution buys vision FLOPs, not context, and the KV cost of an image is permanent.
 4. **Agents and reasoning** are a growing prefix with perfect reuse; without a cache prefill is $O(T^2)$, and at batch 1 a long trace is a trap because the weight read dominates everything.
-5. **RL rollouts** are sized by tokens in flight, not parameters — KV is 86% of the cluster and peak occupancy is the group size.
+5. **RL rollouts** are sized by tokens in flight, not parameters — KV is 86% of the cluster and peak occupancy is the group size. Greedy decoding is not determinism, so a reproducibility contract is part of the spec.
 6. **Diffusion** is compute-bound at ~2% of peak bandwidth, which inverts every purchasing intuition from the rest of the course, and its memory is activations rather than weights.
 7. **On-device** serving is the same bandwidth-bound decode on a machine with a tenth of the memory and a fiftieth of the bandwidth, which is why 4-bit is a prerequisite, why TOPS predicts prefill rather than decode, and why the router — not the model — is the interesting part.

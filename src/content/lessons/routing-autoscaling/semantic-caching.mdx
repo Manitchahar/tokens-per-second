@@ -1,0 +1,304 @@
+---
+title: 'Semantic caching & semantic routing'
+summary: 'Two prompts can ask the same thing in different words. You will learn how a semantic cache turns meaning into a lookup, how to price the threshold that decides a hit, and how one embedding can route a request to the right model.'
+objectives:
+  - Distinguish exact-match, prefix and semantic caches by what they store and what a hit saves
+  - Trace a semantic cache request from PII masking through embedding, vector search and the threshold
+  - Compute the expected saving of a cache from hit rate, false-hit rate and the cost of a wrong answer
+  - Decide what may never be cached and scope every key and index per tenant
+  - Design an offline evaluation and a shadow-mode rollout for a semantic cache or router
+---
+import SemanticCache from '@/components/viz/routing-autoscaling/SemanticCache.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+A support inbox receives two questions on the same morning. One says “How long is the flight from Seattle to Hawaii?” The other says “Tell me how many hours it takes to fly from Seattle to Hawaii.” Same intent, same answer, almost no shared words.
+
+An exact-match cache sees two different strings and misses twice. A prefix cache sees no useful common prefix and misses twice. The model runs twice, and you pay twice for an answer you already had.
+
+A **semantic cache** closes that gap. It compares meaning rather than text: embed both questions, notice that their vectors are close, and return the first answer without calling the model. That sounds like free money, and sometimes it is. But approximate matching can also return a confident answer to a different question, and a wrong answer is far more expensive than a miss. This lesson is about getting the saving without buying the failure.
+
+## Three caches, from exact to clever
+
+The three caches in an inference stack store different things, so they save different work.
+
+An <Term t="exact-match-cache">exact-match response cache</Term> stores a finished answer under a hash of the normalised request. “Normalised” is doing real work in that sentence: the key must include the model and version, the prompt template version, the system prompt, the tool definitions, the sampling settings, the locale, the tenant, and any output schema. Two requests with the same text but a different tenant or model are not the same request, and must not share a key. A hit is exact and cheap: one hash lookup returns the stored response with no prefill and no decode.
+
+An exact-match cache is brittle in a specific way. A timestamp, a request ID, a randomly ordered document list, or a single whitespace change produces a new hash. The cache is then correct and useless. The fix is the same discipline as in <Term t="prefix-caching">prefix caching</Term>: stable content first, volatile content last, and never put a per-request value inside the key.
+
+A prefix cache stores KV blocks, not answers. It was the subject of “Prefix caching”, and its hit condition is token identity: the longest common prefix of the prompt. A hit saves the prefill computation for that prefix, but the model still has to decode a response. It is exact, it is per replica, and it is invisible to the user. Its saving is real GPU work, but it is only part of the call.
+
+A <Term t="semantic-cache">semantic cache</Term> stores a question vector and its answer. At request time it embeds the new question, searches for the nearest stored question vector, and if the <Term t="similarity-threshold">similarity threshold</Term> is met, returns the stored answer. It is approximate and cross-string: a hit can happen when the prompts share no tokens at all. And because it returns a finished answer, it saves the entire call, including generation.
+
+| Cache | What is stored | Hit test | What a hit saves | Main failure |
+|---|---|---|---|---|
+| Exact-match | Normalised request hash → response | Identical hash | The whole LLM call | A key so specific it never hits, or an answer that has gone stale |
+| Prefix / KV | KV blocks for a token prefix | Longest common token prefix | Prefill compute only | Per-replica cache, so the wrong GPU means no hit |
+| Semantic | Question vector → response | Cosine similarity at or above a threshold | The whole LLM call | A confident answer to a different question |
+
+The caches stack rather than compete. Put the exact-match lookup first because it is cheapest and unambiguous. On a miss, try the semantic cache. On a semantic miss, run the model — and let the prefix cache remove whatever prefill it can. Each layer catches a different kind of repetition.
+
+The cost of trying is not zero. Every request that reaches the semantic layer pays for an embedding call and a vector search, whether or not it hits. On a workload with little repetition, that is pure overhead: you have added latency and infrastructure to a path that was going to call the model anyway. Before building the cache, measure the **duplicate share** — the fraction of requests that have a valid duplicate somewhere in recent traffic. If it is 5%, even a perfect matcher caps your true-hit rate at 5%, and the lookup cost has to be tiny for the cache to break even. If it is 40%, the cache is worth engineering. The duplicate share is a property of your product, not of your vector database, and no threshold can create repetition that is not there.
+
+<Callout type="intuition" title="Saving work is not the same as saving an answer">
+  A prefix cache is a **computation** cache: it gives the engine a shorter prompt to prefill. A semantic cache is an **answer** cache: it gives the user a response that was produced for a different string. The first can only be wrong if the KV cache is wrong, which is why it can be exact. The second is wrong whenever the meanings are close but the answers are not, which is why it needs a threshold, an evaluation set, and a rollback plan.
+</Callout>
+
+The difference in value is large. On a single request, generating 250 tokens at a 50 ms TPOT takes 12.5 seconds of wall-clock time; prefilling a 1,000-token prompt on Llama-3.1-8B at about 29.5 µs per token takes about 30 ms. The answer dominates the request. That is why a semantic hit is worth more than a prefix hit — and why a semantic mistake costs more too.
+
+Latency tells the same story from the user’s side. A cache hit can return in tens of milliseconds, while a model call at the p99 of a busy fleet can take seconds. That means a cache improves the tail far more than the mean: the requests it removes are exactly the ones that would have waited behind a queue. This is the goodput argument from “SLOs & goodput” arriving at the front door. It also explains why a cache can look unimpressive in average latency and still be valuable — the users it saves are the ones who would otherwise have complained.
+
+<Scrolly>
+  <SemanticCache client:visible slot="stage" />
+
+  <Step title="1. Meaning becomes distance">
+    Every query becomes a vector, and every stored question–answer pair sits in the same space. The dashed circle around a stored pair is the similarity threshold: a new query inside it is close enough to reuse that answer. The faint dots are ordinary traffic, and most of it never comes near a stored pair.
+  </Step>
+
+  <Step title="2. A near neighbour hits">
+    A new question lands inside the circle around a stored question. Its **cosine similarity clears the threshold**, so the stored answer is returned immediately: no embedding of the answer, no prefill, no decode, and no GPU work for the model.
+  </Step>
+
+  <Step title="3. A miss pays and stores">
+    A question outside every circle misses. It pays for a **full LLM call**, and the pair is then stored with its vector so a repeat can hit later. The cache does not remove the first call; it removes the second one.
+  </Step>
+
+  <Step title="4. Widen the circle">
+    Lower the threshold and every circle grows. More repeats hit — but one query now lands inside the wrong circle and gets a **confident answer to a different question**. That false hit is the failure the threshold exists to control.
+  </Step>
+
+  <Step title="5. Route the easy ones small">
+    The same embedding can choose a model, not just an answer. An easy query scores low on complexity and goes to a **small, cheap model**; the router saves most of a large-model call without touching the cache at all.
+  </Step>
+
+  <Step title="6. Route the hard ones large">
+    A hard query crosses the line and goes to the **large model, or to reasoning mode**. The router is another threshold with the same shape of trade-off: more traffic to the cheap path buys cost savings, and every misroute spends answer quality.
+  </Step>
+</Scrolly>
+
+## The pipeline, one request at a time
+
+A semantic cache is a short pipeline with several places to get the details wrong.
+
+1. **Mask sensitive text.** Before anything is embedded or stored, run <Term t="pii-masking">PII masking</Term>: a named-entity model plus regular expressions for names, emails, phone numbers, card numbers and account IDs. Replace each with a stable placeholder such as `NAME_1`. The embedding and the cached answer must never contain the raw value.
+2. **Embed the request.** Send the masked text to the same <Term t="embedding-model">embedding model</Term> used to build the index, producing a fixed-length vector — 768 or 1,024 numbers are common public sizes. Similar meanings land near each other.
+3. **Search the vector index.** A <Term t="vector-database">vector database</Term> returns the nearest stored vectors without scanning every entry. Production indexes are usually approximate, so a search can miss the true nearest neighbour; that is a small recall loss, not a wrong answer by itself.
+4. **Score with cosine similarity.** <Term t="cosine-similarity">Cosine similarity</Term> compares direction and ignores length, which is what you want when a long and a short phrasing of the same question should match.
+5. **Apply the threshold.** If the best score is at least the threshold, return the stored answer. Otherwise call the LLM.
+6. **Store on miss.** Keep the masked question, its vector, the answer, the tenant, the model and template versions, and an expiry time. A repeat can hit next time.
+7. **Expire and invalidate.** TTL handles time-sensitive content. Event-driven purge handles document updates, price changes and policy changes. A new embedding model invalidates every vector, because vectors from two models are not comparable.
+
+Here is the cosine arithmetic on a tiny three-number sketch. Take the query vector $\mathbf{q} = (0.8, 0.5, 0.1)$ and a stored vector $\mathbf{s} = (0.7, 0.6, 0.1)$:
+
+$$
+\cos(\mathbf{q},\mathbf{s}) = \frac{\mathbf{q}\cdot\mathbf{s}}{\|\mathbf{q}\|\,\|\mathbf{s}\|}
+= \frac{0.56 + 0.30 + 0.01}{\sqrt{0.90}\times\sqrt{0.86}}
+= \frac{0.87}{0.9487 \times 0.9274}
+\approx 0.989
+$$
+
+Now take a far vector $\mathbf{t} = (0.1, -0.6, 0.8)$. Its dot product with $\mathbf{q}$ is $\mathbf{q}\cdot\mathbf{t} = 0.08 - 0.30 + 0.08 = -0.14$, and its length is about 1.005, so the cosine is about −0.15. A threshold of 0.90 keeps the first pair and rejects the second. Real embeddings have hundreds of dimensions, but the arithmetic is the same.
+
+The threshold itself is not universal. A value that works for one embedding model may be far too loose for another. Treat 0.85 to 0.95 as a starting range to calibrate, not a constant to copy. The only honest way to choose it is the evaluation set later in this lesson.
+
+A small Python sketch makes the control flow concrete:
+
+```python
+import numpy as np
+
+def lookup(query, tenant, threshold=0.90):
+    clean = mask_pii(query)
+    q = embed(clean)
+    q = q / np.linalg.norm(q)
+
+    best, best_sim = None, -1.0
+    # The tenant filter is part of the search, not a cleanup afterwards.
+    for entry in index.search(tenant=tenant, vector=q, k=8):
+        sim = float(q @ entry.vector)       # both vectors are unit length
+        if sim > best_sim:
+            best, best_sim = entry, sim
+
+    if best is not None and best_sim >= threshold and not expired(best):
+        return best.answer, best_sim
+    return None, best_sim
+
+
+def store(query, answer, tenant, ttl_seconds=3600):
+    clean = mask_pii(query)
+    vec = embed(clean)
+    vec = vec / np.linalg.norm(vec)
+    index.add(
+        tenant=tenant,
+        vector=vec,
+        answer=mask_pii(answer),
+        expires_at=now() + ttl_seconds,
+        model_version=MODEL_VERSION,
+        template_version=TEMPLATE_VERSION,
+    )
+```
+
+Two details in that sketch matter more than the syntax. The tenant is passed into `index.search`, so another tenant’s vectors are never candidates. And the stored answer is masked as well, because a model can echo a name or an email back into its response.
+
+## The threshold is an economics dial
+
+A semantic cache has one control that decides almost everything: the threshold. Lower it and you get more hits, but some of those hits are wrong. Raise it and you get fewer hits, but the ones you get are more likely to be right. To tune it, write down what a hit is worth and what a false hit costs.
+
+Let:
+
+- $h$ be the hit rate — the fraction of requests that match a stored entry at all;
+- $f$ be the false-hit rate among those hits — the fraction of hits whose stored answer is wrong for this request;
+- $C$ be the cost of one LLM call;
+- $c$ be the cost of one cache lookup, including the embedding call and the vector search;
+- $W$ be the cost of a wrong answer, including the correction call, human escalation and lost trust.
+
+Every request pays the lookup cost $c$. A fraction $h(1-f)$ are true hits and avoid the call, saving $C$ each. A fraction $hf$ are false hits and cost $W$ each. Misses pay $C$ as before, so they cancel against the no-cache baseline. The expected saving per request is therefore
+
+$$
+S = h(1-f)C - c - hfW
+$$
+
+This is the formula to keep. Notice what it says: the benefit term is discounted by precision, and the harm term is multiplied by both the hit rate and the wrong-answer cost. A cache with a high hit rate and a poor precision can lose money while looking busy.
+
+Put in illustrative numbers. Take $C = 0.002$ dollars per call. That is not arbitrary: an H100 at roughly \$2.50 per GPU-hour costs about \$0.0007 per GPU-second, and a 250-token answer at a 50 ms TPOT takes 12.5 seconds. With four requests sharing the GPU, each request’s share is about 3.1 GPU-seconds, or about \$0.002. Take $c = 0.00005$ dollars for the embedding and index lookup, and $W = 0.20$ dollars: suppose one wrong answer in ten reaches a human at about \$2 of support time, so the expected cost is \$0.20.
+
+At a conservative threshold, suppose $h = 0.20$ and $f = 0.005$:
+
+$$
+S = 0.20 \times 0.995 \times 0.002 - 0.00005 - 0.20 \times 0.005 \times 0.20
+= 0.000398 - 0.00005 - 0.0002
+\approx 0.000148
+$$
+
+That is about \$0.00015 saved per request, or roughly \$148 per million requests. Modest, but positive.
+
+Now lower the threshold aggressively. Suppose the hit rate rises to $h = 0.50$, but one hit in ten is wrong, so $f = 0.1$:
+
+$$
+S = 0.50 \times 0.90 \times 0.002 - 0.00005 - 0.50 \times 0.10 \times 0.20
+= 0.0009 - 0.00005 - 0.01
+= -0.00915
+$$
+
+The cache now **loses** about \$0.009 per request — roughly \$9,150 per million. The extra hits did not pay for the wrong answers. This is the trap: the hit rate went up, and the business got worse.
+
+The break-even condition comes from setting $S$ above zero:
+
+$$
+f < \frac{hC - c}{h(C + W)}
+$$
+
+At $h = 0.5$, $C = 0.002$, $c = 0.00005$ and $W = 0.20$, the limit is
+
+$$
+f < \frac{0.001 - 0.00005}{0.5 \times 0.202} \approx 0.0094
+$$
+
+so the false-hit rate must stay below about 0.94%. Among hits, that is a precision above 99%. At a 50% hit rate, a 1% false-hit rate is already too expensive. **Tune for precision, then take whatever hit rate precision allows** — not the other way round.
+
+One consequence is worth stating plainly, because it prevents a lot of bad targets. The true-hit rate cannot exceed the duplicate share of your traffic. If only 20% of requests have a duplicate that would be correct to reuse, then even a perfect matcher has a true-hit rate of 20%, and the rest of the “hit rate” can only come from false hits. A team that promises an 80% hit rate on a workload with a 20% duplicate share is not promising a better cache; it is promising a worse threshold. Measure the ceiling first, then decide whether the cache can clear its own lookup cost inside that ceiling.
+
+<Callout type="math" title="Why a wrong answer dominates the arithmetic">
+  A true hit saves one call, $C$. A false hit costs $W$ and does not save the call you will need to answer the question properly. When $W$ is a hundred times $C$ — a plausible ratio when a human has to repair the answer — a false-hit rate of 1% can erase the benefit of a 50% hit rate. The asymmetry is the whole reason semantic caching is an evaluation problem before it is an infrastructure problem.
+</Callout>
+
+## What must never be cached, and what must be scoped
+
+The threshold decides whether a match is safe. Scoping decides whether a match is legal and correct in the first place.
+
+Some things must never be served from a shared semantic cache:
+
+- **Personalised answers.** A response that depends on the user’s account, history, plan or preferences belongs to that user, not to a question.
+- **Time-sensitive facts.** Prices, inventory, schedules, balances and news change without the embedding changing. A TTL of minutes may be acceptable; a TTL of days is a bug.
+- **Side-effecting answers.** “Cancel my subscription” is not a question to answer from a cache; it is an action to execute once, with authorisation.
+- **Regulated or sensitive content.** Health, legal, financial and safety advice need a policy decision, not a similarity score.
+- **Secrets and raw personal data.** Mask before embedding, mask before storing, and keep raw values out of logs.
+
+<Callout type="pitfall" title="A semantic cache is a database of your users’ questions">
+  Once you store query vectors and answers, you have built a searchable record of what people asked. An embedding is not anonymised text; it is a representation of the text, and it can leak meaning. Treat the cache as personal data: encrypt it, restrict access, set a retention period, support deletion, and never let one tenant’s vectors enter another tenant’s search.
+</Callout>
+
+<Term t="cache-scoping">Cache scoping</Term> is the discipline of putting every dimension that changes the answer into the key or the filter. At minimum: tenant, locale, model and model version, prompt template version, embedding model version, tool permission set, and retrieval index version. If the answer depends on a document collection, the collection’s version belongs in the scope too. A cache hit that ignores any of these is a correctness bug waiting for a customer to find it.
+
+Tenancy deserves its own sentence. Filter by tenant **inside** the vector search, not after it. If the search considers every tenant’s vectors and then discards the wrong ones, the system has already looked at data it should not touch, and a filter bug becomes a leak. Separate namespaces, separate indexes, or a mandatory tenant predicate in the query — whichever your store supports, make the isolation structural rather than hopeful.
+
+## Semantic routing: the same embedding chooses a model
+
+The embedding you computed for the cache can answer a second question: **how much model does this request need?**
+
+<Term t="semantic-routing">Semantic routing</Term> uses a small encoder or classifier to score a request — by task type, complexity, or similarity to labelled examples — and then chooses a destination. An easy factual question can go to a 3B model. A multi-step reasoning question can go to a 70B model, or to the same model with reasoning enabled. A task-specific fine-tune can take the requests it was trained for. The router sits above the replica-level decisions in “Prefix- & cache-aware routing”: that lesson chose which copy of one model serves a request; this choice is which model or mode serves it at all.
+
+The economics has the same shape as the cache. Let $C_s$ be the cost of a small-model call and $C_L$ the cost of a large-model call. Suppose a fraction $p$ of requests are correctly identified as easy and sent small; each such request saves $C_L - C_s$. Suppose a fraction $e$ are incorrectly sent small and produce a wrong answer costing $W$. Then the expected saving per request is
+
+$$
+S_{\text{route}} = p(C_L - C_s) - eW
+$$
+
+With $C_L = 0.002$ and $C_s = 0.0001$, a correct small route saves 0.0019 dollars. At $p = 0.60$ and $W = 0.20$, the break-even misroute rate is
+
+$$
+e < \frac{0.60 \times 0.0019}{0.20} = 0.0057
+$$
+
+so fewer than about 0.57% of all requests may be wrongly sent small. That is a strict budget. It is why real systems often use a **cascade** rather than a hard choice: let the small model answer, check confidence or run a verifier, and escalate to the large model when the check fails. The cost of an escalation is latency, not necessarily a wrong answer, so $W$ falls — but the saving on escalated requests falls with it. A cascade that escalates 20% of traffic pays the small model on every request and the large model on one in five, so its saving is roughly 80% of the hard-routing saving with a much smaller quality risk. Module 25 turns these per-request numbers into cost per million tokens and goodput per dollar; the shape of the trade-off is already here.
+
+A semantic router can also filter tools in an agentic system, or choose whether to enable reasoning. Those are the same decision with different destinations: one score, one threshold, one cost of being wrong. The infrastructure changes; the arithmetic does not.
+
+## Measuring it honestly
+
+A semantic cache is easy to demo and hard to trust. The demo shows a paraphrase hitting. The trust comes from an evaluation set that contains the paraphrases that should hit **and** the near-misses that must not.
+
+Start with real traffic. Sample a few thousand requests, and label pairs as duplicates only when the same answer is correct for both. Similarity is not equivalence: “reset my password” and “cancel my account” can sit close together and need completely different answers. Label by the answer, not by the wording.
+
+Then sweep the threshold and compute precision and recall. Here is a worked evaluation over 1,000 requests, 300 of which have a valid duplicate somewhere in the cache:
+
+| Threshold | Hits | False hits | Precision | Recall |
+|---|---|---|---|---|
+| 0.92 | 200 | 4 | 98% | 65% |
+| 0.85 | 280 | 14 | 95% | 89% |
+| 0.70 | 340 | 68 | 80% | 91% |
+
+Precision is true hits divided by all hits, so at 0.70 it is 272 ÷ 340 = 80%. Recall is true hits divided by the 300 requests that had a valid duplicate, so it is 272 ÷ 300 = 91%. Lowering the threshold bought recall and paid for it in precision.
+
+Observe the false-hit counts, not just the percentages. Four false hits out of 200 sounds small until you remember that each one is a customer seeing a confident answer to a different question. And a small false-hit rate is hard to estimate from a small sample: if you observe 100 hits and one is wrong, your estimate of the false-hit rate is 1%, but the uncertainty around it is enormous. You need enough hits to see tens of failures before the estimate is stable enough to plug into the economics. That usually means thousands of labelled requests, not a hundred, and it is another argument for shadow mode: it collects those observations without spending customer trust.
+
+Now put the 0.70 row into the economics. The hit rate is $h = 340/1000 = 0.34$ and the false-hit rate among hits is $f = 68/340 = 0.20$. With the same costs as before:
+
+$$
+S = 0.34 \times 0.80 \times 0.002 - 0.00005 - 0.34 \times 0.20 \times 0.20
+\approx -0.0131
+$$
+
+That is a loss of about \$13 per thousand requests. The threshold with the best recall is not the threshold with the best economics, and the table alone cannot tell you which is which.
+
+<Callout type="mentor" title="Shadow mode is the cheapest insurance you will ever buy">
+  Before the cache serves a single answer, run it in <Term t="shadow-mode">shadow mode</Term>: process real traffic, log the would-be hit, the similarity, and the stored answer, but serve the normal LLM response. Compare the two offline. You will learn two things fast — how often the cache would have fired, and exactly which questions it would have got wrong. Ship the logger before the cache, and read the disagreements before you trust the agreement rate.
+</Callout>
+
+After shadow mode, canary the cache on a small slice of traffic with a kill switch. Watch guardrail metrics that a hit rate cannot see: escalation rate, thumbs-down rate, the rate at which users ask the same question again, and task completion. A cache that raises repeat questions is telling you it answered the wrong question confidently.
+
+Finally, watch for drift. Query mixes change, documents are updated, prompt templates are edited, and embedding models are upgraded. Track hit rate and a sample of stored answers per tenant, not just in aggregate. When the embedding model changes, rebuild the index; old and new vectors do not share a space, and comparing them is meaningless.
+
+## The three sentences to remember
+
+1. An exact-match cache stores answers by request hash, a prefix cache stores computation by token prefix, and a semantic cache stores answers by meaning.
+2. A semantic hit is a bet that two questions need the same answer; price the bet with $h(1-f)C - c - hfW$, and let precision set the threshold.
+3. Scope every key by tenant and version, mask PII before storing, and prove the whole thing in shadow mode before it answers a real user.
+
+<KeyNotes>
+  1. The three caches store different things: exact-match stores a response under a normalised hash, prefix caching stores KV blocks, and a semantic cache stores an answer under a question embedding.
+  2. A prefix-cache hit saves prefill computation but still decodes; a semantic-cache hit returns a finished answer and skips the entire call.
+  3. The semantic pipeline is mask PII, embed, tenant-filtered vector search, cosine similarity against the threshold, return on a hit, store on a miss, expire on a TTL or an event.
+  4. Cosine similarity is the dot product divided by the two vector lengths; the worked sketch scores 0.989 for a near pair and about −0.15 for a far one.
+  5. Expected saving per request is $h(1-f)C - c - hfW$: the benefit is discounted by precision, and the harm is multiplied by the wrong-answer cost.
+  6. At $C = 0.002$, $c = 0.00005$, $W = 0.20$, $h = 0.5$ and $f = 0.1$, the cache loses about \$0.009 per request — roughly \$9,150 per million.
+  7. At a 50% hit rate, a false-hit rate above about 0.94% turns the cache negative; choose the threshold for precision, not for the highest hit rate.
+  8. Never cache personalised, time-sensitive, side-effecting or regulated answers; filter by tenant inside the vector search, and prove the system in shadow mode before it serves users.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A query vector is (0.8, 0.5, 0.1) and a stored vector is (0.7, 0.6, 0.1). What is their cosine similarity?', numeric: true, answer: 0.99, tolerance: 0.02, unit: 'cosine', why: 'The dot product is 0.56 + 0.30 + 0.01 = 0.87. The lengths are √0.90 ≈ 0.9487 and √0.86 ≈ 0.9274, whose product is ≈ 0.8798. So 0.87 ÷ 0.8798 ≈ 0.989.' },
+  { q: 'A cache has h = 0.5, f = 0.1, C = 0.002 dollars, c = 0.00005 dollars and W = 0.20 dollars. What is the expected saving per 1,000 requests, in dollars?', numeric: true, answer: -9.15, tolerance: 0.5, unit: 'dollars per 1,000', why: 'Per request: 0.5 × 0.9 × 0.002 = 0.0009 saved, minus 0.00005 for the lookup, minus 0.5 × 0.1 × 0.2 = 0.01 for wrong answers. That is −0.00915 per request, so −9.15 per 1,000.' },
+  { q: 'With h = 0.5, C = 0.002, c = 0.00005 and W = 0.20, what false-hit rate among hits is the break-even point, in percent?', numeric: true, answer: 0.94, tolerance: 0.1, unit: '%', why: 'Set h(1−f)C − c − hfW above zero and solve: f < (hC − c) ÷ (h(C+W)) = (0.001 − 0.00005) ÷ (0.5 × 0.202) ≈ 0.0094, or 0.94%.' },
+  { q: 'Which statement best distinguishes a prefix cache from a semantic cache?', options: ['A prefix cache returns a stored answer; a semantic cache only shortens the prompt', 'A prefix cache reuses KV computation but still generates the answer; a semantic cache returns a stored answer without calling the model', 'A prefix cache works across tenants; a semantic cache must be per replica', 'A prefix cache is approximate; a semantic cache is exact'], answer: 1, why: 'Prefix caching reuses the K and V of a token prefix, so prefill is cheaper but decode still happens. A semantic cache returns a previously stored response, so the whole call is skipped — and that is exactly why it can be wrong.' },
+  { q: 'Where should the tenant filter be applied in a semantic cache?', options: ['After the nearest-neighbour search, when formatting the answer', 'Inside the vector search, so other tenants’ vectors are never candidates', 'Only in the prompt sent to the LLM', 'It is unnecessary when answers contain no names'], answer: 1, why: 'Filtering after the search means the system has already looked at another tenant’s vectors, and a filter bug becomes a data leak. Tenant isolation has to be structural: a namespace, a separate index, or a mandatory predicate in the search query.' },
+  { q: 'Why is a high cache hit rate not enough to justify a semantic cache?', options: ['Because hits always cost more than misses', 'Because false hits carry the cost of a wrong answer, which can dominate the saving from true hits', 'Because hit rate is impossible to measure', 'Because the LLM call is always free'], answer: 1, why: 'The saving term is h(1−f)C, so precision discounts it, while the harm term hfW adds a cost that can be a hundred times larger per event. At h = 0.5, a 10% false-hit rate turns the worked example into a net loss of about 0.009 dollars per request.' },
+] } />

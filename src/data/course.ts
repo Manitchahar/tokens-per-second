@@ -187,6 +187,7 @@ export const modules: ModuleMeta[] = [
       L('awq-gptq-smoothquant', 'AWQ, GPTQ & SmoothQuant', 22),
       L('quantized-kernels-kv', 'Quantized GEMMs & KV cache quantization', 18),
       L('measure-quality', 'Measuring quality regression', 16),
+      L('distillation-pruning', 'Beyond quantization: distillation & pruning', 18),
       PROJECT('project-pareto', 'Project: The quality/speed/memory frontier', 90),
     ],
   },
@@ -314,6 +315,7 @@ export const modules: ModuleMeta[] = [
     lessons: [
       L('load-balancing', 'Load balancing & queue-aware routing', 18),
       L('cache-aware-routing', 'Prefix- & cache-aware routing', 16),
+      L('semantic-caching', 'Semantic caching & semantic routing', 18),
       L('autoscaling', 'Autoscaling on the right signals', 18),
       L('orchestration', 'Kubernetes, KServe, Ray Serve & llm-d', 18),
       LAB('lab-hold-the-slo', 'Lab: Hold an SLO under changing traffic', 50),

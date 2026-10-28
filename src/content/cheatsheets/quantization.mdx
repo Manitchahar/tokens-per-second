@@ -205,6 +205,107 @@ Write the **falsifier**: one sentence naming what would move you off your choice
 
 Verify: is the GEMM **fused**? Is the KV dtype **native** in the attention kernel? Reported weight memory after load should match the checkpoint size.
 
+## Distillation & pruning
+
+### The three levers
+
+| | What changes | Who | Training pipeline? | Quality risk |
+|---|---|---|---|---|
+| Quantization | number format | serving team | no | 1–4 pts at 4 bits |
+| Pruning | which weights exist | model team | usually (recovery FT) | moderate–high |
+| Distillation | the model itself | training team | yes | a few pts, hard tasks |
+
+Quantization is the default because it is a config change, not a training project. The other two are worth it only when you need a **fundamentally smaller** model.
+
+### Distillation
+
+$$
+p_i = \frac{\exp(z_i/T)}{\sum_j \exp(z_j/T)},
+\qquad
+L_{\text{soft}} = -\sum_i q_i \log p_i = H(q) + D_{\mathrm{KL}}(q\,\|\,p)
+$$
+
+Teacher logits 3.0, 1.0, 0.0:
+
+| T | top | second | third |
+|---|---|---|---|
+| 1 | 0.844 | 0.114 | 0.042 |
+| 2 | 0.629 | 0.231 | 0.140 |
+| 4 | 0.481 | 0.292 | 0.227 |
+
+$$
+\frac{\partial L_{\text{soft}}}{\partial z_j} = \frac{p_j - q_j}{T}
+\;\approx\; \frac{z_j - s_j}{nT^2}
+\qquad\Longrightarrow\qquad
+\text{multiply the soft loss by } T^2
+$$
+
+- $H(q)$ is constant, so the student minimises the **KL** — distribution matching, not answer-guessing.
+- Hard label = argmax only, zero gradient on the alternatives. Soft label = the whole vector.
+- Worked: teacher $[0.629, 0.231, 0.140]$ vs student $[0.556, 0.276, 0.168]$ → soft loss 0.917 nats, $H(q)$ = 0.906, trainable KL = **0.011 nats**.
+
+**Sequence-level** (no logits needed): prompts from your traffic → sample teacher outputs → filter with a verifier or judge → supervised fine-tune. You need the outputs and a licence that allows training on them, not the weights. Filter, or the student learns the teacher's mistakes.
+
+**Public example, at the time of writing:** DeepSeek-R1 (671B MoE) → R1-Distill-Qwen-1.5B/7B/14B/32B and R1-Distill-Llama-8B/70B. Approximate published scores for the 70B student vs teacher: MATH-500 94.5 vs 97.3, GPQA Diamond 65.2 vs 71.5, LiveCodeBench 57.5 vs 65.9.
+
+### The serving arithmetic
+
+$$
+t_{\text{step}} \approx \frac{P\,b_w/8}{\text{BW}\cdot\text{MBU}}
+\qquad
+\text{tok/s} \approx \frac{\text{BW}\cdot\text{MBU}}{P\,b_w/8}
+$$
+
+H100: 3.35 TB/s × 0.8 MBU = **2.68 TB/s**. Effective: $t \approx \text{weight bytes} / 2.68\text{e}12$.
+
+| Option | Weights | Fits 80 GB? | tok/s, one stream |
+|---|---|---|---|
+| 70B BF16 | 141.2 GB | no (2 cards) | 19 (if it fit); ~38 on 2 cards |
+| 70B INT4 (4.25 b) | 37.5 GB | yes | 71 |
+| 8B BF16 | 16.1 GB | yes | 167 |
+| 8B INT4 | 4.27 GB | yes | 628 |
+
+KV per token: 70B (80 layers) = **327,680 B = 320 KiB**; 8B (32 layers) = **131,072 B = 128 KiB**. 2.5× more context for the same GB.
+
+**Order:** evaluate an existing distilled model → quantize the big model → distill only if quantization cannot reach the target → prune without recovery fine-tuning, never.
+
+Distillation cost, derived: 8B student × 20B tokens × 6 FLOP/param/token = 9.6e20 FLOPs; 8×H100 at 40% MFU ≈ 3.2e15 FLOP/s → ~85 h ≈ 680 GPU-hours ≈ a few thousand dollars. Quantization is one GPU for an afternoon.
+
+### Pruning
+
+| | Unstructured | 2:4 | Structured |
+|---|---|---|---|
+| Removed | single weights | 2 of every 4 | heads / channels / layers |
+| Shape | unchanged | unchanged + 2-bit index | **smaller** |
+| Dense-kernel speed | none | none | **proportional** |
+| Sparse-hw speed | only with kernels | **up to 2× math** | not needed |
+| Decode | no gain | no gain unless compressed | **real gain** |
+| Quality cost | lowest | low | highest |
+
+A zero is not free until something skips it: dense layout still stores, reads and multiplies it.
+
+Arithmetic intensity decides where sparsity pays:
+
+| Phase | FLOP/byte | Bound | 2:4 helps? |
+|---|---|---|---|
+| decode, batch 1 | 2 / 0.53 ≈ **3.8** | memory | no |
+| H100 ridge | ≈ **200** | — | — |
+| prefill, 4k tokens | 8,000 / 0.53 ≈ **15,000** | compute | **yes, up to 2×** |
+
+2:4 storage: 2 values + a 2-bit index per 4 weights → 8.5 bits/weight at FP16 (about half), 4.5 at INT4 — before scale metadata.
+
+Recovery fine-tuning: prune → continue training on a sample of the original data. Always. Published 2:4 checkpoints (e.g. Sparse Llama 3.1, vendor-reported, at the time of writing) are the output of that process.
+
+### Measuring the drop
+
+Same harness as quantization: PPL → tasks from your own traffic → length sweep if the KV shape changed → report with a decision and a rollback.
+
+Three differences for distillation:
+
+1. It can **improve** a task (trained on data like your eval). Keep the golden set out of the training data.
+2. Compare against **two** baselines: the teacher, and the model in production now.
+3. **Prompt format is part of the model.** Evaluate with the exact chat template and sampling settings you will serve.
+
 ## The three sentences
 
 1. Decode reads every weight and all the KV cache every step, so **bytes per step is the latency** — and quantization is the only lever that moves it directly.

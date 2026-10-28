@@ -1,0 +1,323 @@
+---
+title: 'Beyond quantization: distillation & pruning'
+summary: 'Quantization shrinks the numbers. Two other levers make a model cheaper to serve: delete weights, or train a small model to imitate a big one. Here is what each changes, the serving arithmetic that chooses between them, and how to measure the quality you trade away.'
+objectives:
+  - Compare quantization, pruning and distillation by what each changes and who does the work
+  - Derive soft-label distillation from softmax with temperature and work an example by hand
+  - Predict single-stream decode tokens/s from weight bytes for a teacher, a student and a quantized big model
+  - Explain why unstructured sparsity does not speed up decode, and why 2:4 sparsity can speed up prefill
+  - Evaluate a pruned or distilled model with the same harness used for quantization
+---
+import DistillPrune from '@/components/viz/quantization/DistillPrune.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have taken Llama-3.1-8B to 4-bit weights. It is 4.3 GB instead of 16.1, it decodes about four times faster, and the change took an afternoon and one GPU. That is why quantization is this module's default lever.
+
+Now suppose the model you want to serve is Llama-3.1-70B. At 4 bits it is 37.5 GB, so it fits on one 80 GB H100 — and it streams 37.5 GB on every token. The 8B model streams 16.1 GB. If you could get most of the 70B's behaviour out of the 8B, you would roughly double tokens per second, halve the GPU bill, and shrink the KV cache by 2.5× as well.
+
+That is not quantization. There are exactly three ways to make a model cheaper: **fewer bits per weight**, **fewer weights**, and **a smaller model trained to imitate the big one**. This lesson is the last two.
+
+## Three ways to make a model cheaper
+
+The label "model compression" hides the fact that these are different kinds of project.
+
+| | What changes | Who does the work | Need the original training pipeline? | Typical quality risk |
+|---|---|---|---|---|
+| **Quantization** | The number format of the existing weights | Serving team, plus a calibration set | No — post-training | Low: 1–4 points at 4 bits |
+| **<Term t="pruning">Pruning</Term>** | Which weights exist: some are zeroed or deleted | Model team, with serving input | Usually yes, for recovery fine-tuning | Moderate to high |
+| **<Term t="distillation">Distillation</Term>** | The model itself: a new, smaller one is trained | Training team | Yes — a training run and a data pipeline | A few points on the hardest tasks |
+
+Quantization is a config change plus a measurement step; pruning and distillation are training projects that happen to make serving cheaper. That asymmetry is why quantization wins by default: it is the only one you can do this week, on the checkpoint you already have. The others are worth it only when you need a model that is **fundamentally** smaller — fewer parameters, not the same parameters stored more cleverly.
+
+<Scrolly>
+  <DistillPrune client:visible slot="stage" />
+
+  <Step title="1. The model is a grid of weights">
+    One square is a block of weights, read on every decode step. The grid **is** the latency: bytes divided by bandwidth is the time per token.
+  </Step>
+
+  <Step title="2. Quantize: shrink each square">
+    Quantization keeps the grid and shrinks each square: 16 bits becomes 4, so the model is a quarter of the bytes. Same parameters, coarser numbers, no training — the result *What precision buys you* derived.
+  </Step>
+
+  <Step title="3. Prune: set individual weights to zero">
+    Unstructured pruning zeroes individual weights, scattered through the matrix. The grid keeps its shape and its byte count: a zero is still stored and read, and a dense kernel cannot skip it.
+  </Step>
+
+  <Step title="4. 2:4: a pattern the hardware can skip">
+    Two zeros in every group of four, in a regular pattern — the one sparse shape NVIDIA's sparse tensor cores understand from Ampere onwards. Skipping zeros is a **compute** win, so it shows up in prefill.
+  </Step>
+
+  <Step title="5. Structured: delete whole rows">
+    Structured pruning removes whole rows, heads or layers, and the survivors close up. The matrix is genuinely smaller, so any dense kernel runs faster. It is the only pruning that helps decode, and it costs the most quality per weight.
+  </Step>
+
+  <Step title="6. Distill: copy the distribution">
+    Distillation does not compress the teacher. It trains a small student on the teacher's **probability distribution**, not just its chosen token. The bars show both models answering one prompt; matching the shape carries more information than the single right answer.
+  </Step>
+
+  <Step title="7. The bill, three ways">
+    A 70B teacher in BF16 needs 141 GB and does not fit on one card. At 4 bits it fits and buys 71 tokens per second per stream; the 8B student reads 16.1 GB and buys 167.
+  </Step>
+</Scrolly>
+
+## Distillation, from first principles
+
+**Distillation** trains a new, smaller model — the <Term t="teacher-student">student</Term> — to reproduce a big one, the teacher. The student has its own architecture and weights; nothing is copied from the teacher. What is copied is its *function*: the same prompt produces a similar distribution over what comes next.
+
+Take a single position in a sequence. The teacher reads "The capital of France is" and produces a score for every token in its vocabulary. <Term t="softmax">Softmax</Term> turns those scores into probabilities. Two things can be handed to the student:
+
+- The **<Term t="hard-label">hard label</Term>**: the single token with the highest probability, which is what a normal training set contains.
+- The **<Term t="soft-label">soft label</Term>**: the teacher's entire probability vector — the distribution over all tokens, at a <Term t="distillation-temperature">temperature</Term> you choose.
+
+<Callout type="intuition" title="Why the small probabilities are the valuable part">
+  A hard label is a vector with a 1 on one token and zeros on the other 100,000. The gradient touches exactly one number, so the student learns "say Paris" and nothing else.
+
+  A soft label says Paris 0.84, Lyon 0.11, Marseille 0.04. The gradient now touches Lyon and Marseille, and says something specific: *these are the plausible alternatives, and this is their order*. That structure was learned from billions of tokens and is destroyed when you keep only the winner. It is why distilled students need far fewer tokens than the teacher did.
+</Callout>
+
+### Temperature, and a worked example
+
+Softmax with a **temperature** $T$ divides every score by $T$ before exponentiating:
+
+$$
+p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}
+$$
+
+At $T = 1$ you get the model's own distribution. At $T \gt 1$ it flattens, so small probabilities rise into a range where they contribute to the loss. At $T \lt 1$ it sharpens.
+
+Use three candidate tokens with teacher scores $z_1 = 3.0$, $z_2 = 1.0$ and $z_3 = 0.0$. At $T = 1$:
+
+$$
+e^{3} = 20.09,\quad e^{1} = 2.718,\quad e^{0} = 1,\quad \text{sum} = 23.81
+$$
+
+$$
+p = \left[\frac{20.09}{23.81},\ \frac{2.718}{23.81},\ \frac{1}{23.81}\right] = [0.844,\ 0.114,\ 0.042]
+$$
+
+At $T = 2$ the scores become 1.5, 0.5 and 0:
+
+$$
+e^{1.5} = 4.482,\quad e^{0.5} = 1.649,\quad e^{0} = 1,\quad \text{sum} = 7.130
+$$
+
+$$
+p = \left[\frac{4.482}{7.130},\ \frac{1.649}{7.130},\ \frac{1}{7.130}\right] = [0.629,\ 0.231,\ 0.140]
+$$
+
+The order is unchanged, but the third candidate went from 4.2% to 14.0%, from invisible to a real target. The ratio between the two lower candidates actually moved toward 1 (2.7× to 1.65×): temperature does not sharpen ratios, it raises near-invisible probabilities into range.
+
+### The loss, and why $T^2$ appears
+
+Cross-entropy between the teacher's soft distribution $q$ and the student's $p$, both at temperature $T$, is
+
+$$
+L_{\text{soft}} = -\sum_i q_i \log p_i
+$$
+
+Its gradient with respect to a student score $z_j$ is
+
+$$
+\frac{\partial L_{\text{soft}}}{\partial z_j} = \frac{p_j - q_j}{T}
+$$
+
+For large $T$ both distributions approach uniform, so $p_j - q_j$ is itself of order $\frac{1}{T}$ and the gradient shrinks as $\frac{1}{T^2}$. Every implementation therefore multiplies the soft loss by $T^2$; without it, raising the temperature would shrink the learning signal to nothing.
+
+<Callout type="math" title="What the student is actually minimising">
+  Write the soft loss as a sum of two pieces:
+
+  $$L_{\text{soft}} = H(q) + D_{\mathrm{KL}}(q \,\|\, p)$$
+
+  The first term is the teacher's own entropy, constant with respect to the student's weights, so it contributes no gradient. The student minimises the second: the <Term t="kl-divergence">KL divergence</Term> between the distributions.
+
+  On the example above, with the student's temperature-2 distribution at $[0.556, 0.276, 0.168]$, the soft loss is 0.917 nats, but 0.906 is $H(q)$; the part the student can move is 0.011 nats. Soft-label training is **distribution matching**, not answer-guessing, which is why it transfers behaviour.
+</Callout>
+
+In practice you keep both losses, because the true next token is still the most reliable signal you have:
+
+```python
+import torch.nn.functional as F
+
+def distill_loss(student_logits, teacher_logits, target, T=2.0, alpha=0.5):
+    # soft: match the teacher's distribution at temperature T
+    soft = F.kl_div(
+        F.log_softmax(student_logits / T, dim=-1),
+        F.softmax(teacher_logits / T, dim=-1),
+        reduction='batchmean',
+    ) * (T * T)
+    # hard: still learn from the real next token
+    hard = F.cross_entropy(student_logits, target)
+    return alpha * soft + (1 - alpha) * hard
+```
+
+### Sequence-level distillation: when you only have the outputs
+
+The recipe above needs the teacher's full distribution at every position: its weights, or a server that returns logits. Most APIs do not.
+
+The alternative is **<Term t="sequence-level-distillation">sequence-level distillation</Term>**: generate text with the teacher, then fine-tune the student on prompt–response pairs as if they were human-written. You lose the per-token distribution but keep the behaviour, and need nothing but the teacher's outputs.
+
+1. **Collect prompts** from your traffic, or a public corpus that resembles it.
+2. **Sample teacher responses**, usually above zero temperature so the data covers more than the single most likely answer.
+3. **Filter** — keep only responses that pass a unit test, verifier, judge or rule. Unfiltered samples teach the student the teacher's mistakes as truth.
+4. **Fine-tune the student** with ordinary supervised learning on the filtered pairs.
+
+You need the teacher's **outputs**, not its **weights** — and you read the licence first. Many model licences and API terms forbid using outputs to train a competitor, and some require attribution. That is a legal question, cheaper to answer before the GPU-hours than after.
+
+### What a real distillation looks like
+
+At the time of writing, DeepSeek's R1 is a 671-billion-parameter mixture-of-experts teacher, and its distilled models are ordinary dense students: DeepSeek-R1-Distill-Qwen-1.5B, 7B, 14B and 32B, plus DeepSeek-R1-Distill-Llama-8B and 70B — 10× to 400× smaller.
+
+The published scores are approximate calibration: on MATH-500 the 671B teacher scores about 97.3 and the 70B student about 94.5; GPQA Diamond 71.5 against 65.2; LiveCodeBench 65.9 against 57.5. A model ten times smaller kept most of the behaviour and lost a few points on the hardest benchmarks.
+
+## The serving arithmetic: bytes are tokens
+
+Everything here is the decode model from *Prefill vs decode: two different workloads* and *What precision buys you*, with the parameter count left as a variable. One decode step reads every weight once, so
+
+$$
+t_{\text{step}} \approx \frac{P \cdot b_w / 8}{\text{BW} \cdot \text{MBU}}
+\qquad\Longrightarrow\qquad
+\text{tokens/s} \approx \frac{\text{BW} \cdot \text{MBU}}{P \cdot b_w / 8}
+$$
+
+**Tokens per second scales as one over the weight bytes.** Double the parameters and you halve the speed. Halve the bytes per weight and you double it. That sentence is the whole comparison between a teacher, a student and a quantized big model.
+
+On an H100 with 3.35 TB/s peak and an achievable-bandwidth fraction (MBU) of 0.8, the effective bandwidth is 2.68 TB/s. Three options, all Llama-3.1 shapes, all measured the same way:
+
+| Option | Weights | Fits an 80 GB H100? | Bytes read per step | Decode, one stream |
+|---|---|---|---|---|
+| 70B teacher, BF16 | 70.6e9 × 2 = 141.2 GB | No — needs two cards | 141.2 GB, or 70.6 GB per card with tensor parallelism | 19 tok/s if it fit; about 38 tok/s on two cards, before interconnect |
+| 70B at 4 bits | 70.6e9 × 0.5 × 1.0625 = 37.5 GB | Yes, with 42.5 GB to spare | 37.5 GB | 71 tok/s |
+| 8B student, BF16 | 8.03e9 × 2 = 16.1 GB | Yes, with 63.9 GB to spare | 16.1 GB | 167 tok/s |
+
+The arithmetic, once, so you can check the rest:
+
+$$
+t_{70} = \frac{141.2\text{e}9}{2.68\text{e}12} = 52.7\ \text{ms} \;\Rightarrow\; \frac{1}{0.0527} = 19\ \text{tok/s}
+$$
+
+$$
+t_{70,\text{int4}} = \frac{37.5\text{e}9}{2.68\text{e}12} = 14.0\ \text{ms} \;\Rightarrow\; 71\ \text{tok/s}
+\qquad
+t_{8} = \frac{16.1\text{e}9}{2.68\text{e}12} = 6.0\ \text{ms} \;\Rightarrow\; 167\ \text{tok/s}
+$$
+
+Three things are worth pulling out.
+
+**The student is 2.3× faster than the quantized teacher and 8.8× faster than the teacher's own bytes.** It wins on the one axis decode cares about, by the ratio of weight bytes: 141.2 / 16.1 = 8.8.
+
+**The teacher does not fit, which is different from being slow.** With tensor parallelism each of two cards holds 70.6 GB and reads it per step, so the step is about 26 ms and the ideal is roughly 38 tok/s. But you pay for two GPUs, add an interconnect round trip inside every layer, and your smallest deployable unit is two cards. At roughly \$2.50 per GPU-hour, that is \$5.00 an hour before slowdowns.
+
+**The KV cache compounds the difference.** Llama-3.1-70B has 80 layers and 8 KV heads of size 128, so one token costs 2 × 80 × 8 × 128 × 2 = 327,680 bytes — 320 KiB. The 8B model has 32 layers, so the same token costs 131,072 bytes, 2.5× less. At 4,000 tokens and 32 users that is 42 GB against 16.8 GB: the smaller model holds more conversations, not just fewer weights.
+
+### So when does distillation beat quantizing the big model?
+
+Distillation wins when **the student's quality is inside your budget and its bytes are the bottleneck**:
+
+- A published student already exists. Evaluate it first; that costs an afternoon and no training run.
+- You need the big model's *behaviour*, not its exact weights: a narrow domain, a fixed output format, a specific reasoning style. A student trained on your traffic can beat its teacher on your task.
+- The 2.3× speed and 2.5× smaller KV cache compound at long context, and you need one GPU, not two.
+
+Quantization is the cheaper first move when **you need the big model's quality this month**: hours on one GPU, no data pipeline, a 1–4 point regression measured with an instrument you already built. Distillation is a training run: 20 billion tokens at roughly 6 FLOPs per parameter per token is 6 × 8.03e9 × 2e10 = 9.6e20 FLOPs. Eight H100s at 40% MFU (about 3.2e15 FLOP/s) take roughly 85 hours — 680 GPU-hours, a few thousand dollars, plus data.
+
+The honest ordering: **evaluate a distilled model if one exists; quantize the big model if not; distill only when quantization cannot get you where you need to go.**
+
+## Pruning: three shapes of zero
+
+Pruning deletes weights from the model you already have. Big networks are over-parameterised, so some weights are doing very little. The engineering is all in *which* weights you delete and whether the hardware can exploit the hole.
+
+<Callout type="pitfall" title="A zero is not free until something skips it">
+  Setting a weight to zero does not remove it from the matrix: a dense layout still stores it, reads it and multiplies by it. Unstructured pruning alone therefore gives **no speedup**, only a quality loss. The saving is real only when storage is compressed or hardware skips zeros — which is why the pattern matters more than the importance score.
+</Callout>
+
+| | Unstructured | Semi-structured 2:4 | Structured |
+|---|---|---|---|
+| What is removed | Individual weights, anywhere | Exactly 2 of every 4 consecutive weights | Whole heads, channels or layers |
+| Matrix shape | Unchanged | Unchanged, plus a 2-bit index per group | Genuinely smaller |
+| Speedup on dense kernels | None | None | **Proportional to the weights removed** |
+| Speedup on sparse hardware | Only with sparse kernels | **Up to 2× peak math** on Ampere and newer | Not needed |
+| Quality cost per weight removed | Lowest | Low | Highest |
+| Needs recovery fine-tuning | Usually | Usually | Always |
+
+### Unstructured pruning
+
+This is <Term t="unstructured-pruning">unstructured pruning</Term>: zero the smallest-magnitude weights, globally or per layer. At 50% sparsity a well-tuned model often loses only a little quality, because the weights that matter are few and large. But the *shape* is unchanged: 50% zeros in a dense matrix is still 100% of the bytes, so decode reads exactly the same amount. Compressed storage needs a kernel that gathers and multiplies a sparse matrix, which is slower per element than a dense multiply; on a bandwidth-bound decode step the indirection eats the saving. It is mostly a research tool and a way to understand importance.
+
+### Semi-structured 2:4
+
+Take every group of four consecutive weights and keep exactly two: <Term t="semi-structured-sparsity">2:4 sparsity</Term>, 50% zeros in a regular, hardware-friendly shape. NVIDIA's sparse tensor cores, from Ampere onwards, skip the two zeros and do up to twice the math per cycle at the same dtype. Values plus a 2-bit index per group take about 8.5 bits per weight for FP16 — roughly half the dense footprint, before scale metadata.
+
+Two caveats. **2× is a peak number**: the surrounding kernel still loads metadata, and real end-to-end gains on published sparse checkpoints are often well under it. And the win is a **compute** win, so it lands on prefill and barely on decode.
+
+The arithmetic makes the general rule. A decode step at batch 1 does 2 FLOPs per parameter over 0.53 bytes at 4-bit weights — an <Term t="arithmetic-intensity">arithmetic intensity</Term> of about 3.8 FLOP per byte, against an H100 ridge point of roughly 200. Decode is fifty times below it: tensor cores are idle, and skipping math changes nothing. Prefill with a 4,000-token prompt does 2 × 4,000 = 8,000 FLOPs per parameter over the same 0.53 bytes — about 15,000 FLOP per byte, far above the ridge. **Sparsity is a prefill lever, not a decode lever, unless you also compress the storage.**
+
+### Structured pruning
+
+**<Term t="structured-pruning">Structured pruning</Term>** removes whole attention heads, MLP channels or layers. The matrices get smaller and stay dense, so every kernel runs faster in proportion to the weights removed — the only pruning that reliably helps decode. The price is granularity: you cannot be surgical about individual weights, so the quality cost per parameter removed is much higher, and you need an importance score per head or channel, a schedule, and a recovery fine-tune.
+
+### Recovery fine-tuning is not optional
+
+After pruning, the remaining weights were never trained to work without the deleted ones. <Term t="recovery-fine-tuning">Recovery fine-tuning</Term> continues training on a sample of the original data so the survivors adapt. This turns a pruned model from "broken" into "almost as good", and it is why pruning needs the training pipeline quantization does not: data, a loop, and GPU time. Published 2:4 checkpoints that report most accuracy recovered — such as Sparse Llama 3.1 from Neural Magic at the time of writing — are the output of exactly this process, and their throughput numbers are vendor-reported rather than independent.
+
+```python
+import torch
+
+def mask_2_4(w):
+    # keep the two largest-magnitude weights in every group of four
+    g = w.reshape(*w.shape[:-1], -1, 4)
+    keep = g.abs().topk(2, dim=-1).indices
+    mask = torch.zeros_like(g, dtype=torch.bool).scatter_(-1, keep, True)
+    return (g * mask).reshape(w.shape)
+```
+
+Run that on a trained checkpoint and you have a 2:4 mask with no training. It will also lose quality immediately — the mask is easy, and recovery fine-tuning is the work.
+
+## Measuring what you gave up
+
+Everything in *Measuring quality regression* applies unchanged, and that is the point: a pruned or distilled model is a model change, so it goes through the same instrument.
+
+1. **Perplexity first.** Cheap, and it moves early — but it is the weakest signal, for the reasons that lesson gave.
+2. **Task benchmarks from your own traffic**, with enough samples to resolve a couple of points — thousands per task, paired.
+3. **A length sweep** if the KV cache changed, which for a student it did.
+4. **A report with a named decision and a rollback**, because this is a behavioural change.
+
+Three things differ from a quantization eval, and each has caught people out.
+
+**A distilled model is a different model, so it can get better.** Quantization removes information; distillation can raise a benchmark, because the student was trained on data that looks like your eval. A student that beats its teacher on your test set is evidence that your test set leaked into the training data, or that the task is narrower than you thought. Keep the <Term t="golden-set">golden set</Term> out of the distillation data.
+
+**Compare against two baselines, not one.** The teacher (is the student close enough?) and the model in production (is this better for users?). A student 3 points behind its teacher but 10 points ahead of the 4-bit model you were serving is a win.
+
+**Prompt format is part of the model.** A student is fine-tuned on a specific chat template, system prompt and sampling temperature. Serving it with a different template is the most common way a good distillation looks broken. This is also the summary table: quantization is predictable and cheap, pruning only pays when the shape changes or the storage compresses, and distillation buys a different model with a different risk profile.
+
+## Choosing, in order
+
+1. **Is there a distilled model already?** Evaluate it. It costs an afternoon and may end the discussion.
+2. **Can you quantize?** Yes. It is the cheapest first move, with a regression measured by a harness you already have.
+3. **Is prefill your bottleneck?** With 2:4 kernels and a recovery budget, sparsity is a compute lever quantization cannot give you.
+4. **Do you need a fundamentally smaller model** — fewer parameters, not fewer bits, and one GPU instead of two? Then distill, and budget a training run.
+5. **Never prune without recovery fine-tuning**, and never ship a pruned or distilled model without the eval you would demand of a quantized one.
+
+<Callout type="try" title="Check yourself before continuing">
+  1. A 70B model at 4 bits is 37.5 GB and fits on one H100. Why is it still slower than an 8B model in BF16?
+  2. Your teacher has logits 3.0, 1.0, 0.0. At $T = 4$ the scores become 0.75, 0.25, 0. What happens to the third token's probability, and why does that help the student?
+  3. You zero 50% of a model's weights with unstructured pruning and measure no speed change. Is your kernel broken?
+  4. Your workload is 8,000-token prompts and short answers. Which of 2:4 pruning and W4A16 helps more, and why?
+  5. A distilled student scores 2 points above its teacher on your eval. What are the two most likely explanations?
+</Callout><KeyNotes>
+  1. There are three ways to make a model cheaper: fewer bits per weight, fewer weights, or a smaller model trained to imitate. Only quantization is a post-training config change, which is why it wins by default.
+  2. Distillation trains the student on the teacher's full distribution, not just its chosen token; the small probabilities carry the similarity structure, which is why students learn from far less data.
+  3. Temperature flattens the distribution so small probabilities become visible; the gradient then scales as $\frac{1}{T^2}$, which is why implementations multiply the soft loss by $T^2$.
+  4. The soft loss is the teacher's entropy plus a KL divergence. Entropy is constant, so the student minimises the KL — matching a distribution, not guessing an answer.
+  5. Sequence-level distillation needs only the teacher's outputs, not its weights — but the licence must allow training on them, and unfiltered samples teach the student the teacher's mistakes.
+  6. Decode tokens/s scales as one over weight bytes. On one H100's effective bandwidth: the 70B teacher would be 19 tok/s and does not fit, 70B at 4 bits is 71 tok/s, an 8B student is 167 tok/s.
+  7. Unstructured pruning leaves the bytes and the matmul untouched, so it is not a speed lever. 2:4 sparsity helps compute-bound prefill, not bandwidth-bound decode. Structured pruning is the only pruning that reliably speeds up decode, and it costs the most quality. Both pruning and distillation are training projects: budget recovery fine-tuning, data, and the same quality harness.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'An 8B model in BF16 reads 16.1 GB of weights per decode step. On an H100 delivering 2.68 TB/s, how many tokens per second for one stream, ignoring overhead?', numeric: true, answer: 167, tolerance: 12, unit: 'tok/s', why: '16.1e9 ÷ 2.68e12 = 6.0 ms per step, and 1 ÷ 0.006 = 167 tokens per second. The same rule gives 71 tok/s for a 70B model at 4 bits (37.5 GB) and 628 tok/s for the 8B model at 4 bits (4.27 GB).' },
+  { q: 'Teacher logits for three tokens are 3.0, 1.0 and 0.0. At temperature T = 2, what probability does softmax give the top token? Three decimals.', numeric: true, answer: 0.629, tolerance: 0.02, unit: '', why: 'Divide the logits by 2: 1.5, 0.5, 0. e^1.5 = 4.482, e^0.5 = 1.649, e^0 = 1, sum = 7.130. The top probability is 4.482 ÷ 7.130 = 0.629, against 0.844 at T = 1. Flattening raised the third token from 0.042 to 0.140.' },
+  { q: 'How many bytes of KV cache does one token of context occupy in Llama-3.1-70B at BF16? (2 × L × H_kv × D × 2, with L = 80, H_kv = 8, D = 128.)', numeric: true, answer: 327680, tolerance: 9000, unit: 'bytes', why: '2 × 80 × 8 × 128 × 2 = 327,680 bytes, or 320 KiB per token. The 8B model with 32 layers needs 131,072 bytes — 2.5× less — a second, compounding advantage for a smaller student at long context.' },
+  { q: 'You zero 50% of a model’s weights with unstructured pruning, keep a dense layout, and measure no speed change. What is the correct reading?', options: ['The kernel is broken; sparse matmuls are always faster', 'Expected: the zeros are still stored and still read, and a dense kernel cannot skip them', 'The pruning was too aggressive and the GPU throttled', 'The model is now compute-bound, so bytes no longer matter'], answer: 1, why: 'Unstructured pruning changes values, not shape. In a dense layout the byte count and the number of multiplies are identical, so neither the memory term nor the compute term of the decode step moves. You would need compressed storage plus a sparse gather kernel, or a structured pattern.' },
+  { q: 'Your workload is 8,000-token prompts with short answers, and prefill dominates GPU time. Which change helps most?', options: ['Unstructured pruning to 50% sparsity', '2:4 sparsity, if you have sparse tensor cores and a recovery fine-tune', '4-bit KV cache', 'Nothing: prefill is memory-bound'], answer: 1, why: 'An 8,000-token prompt gives arithmetic intensity of roughly 2 × 8,000 ÷ 0.53 ≈ 30,000 FLOP per byte, far above the machine ridge, so the phase is compute-bound. 2:4 sparsity halves the multiplies the tensor core performs, which is exactly the bottleneck. Unstructured zeros save nothing, and KV quantization is a decode-side lever.' },
+  { q: 'You serve a 70B model, need twice the throughput next month, and have no training budget or labelled data. What is the right first move?', options: ['Distil an 8B student from the 70B', 'Quantize the 70B to W4A16 and measure the regression', 'Prune 50% of the weights without recovery fine-tuning', 'Switch to 2:4 sparsity and expect 2× on decode'], answer: 1, why: 'Quantization is hours of work on one GPU, needs no data pipeline, and its typical regression is 1–4 points — measurable with the harness from the previous lesson. Distillation is a training run with a data pipeline; pruning without recovery fine-tuning is a quality disaster; and 2:4 sparsity is a compute lever that barely moves decode.' },
+]} />

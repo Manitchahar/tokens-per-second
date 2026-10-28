@@ -57,6 +57,19 @@ Marginal return collapses past ~128: 1→8 seats is **7.3×** throughput for a 9
 
 Prefill on the same GPU: 512 tok ≈ 17 ms · 2,048 tok ≈ 63 ms · 8,192 tok ≈ 244 ms.
 
+## Dynamic batching (classic servers)
+
+$$
+B_{\text{expected}} \approx \min\left(B,\ 1 + \lambda D\right)
+$$
+
+- The window opens with the first request and closes at B requests or after the oldest has waited D.
+- Added wait ≤ D; mean ≈ D/2 when the window closes on time rather than on size.
+- λ = 200/s, D = 5 ms → λD = 1 → expected batch 2. With s(n) = 1.0 + 0.5n ms: 1.5 ms alone (667 req/s) vs 2.0 ms for 2 (1,000 req/s); latency 1.5 → about 4.5 ms.
+- D = 10 ms → batch 3, 2.5 ms, 1,200 req/s. The cap B = 8 fills at λ ≥ 1,400/s and tops out near 1,600 req/s.
+- Triton: `dynamic_batching` with `max_batch_size`, `preferred_batch_size`, `max_queue_delay_microseconds` (Module 17).
+- Right for fixed-shape classifiers, embedders and rerankers. Wrong for generation: a batch is a stream and still ends with its slowest member, so the tail survives → continuous batching.
+
 ## The engine loop
 
 ```

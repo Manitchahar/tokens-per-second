@@ -118,6 +118,22 @@ For an H100: weight read 6.0 ms, so PCIe allows **330 MB/step** at zero added la
 - Pageable vs pinned is routinely **3–10×**, and it decides whether a CPU tier is viable at all.
 - First-byte latency on a remote tier is **milliseconds**; batching and prefetch depth matter more than bandwidth there.
 
+## LMCache, in practice
+
+An open-source KV cache layer beside the server: blocks in host RAM, local disk or remote storage, reused across requests and engine instances. It enters vLLM through a **KV connector** named in `--kv-transfer-config` (connector plus a `kv_role`), with chunk size and tier capacities set by environment variables or a YAML config. **Names and defaults move between releases — check the docs at the time of writing.**
+
+| quantity | arithmetic | result |
+|---|---|---|
+| tokens in 200 GB of host RAM | 200e9 ÷ 131,072 | **1.53M** ≈ 46 conversations of 32K |
+| the same, in the 54.7 GB GPU budget | 54.7e9 ÷ 131,072 | 417K ≈ 12 conversations |
+| reload a 32,768-token prefix | 4.29 GB ÷ 25 GB/s | **172 ms** |
+| recompute that prefix | 526 TFLOP ÷ 544 TFLOP/s | **0.97 s** |
+
+- The crossover is **length-independent**: $T b_{kv}/BW = T\,t_{\text{recompute}}$, so $BW = b_{kv}/t_{\text{recompute}} \approx 4.4$ GB/s. A 25 GB/s link is 5.7× above it, and the reload is 5.7× faster.
+- A reload lands on **TTFT**, not in idle tensor cores — during decode recompute is nearly free; before the first token it is the critical path.
+- Benchmark **cold then warm**, same workload, same order. Report hit rate with TTFT p50 and p99. It loses on low reuse, short prompts, and storage below the crossover.
+- **CacheGen** compresses KV for transfer; **CacheBlend** reuses non-prefix chunks with selective recompute (at the time of writing).
+
 ## Reference numbers
 
 | GPU | Peak BF16 | Bandwidth | Memory |
@@ -158,3 +174,5 @@ Qwen2.5-0.5B BF16: 12,288 B/token. On a T4 with ~12 GB of budget that is 977,000
 | Double buffering | Two buffers, so writes never clobber a live read |
 | Tier backpressure | Bounding concurrent sequences served from a slow tier |
 | Achieved bandwidth | What your code actually moves — not the spec sheet |
+| LMCache | Off-the-shelf KV cache layer: RAM / disk / remote, reused across engines |
+| KV connector | The engine-side plug-in that stores and fetches blocks (`kv_role`) |

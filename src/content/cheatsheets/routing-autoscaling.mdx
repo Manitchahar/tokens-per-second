@@ -164,3 +164,100 @@ At 2 replicas each carries 18 req/s ⇒ ~70% goodput, multi-second p99.
 1. Route on KV tokens, not request counts — request cost varies by orders of magnitude with prompt length.
 2. Capacity = (KV pool ÷ context) ÷ time in system; size for peak with one spare, because a new replica is useless until it is warm.
 3. Scale on queue depth over a long window, scale out fast and in slow, and never route and scale on the same signal.
+
+## Semantic caching & semantic routing
+
+Three caches, from exact to clever:
+
+| Cache | Stores | Hit test | Saves | Failure |
+|---|---|---|---|---|
+| Exact-match | normalised request hash → response | identical hash | whole call | stale answer / key never hits |
+| Prefix / KV | KV blocks per token prefix | longest common prefix | prefill only | per-replica; wrong GPU misses |
+| Semantic | question vector → answer | cosine ≥ threshold | whole call | confident wrong answer |
+
+They stack: exact-match, then semantic, then the LLM with prefix caching.
+
+### Pipeline
+
+1. Mask PII (NER + regex) → placeholders such as `NAME_1`.
+2. Embed with the same embedding model as the index.
+3. Tenant-filtered vector search, top-k nearest.
+4. Cosine similarity against the threshold.
+5. Hit → return stored answer. Miss → call the LLM, store the masked pair.
+6. TTL for time-sensitive content; purge on document, price, template, model or embedding-version change.
+
+$$
+\cos(\mathbf{q},\mathbf{s}) = \frac{\mathbf{q}\cdot\mathbf{s}}{\|\mathbf{q}\|\,\|\mathbf{s}\|}
+$$
+
+Worked sketch: $\mathbf{q} = (0.8, 0.5, 0.1)$, $\mathbf{s} = (0.7, 0.6, 0.1)$.
+Dot = 0.87. Lengths 0.9487 and 0.9274. Cosine ≈ **0.989**. A far vector can score ≈ −0.15.
+
+Treat 0.85–0.95 as a starting range to calibrate, not a constant.
+
+### Threshold economics
+
+Definitions: $h$ = hit rate, $f$ = false-hit rate among hits, $C$ = cost of one LLM call,
+$c$ = cost of one cache lookup, $W$ = cost of one wrong answer.
+
+$$
+S = h(1-f)C - c - hfW
+$$
+
+Break-even:
+
+$$
+f < \frac{hC - c}{h(C + W)}
+$$
+
+Illustrative costs: $C = 0.002$ dollars (about 3.1 GPU-seconds on an H100 at \$2.50/hr),
+$c = 0.00005$, $W = 0.20$ (one wrong answer in ten costs \$2 of support time).
+
+| $h$ | $f$ | Saving per request | Per million |
+|---|---|---|---|
+| 0.20 | 0.005 | +\$0.000148 | +\$148 |
+| 0.50 | 0.10 | −\$0.00915 | −\$9,150 |
+
+At $h = 0.5$ the break-even false-hit rate is **0.94%**, so precision among hits must be about **99%**. Tune for precision, then take the hit rate precision allows.
+
+### Offline evaluation (1,000 requests, 300 with a valid duplicate)
+
+| Threshold | Hits | False hits | Precision | Recall |
+|---|---|---|---|---|
+| 0.92 | 200 | 4 | 98% | 65% |
+| 0.85 | 280 | 14 | 95% | 89% |
+| 0.70 | 340 | 68 | 80% | 91% |
+
+At 0.70: $h = 0.34$, $f = 0.20$, so $S \approx -0.0131$ — a loss of about \$13 per thousand.
+
+### Never cache / always scope
+
+- Never: personalised answers, time-sensitive facts, side-effecting actions, regulated content, raw PII.
+- Scope by: tenant, locale, model and version, prompt template, embedding model, tool permissions, index version.
+- Filter by tenant **inside** the vector search; after the search is already too late.
+- Embeddings are representations, not anonymisation: encrypt, restrict, expire and delete.
+
+### Semantic routing
+
+Same embedding, different destination: small model, large model, reasoning on/off, or a task-specific endpoint.
+
+$$
+S_{\text{route}} = p(C_L - C_s) - eW
+$$
+
+$p$ = fraction correctly sent small, $e$ = fraction wrongly sent small.
+With $C_L = 0.002$, $C_s = 0.0001$, $W = 0.20$ and $p = 0.60$:
+
+$$
+e < \frac{0.60 \times 0.0019}{0.20} = 0.0057
+$$
+
+so fewer than **0.57%** of requests may be misrouted. Prefer a cascade (small model, then escalate) when a wrong route is expensive.
+
+### Rollout
+
+1. Offline labelled set; label duplicates by **answer equivalence**, not by wording.
+2. Shadow mode: log would-be hits and stored answers, serve the normal LLM.
+3. Canary a small slice with a kill switch.
+4. Guardrails: escalation rate, thumbs-down rate, repeat-question rate, task completion.
+5. Rebuild vectors when the embedding model changes; monitor per tenant, not just in aggregate.

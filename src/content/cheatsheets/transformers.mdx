@@ -90,6 +90,36 @@ $$
 
 **GQA saves bytes, not FLOPs.** Read `num_key_value_heads` from the config, never assume it equals `num_attention_heads`.
 
+## MLA & sliding windows
+
+MLA (DeepSeek-V2/V3) caches one latent per token per layer, then rebuilds K and V with up-projections.
+
+$$
+\text{KV per token} = L \times (d_{\text{latent}} + d_{\text{rope}}) \times b
+$$
+
+DeepSeek-V3, approximate: 61 × (512 + 64) × 2 = 70,272 B ≈ **68.6 KiB/token** — about half of Llama-3.1-8B's GQA cache, from a model roughly 80× larger.
+
+| Llama-3.1-8B shapes | Values/layer | Bytes/token | @32K |
+|---|---|---|---|
+| MHA, 32 KV heads | 8,192 | 512 KiB | 16.0 GiB |
+| MQA, 1 KV head | 256 | 16 KiB | 512 MiB |
+| GQA, 8 KV heads | 2,048 | 128 KiB | 4.0 GiB |
+| DeepSeek-V3 MLA, 61 layers | 576 | 68.6 KiB | 2.14 GiB |
+
+- **Weight absorption**: fold $W_{UK}^\top$ into $W_Q$ and $W_{UV}$ into $W_O$. Queries score against the latent and K/V are never materialised at decode.
+- Rebuilding K and V naively costs 32,768 values/layer = 64 KiB, so 3.7 MiB/token across 61 layers — about 55× the cache.
+
+**Sliding window** (local attention): token i sees only the last W tokens.
+
+$$
+\text{local-layer KV} = \min(T, W) \times 2\,n_{kv}\,d_h\,b
+$$
+
+- Llama-3.1-8B shapes: 4 KiB/token/layer. At 32K: all-global 4.0 GiB; all-local with W = 4,096: 512 MiB (8× less).
+- Hybrid 24 local + 8 global at 32K: 24 × 16 MiB + 8 × 128 MiB = **1.375 GiB** (2.9× less); prefill FLOPs fall by the same factor.
+- Gemma 2 (4,096-token local layers alternating with global), Gemma 3 (1,024-token local, several per global) and Mistral 7B (4,096 everywhere) at the time of writing.
+
 ## The block, parameter by parameter (Llama-3.1-8B)
 
 | Matrix | Shape | Params | Bytes |

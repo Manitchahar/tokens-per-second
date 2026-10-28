@@ -10,6 +10,16 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The old way of serving: collect a group of requests into one batch, run the whole batch until the slowest request finishes, then start the next batch. Every request in the group waits for the slowest one.',
     lesson: 'batching-scheduling/naive-and-static-batching',
   },
+  'dynamic-batching': {
+    term: 'Dynamic batching',
+    def: 'A server-side policy: open a window when the first request arrives and close it when the batch reaches its maximum size B or the oldest request has waited D, then run the batch together. Bounds the added wait at D while letting the batch fill.',
+    lesson: 'batching-scheduling/naive-and-static-batching',
+  },
+  'max-queue-delay': {
+    term: 'Max queue delay (D)',
+    def: 'The longest a dynamic batcher will hold the first request in a window before running the batch, even if it is nearly empty. Triton calls it max_queue_delay_microseconds. A larger D means fuller batches and more added latency.',
+    lesson: 'batching-scheduling/naive-and-static-batching',
+  },
   scheduler: {
     term: 'Scheduler',
     def: 'The component in a serving engine that decides, for each step, which requests run together and which wait. It is the only part of the engine deciding who gets the GPU right now.',

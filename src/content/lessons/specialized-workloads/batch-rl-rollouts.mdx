@@ -207,6 +207,70 @@ Pull it together for Llama-3.1-8B, 1,024 rollouts at 4,096 tokens, 75% generated
 
 Ten minutes per step is the number a research team plans around. It is also why RL experiments are expensive and why throughput work in this area pays off directly: a 2× improvement halves the time to every experiment.
 
+## Reproducibility is part of the spec
+
+You have a cluster, a cap and a wall-clock estimate. One property decides whether the run is worth anything: **the same prompt on the same engine must produce the same tokens, and the trainer must see the probabilities the engine saw.**
+
+Greedy decoding looks deterministic — no sampling, so it always takes the highest-scoring token — but it is only as deterministic as its scores, which are floating-point sums.
+
+**Floating-point addition is not associative.** In exact arithmetic, $(a + b) + c = a + (b + c)$. In a machine, every addition rounds to the nearest representable number, and the neighbours depend on the running total. Group the terms differently and the final value can change.
+
+**A worked example.** FP16 keeps 10 bits of mantissa, so just above 1.0 the representable numbers are 0.000977 apart. Take $a = 1$, $b = 0.0005$, $c = 0.0005$.
+
+Left to right: 1 + 0.0005 gives 1.0005; neighbours 1 and 1.000977, midpoint 1.000488, so it rounds up to 1.000977. Adding the second 0.0005 gives 1.001477, past the next midpoint 1.001465, so **1.001953**.
+
+The other grouping: the small terms add to about 0.001; 1 + 0.001 = 1.001 is below the midpoint 1.001465, so **1.000977**.
+
+Exact answer: 1.001, so the orders differ by one grid step, 0.000977 — about 0.1%. BF16 has 7 mantissa bits, so its grid above 1.0 is eight times coarser: 0.0078.
+
+```python
+import numpy as np
+a, b, c = np.float16(1.0), np.float16(0.0005), np.float16(0.0005)
+print((a + b) + c)   # 1.002  → 1.001953125
+print(a + (b + c))   # 1.001  → 1.0009765625
+```
+
+**Where the order comes from.** A matrix multiply is a sum of products, and no kernel adds them one at a time: it splits the sum across lanes and warps, accumulates partial sums, and sometimes splits the reduction across blocks. How it splits — rows per tile, how far the inner dimension is divided, tokens per attention chunk — depends on the batch, so a prompt alone and the same prompt in a batch of 64 are reduced differently. Chunked prefill changes it again, and so does kernel choice.
+
+So the last bits of every logit depend on the rest of the batch. Usually that changes nothing: the winner leads by far more than 0.001. But when two candidates are nearly tied, one grid step flips the argmax — and once one token differs, everything after it is conditioned on different text. **The sequence does not drift, it jumps.** A rollout can be 99.9% identical and still be a different sample.
+
+**Why RL cares more than serving.** A user gets one answer and never compares it; the trainer does. It recomputes the log-probability of every token it sampled — the log of the probability the policy gave that token — with its own kernels: a different library, different batch shapes, often different precision. The quantity that turns one into the other is the <Term t="importance-ratio">importance ratio</Term>:
+
+$$
+r = \exp\left(\log \pi_{\text{trainer}} - \log \pi_{\text{engine}}\right)
+$$
+
+If the two log-probabilities differ by δ, the ratio is off by about $(1 + \delta)$ — negligible per token. But a policy-gradient update multiplies ratios across tokens and steps and clips them, so a *systematic* δ, such as the engine consistently rounding down, biases every ratio the same way, and a large δ falls outside the clip and discards the sample. Over thousands of iterations that is drift: a reward curve bending for reasons unrelated to the policy.
+
+Which is why <Term t="batch-invariant">batch-invariant kernels</Term> have been proposed and implemented by some serving engines at the time of writing: kernels whose summation order is fixed, so a token's numbers do not depend on the batch. The price is genuine — a fixed reduction cannot use the fastest split for every shape — but it buys reproducibility.
+
+A reproducibility contract has four clauses.
+
+**1. Fix the seeds.** Sampler, data order, dropout — recorded beside the checkpoint, not in a shell history.
+
+**2. Record the versions.** Engine build, attention and matrix-multiply kernel library, dtypes, and whether batch-invariant mode is on. A run on a different kernel build is a different experiment; you want to know when that is why the numbers moved.
+
+**3. Test batch-shape invariance.** Same prompts, greedy, at batch 1 and batch 64: compare token sequences exactly and log-probabilities against a recorded tolerance. This catches a shape-dependent kernel before a training run does.
+
+```python
+def invariance_check(engine, prompts, tol=1e-3):
+    """The shape of the harness, not a specific API."""
+    singles = [engine.generate(p, greedy=True) for p in prompts]   # batch 1
+    grouped = engine.generate(prompts, greedy=True)                # batch 64
+    for p, one, many in zip(prompts, singles, grouped):
+        same = one.token_ids == many.token_ids
+        delta = max(abs(x - y) for x, y in zip(one.logprobs, many.logprobs))
+        print(f"tokens equal: {same}   max |dlogp|: {delta:.2e}   tol: {tol}")
+```
+
+**4. Log the engine-versus-trainer gap.** Every step, record the mean and maximum difference between the engine's log-probability and the trainer's. It is cheap, and a leading indicator: it rises before the loss does.
+
+<Callout type="pitfall" title="A passing test at a loose tolerance proves nothing">
+  A batch-shape test that passes at a tolerance of 0.1 has told you nothing. Set it from the precision you run in, tighten until it fails for numerical reasons, then record it. And read the tokens before the log-probs: if the greedy tokens already differ, the probability tolerance is beside the point — the sample has changed.
+
+  Seeds share the limit: a seed makes a run repeatable on one build, not across builds.
+</Callout>
+
 <Callout type="try" title="Check yourself before continuing">
   1. Llama-3.1-8B on 8 H100s. Compute KV bytes per token, then KV per 4,096-token rollout.
   2. With 16.06 GB of weights per GPU on a 640 GB cluster, how many 4,096-token rollouts fit? What fraction of the cluster is weights versus KV?
@@ -222,8 +286,8 @@ Ten minutes per step is the number a research team plans around. It is also why 
   4. The KV-head count, not the parameter count, decides rollout economics — Llama-3.1-8B has 5× the parameters of Qwen2.5-1.5B and 4.5× the KV per token, which is why GQA is mandatory here.
   5. Without an SLO, batch as large as memory allows: throughput rises 4.5× from batch 8 to 512 while the per-sequence rate falls 14×, and none of that matters when nobody is waiting.
   6. Ragged completion means **peak memory is the group size**, and throughput degrades to roughly a quarter of peak as the batch drains, because fewer rows re-expose the batch-8 regime.
-  7. A single unfinished rollout stalls the entire optimisation step, so a hard generation cap is not optional — and it should sit at ~75% of context to leave room for the reward pass.
-  8. Measure your own completion-length distribution and set the cap near its 90th percentile. RL runs are long enough that a missing cap wedges them hours in.
+  7. A single unfinished rollout stalls the entire optimisation step, so a hard generation cap is not optional — site it at ~75% of context to leave room for the reward pass, and set it near the 90th percentile of the completion lengths you measured.
+  8. Greedy decoding is not the same thing as determinism: floating-point addition is not associative, so batch shape, chunking and kernel choice change the last bits of every logit, and a near-tie flips a token. The contract is fixed seeds, recorded engine and kernel versions, a batch-shape invariance test at batch 1 versus batch 64, and the logged engine-versus-trainer log-prob gap.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -232,4 +296,5 @@ Ten minutes per step is the number a research team plans around. It is also why 
   { q: 'A decode step moves 20 GB at batch 8 and 291 GB at batch 512. By what factor does aggregate throughput improve?', options: ['About 4.5×', 'About 8×', 'About 64×', 'About 256×'], answer: 0, why: 'Throughput improves only 4.5× (1,119 → 5,011 tok/s) for a 64× batch increase, because bytes per token rise with the batch. The weight read is fixed at 16 GB, so its share of traffic falls from 80% at batch 8 to 5.5% at batch 512. Past the roofline knee, extra batch buys throughput very poorly and mostly costs memory.' },
   { q: 'Rollouts complete at different lengths. Why must you provision memory for the full group size rather than the average?', options: ['Because the KV cache is compressed only after completion', 'Because all rollouts are resident at the start of the step, so the peak is the group size', 'Because weights grow with batch size', 'Because throughput improves with more resident rollouts'], answer: 1, why: 'The batch starts with every rollout alive, so peak occupancy equals the group size. Sizing for average occupancy OOMs at the start of every step. Finished rollouts free blocks as the batch drains, but by then the damage would already have happened.' },
   { q: 'A rollout context is 4,096 tokens with 75% generated. Using a 75% cap, how many tokens are left for the reward pass?', numeric: true, answer: 1024, tolerance: 40, unit: 'tokens', why: 'Cap = 0.75 × 4,096 = 3,072, leaving 25% = 1,024 tokens of headroom. A rollout that reaches the context limit has no room for the reward model’s own forward pass or a retry, which is why the cap sits below the context limit rather than at it.' },
+  { q: 'The rollout engine reports a log-probability of −0.40 for a sampled token and the trainer recomputes −0.38 for the same token. What is the importance ratio exp(log π_trainer − log π_engine)?', numeric: true, answer: 1.02, tolerance: 0.01, unit: '×', why: 'exp(−0.38 − (−0.40)) = exp(0.02) ≈ 1.02. A 0.02 gap in log-probability is a 2% error in the ratio — harmless once. The problem is a gap that always points the same way: every ratio is then biased in the same direction, and a sample whose gap is large lands outside the clipping range and is discarded.' },
 ]} />

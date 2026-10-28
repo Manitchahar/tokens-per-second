@@ -79,6 +79,16 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'SGLang’s multi-level KV cache — GPU, host, and optionally a third backing tier — with an LFU-style eviction policy that protects actively used layers. At the time of writing the central name for a cache with more than one level.',
     lesson: 'long-context/tiered-kv',
   },
+  'lmcache': {
+    term: 'LMCache',
+    def: 'An open-source KV cache layer that runs beside the model server and stores KV blocks in host RAM, local disk or a remote store, handing them back when a request can reuse them. Blocks are keyed by their tokens, so reuse crosses requests and, with a shared store, crosses engine instances — which is what separates it from a prefix cache that dies with its process.',
+    lesson: 'long-context/tiered-kv',
+  },
+  'kv-connector': {
+    term: 'KV connector',
+    def: 'The plug-in interface a serving engine uses to hand KV blocks to an external store and ask for them back. In vLLM it is named in a kv-transfer-config JSON at startup together with a kv_role — store only, load only, or both. The connector is the boundary between the engine’s paged pool and whatever tier is behind it.',
+    lesson: 'long-context/tiered-kv',
+  },
   'achieved-bandwidth': {
     term: 'Achieved bandwidth',
     def: 'The bytes per second your code actually moves, which is what a capacity plan needs — not the tier’s spec sheet. Measure it in your own process, with pinned host memory and a proper warmup, because pageable copies and cold first touches routinely cost 3–10×.',

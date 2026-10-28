@@ -72,6 +72,21 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'All query heads share one key and value head. The KV cache shrinks by the query-head count — up to 32× — with a small quality cost. Used by Grok-1 and some Llama-2-70B releases.',
     lesson: 'transformers/multi-head-gqa',
   },
+  'mla': {
+    term: 'Multi-head latent attention (MLA)',
+    def: 'Introduced with DeepSeek-V2 and used in DeepSeek-V3. Instead of caching full K and V, each layer caches one small compressed latent per token — 512 numbers for DeepSeek-V3 — plus a 64-number RoPE key, and rebuilds per-head K and V with learned up-projections.',
+    lesson: 'transformers/multi-head-gqa',
+  },
+  'weight-absorption': {
+    term: 'Weight absorption (MLA)',
+    def: 'Folding MLA’s K and V up-projections into the query and output projections when the weights are loaded, so the decode kernel attends in the small latent space and never writes reconstructed K or V to HBM. It makes MLA’s extra compute a one-time cost.',
+    lesson: 'transformers/multi-head-gqa',
+  },
+  'sliding-window-attention': {
+    term: 'Sliding-window attention',
+    def: 'Each token attends only to the most recent W tokens, so a local layer’s KV cache is capped at W entries however long the context is. Hybrid models interleave local layers with a few global layers that see the whole context.',
+    lesson: 'transformers/multi-head-gqa',
+  },
   'attention-scale': {
     term: 'The 1/√d in attention',
     def: 'Scores are divided by the square root of the head width before the softmax. Dot products over d terms get large, and a softmax over large scores goes one-hot, killing gradients. It is a fixed softmax temperature: 11.31 at d = 128.',

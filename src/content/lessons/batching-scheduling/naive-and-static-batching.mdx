@@ -132,6 +132,56 @@ Recall Module 00's four numbers. Static batching moves them in a very particular
 | Memory | Tiny: no KV for anyone else | Bounded but coarse: the KV of the whole group, all at once |
 | Fairness | Perfect: one user at a time | Terrible: the longest request in the group decides when everyone else's answer stops |
 
+## Dynamic batching: a waiting window
+
+Static batching has an assumption that online traffic breaks: that a full batch will arrive. Picture a server with a fixed batch size of ten. Nine requests arrive in the first second; the tenth arrives five minutes later. The static batcher holds the nine for five minutes, because it promised to run them as a group. Every one of those users sees a five-minute time to first token, and the GPU idles the whole time.
+
+<Term t="dynamic-batching">Dynamic batching</Term> fixes that by putting an upper bound on the wait. The server starts a **window** when the first request arrives at an empty server, and closes it on whichever comes first:
+
+- the batch reaches its maximum size $B$, or
+- the oldest request has waited $D$, the <Term t="max-queue-delay">max delay</Term>.
+
+Then it runs the batch, and the next request opens a new window. $B$ controls how much work a step contains; $D$ controls how long a request may be delayed to get there.
+
+This is what classic model servers do. At the time of writing, NVIDIA's Triton Inference Server exposes it as `dynamic_batching` with `max_batch_size` and `max_queue_delay_microseconds`; you will read a real `config.pbtxt` in Module 17's "Multi-model serving & Triton Inference Server". The idea predates LLMs and is still the right default for models that do one fixed-size forward pass per request.
+
+### The queueing arithmetic
+
+If requests arrive at an average rate $\lambda$ requests per second, a window of length $D$ seconds contains about $\lambda D$ arrivals. One more request — the one that opened the window — is also in the batch, so
+
+$$
+B_{\text{expected}} \approx \min\left(B,\ 1 + \lambda D\right)
+$$
+
+The formula is an approximation: it ignores the time the server spends running the previous batch and assumes arrivals are spread evenly. It is still the right first estimate, and it shows the two regimes clearly. When $\lambda D$ is small the batch is tiny and the window mostly adds latency. When $\lambda D$ is large the batch is capped by $B$, and the window rarely matters.
+
+The latency cost is bounded by construction: no request waits more than $D$ before its batch starts. Under light traffic, when the window closes on time rather than on size, a request's average wait is about $D/2$, because arrivals are spread across the window.
+
+Take a concrete case: $\lambda = 200$ requests/s, $D = 5$ ms, $B = 8$. Then $\lambda D = 1$, so the expected batch is $\min(8, 2) = 2$. To see what that buys, model the service time of a batch of $n$ as
+
+$$
+s(n) = 1.0\ \text{ms} + 0.5n\ \text{ms}
+$$
+
+One millisecond is fixed cost per batch — launching the work, reading the weights — and half a millisecond per request is the actual arithmetic. A single request then takes 1.5 ms, so one-at-a-time serving tops out at 1 / 0.0015 ≈ 667 requests/s. A batch of two takes 2.0 ms and delivers two responses, so it tops out at 2 / 0.002 = 1,000 requests/s.
+
+| Policy | Batch | Service | Capacity | Added wait |
+|---|---|---|---|---|
+| No batching | 1 | 1.5 ms | 667 req/s | 0 |
+| Dynamic, $D = 2$ ms | about 1.4 | about 1.7 ms | about 820 req/s | about 1 ms |
+| Dynamic, $D = 5$ ms | 2 | 2.0 ms | 1,000 req/s | about 2.5 ms |
+| Dynamic, $D = 10$ ms | 3 | 2.5 ms | 1,200 req/s | about 5 ms |
+
+Capacity there is the most requests per second the server can sustain. Read the table carefully, because the first column hides a trap. At the stated arrival rate of 200/s, **throughput does not change at all** — the server is arrival-limited, not capacity-limited, so it still serves 200 requests/s whether it batches or not. What changes is latency: about 1.5 ms alone versus about 4.5 ms with batching (2.5 ms waiting plus 2.0 ms of service). Dynamic batching is not a way to make a lightly loaded server faster. It is a way to buy **headroom**: 1,000 requests/s of capacity instead of 667, paid for with a few milliseconds on every request.
+
+The cap $B = 8$ matters at higher load. At 1,400 requests/s with $D = 5$ ms the window fills by count before it fills by time, the batch becomes 8, and capacity reaches 8 / 0.005 = 1,600 requests/s. That is the trade in one sentence: **the window converts idle throughput into latency**. Choose $D$ from the latency budget you can afford, then check that the batch it produces is big enough to matter.
+
+<Callout type="pitfall" title="Why this is right for classifiers and wrong for chat">
+  A classifier, an embedding model or a reranker does one forward pass per request. Every request has the same shape, every response takes the same time, and a batch of eight is eight independent pieces of work that finish together. Waiting 5 ms to double the batch is close to free.
+
+  An LLM generation request is not one forward pass. It is a stream of hundreds of decode steps, and a batch formed at step 0 is committed until its **slowest** member finishes. Requests have different prompt and output lengths; the short ones finish early and their seats go idle, exactly the static-batch tail from the previous section. A new request also cannot join a batch mid-stream without changing its shape. Dynamic batching therefore fixes the *wait to form* a batch while leaving the *tail* untouched. The next lesson removes the commitment itself.
+</Callout>
+
 <Callout type="real" title="What this looked like in practice">
   For years the standard stack was Hugging Face `generate` in a loop, with a batching layer in front of it (a queue, a fixed batch size, a semaphore). It worked. It was also responsible for an enormous amount of idle GPU time on every chat deployment in the world, which is the gap the next lesson closes.
 </Callout>
@@ -147,8 +197,8 @@ Recall Module 00's four numbers. Static batching moves them in a very particular
   4. **Static batching** forms one batch and runs it until the slowest member finishes. It fixes the idle-GPU problem and creates a tail-latency problem.
   5. Static waste $= 1 - \frac{\sum \ell_i}{n \cdot \max \ell_i}$. On ragged real traffic this is routinely 30–50% of every step.
   6. Padding is why you cannot shrink a batch mid-run: the batch is a rectangle, $[n \times \text{maxLen}]$, and short rows are masked but still occupied.
-  7. Static batching wrecks TTFT and fairness, and helps throughput and memory predictability. Every better policy is a trade against these five rows.
-  8. The two numbers to log for any serving system: the fraction of GPU time that produces a wanted token, and the longest wait in the queue.
+  7. Static batching wrecks TTFT and fairness while helping throughput and memory predictability; every better policy trades against these rows. Log the fraction of GPU time that produces a wanted token and the longest wait in the queue.
+  8. **Dynamic batching** opens a window on the first request and closes it at $B$ requests or after $D$. Expected batch $\approx \min(B, 1 + \lambda D)$ and added wait is at most $D$; it buys capacity headroom for fixed-shape models and leaves the LLM batch tail untouched.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -158,4 +208,5 @@ Recall Module 00's four numbers. Static batching moves them in a very particular
   { q: 'Why can a static batch not shrink when most of its members finish?', options: ['Because the GPU cannot change tensor shapes', 'Because every request in the group has to keep its row until the whole group is done', 'Because the weights are only loaded once', 'Because KV cache cannot be freed'], answer: 1, why: 'The batch was committed as a group for its whole lifetime. A finished request keeps its row, its KV read and its mask, and the loop must keep stepping for the slowest member. Continuous batching exists to break exactly this.' },
   { q: 'A team raises max_num_seqs from 8 to 64 and their p50 TTFT gets much worse. Why?', options: ['The weights no longer fit', 'Larger batches mean longer steps, so a request waits longer to be admitted and each decode step is slower', 'KV cache is always shared', 'Sampling becomes non-deterministic'], answer: 1, why: 'Batching trades per-user latency for throughput. Bigger batches increase both the step time and the time a request sits waiting to be admitted, which lands directly on TTFT.' },
   { q: 'Llama-3.1-8B in BF16, 2,048 tokens of context, on one 80 GB H100 with 90% of memory available for the engine after a 16.06 GB weight read. Ignoring workspace, roughly how many concurrent sequences fit in the KV cache?', numeric: true, answer: 196, tolerance: 15, unit: 'sequences', why: 'KV per token = 2 × 32 layers × 8 KV heads × 128 × 2 B = 131,072 B. Per sequence: 2,048 × 131,072 = 268 MB. Free: 0.9 × 80 − 16.06 = 55.9 GB. 55.9 GB ÷ 0.268 GB ≈ 208, and after workspace ≈ 196.' },
+  { q: 'A dynamic batcher has max batch size 8 and max delay 5 ms. Requests arrive at 200 per second. Using the expected batch size ≈ min(B, 1 + λD), what is the expected batch size?', numeric: true, answer: 2, tolerance: 0.1, unit: 'requests', why: 'λD = 200 × 0.005 = 1, so 1 + 1 = 2, well under the cap of 8. At this arrival rate the window nearly always closes on time, not on size — so the batch stays small and the win is headroom for bursts, not extra throughput now.' },
 ]}/>
