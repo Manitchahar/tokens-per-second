@@ -82,33 +82,265 @@ With temperature T = 0.5 the scores become [4, 2, 0] → softmax ≈ [0.867, 0.1
 
 With 128-number vectors, dot products add up 128 terms, so they get large, and a softmax over large scores becomes almost one-hot (all weight on one key). Attention divides scores by $\sqrt{d}$ (for d = 128, about 11.3) to keep them in a sensible range. That is literally a fixed temperature of √d. You will see it in the attention formula next module.
 
-## In code
+## Numerical stability: why subtracting the max prevents FP16 overflow
+
+In production inference, models run in 16-bit floating point formats (FP16 and BF16) to conserve GPU memory and utilize tensor cores. In IEEE 754 half precision (FP16), numbers use 1 sign bit, 5 exponent bits, and 10 mantissa bits.
+
+The maximum finite number representable in FP16 is exactly:
+
+$$
+(2 - 2^{-10}) \times 2^{15} = 65,504
+$$
+
+Any intermediate calculation that exceeds 65,504 immediately overflows to positive infinity (`+inf`).
+
+Now consider what happens in naive softmax when logits grow even slightly large. To find the exponent value that causes an overflow in FP16, we take the natural logarithm of 65,504:
+
+$$
+\ln(65504) \approx 11.08986
+$$
+
+If any unnormalized logit or attention score $x_i$ exceeds roughly 11.09, $e^{x_i}$ evaluates to `+inf`. For example, suppose a model produces raw scores $x = [12.0, 8.0, 4.0]$. If you compute exponentials directly:
+
+- $e^{12.0} \approx 162,754.79 \to \text{overflows to } +\infty$
+- $e^{8.0} \approx 2,980.96$
+- $e^{4.0} \approx 54.60$
+
+When computing the denominator, the sum includes infinity. When normalizing the first score, the division produces:
+
+$$
+\frac{+\infty}{+\infty + 2980.96 + 54.60} = \frac{+\infty}{+\infty} = \text{NaN}
+$$
+
+The result is Not-a-Number (NaN). Once a single NaN appears inside a layer, every subsequent matrix multiply and residual add propagates NaNs across all tokens. In production serving, this manifests as generation crashing or the server outputting empty strings.
+
+### The mathematical fix: subtract the max
+
+To prevent overflow, every production inference engine and GPU kernel implements **safe softmax**. We find the maximum score in the vector:
+
+$$
+m = \max_j x_j
+$$
+
+Then we subtract $m$ from each score before exponentiating:
+
+$$
+\text{softmax}(x)_i = \dfrac{e^{x_i - m}}{\sum_j e^{x_j - m}}
+$$
+
+Why is this mathematically identical to naive softmax? We factor out $e^{-m}$ from the numerator and denominator:
+
+$$
+\dfrac{e^{x_i - m}}{\sum_j e^{x_j - m}} = \dfrac{e^{x_i} \cdot e^{-m}}{\sum_j (e^{x_j} \cdot e^{-m})} = \dfrac{e^{x_i} \cdot e^{-m}}{e^{-m} \sum_j e^{x_j}} = \dfrac{e^{x_i}}{\sum_j e^{x_j}}
+$$
+
+The scalar $e^{-m}$ cancels out completely.
+
+Notice the numerical guarantee: because $m$ is the maximum value in the set, $x_i - m \le 0$ for every element. Exponentiating any non-positive number yields a result strictly between 0 and 1:
+
+$$
+e^{x_i - m} \in (0, 1]
+$$
+
+The largest possible exponential is $e^{m - m} = e^0 = 1.0$. Overflow is impossible.
+
+Let us trace our problematic vector $x = [12.0, 8.0, 4.0]$ with safe softmax:
+
+1. Maximum value: $m = 12.0$.
+2. Shifted scores: $[12.0 - 12.0, 8.0 - 12.0, 4.0 - 12.0] = [0.0, -4.0, -8.0]$.
+3. Exponentials:
+   - $e^0 = 1.0$
+   - $e^{-4} \approx 0.018316$
+   - $e^{-8} \approx 0.000335$
+4. Sum of exponentials: 1.0 + 0.018316 + 0.000335 = 1.018651.
+5. Probabilities:
+   - $p_0 = 1.0 \div 1.018651 \approx \mathbf{0.9817}$
+   - $p_1 = 0.018316 \div 1.018651 \approx \mathbf{0.0180}$
+   - $p_2 = 0.000335 \div 1.018651 \approx \mathbf{0.0003}$
+
+The probabilities sum to exactly 1.0000, with no numerical instability or overflow.
+
+## Temperature: steering probability distributions
+
+Temperature $T$ is the primary knob used to control token diversity during generation. When you call an LLM API and set `temperature=0.7`, you are dividing the output logits by $T$ prior to softmax:
+
+$$
+\text{softmax}(x / T)_i = \dfrac{e^{(x_i / T) - m'}}{\sum_j e^{(x_j / T) - m'}}, \quad m' = \max_j (x_j / T)
+$$
+
+Let us work through a 3-number example by hand to see how temperature reshapes probabilities. Consider raw logits $z = [6.0, 4.0, 2.0]$.
+
+### Case 1: Baseline temperature ($T = 1.0$)
+
+When $T = 1.0$, the scores remain $[6.0, 4.0, 2.0]$. The maximum is $m = 6.0$.
+- Shifted scores: $[0.0, -2.0, -4.0]$.
+- Exponentials: $e^0 = 1.0$, $e^{-2} \approx 0.1353$, $e^{-4} \approx 0.0183$.
+- Sum: 1.0 + 0.1353 + 0.0183 = 1.1536.
+- Probabilities:
+  - $p_0 = 1.0 \div 1.1536 \approx \mathbf{0.8668}$
+  - $p_1 = 0.1353 \div 1.1536 \approx \mathbf{0.1173}$
+  - $p_2 = 0.0183 \div 1.1536 \approx \mathbf{0.0159}$
+
+### Case 2: Low temperature ($T = 0.5$)
+
+Dividing by 0.5 doubles all scores: $z / 0.5 = [12.0, 8.0, 4.0]$. The maximum is $m = 12.0$.
+- Shifted scores: $[0.0, -4.0, -8.0]$.
+- Exponentials: $e^0 = 1.0$, $e^{-4} \approx 0.0183$, $e^{-8} \approx 0.0003$.
+- Sum: 1.0 + 0.0183 + 0.0003 = 1.0186.
+- Probabilities:
+  - $p_0 = 1.0 \div 1.0186 \approx \mathbf{0.9817}$
+  - $p_1 = 0.0183 \div 1.0186 \approx \mathbf{0.0180}$
+  - $p_2 = 0.0003 \div 1.0186 \approx \mathbf{0.0003}$
+
+The gap between scores expanded. The top choice went from 86.7% to 98.2%. At very low temperatures ($T \to 0$), the highest score takes 100% of the probability mass, reducing softmax to an **argmax** operation (greedy sampling).
+
+### Case 3: High temperature ($T = 2.0$)
+
+Dividing by 2.0 halves all scores: $z / 2.0 = [3.0, 2.0, 1.0]$. The maximum is $m = 3.0$.
+- Shifted scores: $[0.0, -1.0, -2.0]$.
+- Exponentials: $e^0 = 1.0$, $e^{-1} \approx 0.3679$, $e^{-2} \approx 0.1353$.
+- Sum: 1.0 + 0.3679 + 0.1353 = 1.5032.
+- Probabilities:
+  - $p_0 = 1.0 \div 1.5032 \approx \mathbf{0.6652}$
+  - $p_1 = 0.3679 \div 1.5032 \approx \mathbf{0.2447}$
+  - $p_2 = 0.1353 \div 1.5032 \approx \mathbf{0.0900}$
+
+The differences are compressed. The top choice drops to 66.5%, while the trailing options gain significant probability mass. As $T \to \infty$, all probabilities approach equal values: $\frac{1}{N} = \frac{1}{3} \approx 0.3333$ (a uniform distribution).
+
+## Cosine similarity vs dot product: why magnitude matters
+
+Learners often ask: *“Why does attention use dot products instead of cosine similarity?”*
+
+Recall the mathematical definitions for two vectors $q$ and $k$:
+
+$$
+\text{dot product}: \quad q \cdot k = \sum_{i=1}^d q_i k_i = \|q\| \|k\| \cos\theta
+$$
+
+$$
+\text{cosine similarity}: \quad \frac{q \cdot k}{\|q\| \|k\|} = \cos\theta
+$$
+
+Cosine similarity normalizes both vectors to unit length ($\|q\| = 1$, $\|k\| = 1$), isolating only the directional angle $\theta$. Its output is strictly bounded between −1 and +1.
+
+In contrast, the dot product scales with both angle AND vector lengths. Why do transformer models rely on dot products?
+
+1. **Expressive confidence**: By adjusting vector length during training, a model can express confidence. If an attention head determines that a specific key is critical, it can scale the magnitude of the query or key vector. Because softmax uses exponentials, a larger dot product creates a wider score gap, allowing the attention head to place 99% of its weight on that key. If attention were restricted to cosine similarity bounded between −1 and +1, the maximum score difference would be 2.0, severely limiting how sharply attention could focus.
+2. **Computational efficiency**: Normalizing vectors to unit length requires calculating square roots ($\sqrt{\sum x_i^2}$) and reciprocal divisions for every query and key vector. In contrast, unnormalized dot products between thousands of vectors are computed as a single matrix multiplication ($Q K^\top$), running at peak speed on GPU tensor cores. Instead of per-vector normalization, transformers apply RMSNorm once at the block input, stabilizing overall activations without slowing down attention.
+
+## Why standard softmax requires two passes over memory
+
+To compute safe softmax over an array of $N$ numbers on a GPU, standard implementations require **two sequential passes** over memory:
+
+1. **Pass 1 (Find maximum)**: The GPU reads all $N$ numbers from High Bandwidth Memory (HBM) into fast on-chip registers, performs a parallel tree reduction across threads, and computes $m = \max_j x_j$.
+2. **Pass 2 (Exponentials and sum)**: The GPU reads all $N$ numbers from HBM a second time, computes $e^{x_j - m}$, accumulates their sum $S = \sum_j e^{x_j - m}$, and writes the exponentials back to HBM.
+3. **Normalization**: The GPU reads the exponentials and divides each by $S$, writing the final probabilities back to HBM.
+
+### The quadratic memory problem
+
+For single-token decoding, $N$ is the context length, which fits easily in on-chip SRAM. But during prefill, attention computes an $N \times N$ matrix representing the interaction between every query token and every key token.
+
+If context length is $N = 32,768$ (32K tokens):
+
+$$
+N \times N = 32,768 \times 32,768 = 1,073,741,824 \text{ scores}
+$$
+
+In 16-bit precision (2 bytes per score), this single attention matrix occupies:
+
+$$
+1,073,741,824 \times 2 \approx 2.15 \text{ GB}
+$$
+
+That is 2.15 GB of memory for a single attention head in a single layer! For a model with 32 layers and 32 heads, materializing full attention matrices in HBM would require over 2,000 GB (2 TB) of memory, causing instant out-of-memory crashes.
+
+Furthermore, reading and writing gigabytes of intermediate scores across HBM multiple times saturates the memory bus, dragging GPU utilization down.
+
+### Foreshadowing FlashAttention: online softmax
+
+How do modern inference engines run 32K, 64K, and 128K contexts without running out of memory?
+
+In Module 14 (Attention Optimization), you will study **online softmax** and FlashAttention. By maintaining a running maximum and running denominator, the attention kernel computes softmax incrementally across small tiles of tokens that reside entirely in on-chip SRAM (~100 KB per Streaming Multiprocessor). The intermediate $N \times N$ attention matrix is never written to slow HBM, eliminating the two-pass memory traffic and reducing memory consumption from $O(N^2)$ to $O(N)$.
+
+<Callout type="pitfall" title="Common mistake: computing softmax along the wrong dimension">
+  In PyTorch, `torch.softmax(tensor, dim)` requires an explicit `dim` argument. For attention scores of shape `[batch, heads, queries, keys]`, the reduction must happen across keys: `dim=-1`.
+  
+  If you omit `dim` or mistakenly specify `dim=0`, PyTorch normalizes probabilities across batches or queries instead of keys. The resulting numbers still sum to 1 and look like valid probabilities, but the model produces complete nonsense. Always verify that `dim=-1` is explicitly specified when normalizing attention logits.
+</Callout>
+
+## In code: stable softmax and temperature
+
+Here is a runnable Python snippet verifying naive softmax overflow, numerically safe softmax, temperature scaling, and cosine similarity:
 
 ```python
 import torch
+import torch.nn.functional as F
 
-scores = torch.tensor([2.0, 1.0, 0.0])
+# 1. Overflow in FP16 naive softmax vs safe softmax
+scores = torch.tensor([12.0, 8.0, 4.0], dtype=torch.float16)
 
-manual = scores.exp() / scores.exp().sum()
-safe   = (scores - scores.max()).exp() / (scores - scores.max()).exp().sum()
-builtin = torch.softmax(scores, dim=-1)
+# Naive softmax: e^12 in FP16 exceeds 65504 -> inf
+naive_exp = torch.exp(scores)
+naive_softmax = naive_exp / naive_exp.sum()
+print("Naive FP16 softmax:", naive_softmax)
 
-print(manual, safe, builtin)                      # all three: [0.665, 0.245, 0.090]
-print(torch.softmax(scores / 0.5, dim=-1))        # temperature 0.5: sharper
-print(torch.softmax(scores / 2.0, dim=-1))        # temperature 2.0: flatter
+# Safe softmax: subtract max first
+m = scores.max()
+safe_exp = torch.exp(scores - m)
+safe_softmax = safe_exp / safe_exp.sum()
+print("Safe FP16 softmax: ", safe_softmax)
+
+# 2. Temperature scaling (T = 1.0, 0.5, 2.0)
+logits = torch.tensor([6.0, 4.0, 2.0])
+print("\nT = 1.0 (base):  ", torch.softmax(logits / 1.0, dim=-1))
+print("T = 0.5 (sharp): ", torch.softmax(logits / 0.5, dim=-1))
+print("T = 2.0 (flat):  ", torch.softmax(logits / 2.0, dim=-1))
+
+# 3. Dot product vs Cosine similarity
+q = torch.tensor([3.0, 1.0])
+k = torch.tensor([2.0, 2.0])
+dot_prod = torch.dot(q, k)
+cos_sim = F.cosine_similarity(q.unsqueeze(0), k.unsqueeze(0))
+print(f"\nDot product: {dot_prod.item():.1f}, Cosine similarity: {cos_sim.item():.4f}")
 ```
 
+Printed output:
+
+```text
+Naive FP16 softmax: tensor([nan, 0., 0.], dtype=torch.float16)
+Safe FP16 softmax:  tensor([0.9814, 0.0180, 0.0003], dtype=torch.float16)
+
+T = 1.0 (base):   tensor([0.8668, 0.1173, 0.0159])
+T = 0.5 (sharp):  tensor([0.9817, 0.0180, 0.0003])
+T = 2.0 (flat):   tensor([0.6652, 0.2447, 0.0900])
+
+Dot product: 8.0, Cosine similarity: 0.8944
+```
+
+Notice how naive softmax produced `nan` in FP16, while safe softmax computed the correct distribution effortlessly.
+
 <Callout type="real">
-  In a decode step, attention runs a softmax over *every previous token* for every head in every layer. For a 32-layer model with 32 heads and 8,000 tokens of context, that is 32 × 32 × 8,000 ≈ 8 million exponentials per generated token. Tiny operations add up. Where softmax runs, and whether its inputs sit in fast on-chip memory, decides much of attention's speed.
+  In a decode step, attention runs a softmax over every previous token for every head in every layer. For a 32-layer model with 32 heads and 8,000 tokens of context, that is 32 × 32 × 8,000 ≈ 8 million exponentials per generated token. Tiny operations add up. Where softmax runs, and whether its inputs sit in fast on-chip memory, decides much of attention's speed.
 </Callout>
 
+## Why inference engineers care: bridges to later modules
+
+Softmax and dot products sit directly on the critical path of every LLM serving system:
+
+- **Module 03 (From Neurons to Transformers)**: You will compute scaled dot-product attention $\text{softmax}(QK^\top / \sqrt{d_k})V$ across multi-head and grouped-query attention blocks.
+- **Module 13 (Writing Kernels with Triton)**: You will implement a custom GPU reduction kernel that fuses maximum subtraction, exponentiation, and summation into a single GPU pass.
+- **Module 14 (Attention Optimization)**: You will trace FlashAttention’s online softmax algorithm to see how hardware-aware tiling eliminates $O(N^2)$ memory traffic.
+- **Module 16 (Speculative Decoding)**: You will compare target model softmax distributions against draft model proposals to accept or reject speculative tokens in parallel.
+
 <KeyNotes>
-  1. **Dot product** = sum of pairwise products = |q||k|cos θ. Large when vectors point the same way: a similarity score.
+  1. **Dot product** = sum of pairwise products = |q||k|cos θ. It measures alignment while scaling with vector magnitude.
   2. Each cell of a matrix multiply is a dot product; attention scores are dot products of queries with keys.
-  3. **Softmax** = exponentiate, then divide by the sum. Positive outputs that sum to 1; exaggerates the largest.
-  4. **Temperature** divides scores before softmax: T < 1 sharper, T > 1 flatter.
-  5. Subtract the max before exponentiating. Same result, no overflow. Every real kernel does this.
-  6. Attention scales scores by 1/√d to keep them from making softmax too peaky.
+  3. **Softmax** exponentiates scores and divides by their sum, yielding positive probabilities that sum to 1.
+  4. In FP16, exponentials overflow above 65,504 (scores &gt; 11.09). **Safe softmax** subtracts the maximum score ($m = \max x_j$), keeping all exponents $\le 0$.
+  5. **Temperature** divides scores before softmax: $T &lt; 1$ sharpens differences toward argmax; $T &gt; 1$ flattens probabilities toward uniform.
+  6. Cosine similarity discards vector length; attention uses dot products so models can express attention confidence through vector norms.
+  7. Standard softmax requires two memory passes over HBM (one to find max, one to sum); FlashAttention uses online softmax to compute attention in on-chip SRAM.
+  8. Attention scales scores by $\frac{1}{\sqrt{d_k}}$ to prevent large dot products from saturating softmax into one-hot distributions.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -116,6 +348,7 @@ print(torch.softmax(scores / 2.0, dim=-1))        # temperature 2.0: flatter
   { q: 'Two vectors point in exactly opposite directions. Their dot product is…', options: ['Zero', 'Positive and large', 'Negative', 'Always exactly −1'], answer: 2, why: 'cos 180° = −1, so the dot product is −|q||k|: negative. It equals −1 only if both have length 1.' },
   { q: 'Softmax of [0, 0, 0, 0]?', options: ['[0, 0, 0, 0]', '[0.25, 0.25, 0.25, 0.25]', '[1, 0, 0, 0]', 'Undefined'], answer: 1, why: 'e⁰ = 1 for each, sum = 4, so each gets 1/4.' },
   { q: 'Softmax of [2, 1, 0]: what is the probability of the first entry (as a decimal)?', numeric: true, answer: 0.665, tolerance: 0.005, why: 'e² / (e² + e¹ + e⁰) = 7.389 / 11.107 ≈ 0.665.' },
+  { q: 'Given raw scores [10.0, 8.0, 5.0] at temperature T = 2.0, what is the softmax probability of the highest-scoring token (as a decimal rounded to two places)?', numeric: true, answer: 0.69, tolerance: 0.02, why: 'Scaled scores: [5.0, 4.0, 2.5]. Max is 5.0, shifted: [0.0, -1.0, -2.5]. Exponentials: e⁰ = 1.0, e⁻¹ ≈ 0.3679, e⁻²·⁵ ≈ 0.0821. Sum ≈ 1.450. Probability = 1.0 / 1.450 ≈ 0.69.' },
   { q: 'You lower the temperature from 1.0 to 0.2. The resulting distribution…', options: ['Becomes flatter', 'Becomes sharper: the top choice dominates', 'Stays the same', 'Sums to more than 1'], answer: 1, why: 'Dividing by 0.2 multiplies the scores by 5, stretching the gaps, so the largest takes almost all the probability.' },
   { q: 'Why do kernels subtract the maximum score before exponentiating?', options: ['To make it faster', 'To change the result slightly for stability', 'To avoid overflow; the result is mathematically identical', 'To make negative scores positive'], answer: 2, why: 'e^(x − m) / Σ e^(x − m) equals e^x / Σ e^x, since e^(−m) cancels. All exponents become ≤ 0, so nothing overflows.' },
 ]} />

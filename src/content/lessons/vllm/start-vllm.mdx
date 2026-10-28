@@ -1,259 +1,345 @@
----
-title: 'Start vLLM & talk to it'
-summary: 'Run a real serving engine on one GPU, understand every line it prints while it starts, and drive it with the OpenAI-compatible API: health checks, completions, streaming and metrics.'
-objectives:
-  - Install and start a vLLM server, and read its startup log as a memory budget
-  - Compute the KV cache pool a given model and GPU will leave you
-  - Send completion, chat and streaming requests and read the response fields
-  - Explain what sampling parameters do to the numbers vLLM reports
-  - Find the engine's own counters in the /metrics endpoint
-colab: 09-start-vllm.ipynb
----
-import EngineBoot from '@/components/viz/vllm/EngineBoot.tsx';
-import Quiz from '@/components/learn/Quiz.tsx';
-
-For eight modules you built the serving loop yourself: read the weights, run the forward pass, keep the KV cache, answer one request. It worked, one request at a time. The moment two people type at once, every arrival has to wait for the slowest one to finish, because that is how a batch works.
-
-That is the whole problem <Term t="vllm">vLLM</Term> was written to solve. It is an open-source inference engine, first released in 2023 out of the Sky Computing Lab at UC Berkeley, and it is the reference implementation of the two ideas you just learned: **continuous batching** (Module 07 · Batching & Scheduling) and **PagedAttention** (Module 08 · PagedAttention & KV Memory). Everything else in this module is you learning to drive it, read it and tune it.
-
-Today you start it, talk to it over HTTP, and read the startup log as the memory budget it actually is.
-
-## One command
-
-```bash
-pip install vllm
-```
-
-That is the whole installation. The wheel is large, because it pins its own CUDA-enabled PyTorch build, and on some machines it wants a fresh Python process before `import torch` works again. When that happens, restart the runtime. In production you would not do this on a laptop; you would run the published container, which already has a matching driver, CUDA and PyTorch baked in.
-
-Starting the server takes a second command:
-
-```bash
-vllm serve Qwen/Qwen2.5-0.5B-Instruct \
-  --dtype float16 \
-  --max-model-len 8192 \
-  --port 8000
-```
-
-Four things in that line are worth pausing on.
-
-- **The model name** is a Hugging Face repository id. vLLM downloads it once into `~/.cache/huggingface` (or `/root/.cache/huggingface` in a container) as <Term t="safetensors">safetensors</Term> files, then reads them from local disk. Gated repositories need `--token` or the `HF_TOKEN` environment variable.
-- **`--dtype`** is the numeric format the weights are stored and computed in. `bfloat16` on an H100 or A100, `float16` on older cards and on the free Colab T4, which has no BF16 tensor cores.
-- **`--max-model-len`** is the longest prompt-plus-answer, in tokens, that the server will accept. It must not exceed the model's trained context length, and it sets the worst-case KV memory a single request can use.
-- **`--port`** is where the HTTP API listens.
-
-<Scrolly>
-  <EngineBoot client:visible slot="stage" />
-
-  <Step title="1. One command, one process">
-    The server starts as an ordinary process: it imports PyTorch, initialises CUDA, and prints a banner with the model and the arguments you gave. **The GPU is still empty.** Nothing can be served yet, even though the port may already be open.
-  </Step>
-
-  <Step title="2. Read the weights">
-    The engine core reads the safetensors files from disk into <Term t="hbm">HBM</Term>. This is disk-bound work, not math: it is why an 8B model takes tens of seconds to appear and a 70B model takes minutes. The blue span is that read.
-  </Step>
-
-  <Step title="3. Warm up and capture the graph">
-    Before allocating anything for real, vLLM runs the model once on a dummy batch to **measure its peak activation memory**, then captures the decode step as a CUDA graph. Measuring instead of guessing is why it does not crash halfway through your first request.
-  </Step>
-
-  <Step title="4. Buy a KV cache pool">
-    Now the budget is spent. Weights come out first; the remainder becomes the <Term t="kv-cache-pool">KV cache pool</Term>, carved into equal 16-token blocks. The hatched sliver is the reserve for the CUDA context and activations.
-  </Step>
-
-  <Step title="5. Ready: /health answers">
-    The server now answers `GET /health` with `200`. Only from here is real work worth sending. Load balancers in Module 23 use exactly this endpoint to decide whether a replica is alive.
-  </Step>
-
-  <Step title="6. One request, streamed">
-    A `POST /v1/chat/completions` arrives, the prompt is prefilled, and the answer returns as <Term t="sse">server-sent events</Term>: one `data:` line per token. The user starts reading before the model has finished thinking.
-  </Step>
-
-  <Step title="7. Many requests, one GPU">
-    The next arrivals do not queue behind the first. The scheduler keeps them all in the same iteration, so **one read of the weights serves every one of them**. That is continuous batching, and it is the difference between one slow server and a fast one.
-  </Step>
-</Scrolly>
-
-## The startup log is a memory budget
-
-Here is the arithmetic behind that memory bar, and you can do it on paper before you ever start the server.
-
-Say **Llama-3.1-8B** (8.03 B parameters, so 8.03 × 10⁹ × 2 B = **16.06 GB** at BF16) on an **H100 with 80 GB**, with <Term t="gpu-memory-utilization">`gpu_memory_utilization = 0.90`</Term>.
-
-<Callout type="math" title="The three-way split of an 80 GB GPU">
-  $$
-  \text{budget} = 0.90 \times 80 = 72.0\ \text{GB}, \qquad
-  \text{reserve} \approx 0.04 \times 80 = 3.2\ \text{GB}
-  $$
-
-  $$
-  \text{KV pool} = 72.0 - 16.06 - 3.2 = 52.7\ \text{GB}
-  $$
-
-  From Module 05, Llama-3.1-8B needs 128 KB of KV cache per token. So the pool holds
-
-  $$
-  \frac{52.7\times 10^9}{131{,}072} \approx 402{,}000\ \text{tokens}
-  $$
-
-  or about **25,100 blocks of 16 tokens**. That number, not the model, is how much this server can hold at once.
+---
+title: 'Start vLLM & talk to it'
+summary: 'Run a real serving engine on one GPU, understand every line it prints while it starts, and drive it with the OpenAI-compatible API: health checks, completions, streaming and metrics.'
+objectives:
+  - Install and start a vLLM server, and read its startup log as a memory budget
+  - Compute the KV cache pool a given model and GPU will leave you
+  - Send completion, chat and streaming requests and read the response fields
+  - Explain what sampling parameters do to the numbers vLLM reports
+  - Find the engine's own counters in the /metrics endpoint
+colab: 09-start-vllm.ipynb
+---
+import EngineBoot from '@/components/viz/vllm/EngineBoot.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+For eight modules you built the serving loop yourself: read the weights, run the forward pass, keep the KV cache, answer one request. It worked, one request at a time. The moment two people type at once, every arrival has to wait for the slowest one to finish, because that is how a batch works.
+
+That is the whole problem <Term t="vllm">vLLM</Term> was written to solve. It is an open-source inference engine, first released in 2023 out of the Sky Computing Lab at UC Berkeley, and it is the reference implementation of the two ideas you just learned: **continuous batching** (Module 07 · Batching & Scheduling) and **PagedAttention** (Module 08 · PagedAttention & KV Memory). Everything else in this module is you learning to drive it, read it and tune it.
+
+Today you start it, talk to it over HTTP, and read the startup log as the memory budget it actually is.
+
+## One command
+
+```bash
+pip install vllm
+```
+
+That is the whole installation. The wheel is large, because it pins its own CUDA-enabled PyTorch build, and on some machines it wants a fresh Python process before `import torch` works again. When that happens, restart the runtime. In production you would not do this on a laptop; you would run the published container, which already has a matching driver, CUDA and PyTorch baked in.
+
+Starting the server takes a second command:
+
+```bash
+vllm serve Qwen/Qwen2.5-0.5B-Instruct \
+  --dtype float16 \
+  --max-model-len 8192 \
+  --port 8000
+```
+
+Four things in that line are worth pausing on.
+
+- **The model name** is a Hugging Face repository id. vLLM downloads it once into `~/.cache/huggingface` (or `/root/.cache/huggingface` in a container) as <Term t="safetensors">safetensors</Term> files, then reads them from local disk. Gated repositories need `--token` or the `HF_TOKEN` environment variable.
+- **`--dtype`** is the numeric format the weights are stored and computed in. `bfloat16` on an H100 or A100, `float16` on older cards and on the free Colab T4, which has no BF16 tensor cores.
+- **`--max-model-len`** is the longest prompt-plus-answer, in tokens, that the server will accept. It must not exceed the model's trained context length, and it sets the worst-case KV memory a single request can use.
+- **`--port`** is where the HTTP API listens.
+
+<Scrolly>
+  <EngineBoot client:visible slot="stage" />
+
+  <Step title="1. One command, one process">
+    The server starts as an ordinary process: it imports PyTorch, initialises CUDA, and prints a banner with the model and the arguments you gave. **The GPU is still empty.** Nothing can be served yet, even though the port may already be open.
+  </Step>
+
+  <Step title="2. Read the weights">
+    The engine core reads the safetensors files from disk into <Term t="hbm">HBM</Term>. This is disk-bound work, not math: it is why an 8B model takes tens of seconds to appear and a 70B model takes minutes. The blue span is that read.
+  </Step>
+
+  <Step title="3. Warm up and capture the graph">
+    Before allocating anything for real, vLLM runs the model once on a dummy batch to **measure its peak activation memory**, then captures the decode step as a CUDA graph. Measuring instead of guessing is why it does not crash halfway through your first request.
+  </Step>
+
+  <Step title="4. Buy a KV cache pool">
+    Now the budget is spent. Weights come out first; the remainder becomes the <Term t="kv-cache-pool">KV cache pool</Term>, carved into equal 16-token blocks. The hatched sliver is the reserve for the CUDA context and activations.
+  </Step>
+
+  <Step title="5. Ready: /health answers">
+    The server now answers `GET /health` with `200`. Only from here is real work worth sending. Load balancers in Module 23 use exactly this endpoint to decide whether a replica is alive.
+  </Step>
+
+  <Step title="6. One request, streamed">
+    A `POST /v1/chat/completions` arrives, the prompt is prefilled, and the answer returns as <Term t="sse">server-sent events</Term>: one `data:` line per token. The user starts reading before the model has finished thinking.
+  </Step>
+
+  <Step title="7. Many requests, one GPU">
+    The next arrivals do not queue behind the first. The scheduler keeps them all in the same iteration, so **one read of the weights serves every one of them**. That is continuous batching, and it is the difference between one slow server and a fast one.
+  </Step>
+</Scrolly>
+
+## The startup log is a memory budget
+
+Here is the arithmetic behind that memory bar, and you can do it on paper before you ever start the server.
+
+Say **Llama-3.1-8B** (8.03 B parameters, so 8.03 × 10⁹ × 2 B = **16.06 GB** at BF16) on an **H100 with 80 GB**, with <Term t="gpu-memory-utilization">`gpu_memory_utilization = 0.90`</Term>.
+
+<Callout type="math" title="The three-way split of an 80 GB GPU">
+  $$
+  \text{budget} = 0.90 \times 80 = 72.0\ \text{GB}, \qquad
+  \text{reserve} \approx 0.04 \times 80 = 3.2\ \text{GB}
+  $$
+
+  $$
+  \text{KV pool} = 72.0 - 16.06 - 3.2 = 52.7\ \text{GB}
+  $$
+
+  From Module 05, Llama-3.1-8B needs 128 KB of KV cache per token. So the pool holds
+
+  $$
+  \frac{52.7\times 10^9}{131{,}072} \approx 402{,}000\ \text{tokens}
+  $$
+
+  or about **25,100 blocks of 16 tokens**. That number, not the model, is how much this server can hold at once.
+</Callout>
+
+vLLM prints exactly this, and you should learn to read it:
+
+```text
+INFO  Loading safetensors checkpoint shards: 100%
+INFO  Memory profiling results: model weights take 16.06 GiB; non_torch_memory takes 1.9 GiB; PyTorch activation peak memory takes 2.4 GiB
+INFO  GPU KV cache size: 402,432 tokens
+INFO  Maximum concurrency for 8,192 tokens per request: 49.1x
+INFO  Application startup complete.
+```
+
+<Callout type="intuition" title="Your number and the server's number will not be identical">
+  Our flat 4% reserve is a first approximation. vLLM measures two real things instead — the non-torch allocations (CUDA context, NCCL buffers, the allocator) and the peak activation memory from its profiling run — and it also leaves slack for fragmentation. Expect the printed pool to come in a few per cent *below* your arithmetic, and treat the gap as a fact about your stack, not as an error.
+</Callout>
+
+Three numbers to internalise:
+
+| The line | What it tells you | What to do about it |
+|---|---|---|
+| `model weights take …` | The fixed price of admission. It is `params × bytes`, nothing clever. | Quantize (Module 11) if it does not fit. |
+| `GPU KV cache size: N tokens` | The pool, expressed in tokens. **Your real capacity.** | Raise it by lowering `--max-model-len` or the model's memory bill. |
+| `Maximum concurrency … : Nx` | Pool ÷ `max_model_len`: how many longest-possible requests fit. | Raise it with a shorter `max_model_len`, or accept longer contexts. |
+
+<Callout type="intuition" title="Why a shorter max-model-len is often free money">
+  `--max-model-len 8192` is a *promise about the worst case*, not a setting that slows anything down. If your traffic has 2,000-token prompts and 400-token answers, promising 32,768 tokens buys you nothing and cuts your worst-case concurrency by a factor of four (49 requests instead of 12 on this setup). Set it to the longest request you are willing to accept, not to the model's advertised maximum.
+</Callout>
+
+<Callout type="pitfall" title="The most common way to fail at startup">
+  `--gpu-memory-utilization 0.95` sounds like "use more of the GPU". It does the opposite of what you want: vLLM sizes the KV pool from that number, so a higher value means a bigger pool, and then the CUDA context, the NCCL buffers and the allocator's fragmentation collide with it and you get `CUDA out of memory` **before the first request**. Start at the default 0.90 and only move it when you have measured. Module 09.3 is about exactly this.
+</Callout>
+
+## Talk to it
+
+The <Term t="openai-compatible-api">OpenAI-compatible API</Term> is the reason vLLM took over so quickly: the paths and JSON bodies match OpenAI's, so any client, SDK or wrapper that talks to OpenAI can talk to your GPU instead. In production the <Term t="api-server">API server</Term> often runs as a separate process from the engine that owns the GPU; they communicate over a private socket. You do not need to care — the HTTP is the same.
+
+**What is loaded?**
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
+```json
+{ "object": "list", "data": [
+  { "id": "Qwen/Qwen2.5-0.5B-Instruct", "object": "model",
+    "owned_by": "Qwen", "max_model_len": 8192 } ] }
+```
+
+**A plain completion** (the raw-text endpoint, no chat template):
+
+```bash
+curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "prompt": "The capital of France is",
+  "max_tokens": 16, "temperature": 0
+}'
+```
+
+```json
+{ "id": "cmpl-...", "object": "text_completion",
+  "choices": [ { "index": 0, "text": " Paris. The capital of Germany is",
+                 "logprobs": null, "finish_reason": "length" } ],
+  "usage": { "prompt_tokens": 6, "completion_tokens": 8, "total_tokens": 14 } }
+```
+
+**A chat completion** (the endpoint you will actually use; the server applies the model's own chat template, including any special tokens, so you send plain messages):
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "messages": [
+    {"role": "system", "content": "You answer in one short sentence."},
+    {"role": "user", "content": "Why is batching faster?"}
+  ],
+  "max_tokens": 128, "temperature": 0.7, "top_p": 0.9
+}'
+```
+
+The answer comes back at `choices[0].message.content`. Three sibling fields matter for everything after this module:
+
+- **`usage`** — `prompt_tokens`, `completion_tokens`, `total_tokens`. This is how you bill, how you compute `tokens/s`, and how you notice that a client is quietly sending 30,000-token prompts.
+- **`finish_reason`** — `stop` (the model finished or hit a stop string), `length` (it ran out of `max_tokens`), or `content_filter`. `length` at a suspiciously round number is the classic sign of a badly chosen `max_tokens`.
+- **`logprobs`** — set it to an integer and the server returns the top few candidates and their log-probabilities for each generated token. The cheapest possible window into what the model was thinking, and what you will use in Module 11 to compare a quantized model against the original.
+
+**Streaming** is one extra field:
+
+```json
+{"model": "…", "messages": [{"role": "user", "content": "Say hi"}],
+ "max_tokens": 32, "stream": true}
+```
+
+and the response body is a stream of `data: {...}` lines, each one a partial `chat.completion.chunk`, terminated by `data: [DONE]`. That is all <Term t="sse">SSE</Term> is: text over an open HTTP connection. In Python it is three lines:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+stream = client.chat.completions.create(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    messages=[{"role": "user", "content": "Say hi"}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+### The sampling parameters
+
+Every request carries a <Term t="sampling-params">SamplingParams</Term> object. These are the ones worth knowing by heart; the sampling *math* is Module 03 · From Neurons to Transformers, but their effect on serving is what matters here.
+
+| Field | Default | What it does | Effect on serving |
+|---|---|---|---|
+| `max_tokens` | unbounded | Hard cap on generated tokens. | The **only** thing that reliably bounds how long a request occupies a slot. |
+| `temperature` | 1.0 | Divides logits before softmax. 0 is greedy. | Nothing. Same cost either way. |
+| `top_p` | 1.0 | Sample from the smallest set of tokens summing to p. | Nothing. |
+| `stop` | — | Stop at these strings. | Nothing, but it stops a rambling request early. |
+| `n` | 1 | Generate n answers per prompt. | **Multiplies your cost.** n = 4 means 4 sequences of KV. |
+| `logprobs` | null | Return per-token probabilities. | Returns a bigger JSON payload per chunk. |
+| `seed` | null | Make sampling reproducible. | Adds host-side work; useful in tests. |
+
+<Callout type="mentor" title="The one knob that is a scheduling decision">
+  `max_tokens` is not a style choice. A request is admitted to the running batch and stays there until it finishes or is cancelled, so `max_tokens` is how long it will hold KV blocks that other people could be using. Teams that get paged for tail latency usually find the cause is one client asking for 4,096 tokens. Bound it in the gateway, not in the model.
+</Callout>
+
+## Read the engine's own numbers
+
+vLLM serves Prometheus metrics on its <Term t="engine-metrics">`/metrics` endpoint</Term> — no extra flag on recent versions — and periodically prints a human-readable summary to stdout:
+
+```text
+Avg prompt throughput: 1284.2 tokens/s, Avg generation throughput: 96.3 tokens/s,
+Running: 24 reqs, Waiting: 37 reqs, GPU KV cache usage: 71.4%, Prefix cache hit rate: 12.8%
+```
+
+Those four numbers are the operational dashboard, and each one points at a specific fix:
+
+- **Running** — how many sequences are in the current batch. If it is pinned at `--max-num-seqs`, you are leaving throughput on the table or protecting latency deliberately.
+- **Waiting** — the queue. If it is always above zero, the GPU is the bottleneck and you need more capacity, not more flags.
+- **GPU KV cache usage** — the fraction of the pool in use. Above ~90% you are one long request away from preemption.
+- **Prefix cache hit rate** — how often a request reuses a prefix another request already prefilled. High for multi-turn chat, and the subject of Module 10.
+
+<Callout type="try" title="Do it for real, on a free T4">
+  The notebook for this lesson starts the same server you just read about, but with Qwen2.5-0.5B-Instruct so it fits in Colab's 16 GB, talks to it over HTTP from inside the notebook, and prints the startup log lines above next to the numbers it calculates by hand. Open it, switch the runtime to a T4, and compare its `GPU KV cache size` with your own arithmetic.
+  <Colab nb="09-start-vllm.ipynb" />
 </Callout>
 
-vLLM prints exactly this, and you should learn to read it:
+## Offline batch inference: no server at all
 
-```text
-INFO  Loading safetensors checkpoint shards: 100%
-INFO  Memory profiling results: model weights take 16.06 GiB; non_torch_memory takes 1.9 GiB; PyTorch activation peak memory takes 2.4 GiB
-INFO  GPU KV cache size: 402,432 tokens
-INFO  Maximum concurrency for 8,192 tokens per request: 49.1x
-INFO  Application startup complete.
-```
+Up to this point, you ran vLLM as an HTTP daemon with `vllm serve` and queried it through network requests. That client-server architecture is essential when you have a web application, an interactive chat frontend, or an array of microservices sending unpredictable queries across the network.
 
-<Callout type="intuition" title="Your number and the server's number will not be identical">
-  Our flat 4% reserve is a first approximation. vLLM measures two real things instead — the non-torch allocations (CUDA context, NCCL buffers, the allocator) and the peak activation memory from its profiling run — and it also leaves slack for fragmentation. Expect the printed pool to come in a few per cent *below* your arithmetic, and treat the gap as a fact about your stack, not as an error.
-</Callout>
+However, not all LLM workloads look like a chat box. If you need to summarize 50,000 archived support tickets, translate an entire technical documentation library, or generate synthetic data overnight, setting up a web server, managing HTTP ports, and serializing JSON payloads across a network socket adds pure overhead.
 
-Three numbers to internalise:
+For these workloads, vLLM provides a direct Python interface via its <Term t="llm-class">`LLM` class</Term> for <Term t="offline-inference">offline batch inference</Term>. There is no network server, no background daemon, and no HTTP stack: the engine runs entirely within your Python script.
 
-| The line | What it tells you | What to do about it |
-|---|---|---|
-| `model weights take …` | The fixed price of admission. It is `params × bytes`, nothing clever. | Quantize (Module 11) if it does not fit. |
-| `GPU KV cache size: N tokens` | The pool, expressed in tokens. **Your real capacity.** | Raise it by lowering `--max-model-len` or the model's memory bill. |
-| `Maximum concurrency … : Nx` | Pool ÷ `max_model_len`: how many longest-possible requests fit. | Raise it with a shorter `max_model_len`, or accept longer contexts. |
+### A complete minimal example
 
-<Callout type="intuition" title="Why a shorter max-model-len is often free money">
-  `--max-model-len 8192` is a *promise about the worst case*, not a setting that slows anything down. If your traffic has 2,000-token prompts and 400-token answers, promising 32,768 tokens buys you nothing and cuts your worst-case concurrency by a factor of four (49 requests instead of 12 on this setup). Set it to the longest request you are willing to accept, not to the model's advertised maximum.
-</Callout>
-
-<Callout type="pitfall" title="The most common way to fail at startup">
-  `--gpu-memory-utilization 0.95` sounds like "use more of the GPU". It does the opposite of what you want: vLLM sizes the KV pool from that number, so a higher value means a bigger pool, and then the CUDA context, the NCCL buffers and the allocator's fragmentation collide with it and you get `CUDA out of memory` **before the first request**. Start at the default 0.90 and only move it when you have measured. Module 09.3 is about exactly this.
-</Callout>
-
-## Talk to it
-
-The <Term t="openai-compatible-api">OpenAI-compatible API</Term> is the reason vLLM took over so quickly: the paths and JSON bodies match OpenAI's, so any client, SDK or wrapper that talks to OpenAI can talk to your GPU instead. In production the <Term t="api-server">API server</Term> often runs as a separate process from the engine that owns the GPU; they communicate over a private socket. You do not need to care — the HTTP is the same.
-
-**What is loaded?**
-
-```bash
-curl http://localhost:8000/v1/models
-```
-
-```json
-{ "object": "list", "data": [
-  { "id": "Qwen/Qwen2.5-0.5B-Instruct", "object": "model",
-    "owned_by": "Qwen", "max_model_len": 8192 } ] }
-```
-
-**A plain completion** (the raw-text endpoint, no chat template):
-
-```bash
-curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
-  "model": "Qwen/Qwen2.5-0.5B-Instruct",
-  "prompt": "The capital of France is",
-  "max_tokens": 16, "temperature": 0
-}'
-```
-
-```json
-{ "id": "cmpl-...", "object": "text_completion",
-  "choices": [ { "index": 0, "text": " Paris. The capital of Germany is",
-                 "logprobs": null, "finish_reason": "length" } ],
-  "usage": { "prompt_tokens": 6, "completion_tokens": 8, "total_tokens": 14 } }
-```
-
-**A chat completion** (the endpoint you will actually use; the server applies the model's own chat template, including any special tokens, so you send plain messages):
-
-```bash
-curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
-  "model": "Qwen/Qwen2.5-0.5B-Instruct",
-  "messages": [
-    {"role": "system", "content": "You answer in one short sentence."},
-    {"role": "user", "content": "Why is batching faster?"}
-  ],
-  "max_tokens": 128, "temperature": 0.7, "top_p": 0.9
-}'
-```
-
-The answer comes back at `choices[0].message.content`. Three sibling fields matter for everything after this module:
-
-- **`usage`** — `prompt_tokens`, `completion_tokens`, `total_tokens`. This is how you bill, how you compute `tokens/s`, and how you notice that a client is quietly sending 30,000-token prompts.
-- **`finish_reason`** — `stop` (the model finished or hit a stop string), `length` (it ran out of `max_tokens`), or `content_filter`. `length` at a suspiciously round number is the classic sign of a badly chosen `max_tokens`.
-- **`logprobs`** — set it to an integer and the server returns the top few candidates and their log-probabilities for each generated token. The cheapest possible window into what the model was thinking, and what you will use in Module 11 to compare a quantized model against the original.
-
-**Streaming** is one extra field:
-
-```json
-{"model": "…", "messages": [{"role": "user", "content": "Say hi"}],
- "max_tokens": 32, "stream": true}
-```
-
-and the response body is a stream of `data: {...}` lines, each one a partial `chat.completion.chunk`, terminated by `data: [DONE]`. That is all <Term t="sse">SSE</Term> is: text over an open HTTP connection. In Python it is three lines:
+Here is a complete, standalone script that loads Qwen2.5-0.5B-Instruct and generates completions for a batch of prompts. It is configured to run comfortably on a free Google Colab T4 GPU (which has 16 GB of memory and no native BF16 tensor cores, requiring `dtype="half"` or `float16`):
 
 ```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
-stream = client.chat.completions.create(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    messages=[{"role": "user", "content": "Say hi"}],
-    stream=True,
+from vllm import LLM, SamplingParams
+
+# 1. Define prompts to process in bulk
+prompts = [
+    "Explain what a matrix multiply is in one sentence.",
+    "Why does continuous batching improve GPU throughput?",
+    "Write a haiku about high bandwidth memory.",
+    "Name three differences between prefill and decode.",
+]
+
+# 2. Configure sampling parameters (at the time of writing)
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.9,
+    max_tokens=64,
 )
-for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+
+# 3. Initialize the offline engine directly in Python
+# We set dtype="half" because Turing T4 lacks BF16 tensor cores
+llm = LLM(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    dtype="half",
+    max_model_len=2048,
+    gpu_memory_utilization=0.90,
+)
+
+# 4. Generate completions for the entire list
+outputs = llm.generate(prompts, sampling_params)
+
+# 5. Print results
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}")
+    print(f"Generated: {generated_text.strip()}\n")
 ```
 
-### The sampling parameters
+At the time of writing, calling `llm.generate()` accepts a Python list of strings (or tokenized prompt IDs) and blocks until all requests in the batch have completed, returning a list of `RequestOutput` objects.
 
-Every request carries a <Term t="sampling-params">SamplingParams</Term> object. These are the ones worth knowing by heart; the sampling *math* is Module 03 · From Neurons to Transformers, but their effect on serving is what matters here.
+### Continuous batching still runs under the hood
 
-| Field | Default | What it does | Effect on serving |
-|---|---|---|---|
-| `max_tokens` | unbounded | Hard cap on generated tokens. | The **only** thing that reliably bounds how long a request occupies a slot. |
-| `temperature` | 1.0 | Divides logits before softmax. 0 is greedy. | Nothing. Same cost either way. |
-| `top_p` | 1.0 | Sample from the smallest set of tokens summing to p. | Nothing. |
-| `stop` | — | Stop at these strings. | Nothing, but it stops a rambling request early. |
-| `n` | 1 | Generate n answers per prompt. | **Multiplies your cost.** n = 4 means 4 sequences of KV. |
-| `logprobs` | null | Return per-token probabilities. | Returns a bigger JSON payload per chunk. |
-| `seed` | null | Make sampling reproducible. | Adds host-side work; useful in tests. |
+When you pass a list of 1,000 prompts to `llm.generate()`, does vLLM pad them into one massive static tensor like naive PyTorch?
 
-<Callout type="mentor" title="The one knob that is a scheduling decision">
-  `max_tokens` is not a style choice. A request is admitted to the running batch and stays there until it finishes or is cancelled, so `max_tokens` is how long it will hold KV blocks that other people could be using. Teams that get paged for tail latency usually find the cause is one client asking for 4,096 tokens. Bound it in the gateway, not in the model.
-</Callout>
+No. Even without an HTTP server, the Python `LLM` class instantiates the full vLLM engine core in the background. It creates the scheduler, manages the paged KV cache pool, and runs continuous batching across every iteration.
 
-## Read the engine's own numbers
+As shorter responses in your batch finish, the scheduler immediately frees their KV blocks and admits new prompts from your 1,000-item queue into the running batch on the very next forward pass. You get all the throughput benefits of dynamic iteration-level scheduling without opening a single network port.
 
-vLLM serves Prometheus metrics on its <Term t="engine-metrics">`/metrics` endpoint</Term> — no extra flag on recent versions — and periodically prints a human-readable summary to stdout:
+### Throughput vs TTFT: why offline metrics differ
 
-```text
-Avg prompt throughput: 1284.2 tokens/s, Avg generation throughput: 96.3 tokens/s,
-Running: 24 reqs, Waiting: 37 reqs, GPU KV cache usage: 71.4%, Prefix cache hit rate: 12.8%
-```
+In an online serving system, <Term t="ttft">time to first token (TTFT)</Term> and inter-token latency dominate. A human user staring at a screen notices a 900 ms delay before words appear. If a server achieves record-breaking throughput by letting requests sit in a queue for 5 seconds to build giant batches, users will abandon the product.
 
-Those four numbers are the operational dashboard, and each one points at a specific fix:
+In offline batch inference, nobody is waiting at a screen. You do not care if prompt number 400 waited 30 seconds before its first token was generated. Your single objective is **maximum aggregate throughput** (tokens per second or completed documents per hour) at the lowest dollar cost:
 
-- **Running** — how many sequences are in the current batch. If it is pinned at `--max-num-seqs`, you are leaving throughput on the table or protecting latency deliberately.
-- **Waiting** — the queue. If it is always above zero, the GPU is the bottleneck and you need more capacity, not more flags.
-- **GPU KV cache usage** — the fraction of the pool in use. Above ~90% you are one long request away from preemption.
-- **Prefix cache hit rate** — how often a request reuses a prefix another request already prefilled. High for multi-turn chat, and the subject of Module 10.
+$$
+\text{Total run time} = \frac{\text{Total generated tokens}}{\text{Sustained throughput (tokens/s)}}
+$$
 
-<Callout type="try" title="Do it for real, on a free T4">
-  The notebook for this lesson starts the same server you just read about, but with Qwen2.5-0.5B-Instruct so it fits in Colab's 16 GB, talks to it over HTTP from inside the notebook, and prints the startup log lines above next to the numbers it calculates by hand. Open it, switch the runtime to a T4, and compare its `GPU KV cache size` with your own arithmetic.
-  <Colab nb="09-start-vllm.ipynb" />
+Because TTFT does not matter, you can push the engine to its limits: raise `max_num_seqs` to fill every available KV block, saturate GPU memory bandwidth, and let the GPU compute units run at maximum occupancy.
+
+### When to choose offline batch vs an online server
+
+| Decision factor | Offline batch (`LLM` class) | Online server (`vllm serve`) |
+|---|---|---|
+| **Interface** | Native Python script or data pipeline | OpenAI-compatible HTTP or REST API |
+| **Typical workloads** | Nightly summarization, ETL pipelines, dataset labeling | Chatbots, user-facing search, IDE code autocompletion |
+| **Primary metric** | Total throughput (tokens/s, docs/hr) | Latency (TTFT, TPOT, p99 SLOs) |
+| **Traffic pattern** | Static, known list of thousands of items | Unpredictable, dynamic Poisson arrival of requests |
+| **Operational cost** | Zero server idle cost: runs and exits | Requires persistent GPU instances listening for requests |
+
+<Callout type="mentor" title="Don't deploy a server for a batch script">
+  Inference engineers often default to spinning up `vllm serve` and writing an async Python client with `httpx` to blast requests at `http://localhost:8000`. If your data is already on disk, avoid the network hop entirely. The Python `LLM` class executes with lower overhead, avoids HTTP serialization, and automatically maximizes continuous batch efficiency.
 </Callout>
 
 ## Now you can drive it
 
-You have a server, an API, and a memory budget you can compute before starting. The next lesson opens the hood: what happens to a request between the HTTP body and the bytes that come back.
+You have a server, an API, an offline Python engine, and a memory budget you can compute before starting. The next lesson opens the hood: what happens to a request between the HTTP body and the bytes that come back.
 
 <KeyNotes>
   1. `pip install vllm`, then `vllm serve <model>`: the engine is a process that owns a GPU and serves an OpenAI-compatible HTTP API on `/v1`.
   2. The startup log is a memory budget: `budget = gpu_memory_utilization × total`, minus weights, minus the activation reserve, and what is left is the KV cache pool. That pool is the server's real capacity.
   3. `GPU KV cache size: N tokens` and `Maximum concurrency: Nx` are the two lines to read on every start. Divide: pool ÷ KV-bytes-per-token, and pool ÷ `max_model_len`.
   4. `--max-model-len` is a promise about the worst case, not a performance setting. Set it to the longest request you accept, and your concurrency multiplies.
-  5. `/v1/completions` takes raw text; `/v1/chat/completions` applies the model's chat template for you. Both return `usage` (prompt, completion, total tokens) and `finish_reason`.
-  6. `stream: true` gives you server-sent events, one `data:` line per token. Streaming is a latency feature: it is what makes TTFT matter so much.
-  7. Of the sampling parameters, only `max_tokens`, `n` and `stop` change how much work a request creates. The rest are quality knobs that cost the same either way.
-  8. `/metrics` and the periodic stdout summary tell you `Running`, `Waiting`, KV cache usage and prefix-cache hit rate. Waiting above zero means capacity, not configuration, is your limit.
+  5. `/v1/completions` handles raw text while `/v1/chat/completions` formats chat templates; setting `stream: true` streams server-sent events per token so users read while the model generates.
+  6. Of the sampling parameters, only `max_tokens`, `n` and `stop` change how much work a request creates. The rest are quality knobs that cost the same either way.
+  7. `/metrics` and the periodic stdout summary tell you `Running`, `Waiting`, KV cache usage and prefix-cache hit rate. Waiting above zero means capacity, not configuration, is your limit.
+  8. For offline pipelines like bulk summarization, the Python `LLM` class executes continuous batching directly in-process without HTTP overhead, maximizing throughput rather than TTFT.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -263,4 +349,5 @@ You have a server, an API, and a memory budget you can compute before starting. 
   { q: 'Which request field is really a scheduling decision, because it decides how long a request holds KV blocks?', options: ['temperature', 'top_p', 'max_tokens', 'stream'], answer: 2, why: 'A sequence stays in the running batch until it finishes or is cancelled, so max_tokens is how long it occupies a slot. Temperature and top_p change the output but not the work.' },
   { q: 'Why does vLLM run the model on a dummy batch before allocating the KV cache?', options: ['To warm up the weights file', 'To measure peak activation memory, so the pool is sized against real numbers', 'To check the GPU is not already full', 'To compile CUDA graphs for speed'], answer: 1, why: 'The profiling run measures the activation peak, which has to come out of the budget before the KV pool can be sized. That is why startup does not crash later on a long prompt.' },
   { q: 'The server logs Running: 24 reqs, Waiting: 37 reqs. What does that tell an inference engineer?', options: ['The GPU is saturated; you need more capacity', 'The KV cache is about to run out', 'The sampler is too slow', 'The token budget per step is too small'], answer: 0, why: 'A non-empty waiting queue means arrivals outpace what the engine can retire per second. Tuning flags move the point on the curve; only more GPUs or cheaper tokens change the queue.' },
+  { q: 'An offline batch job processes 10,000 documents with vLLM’s Python LLM class. If each document generates 180 tokens and the engine sustains an aggregate throughput of 500 tokens/s, how many hours will the job take?', numeric: true, answer: 1, tolerance: 0.05, unit: 'hours', why: '10,000 documents × 180 tokens = 1,800,000 tokens. At 500 tokens/s, total execution time is 1,800,000 ÷ 500 = 3,600 seconds = 1.0 hour. Offline batch processing focuses on total runtime and throughput rather than per-request latency.' },
 ]} />

@@ -14,6 +14,11 @@
 # pieces; **you write the rest**. Every section ends with a task that has no answer
 # in the output.
 #
+# **Important: this notebook is intentionally incomplete.** Cells that raise
+# `NotImplementedError` are blanks for you to fill in. It will **not run top to
+# bottom** until you implement those sections. Treat each `NotImplementedError` as
+# your task — the surrounding code is the scaffold, the logic is yours.
+#
 # **Write every number into your notes.** Your report at the end of the project is
 # built from them.
 

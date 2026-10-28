@@ -159,4 +159,24 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The number of bits of choice left in a distribution: 0 bits means one outcome is certain, log₂(V) bits means no preference at all. Measured in bits, it is far more meaningful than a temperature value.',
     lesson: 'transformers/sampling',
   },
+  word2vec: {
+    term: 'Word2Vec',
+    def: 'The 2013 technique that mapped words to dense vectors in continuous space based on local context. Words with similar meanings landed close together, but each word had one fixed vector regardless of context.',
+    lesson: 'transformers/neural-networks',
+  },
+  'recurrent-neural-network': {
+    term: 'Recurrent neural network (RNN)',
+    def: 'A sequence model that updates a hidden state step by step: token t strictly requires the state from token t−1. This created a sequential bottleneck that prevented parallel processing on GPUs.',
+    lesson: 'transformers/neural-networks',
+  },
+  'decoder-only': {
+    term: 'Decoder-only transformer',
+    def: 'A transformer architecture using only causal self-attention layers to predict the next token given prior tokens. It forms the foundation of modern autoregressive LLMs like GPT, Llama, and Qwen.',
+    lesson: 'transformers/neural-networks',
+  },
+  'instruction-tuning': {
+    term: 'Instruction tuning',
+    def: 'Fine-tuning a base pre-trained language model on demonstrations of questions and answers so it follows instructions and converses rather than simply completing text.',
+    lesson: 'transformers/neural-networks',
+  },
 };

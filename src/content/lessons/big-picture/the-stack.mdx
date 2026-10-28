@@ -60,6 +60,81 @@ A profiler lets you zoom: select a slice of time and blow it up to fill the scre
   Think of a restaurant. The **product** is the diner's experience. The **fleet** is the chain of restaurants and the host who seats people. The **engine** is the head chef deciding which orders to cook together. The **runtime** is the recipe being followed. The **kernels** are the individual techniques: chop, sear, plate. The **hardware** is the stove and the fridge. A slow dinner can be caused by any of them, and a great operator knows all six.
 </Callout>
 
+## The seven-stage request path and tuning knobs
+
+When a user submits a prompt, the request travels through seven distinct system layers before silicon registers execute a single multiply-add. At each layer, an inference engineer configures specific levers to balance latency, throughput, and reliability:
+
+1. **Client (Web, Mobile, CLI)**:
+   - *What happens*: Establishes HTTP connections, sends prompt text, and parses streaming token chunks.
+   - *What you tune*: Server-Sent Events (SSE) buffering, connection timeouts, and exponential retry backoff with jitter to prevent retry storms.
+2. **API Gateway (Envoy, Kong, Nginx)**:
+   - *What happens*: Terminates TLS, validates JSON payloads, authenticates API keys, and meters rate limits.
+   - *What you tune*: Token-bucket rate limits, payload size limits (rejecting prompts exceeding context length before GPUs run), and admission shedding under load.
+3. **Fleet Router & Load Balancer**:
+   - *What happens*: Dispatches incoming requests to GPU worker servers (replicas).
+   - *What you tune*: Routing policies: least-connections or cache-aware prefix routing, directing prompts sharing system instructions to the same replica to maximize KV cache hits.
+4. **Serving Engine Daemon (vLLM, SGLang, TensorRT-LLM)**:
+   - *What happens*: Hosts the model, initializes GPU memory, and coordinates worker threads.
+   - *What you tune*: GPU memory utilization fraction (reserving e.g. 90% for weights and KV cache), KV block size, and tensor parallelism sharding across local GPUs.
+5. **Engine Scheduler**:
+   - *What happens*: Re-evaluates waiting and running queues at every forward pass (iteration-level scheduling).
+   - *What you tune*: Maximum concurrent sequences (`max_num_seqs`), token budgets per step (`max_num_batched_tokens`), chunked prefill sizes, and preemption strategies.
+6. **GPU Kernels (CUDA, Triton, cuBLAS)**:
+   - *What happens*: Compiled parallel code executing on Streaming Multiprocessors.
+   - *What you tune*: Attention backends (FlashAttention-2 vs FlashInfer vs PagedAttention), GEMM tile sizes, and operator fusion (combining normalization and positional embeddings).
+7. **Physical Hardware (GPU, HBM, Interconnect)**:
+   - *What happens*: Execution units, high-bandwidth memory chips, and high-speed links.
+   - *What you tune*: Locking GPU clocks (`nvidia-smi -lgc`) to eliminate thermal throttling jitter, power caps, verifying PCIe/NVLink bandwidth, and NUMA node CPU-GPU affinity.
+
+## The model lifecycle: where serving fits
+
+In machine learning discussions, training garners immense attention: gathering datasets, designing architectures, and running gradient descent. But in commercial systems, training is merely the initial phase. A model creates economic value only when it is deployed, served reliably, and operated efficiently at scale.
+
+The end-to-end model lifecycle consists of six interconnected stages:
+
+1. **Data Collection & Curation**: Raw data is ingested, cleaned, deduplicated, and formatted into training sets.
+2. **Training & Fine-Tuning**: Foundation models are pretrained on thousands of GPUs (such as 16,384 H100s for Llama 3 405B) and fine-tuned on task-specific instructions. This stage is compute-intensive, requires backpropagation, and consumes 16 to 20 bytes of memory per parameter for optimizer states and gradients.
+3. **Offline Evaluation**: The checkpoint is validated against accuracy benchmarks (MMLU, GSM8K) and loss targets to determine production readiness.
+4. **Packaging & Conversion**: The model is converted from raw training checkpoints into deployment artifacts. This includes converting weights to SafeTensors, quantizing to AWQ, GPTQ, or FP8, and capturing optimized computational graphs.
+5. **Serving (Our Focus)**: The model is deployed onto GPU infrastructure behind streaming APIs. The serving engine executes forward-pass inference on unseen user inputs in real time under strict latency Service-Level Objectives (SLOs) and budget constraints.
+6. **Monitoring & Continuous Iteration**: Production telemetry tracks TTFT, TPOT, error rates, and data drift. Challenging edge-case prompts and user feedback are routed back into data curation for subsequent fine-tuning runs, restarting the cycle.
+
+### Why training frameworks fail at serving
+
+Engineers often ask: *“Why not run production inference using the PyTorch training codebase?”*
+
+While both environments execute the same underlying neural network architecture, their engineering objectives and operational constraints are fundamentally opposed:
+
+| Dimension | Model Training | Production Serving |
+|---|---|---|
+| **Lifecycle Stage** | Prepares model parameters | Deploys model to live users |
+| **Primary Goal** | Minimize loss function across data | Deliver low latency per token at low cost |
+| **Computation** | Forward pass + backpropagation + weight updates | Forward pass only (frozen weights, zero gradients) |
+| **Batching** | Huge, static batches to maximize GPU utilization | Dynamic, variable-length continuous batching |
+| **Memory Focus** | Dominated by optimizer states (Adam) and activations | Dominated by static weights and dynamic KV cache |
+| **Workload Type** | Always compute-bound | Mix of compute-bound prefill and memory-bound decode |
+
+Deploying a model with baseline training code yields low concurrency, high latency, and excessive memory waste. Optimized engines like vLLM and SGLang achieve 5× to 20× higher throughput on identical hardware by replacing static execution loops with continuous batching, PagedAttention, and custom inference kernels.
+
+## Model serving paradigms: finding the right trade-off
+
+No single serving architecture fits every business application. When designing an inference system, engineers select from four primary serving paradigms:
+
+| Paradigm | Architecture | Primary Strengths | Key Trade-offs | Ideal Applications | Course Deep-Dive |
+|---|---|---|---|---|---|
+| **Single-Model Server** | Dedicated GPU replica running one engine and model (e.g. vLLM running Llama-3.1-8B) | Maximum latency predictability; straightforward capacity scaling; dedicated memory | Can be cost-inefficient during traffic troughs or when serving many niche models | Core conversational assistants, high-volume customer service APIs | Module 09 (A Real Engine: vLLM) |
+| **Multi-Model Server** | A centralized server (like NVIDIA Triton) multiplexing dozens of models across shared GPUs | High hardware utilization; dynamic model swapping; lower aggregate infrastructure spend | Model switching latency (cold starts); potential GPU memory fragmentation | Enterprise suites hosting 50+ specialized task or classification models | Module 17 (Multi-model serving & Triton Inference Server) |
+| **Managed API** | Consuming cloud vendor endpoints (OpenAI, Anthropic, AWS Bedrock, Together AI) | Zero server management; instant scalability; zero up-front hardware capital | Higher cost per million tokens at scale; vendor lock-in; data privacy concerns | Early prototypes; low-volume features; frontier reasoning tasks | Module 25 (Managed APIs, cloud platforms & build vs buy) |
+| **On-Device (Edge)** | Executing quantized models locally on phones, laptops, robots, or Coral TPUs | Zero cloud hosting costs; zero network latency; total user privacy offline | Severe compute and memory constraints; device battery drain; hardware diversity | Personal offline assistants; local coding copilots; autonomous robotics | Module 26 (On-device & edge inference) |
+
+<Callout type="pitfall" title="Common mistake: confusing queueing delay with GPU execution time">
+  When users complain that responses feel sluggish, developers often assume the GPU’s matrix multiplication or attention kernels are running slowly.
+  
+  In reality, GPU math execution time is largely deterministic: for a given model and batch size, a forward pass takes nearly the exact same number of milliseconds every time.
+  
+  When Time-to-First-Token (TTFT) spikes from 200 ms to 3,000 ms during peak hours, over 90% of the delay is typically **queueing time**. Requests sit waiting in the engine’s scheduler queue because all GPU memory blocks are occupied by in-flight KV caches. Profiling must always separate queue wait time from GPU forward-pass latency before attempting optimizations.
+</Callout>
+
 ## What does the job look like day to day?
 
 "Inference engineer" covers a range of work. It is useful to think of four levels. Each level builds on the one before, and this course takes you through all four.
@@ -78,7 +153,7 @@ Most job postings for "inference engineer" want levels 2 and 3 on day one, and l
 Across all levels, the work follows the same loop. You will do it in almost every lab:
 
 1. **Define the goal.** For example: *"serve Llama-3.1-8B to 200 concurrent users with p95 time-to-first-token under 500 ms, as cheaply as possible."*
-2. **Measure a baseline.** Honestly, with realistic traffic (Module 6).
+2. **Measure a baseline.** Honestly, with realistic traffic (Module 06).
 3. **Find the bottleneck.** Which layer? Memory, compute, queueing or network? (Module 12)
 4. **Change one thing.** A config flag, a quantization scheme, a kernel, a routing policy.
 5. **Measure again.** Did it help? Did quality or anything else get worse?
@@ -86,6 +161,55 @@ Across all levels, the work follows the same loop. You will do it in almost ever
 <Callout type="mentor">
   Beginners optimize what they *guess* is slow. Engineers measure first. The trace view you are learning to read is the habit that separates the two. Whenever you feel lost in a later lesson, ask: *where on the trace does this time go?*
 </Callout>
+
+## In code: tracing request latency across layers
+
+Here is a runnable Python script that models request latency breakdown across network gateway, scheduler queue, prompt prefill, and sequential token decoding:
+
+```python
+def analyze_request_latency(
+    network_gateway_ms: float,
+    queue_wait_ms: float,
+    prefill_ms: float,
+    output_tokens: int,
+    tpot_ms: float,
+):
+    ttft_ms = network_gateway_ms + queue_wait_ms + prefill_ms
+    decode_total_ms = output_tokens * tpot_ms
+    total_latency_ms = ttft_ms + decode_total_ms
+    tokens_per_sec = output_tokens / (total_latency_ms / 1000.0)
+
+    print(f"Time to First Token (TTFT): {ttft_ms:6.1f} ms")
+    print(f"  - Gateway & Network:      {network_gateway_ms:6.1f} ms")
+    print(f"  - Scheduler Queue Wait:   {queue_wait_ms:6.1f} ms")
+    print(f"  - Model Prefill Pass:     {prefill_ms:6.1f} ms")
+    print(f"Decode Phase ({output_tokens} tokens):    {decode_total_ms:6.1f} ms ({tpot_ms:.1f} ms/token)")
+    print(f"Total Request Latency:      {total_latency_ms:6.1f} ms")
+    print(f"Effective User Speed:       {tokens_per_sec:6.1f} tokens/s")
+    return total_latency_ms
+
+total = analyze_request_latency(
+    network_gateway_ms=15.0,
+    queue_wait_ms=35.0,
+    prefill_ms=50.0,
+    output_tokens=40,
+    tpot_ms=20.0,
+)
+```
+
+Printed output:
+
+```text
+Time to First Token (TTFT):  100.0 ms
+  - Gateway & Network:        15.0 ms
+  - Scheduler Queue Wait:     35.0 ms
+  - Model Prefill Pass:       50.0 ms
+Decode Phase (40 tokens):    800.0 ms (20.0 ms/token)
+Total Request Latency:       900.0 ms
+Effective User Speed:         44.4 tokens/s
+```
+
+Notice how decomposing the latency exposes the distinct operational phases: the user waited 100 ms before the first word appeared, followed by a steady 50 tokens per second stream during decode.
 
 ## Where the course covers each layer
 
@@ -99,20 +223,22 @@ Across all levels, the work follows the same loop. You will do it in almost ever
 | Product | 06 Benchmarking, 22 Production, 24 Reliability, 25 Economics |
 
 <KeyNotes>
-  1. The inference stack has six layers: **product → fleet → serving engine → model runtime → kernels → hardware**.
-  2. A slow or expensive request can be caused at any layer. The job is finding *which one*.
-  3. The **serving engine** (vLLM, SGLang, TensorRT-LLM) schedules and batches requests and manages KV cache memory. It is where most tuning happens.
-  4. A forward pass is layers → kernels. Most time goes to **matrix multiplies and attention**.
-  5. At the bottom, decode is **memory-bound**: memory streams weights while the tensor cores wait.
-  6. The four levels of the job: consumer, operator, optimizer, builder.
-  7. The core loop: define the goal → measure → find the bottleneck → change one thing → measure again.
+  1. The inference stack has seven operational layers: **client → gateway → router → engine → scheduler → kernels → hardware**.
+  2. A slow or expensive request can originate at any layer; finding the root cause requires tracing across the full stack.
+  3. The **serving engine** (vLLM, SGLang, TensorRT-LLM) manages scheduling, continuous batching, and KV cache allocation.
+  4. Training frameworks optimize for static batch throughput with backpropagation; serving engines optimize forward-pass token latency with dynamic batching.
+  5. The model lifecycle spans data curation, training, evaluation, packaging, serving, and production monitoring.
+  6. The four serving paradigms are **single-model servers**, **multi-model servers**, **managed APIs**, and **on-device edge inference**.
+  7. When TTFT spikes under load, queueing delay in the scheduler—not GPU kernel slowdown—is usually the primary culprit.
+  8. The core engineering loop: define the goal → measure baseline → find bottleneck → change one variable → measure again.
 </KeyNotes>
 
 <Quiz client:visible questions={[
   { q: 'Your chatbot is slow only at peak hours, and some GPU servers are overloaded while others are nearly idle. Which layer is the most likely culprit?', options: ['Kernels', 'Hardware', 'The fleet: routing across replicas', 'The tokenizer'], answer: 2, why: 'Uneven load across replicas is a routing and load-balancing problem at the fleet level. Kernels and hardware would be slow all the time, not just at peak.' },
-  { q: 'Which layer decides which requests are processed together in each GPU step?', options: ['The router', 'The serving engine’s scheduler', 'The tensor cores', 'The product team'], answer: 1, why: 'The serving engine (vLLM, SGLang, ...) schedules and batches requests every step. That is the heart of Part 3.' },
+  { q: 'Which layer decides which requests are processed together in each GPU step?', options: ['The router', 'The serving engine’s scheduler', 'The tensor cores', 'The product team'], answer: 1, why: 'The serving engine’s scheduler (vLLM, SGLang, ...) batches and schedules requests every step. That is the heart of Part 3.' },
   { q: 'Inside one transformer layer during decode, what takes most of the time?', options: ['Normalization', 'Big matrix multiplies and attention', 'Sampling the next token', 'Tokenization'], answer: 1, why: 'The matmuls (qkv, output projection, gate/up, down) and attention move the most bytes. Norms and activations are tiny by comparison.' },
   { q: 'What is the first step when a system is too slow?', options: ['Rewrite the attention kernel', 'Buy bigger GPUs', 'Measure a baseline and find where the time goes', 'Quantize to 4 bits'], answer: 2, why: 'Always measure first. Each of the other fixes targets one specific bottleneck, and might target the wrong one.' },
+  { q: 'A request incurs 20 ms in the gateway and network, waits 40 ms in the scheduler queue, takes 60 ms for prompt prefill, and produces 50 decode tokens at 18 ms per token. What is its total latency in milliseconds?', numeric: true, answer: 1020, tolerance: 10, unit: 'ms', why: 'TTFT = 20 + 40 + 60 = 120 ms. Decode duration = 50 × 18 = 900 ms. Total latency = 120 + 900 = 1,020 ms.' },
   { q: 'A request reaches its first token after 245 ms, then produces 15 more tokens at 25 ms each. What is its total latency in ms?', numeric: true, answer: 620, tolerance: 20, unit: 'ms', why: 'The first token costs 245 ms of queueing plus prefill. The other 15 tokens cost 15 × 25 = 375 ms of decode. Total = 245 + 375 = 620 ms, the same 620 ms request we zoomed through at the start.' },
   { q: 'One decode step takes 25 ms and the model runs 32 layers in that step. On average, how many milliseconds does each layer take?', numeric: true, answer: 0.78, tolerance: 0.03, unit: 'ms', why: 'The layers run one after another inside the step, so divide the step time by the layer count: 25 ÷ 32 = 0.78125 ms per layer, about 0.78 ms.' },
 ]} />

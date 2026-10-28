@@ -79,6 +79,129 @@ $$
 
 This ignores the attention computation between tokens (the part that grows with context length). For short and medium contexts it is small. We add it back in Module 05.
 
+## Deriving the 2 × params rule for an 8B model
+
+To understand why this rule of thumb is remarkably accurate, let us dissect the exact matrix projections of Llama-3.1-8B.
+
+Llama-3.1-8B has 32 transformer layers, a hidden dimension $d_{\text{model}} = 4096$, and uses SwiGLU feed-forward networks with intermediate dimension $d_{\text{ff}} = 14336$. Its multi-head attention uses Grouped-Query Attention (GQA) with 32 query heads ($d_q = 4096$) and 8 key/value heads ($d_{kv} = 8 \times 128 = 1024$).
+
+Let us tally every linear projection weight matrix in each of the 32 layers:
+
+1. **Query projection ($W_q$)**: shape `[4096, 4096]`: 4,096 × 4,096 = 16,777,216 parameters.
+2. **Key projection ($W_k$)**: shape `[4096, 1024]`: 4,096 × 1,024 = 4,194,304 parameters.
+3. **Value projection ($W_v$)**: shape `[4096, 1024]`: 4,096 × 1,024 = 4,194,304 parameters.
+4. **Output projection ($W_o$)**: shape `[4096, 4096]`: 4,096 × 4,096 = 16,777,216 parameters.
+   - Total attention projection weights per layer: 16,777,216 + 4,194,304 + 4,194,304 + 16,777,216 = **41,943,040 parameters**.
+5. **MLP Gate projection ($W_{\text{gate}}$)**: shape `[4096, 14336]`: 4,096 × 14,336 = 58,720,256 parameters.
+6. **MLP Up projection ($W_{\text{up}}$)**: shape `[4096, 14336]`: 4,096 × 14,336 = 58,720,256 parameters.
+7. **MLP Down projection ($W_{\text{down}}$)**: shape `[14336, 4096]`: 14,336 × 4,096 = 58,720,256 parameters.
+   - Total MLP projection weights per layer: 3 × 58,720,256 = **176,160,768 parameters**.
+
+Summing attention and MLP projections gives 41,943,040 + 176,160,768 = **218,103,808 parameters per layer**. Across all 32 layers, the linear weights total:
+
+$$
+32 \times 218,103,808 = 6,979,321,856 \text{ parameters} \approx 6.98\text{B}
+$$
+
+When you add the embedding table and the final language model head (128,256 × 4,096 ≈ 525,336,576 parameters each, or shared), plus normalization parameters, the total parameter count comes to approximately **8.03 billion parameters**.
+
+Now consider the compute required to pass a single token ($m = 1$) through any weight matrix of shape `[k, n]`:
+
+$$
+\text{FLOPs} = 2 \cdot m \cdot k \cdot n = 2 \cdot 1 \cdot (k \cdot n) = 2 \times (\text{parameters in that matrix})
+$$
+
+Because every token vector must be multiplied by every weight matrix in every layer, summing the compute across the entire model gives:
+
+$$
+\text{Total FLOPs per token} = 2 \times \sum \text{parameters} \approx 2 \times 8.03 \times 10^9 \approx \mathbf{16.06 \text{ GFLOPs}}
+$$
+
+Every parameter performs exactly 2 FLOPs per token during generation. The quadratic attention score calculations ($Q K^\top$ and softmax weights times $V$) add extra operations, but for prompts up to 4,096 tokens, attention represents less than 2% of the overall compute budget.
+
+## FLOPs vs bytes moved: counting work and memory traffic
+
+Every GPU workload is governed by two fundamental constraints:
+
+1. **Compute work**: the number of floating-point arithmetic operations performed (FLOPs).
+2. **Memory traffic**: the number of bytes moved across the memory bus between GPU High Bandwidth Memory (HBM) and on-chip SRAM/registers.
+
+For a matrix multiplication $C = A \cdot B$ with shapes $A \in \mathbb{R}^{m \times k}$, $B \in \mathbb{R}^{k \times n}$, and $C \in \mathbb{R}^{m \times n}$ in 16-bit precision (FP16 or BF16, 2 bytes per number):
+
+- **Compute work**: Each of the $m \cdot n$ output elements requires $k$ multiply-accumulate operations (2 FLOPs each):
+  $$\text{FLOPs} = 2 \cdot m \cdot k \cdot n$$
+- **Memory traffic**:
+  - Reading matrix $A$: $m \cdot k \times 2$ bytes
+  - Reading matrix $B$: $k \cdot n \times 2$ bytes
+  - Writing matrix $C$: $m \cdot n \times 2$ bytes
+  - Total bytes moved:
+    $$\text{Bytes} = 2 \cdot (m \cdot k + k \cdot n + m \cdot n)$$
+
+The ratio of compute work to memory traffic is called **arithmetic intensity** ($I$):
+
+$$
+I = \dfrac{\text{FLOPs}}{\text{Bytes moved}} = \dfrac{2 \cdot m \cdot k \cdot n}{2 \cdot (m \cdot k + k \cdot n + m \cdot n)} = \dfrac{m \cdot k \cdot n}{m \cdot k + k \cdot n + m \cdot n} \quad [\text{FLOPs/byte}]
+$$
+
+Arithmetic intensity measures how much math the GPU extracts from every byte transferred across the memory bus.
+
+## Decode vs prefill arithmetic intensity: a worked derivation
+
+Let us contrast the arithmetic intensity of a decode step against a prefill step using a standard layer projection with $k = n = 4096$ in FP16 (2 bytes per number).
+
+### Case 1: Single-token decode (`[1, 4096] · [4096, 4096]`)
+
+During single-user decode, $m = 1$. The model evaluates one newly generated token against the weight matrix:
+
+- **Compute work**:
+  $$\text{FLOPs} = 2 \cdot 1 \cdot 4096 \cdot 4096 = 33,554,432 \text{ FLOPs} \approx 33.55 \text{ MFLOPs}$$
+- **Memory traffic**:
+  - Input $A$ `[1, 4096]`: 1 × 4,096 × 2 = 8,192 bytes
+  - Weight $B$ `[4096, 4096]`: 4,096 × 4,096 × 2 = 33,554,432 bytes ≈ 33.55 MB
+  - Output $C$ `[1, 4096]`: 1 × 4,096 × 2 = 8,192 bytes
+  - Total bytes moved: 8,192 + 33,554,432 + 8,192 = 33,570,816 bytes ≈ **33.57 MB**
+- **Arithmetic intensity**:
+  $$I_{\text{decode}} = \dfrac{33,554,432 \text{ FLOPs}}{33,570,816 \text{ bytes}} \approx \mathbf{0.9995 \text{ FLOPs/byte}} \approx \mathbf{1.0 \text{ FLOP/byte}}$$
+
+Notice what just happened: to perform 33.55 million math operations, the GPU had to move 33.57 megabytes across the memory bus. That is roughly **1 FLOP per byte loaded**.
+
+Now compare this with hardware specs. An NVIDIA H100 SXM GPU provides **989 TFLOP/s** of dense 16-bit tensor core compute and **3.35 TB/s** of HBM3 memory bandwidth. Its hardware balance ratio (the roofline knee) is:
+
+$$
+\dfrac{989 \times 10^{12} \text{ FLOP/s}}{3.35 \times 10^{12} \text{ bytes/s}} \approx \mathbf{295 \text{ FLOPs/byte}}
+$$
+
+To keep the tensor cores fully saturated, a kernel must perform at least 295 FLOPs for every byte loaded from memory. Because decode achieves only 1.0 FLOP/byte, it falls 295× short of the compute balance point. Single-token decode is deeply **memory-bound**. The tensor cores sit idle 99.7% of the time, waiting for weights to stream in from memory.
+
+### Case 2: 512-token prompt prefill (`[512, 4096] · [4096, 4096]`)
+
+During prompt prefill, all prompt tokens are processed together in parallel: $m = 512$.
+
+- **Compute work**:
+  $$\text{FLOPs} = 2 \cdot 512 \cdot 4096 \cdot 4096 = 17,179,869,184 \text{ FLOPs} \approx 17.18 \text{ GFLOPs}$$
+  (The GPU performs 512× more arithmetic than during decode!)
+- **Memory traffic**:
+  - Input $A$ `[512, 4096]`: 512 × 4,096 × 2 = 4,194,304 bytes ≈ 4.19 MB
+  - Weight $B$ `[4096, 4096]`: 4,096 × 4,096 × 2 = 33,554,432 bytes ≈ 33.55 MB
+  - Output $C$ `[512, 4096]`: 512 × 4,096 × 2 = 4,194,304 bytes ≈ 4.19 MB
+  - Total bytes moved: 4,194,304 + 33,554,432 + 4,194,304 = 41,943,040 bytes ≈ **41.94 MB**
+- **Arithmetic intensity**:
+  $$I_{\text{prefill}} = \dfrac{17,179,869,184 \text{ FLOPs}}{41,943,040 \text{ bytes}} \approx \mathbf{409.6 \text{ FLOPs/byte}}$$
+
+The arithmetic intensity jumped from 1.0 to **409.6 FLOPs/byte**!
+
+Because 409.6 FLOPs/byte exceeds the H100 balance threshold of 295 FLOPs/byte, prompt prefill is **compute-bound**. The 33.55 MB weight matrix is loaded once into fast on-chip SRAM/registers and reused across all 512 token rows. The memory bus easily keeps up, and tensor cores run near peak capability.
+
+<Callout type="pitfall" title="Common mistake: confusing FLOPs with FLOP/s and ignoring memory bandwidth">
+  A common beginner mistake is calculating single-user decode speed by dividing peak GPU FLOP/s by model FLOPs per token:
+  
+  *“My GPU delivers 100 TFLOP/s, and an 8B model needs 16 GFLOPs per token, so I should get 100,000 ÷ 16 = 6,250 tokens per second!”*
+  
+  In reality, a single user gets around 30 to 60 tokens per second. Why? Because single-user decode does not hit the compute ceiling; it hits the **memory bandwidth ceiling**. To generate one token, the GPU must read all 16 GB of weights from memory.
+  
+  On an H100 with 3.35 TB/s bandwidth: 16 GB ÷ 3.35 TB/s ≈ 4.8 ms per token (≈ 208 tokens/s maximum). On a T4 with 320 GB/s bandwidth: 16 GB ÷ 320 GB/s ≈ 50 ms per token (≈ 20 tokens/s). Peak FLOP/s only becomes relevant when you batch many requests together to raise arithmetic intensity.
+</Callout>
+
 ## From FLOPs to seconds
 
 A GPU's compute speed is quoted in **FLOP/s** (FLOPs per second). An H100 does about **989 TFLOP/s** (989 × 10¹² per second) in dense BF16 on its tensor cores. The free T4 does about **65 TFLOP/s** in FP16.
@@ -99,33 +222,56 @@ The same formula says one decode token of an 8B model is 16 GFLOP, which takes a
 
 Into **loading 16 GB of weights from memory** to do that little bit of math. For decode, FLOPs are not the limit; bytes are. Keeping both numbers in view, FLOPs and bytes, is what the next module is about.
 
-## In code
+## In code: calculating FLOPs and arithmetic intensity
+
+Here is a runnable Python script demonstrating the exact FLOP count, memory traffic, and arithmetic intensity for decode ($m = 1$) versus prefill ($m = 512$):
 
 ```python
-import torch, time
+def matmul_metrics(m: int, k: int, n: int, bytes_per_elem: int = 2):
+    flops = 2 * m * k * n
+    bytes_a = m * k * bytes_per_elem
+    bytes_b = k * n * bytes_per_elem
+    bytes_c = m * n * bytes_per_elem
+    total_bytes = bytes_a + bytes_b + bytes_c
+    intensity = flops / total_bytes
+    return flops, total_bytes, intensity
 
-m, k, n = 1024, 4096, 4096
-a = torch.randn(m, k, device="cuda", dtype=torch.float16)
-b = torch.randn(k, n, device="cuda", dtype=torch.float16)
+# Compare decode (m = 1) vs prefill (m = 512) for a 4096 x 4096 projection in FP16
+f_dec, b_dec, i_dec = matmul_metrics(m=1, k=4096, n=4096, bytes_per_elem=2)
+f_pre, b_pre, i_pre = matmul_metrics(m=512, k=4096, n=4096, bytes_per_elem=2)
 
-torch.cuda.synchronize(); t0 = time.perf_counter()
-for _ in range(20):
-    c = a @ b                                   # [1024 x 4096] @ [4096 x 4096]
-torch.cuda.synchronize(); dt = (time.perf_counter() - t0) / 20
-
-flops = 2 * m * k * n
-print(f"{flops/1e9:.1f} GFLOP in {dt*1e3:.2f} ms = {flops/dt/1e12:.1f} TFLOP/s")
+print(f"Decode (m=1):   {f_dec/1e6:6.2f} MFLOPs, {b_dec/1e6:5.2f} MB moved -> Intensity: {i_dec:5.2f} FLOPs/byte")
+print(f"Prefill (m=512): {f_pre/1e9:5.2f} GFLOPs, {b_pre/1e6:5.2f} MB moved -> Intensity: {i_pre:5.2f} FLOPs/byte")
 ```
 
-On a T4, expect somewhere around 25–45 TFLOP/s: a good fraction of its 65 TFLOP/s peak. You will run this in the lab.
+Printed output:
+
+```text
+Decode (m=1):    33.55 MFLOPs, 33.57 MB moved -> Intensity:  1.00 FLOPs/byte
+Prefill (m=512): 17.18 GFLOPs, 41.94 MB moved -> Intensity: 409.60 FLOPs/byte
+```
+
+The numbers match our derivations exactly: prefill achieves over 400× higher arithmetic intensity than decode for the same weight matrix.
+
+## Why inference engineers care: bridges to later modules
+
+Understanding GEMM arithmetic intensity is the foundation of inference optimization:
+
+- **Module 02 (The GPU from First Principles)**: You will construct roofline models plotting arithmetic intensity on the horizontal axis to pinpoint whether an operation is memory-bound or compute-bound.
+- **Module 05 (Prefill, Decode & the KV Cache)**: You will analyze the fundamental dichotomy between high-intensity prefill and bandwidth-starved decode loops.
+- **Module 07 (Batching & Scheduling)**: You will use continuous batching to group decode requests from 64 concurrent users together ($m = 64$), raising arithmetic intensity from 1.0 to ~62 FLOPs/byte and saturating tensor cores.
+- **Module 11 (Quantization)**: You will quantize weights from 16-bit to 4-bit (INT4), halving the bytes moved across the bus and directly doubling decode speed on memory-bound workloads.
+- **Module 12 (Profiling & GPU Performance)**: You will measure Model FLOPs Utilization (MFU) using hardware profilers to verify whether GEMM kernels reach peak hardware efficiency.
 
 <KeyNotes>
   1. Shapes: `[m × k] × [k × n] → [m × n]`. Each output cell is a dot product of a row and a column.
-  2. A matrix multiply (GEMM) costs **2·m·k·n FLOPs**: k multiplies and k adds per output cell.
-  3. Each weight is used once per token, so a forward pass costs about **2 × parameters FLOPs per token** (plus attention).
-  4. Time ≥ FLOPs ÷ FLOP/s. Real kernels reach maybe 50–70% of peak; use dense, not sparse, peak numbers.
-  5. **Decode** (m = 1) uses each loaded weight once: ~1 FLOP per byte. **Prefill** (m = hundreds) reuses each weight for every token.
-  6. FLOPs per byte loaded is **arithmetic intensity**, the key to whether a job is limited by math or by memory.
+  2. A matrix multiply (GEMM) costs **2·m·k·n FLOPs**: k multiplications and k additions per output cell.
+  3. Total memory moved for a GEMM is 2·(mk + kn + mn) bytes in 16-bit precision.
+  4. **Arithmetic intensity** ($\text{FLOPs} \div \text{bytes}$) dictates whether an operation is memory-bound or compute-bound.
+  5. **Decode** ($m = 1$) has an arithmetic intensity of ~1.0 FLOP/byte: tensor cores sit idle waiting for weights.
+  6. **Prefill** ($m = 512$) reuses weights across all tokens, achieving ~410 FLOPs/byte and running compute-bound.
+  7. Each weight is used once per token, so a forward pass costs about **2 × parameters FLOPs per token** (~16 GFLOPs for Llama-3.1-8B).
+  8. Batching multiple users raises $m$, converting low-intensity decode operations into high-throughput tensor core workloads.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -133,5 +279,6 @@ On a T4, expect somewhere around 25–45 TFLOP/s: a good fraction of its 65 TFLO
   { q: 'How many FLOPs is [16 × 4096] × [4096 × 11008]? Answer in billions (GFLOP).', numeric: true, answer: 1.443, tolerance: 0.02, unit: 'GFLOP', why: '2 × 16 × 4096 × 11008 = 1,442,840,576 ≈ 1.44 GFLOP.' },
   { q: 'Roughly how many FLOPs does a 70B-parameter model need per generated token?', numeric: true, answer: 140, tolerance: 3, unit: 'GFLOP', why: '≈ 2 × parameters = 2 × 70 × 10⁹ = 140 GFLOP per token (ignoring attention).' },
   { q: 'A 2,000-token prompt through an 8B model on a GPU sustaining 500 TFLOP/s. Minimum prefill time in milliseconds?', numeric: true, answer: 64, tolerance: 2, unit: 'ms', why: '2 × 8e9 × 2000 = 3.2e13 FLOPs. 3.2e13 ÷ 5e14 = 0.064 s = 64 ms.' },
+  { q: 'Compute the arithmetic intensity (FLOPs per byte moved) for a matrix multiply [64, 4096] · [4096, 4096] in FP16 (2 bytes per number), counting input, weight, and output tensors. Round to one decimal place.', numeric: true, answer: 62.1, tolerance: 0.5, unit: 'FLOPs/byte', why: 'FLOPs = 2 × 64 × 4096 × 4096 = 2,147,483,648. Bytes = 2 × (64×4096 + 4096×4096 + 64×4096) = 34,603,008 bytes. Intensity = 2,147,483,648 ÷ 34,603,008 ≈ 62.06 ≈ 62.1 FLOPs/byte.' },
   { q: 'Why does decode get so little math done per byte of weights loaded?', options: ['Decode uses lower precision', 'Only one token (m = 1) uses each loaded weight, so each byte feeds about one FLOP', 'The weights are compressed', 'Decode skips the MLP layers'], answer: 1, why: 'With m = 1 each weight is loaded, used in a single multiply-add, and dropped. Prefill reuses it across all prompt tokens.' },
 ]} />

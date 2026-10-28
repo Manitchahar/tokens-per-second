@@ -95,17 +95,196 @@ print(heads.shape)                 # torch.Size([3, 32, 5, 128])
   Think of a spreadsheet. A vector is one row. A matrix is a sheet. A 3-D tensor is a workbook of identical sheets. A 4-D tensor is a shelf of workbooks. The shape is the table of contents: how many workbooks, sheets per workbook, rows per sheet, cells per row.
 </Callout>
 
-<Callout type="pitfall">
-  `view`/`reshape` never moves data; it only changes how the same memory is read. `transpose` changes the *order* in which dimensions are read, so the tensor is no longer laid out row by row in memory ("non-contiguous"). Some operations then need `.contiguous()`, which *does* copy. Unexpected copies like this show up as mystery memory traffic in profiles (Module 12).
+## Real-world layer bookkeeping: inside Llama-3.1-8B
+
+In production LLMs, shapes are the architectural blueprint of every kernel execution. To see how shapes dictate memory and compute, let us trace a real layer inside Meta’s Llama-3.1-8B.
+
+In Llama-3.1-8B, the hidden size $d_{\text{model}}$ is 4,096. Each token flowing through the network is a vector of 4,096 values. Inside each of the 32 transformer blocks sits a feed-forward network (MLP) using the SwiGLU architecture. While attention mixes information across different tokens, the MLP processes each token independently, expanding it into a wider intermediate space before projecting back.
+
+In Llama-3.1-8B, the MLP expands the hidden dimension from 4,096 to an intermediate dimension of 14,336. Why 14,336? In standard transformers, the feed-forward layer expands by 4× (4 × 4,096 = 16,384). Because SwiGLU uses three linear projections per block (gate, up, and down), architects scale the expansion to roughly eight-thirds of hidden size: $\frac{8}{3} \times 4096 \approx 10922.6$. Meta rounded this up to 14,336, an exact multiple of 1,024 and 256, ensuring that GPU memory transactions and tensor core tiles align cleanly with hardware vector registers.
+
+Now consider the matrix multiply for the gate projection. Suppose our model processes a batch of $T$ tokens during prefill. The input activation tensor $X$ has shape `[tokens, 4096]`. The gate projection weight matrix $W_{\text{gate}}$ has shape `[4096, 14336]`. The matrix multiplication produces an output tensor $Y$:
+
+$$
+[T, 4096] \cdot [4096, 14336] \to [T, 14336]
+$$
+
+The inner dimensions (4,096) match and collapse, while outer dimensions ($T$ and 14,336) define the output shape. Let us derive the exact weight count and memory footprint:
+
+1. **Parameter count**: 4,096 × 14,336 = 58,720,256 weights.
+2. **Memory in BF16 (2 bytes per weight)**: 58,720,256 × 2 = 117,440,512 bytes ≈ **117.44 MB**.
+
+This single matrix consumes 117.44 MB of GPU memory. Across 32 layers with three MLP projections each (gate, up, down), the MLP weights alone total 3 × 117.44 MB × 32 ≈ **11.27 GB**.
+
+<Callout type="math" title="Activation memory expands across layers">
+  Weights remain constant in memory during serving, but activation tensors scale with batch size and sequence length. If you serve a batch of 4 concurrent users with prompts of 512 tokens each, the total active token count is $T = 4 \times 512 = 2048$ tokens.
+  
+  The input tensor $X$ of shape `[2048, 4096]` in BF16 consumes 2,048 × 4,096 × 2 = 16,777,216 bytes ≈ 16.78 MB.
+  
+  When projected into the intermediate space, the resulting tensor of shape `[2048, 14336]` consumes 2,048 × 14,336 × 2 = 58,720,256 bytes ≈ 58.72 MB.
+  
+  In a single layer, activation memory expands by 3.5×. Sizing intermediate activation buffers is essential to prevent out-of-memory crashes during large prefill spikes.
 </Callout>
 
+## Memory layout: row-major order and strides
+
+Physical RAM or GPU High Bandwidth Memory (HBM) is not a multi-dimensional grid. Physical memory is strictly a linear, 1-dimensional array of consecutive byte addresses: address 0, address 1, address 2, and so on.
+
+To map multi-dimensional coordinates onto this flat line, PyTorch, C, and CUDA use **row-major order** (C-contiguous layout). In row-major order, values along the last dimension (the rightmost index) sit immediately next to each other in memory.
+
+Consider a 2-dimensional tensor with shape `[3, 4]`, containing 3 rows and 4 columns:
+
+```
+Row 0: [v00, v01, v02, v03]
+Row 1: [v10, v11, v12, v13]
+Row 2: [v20, v21, v22, v23]
+```
+
+On physical memory chips, these 12 values are stored in a continuous flat line:
+
+`[v00, v01, v02, v03, v10, v11, v12, v13, v20, v21, v22, v23]`
+
+Advancing one column moves forward 1 element. Advancing one row jumps past 4 elements. These step sizes are called **strides**. A tensor’s stride is a tuple of integers specifying how many elements the hardware skips to increment each respective dimension by 1. For our `[3, 4]` tensor, strides are `(4, 1)`. The flat memory offset for index $(r, c)$ is:
+
+$$
+\text{offset}(r, c) = r \times \text{stride}_0 + c \times \text{stride}_1 = r \times 4 + c \times 1
+$$
+
+For a 3D activation tensor `[B, T, D]` with shape `[2, 5, 4096]`:
+- Hidden dimension $D$: step size is 1 element.
+- Token dimension $T$: step size is $D = 4096$ elements.
+- Batch dimension $B$: step size is $T \times D = 5 \times 4096 = 20480$ elements.
+
+The strides are `(20480, 4096, 1)`.
+
+### Why transpose can be free or very costly
+
+In attention, you frequently swap dimensions, transforming `[B, T, H, Dh]` to `[B, H, T, Dh]`. Calling `x.transpose(1, 2)` copies zero data. PyTorch simply creates a new metadata header that swaps the stride values of dimensions 1 and 2! The underlying memory buffer is unchanged. Because no memory is moved, `transpose` is an instantaneous, $O(1)$ operation taking less than a microsecond.
+
+However, the tensor is now **non-contiguous**. Elements adjacent along the new sequence dimension are no longer adjacent in physical memory. This affects inference in three ways:
+
+1. **Memory coalescing**: GPUs achieve peak bandwidth (3.35 TB/s on H100) only when warps of 32 threads read contiguous 32-byte or 128-byte segments. Reading along a non-contiguous dimension with stride &gt; 1 scatters requests, cutting effective bandwidth.
+2. **Kernel requirements**: Optimized GEMM libraries (cuBLAS) and attention kernels require contiguous memory. They reject non-contiguous inputs.
+3. **The hidden copy trap**: Calling `.contiguous()` allocates a new GPU buffer and physically copies every byte. In tight generation loops, unnecessary `.contiguous()` calls waste gigabytes of memory bandwidth per second.
+
+## Broadcasting: arithmetic across different shapes
+
+During inference, models combine tensors of different ranks. In RMSNorm, an activation tensor of shape `[3, 5, 4096]` is multiplied elementwise by a gain vector of shape `[4096]`. The mechanism that makes this possible is **broadcasting**.
+
+PyTorch and NumPy evaluate broadcasting through four strict steps:
+
+1. **Right-alignment**: Align shapes starting from the rightmost (trailing) dimension and work leftward.
+2. **Dimension prepending**: If one tensor has fewer dimensions, prepend dimensions of size 1 until both shapes match in rank.
+3. **Compatibility check**: At each dimension, sizes are compatible if they are identical OR one size is exactly 1.
+4. **Zero-stride expansion**: Wherever a dimension has size 1 while the other has size $N$, the smaller tensor is virtually expanded to size $N$. Internally, its memory stride is set to 0, reusing the exact same memory value across all $N$ steps with zero memory allocation.
+
+### A worked numerical example
+
+Suppose activation tensor $A$ represents 2 tokens with 3 features each, shape `[2, 3]`:
+
+$$
+A = \begin{bmatrix} 1.0 & 2.0 & 3.0 \\ 4.0 & 5.0 & 6.0 \end{bmatrix}
+$$
+
+Suppose bias vector $B$ contains 3 scale values, shape `[3]`:
+
+$$
+B = \begin{bmatrix} 10.0 & 20.0 & 30.0 \end{bmatrix}
+$$
+
+Computing $C = A + B$:
+- Align and prepend: $B$ becomes `[1, 3]`.
+- Dimension 1: sizes 3 and 3 match. Dimension 0: size 1 expands to 2.
+- The output shape is `[2, 3]`.
+
+The arithmetic for each cell:
+- $C[0, 0] = 1.0 + 10.0 = 11.0$, $C[0, 1] = 2.0 + 20.0 = 22.0$, $C[0, 2] = 3.0 + 30.0 = 33.0$
+- $C[1, 0] = 4.0 + 10.0 = 14.0$, $C[1, 1] = 5.0 + 20.0 = 25.0$, $C[1, 2] = 6.0 + 30.0 = 36.0$
+
+$$
+C = \begin{bmatrix} 11.0 & 22.0 & 33.0 \\ 14.0 & 25.0 & 36.0 \end{bmatrix}
+$$
+
+Vector $B$ was broadcast across both tokens without allocating new memory. If you instead try adding $A$ of shape `[2, 3]` to a vector $D$ of shape `[2]`, the trailing sizes 3 and 2 clash, raising `RuntimeError: The size of tensor a (3) must match the size of tensor b (2) at non-singleton dimension 1`. You must reshape $D$ to `[2, 1]` first.
+
+## How shape errors appear and how to debug them
+
+When serving models, shape mismatches cause the majority of runtime crashes. Here is how to decode them:
+
+- **Matrix multiply mismatch**: `RuntimeError: mat1 and mat2 shapes cannot be multiplied (16x4096 and 2048x14336)`. Inner dimensions 4,096 and 2,048 differ. Check projection sizes and tensor parallel sharding.
+- **Incompatible view**: `RuntimeError: view size is not compatible with input tensor's size and stride...`. Code called `.view()` on a transposed, non-contiguous tensor.
+
+<Callout type="pitfall" title="Common mistake: confusing view() and reshape()">
+  `.view()` guarantees zero memory copies: it strictly operates on existing strides. If the tensor is non-contiguous, `.view()` throws an error immediately, alerting you to inefficiency.
+  
+  In contrast, `.reshape()` silently inspects contiguity. If non-contiguous, `.reshape()` automatically invokes `.contiguous()`, allocating a fresh memory buffer and copying all bytes. In a serving engine handling 100 requests per second, these hidden allocations hurt throughput and can trigger sudden out-of-memory crashes. Always prefer `.view()` when zero-copy is intended, and make copies explicit when necessary.
+</Callout>
+
+## A runnable Python verification
+
+Here is a short Python snippet demonstrating real layer projection shapes, tensor strides, and broadcasting:
+
+```python
+import torch
+
+# 1. Real layer shape bookkeeping: Llama-3.1-8B MLP projection
+tokens, hidden, intermediate = 4, 4096, 14336
+x = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
+w = torch.zeros(hidden, intermediate, dtype=torch.bfloat16)
+out = x @ w
+print(f"MLP output shape: {list(out.shape)}")
+print(f"Weight elements: {w.numel():,}")
+print(f"Weight memory (BF16): {w.numel() * 2 / 1e6:.2f} MB")
+
+# 2. Strides and non-contiguous transpose
+t = torch.zeros(2, 4, 8)
+print(f"Original shape {list(t.shape)} strides: {t.stride()}, contiguous: {t.is_contiguous()}")
+t_transposed = t.transpose(1, 2)
+print(f"Transposed shape {list(t_transposed.shape)} strides: {t_transposed.stride()}, contiguous: {t_transposed.is_contiguous()}")
+
+# 3. Broadcasting arithmetic
+a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+b = torch.tensor([10.0, 20.0, 30.0])
+c = a + b
+print(f"Broadcasted shape: {list(c.shape)}")
+print(f"Result matrix:\n{c.numpy()}")
+```
+
+Printed output:
+
+```text
+MLP output shape: [4, 14336]
+Weight elements: 58,720,256
+Weight memory (BF16): 117.44 MB
+Original shape [2, 4, 8] strides: (32, 8, 1), contiguous: True
+Transposed shape [2, 8, 4] strides: (32, 1, 8), contiguous: False
+Broadcasted shape: [2, 3]
+Result matrix:
+[[11. 22. 33.]
+ [14. 25. 36.]]
+```
+
+## Why inference engineers care: bridges to later modules
+
+Every major serving optimization relies directly on shapes, strides, and memory layout:
+
+- **Module 03 (From Neurons to Transformers)**: Tracking shapes through attention heads, RMSNorm, and SwiGLU MLP layers.
+- **Module 05 (Prefill, Decode & the KV Cache)**: Sizing and indexing the KV cache tensor `[layers, 2, batch, heads, tokens, head_dim]`.
+- **Module 07 (Batching & Scheduling)**: Packing variable-length requests into flattened 1D continuous batching buffers.
+- **Module 08 (PagedAttention & KV Memory)**: Managing page tables that map non-contiguous physical blocks into logical sequences.
+- **Module 11 (Quantization)**: Reshaping and packing 4-bit weights into INT32 containers with broadcasted scaling factors.
+- **Module 12 (Profiling & GPU Performance)**: Identifying uncoalesced memory strides and eliminating unintended `.contiguous()` copy overhead.
+- **Module 13 (Writing Kernels with Triton)**: Passing explicit pointer strides into custom GPU kernels to compute memory load addresses.
+
 <KeyNotes>
-  1. Scalar `[]`, vector `[D]`, matrix `[T, D]`, 3-D tensor `[B, T, D]`. Any of these is a **tensor**.
-  2. Shapes list sizes from the outside in. The number of elements is the product of the shape.
-  3. Standard names: **B** batch, **T** tokens, **D** hidden size, **H** heads, **Dh** head dim, **V** vocabulary.
-  4. Each index you fix removes a dimension: `x[:, -1]` → `[B, D]`, the last token of each sequence.
-  5. **Reshape** reinterprets the same numbers: `[T, 4096]` → `[T, 32, 128]` splits each vector into 32 heads.
-  6. Memory = number of elements × bytes per element.
+  1. Scalar `[]`, vector `[D]`, matrix `[T, D]`, 3-D tensor `[B, T, D]`. Any grid of numbers is a **tensor**.
+  2. Shapes list dimensions from the outside in; the total element count is the mathematical product of all dimensions.
+  3. In Llama-3.1-8B, hidden size is 4,096 and MLP intermediate size is 14,336; projecting between them requires 58.7M parameters (117.44 MB in BF16).
+  4. Physical memory is a flat 1D sequence of bytes; **strides** dictate the number of elements skipped in memory to advance by 1 along each dimension.
+  5. `transpose` swaps stride metadata in $O(1)$ time without copying memory, but leaves the tensor non-contiguous; calling `.contiguous()` triggers an expensive full buffer copy.
+  6. **Broadcasting** right-aligns shapes, treats size-1 dimensions as virtually expanded with a stride of 0, and avoids duplicate memory allocations.
+  7. `.view()` guarantees zero-copy reshapes and throws on non-contiguous tensors, while `.reshape()` silently copies memory when contiguity is broken.
+  8. Each fixed index drops one dimension; `x[:, -1]` extracts the final token representation `[B, D]` used for next-token generation.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -113,5 +292,6 @@ print(heads.shape)                 # torch.Size([3, 32, 5, 128])
   { q: 'How many numbers are in a tensor of shape [4, 128, 4096]?', numeric: true, answer: 2097152, tolerance: 1, why: '4 × 128 × 4096 = 2,097,152.' },
   { q: 'How much memory does that tensor take in BF16, in MB?', numeric: true, answer: 4.19, tolerance: 0.1, unit: 'MB', why: '2,097,152 × 2 bytes = 4,194,304 bytes ≈ 4.19 MB.' },
   { q: 'A model has hidden size 5120 and 40 attention heads. What is the head dimension?', numeric: true, answer: 128, tolerance: 0, why: '5120 ÷ 40 = 128. Most modern models use 128.' },
+  { q: 'A Llama-3.1-8B MLP gate projection weight matrix has shape [4096, 14336]. Stored in BF16 (2 bytes per number), how many megabytes (MB in decimal, 10⁶ bytes) does this matrix take?', numeric: true, answer: 117.44, tolerance: 0.5, unit: 'MB', why: '4096 × 14336 = 58,720,256 elements. At 2 bytes per element in BF16, that is 117,440,512 bytes ≈ 117.44 MB.' },
   { q: 'What does reshaping [T, 4096] to [T, 32, 128] do to memory?', options: ['Copies the data into a new layout', 'Nothing: the same numbers are read with a different shape', 'Doubles the memory', 'Deletes half the numbers'], answer: 1, why: '32 × 128 = 4096, so the elements are identical and a view just reinterprets the same buffer.' },
 ]} />

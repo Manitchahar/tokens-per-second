@@ -1,260 +1,318 @@
----
-title: 'Neurons, layers & weights'
-summary: 'Every weight in an LLM is a number someone learned once. This lesson builds a neuron from a dot product you already know, stacks neurons into a layer, and then shows exactly where Llama-3.1-8B keeps its 8.03 billion of them.'
-objectives:
-  - 'Compute one neuron by hand: dot product, bias, nonlinearity'
-  - Explain why the nonlinearity is what makes 32 layers worth having
-  - Turn a published config into a parameter count and check it against the advertised number
-  - Show that roughly two thirds of a Llama-style model’s weights sit in MLP matrices, not attention
-  - 'State precisely what inference does with a weight: read it, multiply it, never change it'
----
-import NeuronNet from '@/components/viz/transformers/NeuronNet.tsx';
-import Quiz from '@/components/learn/Quiz.tsx';
-
-Module 02 ended with a fact that felt slightly abstract: a decode step on an 8B model reads about 16 GB of weights, and that is why it is **memory-bound**. This module explains where those 16 GB come from, one neuron at a time, and then builds the whole transformer on top of them.
-
-You already have every tool needed. A neuron is a dot product. A layer is a <Term t="matmul">matrix multiply</Term>. A deep network is a stack of matrix multiplies with a nonlinearity wedged between them. The only new idea is that those numbers were **learned**, and that learning is a completely separate activity from everything this course is about.
-
-## One neuron, in full
-
-A neuron takes a vector in and gives one number out. Take a token's vector as four numbers for now: $x = [0.4,\ -1.2,\ 2.0,\ 0.7]$. Multiply each by its own weight, $w = [1.1,\ 0.4,\ -0.8,\ 0.9]$:
-
-$$
-[0.4 \times 1.1,\ -1.2 \times 0.4,\ 2.0 \times (-0.8),\ 0.7 \times 0.9] = [0.44,\ -0.48,\ -1.60,\ 0.63]
-$$
-
-Add them up. That is a dot product, the same operation as one cell of the matrix multiply in Module 01:
-
-$$
-0.44 - 0.48 - 1.60 + 0.63 = -1.01
-$$
-
-Add a learned **bias**, one number per neuron: $z = -1.01 + 0.25 = -0.76$.
-
-Then **squash** it. The squash is a nonlinear function $f$, and the neuron's output is $y = f(z)$:
-
-$$
-y = \mathrm{SiLU}(-0.76) = -0.76 \times \sigma(-0.76) = -0.76 \times 0.3184 = -0.242
-$$
-
-Three ingredients, in order: **weighted sum, bias, nonlinearity**. That is the entire definition. Scroll the visual and drag the slider to watch each step appear.
-
-<Callout type="intuition" title="Why the squash is the whole point">
-  Without a nonlinearity, a stack of layers is one big linear map. Two matrices multiplied together can always be collapsed into a single matrix, so 32 layers of pure matrix multiplies would be worth exactly one layer — you would save all the compute and lose nothing. The nonlinearity is what makes depth mean something.
+---
+title: 'Neurons, layers & weights'
+summary: 'Every weight in an LLM is a number someone learned once. This lesson builds a neuron from a dot product you already know, stacks neurons into a layer, and then shows exactly where Llama-3.1-8B keeps its 8.03 billion of them.'
+objectives:
+  - 'Compute one neuron by hand: dot product, bias, nonlinearity'
+  - Explain why the nonlinearity is what makes 32 layers worth having
+  - Turn a published config into a parameter count and check it against the advertised number
+  - Show that roughly two thirds of a Llama-style model’s weights sit in MLP matrices, not attention
+  - 'State precisely what inference does with a weight: read it, multiply it, never change it'
+---
+import NeuronNet from '@/components/viz/transformers/NeuronNet.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Module 02 ended with a fact that felt slightly abstract: a decode step on an 8B model reads about 16 GB of weights, and that is why it is **memory-bound**. This module explains where those 16 GB come from, one neuron at a time, and then builds the whole transformer on top of them.
+
+You already have every tool needed. A neuron is a dot product. A layer is a <Term t="matmul">matrix multiply</Term>. A deep network is a stack of matrix multiplies with a nonlinearity wedged between them. The only new idea is that those numbers were **learned**, and that learning is a completely separate activity from everything this course is about.
+
+## One neuron, in full
+
+A neuron takes a vector in and gives one number out. Take a token's vector as four numbers for now: $x = [0.4,\ -1.2,\ 2.0,\ 0.7]$. Multiply each by its own weight, $w = [1.1,\ 0.4,\ -0.8,\ 0.9]$:
+
+$$
+[0.4 \times 1.1,\ -1.2 \times 0.4,\ 2.0 \times (-0.8),\ 0.7 \times 0.9] = [0.44,\ -0.48,\ -1.60,\ 0.63]
+$$
+
+Add them up. That is a dot product, the same operation as one cell of the matrix multiply in Module 01:
+
+$$
+0.44 - 0.48 - 1.60 + 0.63 = -1.01
+$$
+
+Add a learned **bias**, one number per neuron: $z = -1.01 + 0.25 = -0.76$.
+
+Then **squash** it. The squash is a nonlinear function $f$, and the neuron's output is $y = f(z)$:
+
+$$
+y = \mathrm{SiLU}(-0.76) = -0.76 \times \sigma(-0.76) = -0.76 \times 0.3184 = -0.242
+$$
+
+Three ingredients, in order: **weighted sum, bias, nonlinearity**. That is the entire definition. Scroll the visual and drag the slider to watch each step appear.
+
+<Callout type="intuition" title="Why the squash is the whole point">
+  Without a nonlinearity, a stack of layers is one big linear map. Two matrices multiplied together can always be collapsed into a single matrix, so 32 layers of pure matrix multiplies would be worth exactly one layer — you would save all the compute and lose nothing. The nonlinearity is what makes depth mean something.
+</Callout>
+
+The three squashes you will meet in open models:
+
+| Function | Formula | Used by |
+|---|---|---|
+| ReLU | $\max(0, z)$ | older models, still common |
+| GELU | $\mathrm{GELU}(z) = 0.5z\left(1 + \tanh\left(\sqrt{2/\pi}\,(z + 0.044715 z^3)\right)\right)$ | GPT-2, GPT-3, many small models |
+| SiLU (swish) | $z \cdot \sigma(z)$ where $\sigma(z) = 1/(1+e^{-z})$ | <Term t="llm">Llama</Term>, Qwen2, Mistral — most current open models |
+
+SiLU is the sigmoid multiplied by the input. For negative $z$ the sigmoid is small, so SiLU keeps a little negative signal instead of clipping it to exactly zero, which is why it trains a little better and is what you will see in every MLP from here on.
+
+## A layer is a row of neurons, done at once
+
+Now make 4,096 of them. Neuron $j$ uses row $j$ of the weight matrix $W$:
+
+$$
+y_j = f\left(\sum_{i=1}^{4096} W_{ji} x_i + b_j\right)
+$$
+
+Stacking all 4,096 outputs gives $y = f(Wx + b)$, and because $f$ is applied element by element, the whole thing is:
+
+$$
+\mathbf{y} = f(\mathbf{W}\mathbf{x} + \mathbf{b}), \qquad \mathbf{W} \in \mathbb{R}^{4096 \times 4096}
+$$
+
+That is a <Term t="matmul">matrix multiply</Term>, which the GPU does with tensor cores, which is the operation Module 01 measured and Module 02 put on the roofline. Nothing new has happened — a layer is just the same dot product, done 4,096 times without writing a loop.
+
+**How many weights is that?** $d^2 = 4{,}096 \times 4{,}096 = 16{,}777{,}216$ weights for **one** projection in **one** layer, plus 4,096 biases. That number is worth pausing on: a single matrix is 16.8 million learned numbers, and Llama-3.1-8B contains 32 layers with several of these matrices each. "8 billion parameters" is not a vague marketing phrase; it is 8.03 billion specific numbers in a file on your disk.
+
+### The three-line recipe every neural network follows
+
+<Scrolly>
+  <NeuronNet client:visible slot="stage" />
+
+  <Step title="1. One number in">
+    A neuron receives a vector — here a token's four numbers: 0.4, −1.2, 2.0, 0.7. In a real Llama-3.1-8B layer the vector has 4,096 numbers instead of four. The arithmetic is identical.
+  </Step>
+
+  <Step title="2. Multiply by a weight">
+    Each number meets its own weight, 1.1, 0.4, −0.8 and 0.9. These are the **parameters**. They were learned once, during training, and since then nobody has touched them. At inference they are read, used, and read again on the next token.
+  </Step>
+
+  <Step title="3. Add them all up">
+    Sum the four products: 0.44 − 0.48 − 1.60 + 0.63 = **−1.01**. A dot product, the same operation as one cell of a matrix multiply.
+  </Step>
+
+  <Step title="4. Add the bias">
+    One more learned number per neuron: **z = −0.76**. Biases let a neuron fire even when its input is zero; in a 4,096-wide layer that is 4,096 extra degrees of freedom.
+  </Step>
+
+  <Step title="5. Squash it">
+    Apply the nonlinearity. ReLU, GELU and SiLU all appear in open models today. Drag the segmented control to compare: at z = −0.76, ReLU gives exactly 0 while SiLU gives −0.242, keeping a little negative signal.
+  </Step>
+
+  <Step title="6. A layer is a stack of them">
+    Do that 4,096 times and you have a layer. The grid on the left is `q_proj`: 4,096 rows (one per neuron) by 4,096 columns (one per incoming number), **16.8 million weights**. One highlighted row is the neuron you just watched.
+  </Step>
+
+  <Step title="7. Where 8.03 billion weights live">
+    Repeat for 32 layers and add the embedding table and the output head, and the bar on the right is the whole model. **70.2% of Llama-3.1-8B sits in MLP matrices; only 16.7% sits in attention.** Attention is the famous part, and it is the small part.
+  </Step>
+
+  <Step title="8. Training moves them. Inference reads them.">
+    This is the single most important sentence in the module. **Training** adjusts every one of those 8.03 billion numbers by gradient descent to reduce a loss on data — days of compute, done once. **Inference** never changes a weight. It reads 16.1 GB, multiplies, and moves on.
+  </Step>
+</Scrolly>
+
+## Where the 8.03 billion actually are
+
+Take Llama-3.1-8B's published config and do the arithmetic yourself. You already know the shapes; now multiply them out.
+
+| Group | Shape | Parameters | Share |
+|---|---|---|---|
+| `q_proj` per layer | 4096 × 4096 | 16.78 M | |
+| `k_proj`, `v_proj` per layer | 4096 × 1024 each | 8.39 M | |
+| `o_proj` per layer | 4096 × 4096 | 16.78 M | |
+| **Attention, per layer** | | **41.94 M** | 19.2% of a layer |
+| `gate_proj`, `up_proj` per layer | 4096 × 14336 each | 58.72 M each | |
+| `down_proj` per layer | 14336 × 4096 | 58.72 M | |
+| **MLP, per layer** | | **176.16 M** | 80.8% of a layer |
+| RMSNorm gains (2 per layer + final) | 4096 each | 0.4 M total | ~0.005% |
+| **× 32 layers** | | **6.979 B** | 86.9% |
+| Embedding table | 128256 × 4096 | 0.525 B | 6.5% |
+| Output head `lm_head` | 4096 × 128256 | 0.525 B | 6.5% |
+| **Total** | | **8.03 B** | 100% |
+
+Two things fall out of this table that matter for the rest of your career.
+
+**First, attention is a minority of the weights.** 6.979 B × 19.2% = 1.342 B, or 16.7% of the model. The MLPs hold 5.637 B, or 70.2%. When someone quantizes a model to make it fit, most of the bytes they are removing come from the MLP matrices. When someone writes a kernel to go faster, most of the time is in `gate_proj`, `up_proj` and `down_proj` — not in the attention operation that gave the architecture its name.
+
+**Second, the embedding table is not small.** 128,256 rows of 4,096 is 525 million parameters, 6.5% of the model, and it exists twice: once as the lookup table at the front, once as the `lm_head` that produces logits at the end. Llama-3.1 does not tie them together; Qwen2.5-0.5B does, sharing one table for both jobs.
+
+<Callout type="pitfall" title="Why hidden 4096 and not 3000">
+  `$k\_proj$` is not 4096 × 4096. Llama-3.1-8B has **8 KV heads**, not 32, so `k_proj` and `v_proj` are 4096 × 1024. If you assume full multi-head attention you will over-count a Llama model's weights by about 1.2 billion and every memory calculation you make afterwards will be wrong. Read the config, not the family name. Module 03.5 shows why those KV heads are fewer.
+</Callout>
+
+## Bytes: the number that decides everything
+
+At 2 bytes per weight in <Term t="bf16">BF16</Term>, Llama-3.1-8B occupies:
+
+$$
+8.03 \times 10^9 \times 2 = 16.06 \times 10^9 \text{ bytes} = 16.1 \text{ GB}
+$$
+
+Now check that against real hardware:
+
+| GPU | Memory | Does Llama-3.1-8B in BF16 fit? |
+|---|---|---|
+| T4 (free Colab) | 16 GB | **No** — 16.1 GB of weights alone, before activations |
+| L4 | 24 GB | Barely; ~8 GB left for KV cache and workspace |
+| A100 80GB | 80 GB | Yes, with ~64 GB for KV cache |
+| H100 SXM | 80 GB | Yes, with ~64 GB for KV cache |
+
+And compare with the other models on your course list:
+
+| Model | Parameters | BF16 size | Fits a free T4? |
+|---|---|---|---|
+| Qwen2.5-0.5B | 0.49 B | 0.99 GB | Yes, comfortably |
+| Llama-3.2-3B | 3.2 B | 6.4 GB | Yes |
+| Llama-3.1-8B | 8.03 B | 16.1 GB | No |
+| Qwen2.5-32B | 32.8 B | 65.6 GB | No |
+| Llama-3.1-70B | 70.6 B | 141 GB | No — needs two 80 GB GPUs |
+
+That table is the reason the Colab labs in this module use Qwen2.5-0.5B and TinyLlama-1.1B. It is also why <Term t="quantization">quantization</Term> exists: at 8 bits the 8B model is 8.0 GB and fits a T4, and at 4 bits it is 4.0 GB.
+
+<Callout type="mentor" title="One sentence to carry into every module">
+  **At inference, a weight is a number you read from HBM, multiply by something, and read again next token.** Everything expensive about serving — why decode is memory-bound, why batching helps, why 4-bit quantization exists, why the KV cache dwarfs the weights at long context — follows from that one sentence.
+</Callout>
+
+## The forward pass, formally
+
+With $L$ layers, hidden size $d$, MLP width $m$ and vocabulary $V$, a transformer computes:
+
+$$
+\mathbf{x}_0 = \text{Embed}[\text{token}],\qquad
+\mathbf{x}_{l+1} = \mathbf{x}_l + \text{Block}_l(\mathbf{x}_l),\qquad
+\text{logits} = \text{Head}(\mathbf{x}_L)
+$$
+
+Each **block** is two sublayers — attention and an MLP — each wrapped in a normalisation and a residual add:
+
+$$
+\mathbf{u} = \mathbf{x} + \mathrm{Attn}(\mathrm{Norm}(\mathbf{x})), \qquad
+\mathbf{y} = \mathbf{u} + \mathrm{MLP}(\mathrm{Norm}(\mathbf{u}))
+$$
+
+Every symbol in that expression is a lesson in this module. The next eight pages build it, in order: <Term t="embedding">embeddings</Term> and positions (03.3), attention (03.4), heads (03.5), the MLP and the residual stream (03.6), and then the whole thing running (03.7).
+
+<Callout type="try" title="Prove the parameter count yourself">
+  In the Colab notebook for this module, load `Qwen/Qwen2.5-0.5B-Instruct` and read its config. Compute the parameter count from the shapes **on paper**, then compare with `sum(p.numel() for p in model.parameters())`. If they disagree by more than 0.1%, find the matrix you forgot. Doing this once with real weights is worth ten readings of the table above.
+</Callout>
+
+## In code
+
+The whole of a transformer block, as PyTorch sees it:
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.g = nn.Parameter(torch.ones(d))   # one learned gain per dimension
+        self.eps = eps
+
+    def forward(self, x):
+        return self.g * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+class Block(nn.Module):
+    def __init__(self, d=4096, heads=32, kv_heads=8, d_head=128, inter=14336):
+        super().__init__()
+        self.n1 = RMSNorm(d)                     # pre-norm, before attention
+        self.q  = nn.Linear(d, heads * d_head, bias=False)
+        self.k  = nn.Linear(d, kv_heads * d_head, bias=False)   # 1024 wide, not 4096
+        self.v  = nn.Linear(d, kv_heads * d_head, bias=False)
+        self.o  = nn.Linear(heads * d_head, d, bias=False)
+        self.n2 = RMSNorm(d)                     # pre-norm, before the MLP
+        self.gate = nn.Linear(d, inter, bias=False)
+        self.up   = nn.Linear(d, inter, bias=False)
+        self.down = nn.Linear(inter, d, bias=False)
+
+    def forward(self, x):                      # x: [batch, tokens, d]
+        h = self.n1(x)
+        # attention: project, score, softmax, mix  (03.4 and 03.5 do this properly)
+        h2 = self.n2(x)
+        a = self.o(F.scaled_dot_product_attention(self.q(h), self.k(h), self.v(h), is_causal=True))
+        x = x + a                              # residual add: 03.6
+        m = self.down(F.silu(self.gate(h2)) * self.up(h2))
+        return x + m                           # residual add: 03.6
+```
+
+Two details already visible: `bias=False` on every projection (Llama and Qwen2 put the bias nowhere; RMSNorm and the residual stream do that job instead), and `k`/`v` are only 1,024 wide because there are 8 KV heads.
+
+<Callout type="real" title="What this looks like in a real engine">
+  vLLM, SGLang and TensorRT-LLM all run essentially this graph. They differ in how they schedule it, how they store the <Term t="kv-cache">KV cache</Term>, and which kernels they call — not in what they compute. When you read engine code later in this course, you are reading choices about memory and scheduling, because the arithmetic above is fixed by the model file.
 </Callout>
 
-The three squashes you will meet in open models:
+## How we got here: from word vectors to today's LLMs
 
-| Function | Formula | Used by |
-|---|---|---|
-| ReLU | $\max(0, z)$ | older models, still common |
-| GELU | $\mathrm{GELU}(z) = 0.5z\left(1 + \tanh\left(\sqrt{2/\pi}\,(z + 0.044715 z^3)\right)\right)$ | GPT-2, GPT-3, many small models |
-| SiLU (swish) | $z \cdot \sigma(z)$ where $\sigma(z) = 1/(1+e^{-z})$ | <Term t="llm">Llama</Term>, Qwen2, Mistral — most current open models |
+Language models did not begin as 8-billion-parameter giants. Every modern architectural choice exists because an earlier approach hit a concrete wall. When you look at how LLMs evolved, you are looking at a series of engineering problems and their fixes.
 
-SiLU is the sigmoid multiplied by the input. For negative $z$ the sigmoid is small, so SiLU keeps a little negative signal instead of clipping it to exactly zero, which is why it trains a little better and is what you will see in every MLP from here on.
+### 1. Word embeddings (2013): geometry for words
 
-## A layer is a row of neurons, done at once
+Before 2013, natural language processing treated words as discrete symbols. In a one-hot representation, a 50,000-word vocabulary produced 50,000-dimensional vectors that were mutually perpendicular. "King" had no closer mathematical relationship to "queen" than to "refrigerator".
 
-Now make 4,096 of them. Neuron $j$ uses row $j$ of the weight matrix $W$:
+The breakthrough came in 2013 with <Term t="word2vec">Word2Vec</Term>. Instead of sparse IDs, words were mapped to dense vectors (such as 300 numbers) in a continuous space learned from co-occurrence patterns. Words with similar meanings clustered together.
 
-$$
-y_j = f\left(\sum_{i=1}^{4096} W_{ji} x_i + b_j\right)
-$$
+**What changed for inference:** Token lookup was lightning-fast (reading a single row of a table), but a word's representation was frozen. The word "bank" received the exact same vector in "river bank" as in "bank account".
 
-Stacking all 4,096 outputs gives $y = f(Wx + b)$, and because $f$ is applied element by element, the whole thing is:
+### 2. Recurrent networks (2013–2014): the sequential bottleneck
 
-$$
-\mathbf{y} = f(\mathbf{W}\mathbf{x} + \mathbf{b}), \qquad \mathbf{W} \in \mathbb{R}^{4096 \times 4096}
-$$
+Language depends on order and context. To handle sequences, researchers adopted <Term t="recurrent-neural-network">recurrent neural networks (RNNs)</Term>, later improved with LSTMs and GRUs in 2014. An RNN passed a hidden state from word to word: each step took the previous hidden state and the current word vector to produce a new hidden state.
 
-That is a <Term t="matmul">matrix multiply</Term>, which the GPU does with tensor cores, which is the operation Module 01 measured and Module 02 put on the roofline. Nothing new has happened — a layer is just the same dot product, done 4,096 times without writing a loop.
+The fatal limitation was the sequential bottleneck. To compute token 100, the RNN had to finish token 99, which needed token 98, all the way back to token 1. Modern GPUs thrive on massive parallelism, but recurrence forced them to execute one serial step after another.
 
-**How many weights is that?** $d^2 = 4{,}096 \times 4{,}096 = 16{,}777{,}216$ weights for **one** projection in **one** layer, plus 4,096 biases. That number is worth pausing on: a single matrix is 16.8 million learned numbers, and Llama-3.1-8B contains 32 layers with several of these matrices each. "8 billion parameters" is not a vague marketing phrase; it is 8.03 billion specific numbers in a file on your disk.
+**What changed for inference:** RNNs could not process a prompt in parallel; every prompt token had to be evaluated sequentially, leaving GPU tensor cores largely idle.
 
-### The three-line recipe every neural network follows
+### 3. The Transformer (2017): parallel attention
 
-<Scrolly>
-  <NeuronNet client:visible slot="stage" />
+In 2017, the paper "Attention Is All You Need" removed recurrence entirely. By replacing recurrent loops with self-attention and positional encodings, the model allowed every token in a sequence to connect directly to every other token in parallel.
 
-  <Step title="1. One number in">
-    A neuron receives a vector — here a token's four numbers: 0.4, −1.2, 2.0, 0.7. In a real Llama-3.1-8B layer the vector has 4,096 numbers instead of four. The arithmetic is identical.
-  </Step>
+**What changed for inference:** Parallel prefill was born. Because all prompt tokens attend to one another simultaneously, a 512-token prompt is processed in a single compute-bound matrix multiply rather than 512 serial passes, making prompt ingestion orders of magnitude faster.
 
-  <Step title="2. Multiply by a weight">
-    Each number meets its own weight, 1.1, 0.4, −0.8 and 0.9. These are the **parameters**. They were learned once, during training, and since then nobody has touched them. At inference they are read, used, and read again on the next token.
-  </Step>
+### 4. Decoder-only scaling (2018–2020): predicting the next token
 
-  <Step title="3. Add them all up">
-    Sum the four products: 0.44 − 0.48 − 1.60 + 0.63 = **−1.01**. A dot product, the same operation as one cell of a matrix multiply.
-  </Step>
+Early transformers explored two styles: bidirectional encoders like BERT (reading both directions, ideal for classification) and causal autoregressive decoders like GPT. Researchers discovered that scaling <Term t="decoder-only">decoder-only</Term> architectures across larger parameter counts and massive text corpora yielded remarkable text generation and in-context learning.
 
-  <Step title="4. Add the bias">
-    One more learned number per neuron: **z = −0.76**. Biases let a neuron fire even when its input is zero; in a 4,096-wide layer that is 4,096 extra degrees of freedom.
-  </Step>
+**What changed for inference:** Auto-regressive generation requires generating one token at a time in a loop, which gave birth to the <Term t="kv-cache">KV cache</Term> (Module 05 · Prefill, Decode & the KV Cache) and turned text generation into a memory-bound decode loop.
 
-  <Step title="5. Squash it">
-    Apply the nonlinearity. ReLU, GELU and SiLU all appear in open models today. Drag the segmented control to compare: at z = −0.76, ReLU gives exactly 0 while SiLU gives −0.242, keeping a little negative signal.
-  </Step>
+### 5. Instruction tuning and chat models (2022): following orders
 
-  <Step title="6. A layer is a stack of them">
-    Do that 4,096 times and you have a layer. The grid on the left is `q_proj`: 4,096 rows (one per neuron) by 4,096 columns (one per incoming number), **16.8 million weights**. One highlighted row is the neuron you just watched.
-  </Step>
+A raw base language model is an autocomplete engine: given a question, it might generate more questions instead of answering. <Term t="instruction-tuning">Instruction tuning</Term> and reinforcement learning aligned models to act as interactive assistants following user prompts.
 
-  <Step title="7. Where 8.03 billion weights live">
-    Repeat for 32 layers and add the embedding table and the output head, and the bar on the right is the whole model. **70.2% of Llama-3.1-8B sits in MLP matrices; only 16.7% sits in attention.** Attention is the famous part, and it is the small part.
-  </Step>
+**What changed for inference:** Chat templates introduced special control tokens (such as `<|im_start|>` and `<|im_end|>`) and transformed batch inference into long multi-turn sessions with shared conversational history, creating demand for prefix caching (Module 10).
 
-  <Step title="8. Training moves them. Inference reads them.">
-    This is the single most important sentence in the module. **Training** adjusts every one of those 8.03 billion numbers by gradient descent to reduce a loss on data — days of compute, done once. **Inference** never changes a weight. It reads 16.1 GB, multiplies, and moves on.
-  </Step>
-</Scrolly>
+### 6. Mixture-of-experts and reasoning models: scaling smarter
 
-## Where the 8.03 billion actually are
+Scaling dense models indefinitely becomes unaffordable: an 800-billion parameter dense model requires reading hundreds of gigabytes per generated token. Modern architectures employ a <Term t="mixture-of-experts">mixture-of-experts (MoE)</Term> design, where only a fraction of total parameters (experts) activate for any single token. Alongside MoE, reasoning models trade extra output tokens (test-time computation) for higher accuracy on complex math and code.
 
-Take Llama-3.1-8B's published config and do the arithmetic yourself. You already know the shapes; now multiply them out.
+**What changed for inference:** MoE decouples total model memory footprint from active compute FLOPs (Module 19 · Mixture-of-Experts), while reasoning models dramatically lengthen output sequences, making serving throughput and KV cache occupancy the dominant operational challenges (Module 27 · Specialized Workloads).
 
-| Group | Shape | Parameters | Share |
+| Era | Architecture | Problem solved | What changed for inference |
 |---|---|---|---|
-| `q_proj` per layer | 4096 × 4096 | 16.78 M | |
-| `k_proj`, `v_proj` per layer | 4096 × 1024 each | 8.39 M | |
-| `o_proj` per layer | 4096 × 4096 | 16.78 M | |
-| **Attention, per layer** | | **41.94 M** | 19.2% of a layer |
-| `gate_proj`, `up_proj` per layer | 4096 × 14336 each | 58.72 M each | |
-| `down_proj` per layer | 14336 × 4096 | 58.72 M | |
-| **MLP, per layer** | | **176.16 M** | 80.8% of a layer |
-| RMSNorm gains (2 per layer + final) | 4096 each | 0.4 M total | ~0.005% |
-| **× 32 layers** | | **6.979 B** | 86.9% |
-| Embedding table | 128256 × 4096 | 0.525 B | 6.5% |
-| Output head `lm_head` | 4096 × 128256 | 0.525 B | 6.5% |
-| **Total** | | **8.03 B** | 100% |
+| 2013 | Word2Vec | Discrete words had no semantic distance | Fast table lookup, but representations were context-blind |
+| 2014 | RNNs & LSTMs | Capturing word sequence and memory | Sequential bottleneck: GPU forced to compute prompt serially |
+| 2017 | Transformer | Removed sequential loop via attention | Enabled single-pass parallel prefill across the whole prompt |
+| 2018–2020 | GPT decoder-only | Bidirectional encoders could not generate freely | Autoregressive generation created the memory-bound decode loop and KV cache |
+| 2022 | Chat & Instruction | Autocomplete models rambled instead of answering | Introduced special tokens, chat templates, and multi-turn state |
+| Recent | MoE & Reasoning | Dense parameters too heavy; hard logic needs thought | Sparse memory access per token and prolonged generation runs |
 
-Two things fall out of this table that matter for the rest of your career.
-
-**First, attention is a minority of the weights.** 6.979 B × 19.2% = 1.342 B, or 16.7% of the model. The MLPs hold 5.637 B, or 70.2%. When someone quantizes a model to make it fit, most of the bytes they are removing come from the MLP matrices. When someone writes a kernel to go faster, most of the time is in `gate_proj`, `up_proj` and `down_proj` — not in the attention operation that gave the architecture its name.
-
-**Second, the embedding table is not small.** 128,256 rows of 4,096 is 525 million parameters, 6.5% of the model, and it exists twice: once as the lookup table at the front, once as the `lm_head` that produces logits at the end. Llama-3.1 does not tie them together; Qwen2.5-0.5B does, sharing one table for both jobs.
-
-<Callout type="pitfall" title="Why hidden 4096 and not 3000">
-  `$k\_proj$` is not 4096 × 4096. Llama-3.1-8B has **8 KV heads**, not 32, so `k_proj` and `v_proj` are 4096 × 1024. If you assume full multi-head attention you will over-count a Llama model's weights by about 1.2 billion and every memory calculation you make afterwards will be wrong. Read the config, not the family name. Module 03.5 shows why those KV heads are fewer.
+<Callout type="intuition" title="The invariant across all six eras">
+  Notice what remained constant: whether an algorithm processes dense vectors from 2013 or routes sparse experts today, inference on a GPU is always a cycle of reading weights from memory and performing matrix multiplies. The models changed how those matrices interact, but the hardware speed limits from Module 02 still govern every single token.
 </Callout>
 
-## Bytes: the number that decides everything
-
-At 2 bytes per weight in <Term t="bf16">BF16</Term>, Llama-3.1-8B occupies:
-
-$$
-8.03 \times 10^9 \times 2 = 16.06 \times 10^9 \text{ bytes} = 16.1 \text{ GB}
-$$
-
-Now check that against real hardware:
-
-| GPU | Memory | Does Llama-3.1-8B in BF16 fit? |
-|---|---|---|
-| T4 (free Colab) | 16 GB | **No** — 16.1 GB of weights alone, before activations |
-| L4 | 24 GB | Barely; ~8 GB left for KV cache and workspace |
-| A100 80GB | 80 GB | Yes, with ~64 GB for KV cache |
-| H100 SXM | 80 GB | Yes, with ~64 GB for KV cache |
-
-And compare with the other models on your course list:
-
-| Model | Parameters | BF16 size | Fits a free T4? |
-|---|---|---|---|
-| Qwen2.5-0.5B | 0.49 B | 0.99 GB | Yes, comfortably |
-| Llama-3.2-3B | 3.2 B | 6.4 GB | Yes |
-| Llama-3.1-8B | 8.03 B | 16.1 GB | No |
-| Qwen2.5-32B | 32.8 B | 65.6 GB | No |
-| Llama-3.1-70B | 70.6 B | 141 GB | No — needs two 80 GB GPUs |
-
-That table is the reason the Colab labs in this module use Qwen2.5-0.5B and TinyLlama-1.1B. It is also why <Term t="quantization">quantization</Term> exists: at 8 bits the 8B model is 8.0 GB and fits a T4, and at 4 bits it is 4.0 GB.
-
-<Callout type="mentor" title="One sentence to carry into every module">
-  **At inference, a weight is a number you read from HBM, multiply by something, and read again next token.** Everything expensive about serving — why decode is memory-bound, why batching helps, why 4-bit quantization exists, why the KV cache dwarfs the weights at long context — follows from that one sentence.
-</Callout>
-
-## The forward pass, formally
-
-With $L$ layers, hidden size $d$, MLP width $m$ and vocabulary $V$, a transformer computes:
-
-$$
-\mathbf{x}_0 = \text{Embed}[\text{token}],\qquad
-\mathbf{x}_{l+1} = \mathbf{x}_l + \text{Block}_l(\mathbf{x}_l),\qquad
-\text{logits} = \text{Head}(\mathbf{x}_L)
-$$
-
-Each **block** is two sublayers — attention and an MLP — each wrapped in a normalisation and a residual add:
-
-$$
-\mathbf{u} = \mathbf{x} + \mathrm{Attn}(\mathrm{Norm}(\mathbf{x})), \qquad
-\mathbf{y} = \mathbf{u} + \mathrm{MLP}(\mathrm{Norm}(\mathbf{u}))
-$$
-
-Every symbol in that expression is a lesson in this module. The next eight pages build it, in order: <Term t="embedding">embeddings</Term> and positions (03.3), attention (03.4), heads (03.5), the MLP and the residual stream (03.6), and then the whole thing running (03.7).
-
-<Callout type="try" title="Prove the parameter count yourself">
-  In the Colab notebook for this module, load `Qwen/Qwen2.5-0.5B-Instruct` and read its config. Compute the parameter count from the shapes **on paper**, then compare with `sum(p.numel() for p in model.parameters())`. If they disagree by more than 0.1%, find the matrix you forgot. Doing this once with real weights is worth ten readings of the table above.
-</Callout>
-
-## In code
-
-The whole of a transformer block, as PyTorch sees it:
-
-```python
-import torch, torch.nn as nn, torch.nn.functional as F
-
-class RMSNorm(nn.Module):
-    def __init__(self, d, eps=1e-5):
-        super().__init__()
-        self.g = nn.Parameter(torch.ones(d))   # one learned gain per dimension
-        self.eps = eps
-
-    def forward(self, x):
-        return self.g * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-class Block(nn.Module):
-    def __init__(self, d=4096, heads=32, kv_heads=8, d_head=128, inter=14336):
-        super().__init__()
-        self.n1 = RMSNorm(d)                     # pre-norm, before attention
-        self.q  = nn.Linear(d, heads * d_head, bias=False)
-        self.k  = nn.Linear(d, kv_heads * d_head, bias=False)   # 1024 wide, not 4096
-        self.v  = nn.Linear(d, kv_heads * d_head, bias=False)
-        self.o  = nn.Linear(heads * d_head, d, bias=False)
-        self.n2 = RMSNorm(d)                     # pre-norm, before the MLP
-        self.gate = nn.Linear(d, inter, bias=False)
-        self.up   = nn.Linear(d, inter, bias=False)
-        self.down = nn.Linear(inter, d, bias=False)
-
-    def forward(self, x):                      # x: [batch, tokens, d]
-        h = self.n1(x)
-        # attention: project, score, softmax, mix  (03.4 and 03.5 do this properly)
-        h2 = self.n2(x)
-        a = self.o(F.scaled_dot_product_attention(self.q(h), self.k(h), self.v(h), is_causal=True))
-        x = x + a                              # residual add: 03.6
-        m = self.down(F.silu(self.gate(h2)) * self.up(h2))
-        return x + m                           # residual add: 03.6
-```
-
-Two details already visible: `bias=False` on every projection (Llama and Qwen2 put the bias nowhere; RMSNorm and the residual stream do that job instead), and `k`/`v` are only 1,024 wide because there are 8 KV heads.
-
-<Callout type="real" title="What this looks like in a real engine">
-  vLLM, SGLang and TensorRT-LLM all run essentially this graph. They differ in how they schedule it, how they store the <Term t="kv-cache">KV cache</Term>, and which kernels they call — not in what they compute. When you read engine code later in this course, you are reading choices about memory and scheduling, because the arithmetic above is fixed by the model file.
-</Callout>
-
-<KeyNotes>
-  1. A neuron is a weighted sum, plus a bias, plus a nonlinearity: $y = f(Wx + b)$. Three steps, and you can do all of them by hand.
-  2. Without the nonlinearity, stacked layers collapse into one linear map, so depth would buy nothing. SiLU is what current open models use.
-  3. A layer is the same operation done 4,096 times at once, which is a matrix multiply on tensor cores. Nothing new happens between the neuron and the layer.
-  4. Parameters are learned once during training. **At inference every weight is read-only.** That single fact governs the rest of this course.
-  5. Llama-3.1-8B, derived from its config: 41.94 M attention weights + 176.16 M MLP weights per layer × 32 layers = 6.979 B, plus a 0.525 B embedding table and a 0.525 B output head = 8.03 B.
-  6. **70.2% of the weights are in MLP matrices, 16.7% in attention, 13.1% split between the embedding table and the output head.** Attention is the small part.
-  7. `k_proj` and `v_proj` are 4096 × 1024, not 4096 × 4096, because Llama-3.1-8B has 8 KV heads. Read the config, not the family name.
-  8. 8.03 B weights × 2 bytes = **16.1 GB in BF16** — too big for a free Colab T4. At 8 bits it is 8.0 GB and fits; at 4 bits, 4.0 GB.
-</KeyNotes>
-
-<Quiz client:visible questions={[
-  { q: 'A neuron computes a dot product, adds a bias and applies a nonlinearity. What happens to the value at the neuron output?', numeric: true, answer: -0.242, tolerance: 0.005, why: 'Products 0.44, −0.48, −1.60, 0.63 sum to −1.01; +0.25 bias gives z = −0.76; SiLU(−0.76) = −0.76 × 0.3184 ≈ −0.242.' },
-  { q: 'Llama-3.1-8B in BF16 occupies how many gigabytes of weights?', numeric: true, answer: 16.1, tolerance: 0.2, unit: 'GB', why: '8.03e9 parameters × 2 bytes each = 16.06e9 bytes ≈ 16.1 GB. That alone exceeds the 16 GB of a free Colab T4, which is why 8-bit quantization (8.0 GB) is needed to run it there.' },
-  { q: 'What fraction of Llama-3.1-8B’s parameters sit in MLP matrices?', options: ['About 17%', 'About 70%', 'About 13%', 'About 50%'], answer: 1, why: '176.16 M per layer × 32 layers = 5.637 B out of 8.03 B = 70.2%. Attention holds 41.94 M × 32 = 1.342 B (16.7%); the embedding table and lm_head hold 1.05 B (13.1%).' },
-  { q: 'Llama-3.1-8B has 8 KV heads. How wide is k_proj in one layer?', options: ['4096', '8192', '1024', '16384'], answer: 2, why: 'k_proj maps hidden → kv_heads × head_dim = 8 × 128 = 1024. That is why k_proj and v_proj together are 8.39 M parameters rather than 33.55 M.' },
-  { q: 'One neuron receives 4 inputs with weights 1.1, 0.4, −0.8, 0.9, and the dot product comes to −1.01. With a bias of 0.25, what is z?', numeric: true, answer: -0.76, tolerance: 0.01, why: 'z = dot + bias = −1.01 + 0.25 = −0.76. The bias is added after the dot product and before the nonlinearity.' },
-  { q: 'Why can’t Llama-3.1-8B in BF16 run on the free Colab T4?', options: ['A T4 has no BF16 support', 'The weights alone are 16.1 GB and the T4 has 16 GB in total, with nothing left for activations', '8.03 billion weights is above the T4’s parameter limit', 'The T4’s bandwidth is too low'], answer: 1, why: '16.1 GB of weights versus 16 GB of total memory, before the KV cache, the CUDA context or any activations. Qwen2.5-0.5B (0.99 GB) fits comfortably — which is why the labs use it.' },
+<KeyNotes>
+  1. A neuron is a weighted sum, plus a bias, plus a nonlinearity: $y = f(Wx + b)$. Three steps, and you can do all of them by hand.
+  2. Without the nonlinearity, stacked layers collapse into one linear map, so depth would buy nothing. SiLU is what current open models use.
+  3. A layer is the same operation done 4,096 times at once, which is a matrix multiply on tensor cores. Nothing new happens between the neuron and the layer.
+  4. Parameters are learned once during training. **At inference every weight is read-only.** That single fact governs the rest of this course.
+  5. Llama-3.1-8B holds 8.03 B parameters across 32 layers: 70.2% in MLP matrices, 16.7% in attention, and 13.1% in the embedding table and output head.
+  6. `k_proj` and `v_proj` are 4096 × 1024, not 4096 × 4096, because Llama-3.1-8B has 8 KV heads. Read the config, not the family name.
+  7. 8.03 B weights × 2 bytes = **16.1 GB in BF16** — too big for a free Colab T4. At 8 bits it is 8.0 GB and fits; at 4 bits, 4.0 GB.
+  8. Language models evolved by replacing sequential recurrent bottlenecks with parallel attention, enabling single-pass prompt prefill on GPUs while leaving auto-regressive decode memory-bound.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A neuron computes a dot product, adds a bias and applies a nonlinearity. What happens to the value at the neuron output?', numeric: true, answer: -0.242, tolerance: 0.005, why: 'Products 0.44, −0.48, −1.60, 0.63 sum to −1.01; +0.25 bias gives z = −0.76; SiLU(−0.76) = −0.76 × 0.3184 ≈ −0.242.' },
+  { q: 'Llama-3.1-8B in BF16 occupies how many gigabytes of weights?', numeric: true, answer: 16.1, tolerance: 0.2, unit: 'GB', why: '8.03e9 parameters × 2 bytes each = 16.06e9 bytes ≈ 16.1 GB. That alone exceeds the 16 GB of a free Colab T4, which is why 8-bit quantization (8.0 GB) is needed to run it there.' },
+  { q: 'What fraction of Llama-3.1-8B’s parameters sit in MLP matrices?', options: ['About 17%', 'About 70%', 'About 13%', 'About 50%'], answer: 1, why: '176.16 M per layer × 32 layers = 5.637 B out of 8.03 B = 70.2%. Attention holds 41.94 M × 32 = 1.342 B (16.7%); the embedding table and lm_head hold 1.05 B (13.1%).' },
+  { q: 'Llama-3.1-8B has 8 KV heads. How wide is k_proj in one layer?', options: ['4096', '8192', '1024', '16384'], answer: 2, why: 'k_proj maps hidden → kv_heads × head_dim = 8 × 128 = 1024. That is why k_proj and v_proj together are 8.39 M parameters rather than 33.55 M.' },
+  { q: 'One neuron receives 4 inputs with weights 1.1, 0.4, −0.8, 0.9, and the dot product comes to −1.01. With a bias of 0.25, what is z?', numeric: true, answer: -0.76, tolerance: 0.01, why: 'z = dot + bias = −1.01 + 0.25 = −0.76. The bias is added after the dot product and before the nonlinearity.' },
+  { q: 'Why can’t Llama-3.1-8B in BF16 run on the free Colab T4?', options: ['A T4 has no BF16 support', 'The weights alone are 16.1 GB and the T4 has 16 GB in total, with nothing left for activations', '8.03 billion weights is above the T4’s parameter limit', 'The T4’s bandwidth is too low'], answer: 1, why: '16.1 GB of weights versus 16 GB of total memory, before the KV cache, the CUDA context or any activations. Qwen2.5-0.5B (0.99 GB) fits comfortably — which is why the labs use it.' },
+  { q: 'An RNN processing a 512-token prompt executes 512 sequential recurrent steps. Because self-attention attends to all positions in parallel, how many forward prefill passes does a transformer need to process the same 512-token prompt?', numeric: true, answer: 1, tolerance: 0, why: 'Self-attention allows all tokens in a prompt to attend to each other simultaneously, collapsing what was 512 serial steps in an RNN into exactly 1 forward prefill pass on a GPU.' },
 ] } />

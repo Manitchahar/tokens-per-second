@@ -5,19 +5,50 @@ module: big-picture
 
 ## The life of a request
 
-**network → tokenize → queue → prefill → decode loop → detokenize → stream back**
+**client → gateway → router → serving engine → scheduler → kernels → GPU hardware**
 
 - **Prefill**: whole prompt in one parallel pass. Fills the KV cache, produces token 1. <span class="ink k-compute">Compute-bound</span>.
 - **Decode**: one token per step, each step reads all weights and the KV cache. <span class="ink k-memory">Memory-bound</span>.
 - **KV cache**: stored keys and values of every past token. Grows by one entry per token.
 
-## Training vs inference
+## The seven request path layers & tuning levers
 
-| | Training | Inference |
+| Layer | Component | What an inference engineer tunes |
 |---|---|---|
-| Weights | change | frozen |
-| How often | once per model | every request, forever |
-| Goal | quality | latency, throughput, cost at fixed quality |
+| 1. Client | Browser, CLI, App | SSE streaming chunk buffers, timeouts, retry backoff with jitter |
+| 2. Gateway | Envoy, Nginx | Token-bucket rate limits, context payload size limits, admission control |
+| 3. Router | Load balancer | Least-connections routing, prefix / cache-aware routing |
+| 4. Serving engine | vLLM, SGLang | `gpu_memory_utilization` (e.g. 0.90), tensor parallelism (`--tp`), block size |
+| 5. Scheduler | Iteration scheduler | `max_num_seqs`, `max_num_batched_tokens`, chunked prefill, preemption |
+| 6. Kernels | CUDA, Triton | FlashAttention-2/3/FlashInfer, GEMM tiling, fused RMSNorm + RoPE |
+| 7. Hardware | GPU, HBM, NVLink | Core/memory clock locking (`nvidia-smi -lgc`), power limits, NUMA affinity |
+
+## Model lifecycle: from training to serving
+
+1. **Data Curation**: Raw data ingest, cleaning, tokenization.
+2. **Training & Fine-Tuning**: Iterative backpropagation, optimizer states (16–20 bytes/param), compute-bound on GPU clusters.
+3. **Evaluation**: Offline benchmarks (MMLU, GSM8K), loss validation.
+4. **Packaging & Conversion**: SafeTensors, quantization (AWQ, GPTQ, FP8), engine graph compilation.
+5. **Serving**: Low-latency forward pass only, dynamic continuous batching, frozen weights, KV cache management under strict SLOs.
+6. **Monitoring & Iteration**: TTFT/TPOT telemetry, error rates, data drift logging feeding retraining.
+
+### Training vs serving frameworks
+
+| Dimension | Model Training | Production Serving |
+|---|---|---|
+| Weights | Updated via backpropagation | Frozen (read-only) |
+| Goal | Minimize loss | Latency, throughput, cost-to-serve at fixed quality |
+| Memory | Dominated by Adam optimizer states | Dominated by static weights and dynamic KV cache |
+| Batching | Large, static batches | Dynamic, iteration-level continuous batching |
+
+## Model serving paradigms
+
+| Paradigm | Architecture | Key Characteristics | Course Lesson |
+|---|---|---|---|
+| **Single-Model** | Dedicated GPU replica running one model | Maximum latency predictability, simplest tuning | Module 09 (A Real Engine: vLLM) |
+| **Multi-Model** | Shared server multiplexing many models/LoRAs | High GPU utilization, lower idle spend, model swapping overhead | Module 17 (Multi-model serving & Triton Inference Server) |
+| **Managed API** | External vendor endpoints (OpenAI, Bedrock) | Zero infra management, instant scale, high volume-based cost | Module 25 (Managed APIs, cloud platforms & build vs buy) |
+| **On-Device** | Local client execution (phone, laptop, edge) | Zero hosting bill, offline privacy, severely restricted memory/compute | Module 26 (On-device & edge inference) |
 
 ## The four numbers
 
@@ -27,8 +58,14 @@ module: big-picture
 - **Cost**: dollars per million tokens.
 
 $$
-T_{\text{total}} \approx \text{TTFT} + (n-1)\cdot\text{TPOT}
+T_{\text{total}} = t_{\text{gateway}} + t_{\text{queue}} + t_{\text{prefill}} + (n-1)\cdot t_{\text{step}}
 $$
+
+$$
+\text{TTFT} = t_{\text{gateway}} + t_{\text{queue}} + t_{\text{prefill}}
+$$
+
+- When TTFT spikes under load, queue wait time $t_{\text{queue}}$ (not GPU compute) is usually the primary cause.
 
 $$
 \text{throughput} = \frac{B}{t_{\text{step}}}, \qquad \text{per-user speed} = \frac{1}{t_{\text{step}}}
@@ -49,17 +86,6 @@ $$
 - The **KV cache**, not the model, usually limits how many users fit.
 - Raising batch size: throughput ↑, per-user speed ↓, memory ↑, cost per token ↓.
 - Always report **all four** numbers, plus hardware and batch size.
-
-## The stack
-
-| Layer | Examples |
-|---|---|
-| Product | chat UI, API, SLOs, pricing |
-| Fleet | router, replicas, autoscaler |
-| Serving engine | vLLM, SGLang, TensorRT-LLM: scheduler, batching, KV manager |
-| Model runtime | PyTorch, CUDA graphs, torch.compile, quantized weights |
-| Kernels | matmul (GEMM), attention, norms, fused ops |
-| Hardware | HBM, SMs, tensor cores, NVLink |
 
 ## Debug loop
 

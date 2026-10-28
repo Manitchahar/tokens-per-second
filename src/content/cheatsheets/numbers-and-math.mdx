@@ -16,28 +16,65 @@ module: numbers-and-math
 
 **Weights GB ≈ billions of params × bytes per param.** 1 GiB = 2³⁰ ≈ 1.074 GB.
 
-## Shapes
+## Shapes, strides and memory layout
 
-- `[B, T, D]`: batch, tokens, hidden. Heads: `[B, H, T, Dh]`, Dh = D / H.
+- `[B, T, D]`: batch, tokens, hidden size. Heads: `[B, H, T, Dh]`, Dh = D / H.
 - Elements = product of the shape. Memory = elements × bytes.
 - Fixing an index removes a dimension; `view` never copies.
+- Physical memory is a flat 1D sequence of addresses stored in **row-major order** (C-contiguous).
+- **Strides**: element jump required to step by 1 along each dimension. For `[3, 4]`, strides are `(4, 1)`.
+- 1D memory offset:
+  $$
+  \text{offset}(r, c) = r \times \text{stride}_0 + c \times \text{stride}_1 = r \times \text{cols} + c
+  $$
+  For a 3D tensor `[B, T, D]`:
+  $$
+  \text{offset}(b, t, d) = b \cdot (T \cdot D) + t \cdot D + d
+  $$
+- `transpose` swaps stride metadata in $O(1)$ time without moving memory, but leaves the tensor non-contiguous.
+- `.contiguous()` allocates a new GPU memory buffer and copies all bytes in memory order.
 
-## Matrix multiply
+## Broadcasting rules
+
+- Align shapes starting from the rightmost (trailing) dimension.
+- Prepend dimensions of size 1 on the left if rank is smaller.
+- Dimensions match if they are equal OR if one is 1.
+- Size 1 dimensions virtually expand with stride 0 (reusing memory with zero allocation).
+
+## Real-world layer shapes (Llama-3.1-8B)
+
+- Hidden size: $d_{\text{model}} = 4096$, intermediate MLP size: $d_{\text{ff}} = 14336 \approx \frac{8}{3} d_{\text{model}}$ (rounded to multiple of 1024).
+- SwiGLU MLP projection matrix (`[4096, 14336]`): 4,096 × 14,336 = 58,720,256 weights.
+- Weight memory: 58,720,256 × 2 bytes = 117,440,512 bytes ≈ **117.44 MB** in BF16.
+- Model MLP total: 3 projections (gate, up, down) × 32 layers × 117.44 MB ≈ **11.27 GB**.
+
+## Matrix multiply and arithmetic intensity
 
 $$
 [m \times k]\cdot[k \times n] \to [m \times n], \qquad \text{FLOPs} = 2mkn
 $$
 
+- Memory traffic (FP16/BF16, 2 bytes/element):
+  $$
+  \text{Bytes moved} = 2 \cdot (m \cdot k + k \cdot n + m \cdot n)
+  $$
+- **Arithmetic Intensity** ($I$):
+  $$
+  I = \frac{\text{FLOPs}}{\text{Bytes moved}} = \frac{m \cdot k \cdot n}{m \cdot k + k \cdot n + m \cdot n} \quad [\text{FLOPs/byte}]
+  $$
+- **Decode** ($m = 1, k = 4096, n = 4096$): 33.55 MFLOPs / 33.57 MB moved $\approx \mathbf{1.0 \text{ FLOP/byte}}$ (<span class="ink k-memory">memory-bound</span>).
+- **Prefill** ($m = 512, k = 4096, n = 4096$): 17.18 GFLOPs / 41.94 MB moved $\approx \mathbf{409.6 \text{ FLOPs/byte}}$ (<span class="ink k-compute">compute-bound</span>).
+- H100 SXM5 balance point: 989 TFLOP/s ÷ 3.35 TB/s ≈ **295 FLOPs/byte**.
+
 $$
 \text{FLOPs per token} \approx 2 \times \text{params}
 $$
 
+- Llama-3.1-8B: ~8.03 billion parameters $\implies \approx 2 \times 8.03 \times 10^9 \approx \mathbf{16.06 \text{ GFLOPs per token}}$.
+
 $$
 \text{time} \ge \text{FLOPs} / \text{FLOP/s}
 $$
-
-- Decode (m = 1): about 1 FLOP per byte loaded, so it is memory-bound.
-- Prefill (m = hundreds): the weight is reused for every token, so it is compute-bound.
 
 ## Dot product & softmax
 
@@ -46,8 +83,27 @@ q\cdot k = \sum_i q_i k_i = |q||k|\cos\theta
 $$
 
 $$
-\text{softmax}(x)_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}},\quad m=\max_j x_j
+\text{cosine\_similarity}(q, k) = \frac{q \cdot k}{|q||k|} = \cos\theta
 $$
 
-- Temperature: softmax(x / T). T < 1 is sharper; T > 1 is flatter.
-- Attention scales scores by 1/√d.
+- Attention uses dot products rather than cosine similarity so vector length can express confidence.
+
+### Numerically safe softmax
+
+- FP16 overflow threshold: max representable is 65,504. $\ln(65504) \approx 11.08986$. Unnormalized scores &gt; 11.09 overflow naive softmax to `+inf` and cause NaN outputs.
+- Safe softmax subtracts the maximum:
+  $$
+  \text{softmax}(x)_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}},\quad m=\max_j x_j
+  $$
+  All exponents become $\le 0$, so $e^{x_i - m} \in (0, 1]$. No overflow.
+- **Two-pass memory bottleneck**: standard softmax requires 2 passes over HBM (one to find max, one to sum exponentials). FlashAttention uses online softmax to compute attention incrementally inside on-chip SRAM.
+
+### Temperature
+
+$$
+\text{softmax}(x / T)_i = \frac{e^{(x_i / T) - m'}}{\sum_j e^{(x_j / T) - m'}}, \quad m' = \max_j (x_j / T)
+$$
+
+- $T &lt; 1$: sharpens differences (approaches argmax / greedy decoding as $T \to 0$).
+- $T &gt; 1$: flattens differences (approaches uniform $\frac{1}{N}$ as $T \to \infty$).
+- Attention scales scores by $\frac{1}{\sqrt{d_k}}$ (for $d_k = 128$, $\approx 11.31$) to prevent large dot products from saturating softmax.

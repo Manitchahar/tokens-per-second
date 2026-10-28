@@ -136,3 +136,110 @@ Admit a request only if **all three** hold: free KV blocks, batch below `max_num
 `--dtype`, `--quantization` (awq / gptq / fp8 — Module 11), `--tensor-parallel-size` (Module 18), `--enable-prefix-caching` (Module 10), `--block-size` (16 in V1), `--enforce-eager` (no CUDA graphs; needed on small/old GPUs), `--api-key`, `--served-model-name`, `--disable-log-requests`, `--seed`, `--token` (for gated Hugging Face repos).
 
 Defaults move between versions: read them from `vllm serve --help`, not from a blog post.
+
+## Optimization plan: the 7-station method
+
+```
+1. Hardware → 2. Workload → 3. Metrics/SLO → 4. Baseline → 5. Benchmark → 6. Change ONE knob → 7. Record & decide ↺
+```
+
+1. **Examine hardware:** Audit GPU model, HBM capacity, bandwidth, and NVLink interconnect via `nvidia-smi`.
+2. **Define workload:** Lock prompt and output distributions and arrival rate using a reproducible generator.
+3. **Define metrics & SLO:** Explicit targets for TTFT (prefill/queueing) and TPOT (decode), measured at p95/p99.
+4. **Deploy baseline server:** Standard engine defaults; log weight footprint and KV pool size.
+5. **Benchmark baseline:** Measure reference throughput, TTFT, TPOT, and goodput using native tooling.
+6. **Change ONE knob:** Formulate one hypothesis; isolate a single configuration variable.
+7. **Record and decide:** Apply keep-or-revert rule immediately: keep wins that preserve SLOs; revert regressions.
+
+### Qwen3-14B on one H100 80GB (first-principles specs)
+
+- **Weights (BF16):** ${}14.8\text{B} \times 2\text{ bytes} \approx 29.6\text{ GB}$
+- **KV cache per token:** ${}2 \times L \times n_{kv} \times d_{head} \times 2 = 2 \times 40 \times 8 \times 128 \times 2 = 163{,}840\text{ bytes} \approx 160\text{ KB}$
+- **KV cache pool (`util 0.90`):** ${}72.0\text{ GB} - 29.6\text{ GB} - 3.2\text{ GB} = 39.2\text{ GB} \approx 239{,}257\text{ tokens}$ ($\approx 14{,}953$ blocks of 16 tokens)
+- **Worst-case concurrency at 4K context:** ${}39.2\text{ GB} \div (4{,}096 \times 160\text{ KB}) \approx 58\text{ concurrent sequences}$
+- **Single-stream decode ceiling:** ${}3.35\text{ TB/s} \div 29.6\text{ GB} \approx 113\text{ tok/s}$ upper bound (ideal); practical $\approx 80\text{ tok/s}$ at 80% MBU + 1.5 ms overhead
+
+### Production command template
+
+```bash
+vllm serve Qwen/Qwen3-14B \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 4096 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 2048 \
+  --tensor-parallel-size 1 \
+  --port 8000
+```
+
+### Native client-server benchmarking
+
+```bash
+vllm bench serve \
+  --backend vllm \
+  --base-url "http://localhost:8000" \
+  --model Qwen/Qwen3-14B \
+  --dataset-name sharegpt \
+  --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 1000 \
+  --request-rate 10 \
+  --max-concurrency 64 \
+  --save-result \
+  --result-filename baseline_results.json
+```
+
+### Experimental results ledger template
+
+| Exp | Change (ONE knob) | Throughput | TTFT (p50/p99) | TPOT (p50/p99) | Goodput | Decision |
+|---|---|---|---|---|---|---|
+| **00** | *Baseline defaults (illustrative)* | 474 tok/s | 104 / 185 ms | 32 / 38 ms | 445 tok/s | **BASELINE** |
+| **01** | `--max-model-len 4096` | 582 tok/s | 98 / 172 ms | 31 / 37 ms | 548 tok/s | **✓ KEEP** |
+| **02** | `--max-num-seqs 512` | 695 tok/s | 165 / 310 ms | 44 / 58 ms | 210 tok/s | **✗ REVERT** |
+
+### Common serving trade-offs
+
+| Trade-off axis | Optimization choice | The gain | The compromise |
+|---|---|---|---|
+| **Throughput vs Latency** | Larger batch sizes (`max_num_seqs`) | Higher aggregate throughput, lower $/token | Increased per-token latency (TPOT) and longer queue delays (TTFT) |
+| **Memory vs Concurrency** | Truncating context (`max_model_len`) | Dramatically higher safe concurrent capacity | Rejection of very long prompts at the gateway |
+| **Quality vs Speed** | Model quantization (Module 11) | 2–3× memory reduction, larger KV pool, higher throughput | Slight loss in numerical precision or reasoning quality |
+| **Cost vs Headroom** | Pushing utilization to 95% (`gpu_memory_utilization`) | Maximum token output per hardware dollar | Vulnerability to OOM crashes during sudden request spikes |
+
+### Optimization rules of thumb
+
+1. **Audit hardware first:** Verify GPU memory, bandwidth, clocks, and interconnect via `nvidia-smi` before touching code.
+2. **Never benchmark on shifting traffic:** Fix prompt and output distributions and arrival rates with a traffic generator (`vllm bench serve`).
+3. **Goodput over throughput:** Raw tokens/s gained by breaching TTFT or TPOT SLOs represents negative engineering value.
+4. **Isolate one knob per experiment:** Changing two variables creates confounding interactions and ruins attribution.
+5. **Keep or revert immediately:** If goodput improves and SLOs hold, KEEP; if latency regresses, REVERT immediately.
+
+
+## Offline batch inference (Python LLM class)
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="Qwen/Qwen2.5-0.5B-Instruct", dtype="half")  # T4 needs half/float16
+outputs = llm.generate(prompts, SamplingParams(max_tokens=64, temperature=0.7))
+```
+
+- **Continuous batching still active**: Scheduler admits and retires sequences dynamically per iteration without HTTP overhead.
+- **Goal is throughput, not TTFT**: Concurrency can be maximized without user latency SLO constraints.
+- Choose **offline batch** for static datasets, pipelines, and ETL; choose **online server** (`vllm serve`) for real-time APIs and interactive streaming.
+
+## Startup sequence & layered optimization
+
+**The 7 startup steps:**
+1. Parse engine configuration (`ModelConfig`, `CacheConfig`).
+2. Spawn worker processes (one per GPU under tensor parallelism, at the time of writing).
+3. Load model weights into GPU memory from safetensors.
+4. Profile peak activation memory via a dummy forward pass.
+5. Compute KV block budget from remaining space under `gpu_memory_utilization`.
+6. Pre-allocate contiguous paged KV cache tensor.
+7. Capture CUDA graphs for common decode batch sizes (unless `--enforce-eager`).
+
+**The 4 optimization layers:**
+- **Request / scheduler level**: Continuous batching, token budgets, preemption (Modules 07, 10).
+- **Memory level (KV)**: PagedAttention, block tables, prefix caching (Modules 08, 10).
+- **Kernel level**: Fused attention, Triton kernels, graph replay (Modules 13, 14, 15).
+- **Model level**: Quantization (FP8, AWQ), speculative decoding, MoE routing (Modules 11, 16, 19).

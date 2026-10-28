@@ -374,9 +374,6 @@ prompts = {
 for name, toks in prompts.items():
     shared = tree.find_shared(toks, None)
     fresh_from = len(toks) - len(shared) * BLOCK
-    new_blocks = []
-    for _ in range(max(0, (fresh_from + BLOCK - 1)//BLOCK)):
-        new_blocks.append(len(pg.free) - 1 - len(pg.free))   # placeholder; real alloc below
     # real allocation for the unmatched part
     ids = []
     for _ in range(max(0, (fresh_from + BLOCK - 1)//BLOCK)):

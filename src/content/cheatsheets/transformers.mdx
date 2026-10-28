@@ -215,3 +215,15 @@ ridge check   decode 1 FLOP/byte vs H100 295, A100 156, T4 203
 - 90% of a decode step's bytes are the 32 blocks of weights; 72.5% of those are MLPs.
 - 128 KiB of KV per token per sequence. Llama-2-7B: 512 KiB.
 - KV cache equals all the weights at **122,500 tokens** of context (Llama-3.1-8B).
+
+
+## LLM evolution timeline
+
+| Era | Landmark | Inference impact |
+|---|---|---|
+| 2013 | Word2Vec | Static embedding lookup; no contextual variation |
+| 2014 | RNNs / LSTMs | Serial hidden state update; prompt cannot be parallelized |
+| 2017 | Transformer | Self-attention enables parallel prefill in 1 matrix multiply |
+| 2018–2020 | Decoder-only | Autoregressive generation makes decode memory-bound with KV cache |
+| 2022 | Instruction tuning | Chat templates add special tokens and multi-turn KV retention |
+| Recent | MoE & Reasoning | Sparse parameter routing cuts active FLOPs; long reasoning expands output KV |

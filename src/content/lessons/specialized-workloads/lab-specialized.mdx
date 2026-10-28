@@ -1,0 +1,166 @@
+---
+title: 'Lab: Specialized workloads, measured'
+summary: 'Measure six specialized workloads that break standard text serving assumptions: constrained decoding masks, LoRA parameter arithmetic, batch splitting, prefix caching, RL rollout sizing, and convolution roofline intensity.'
+objectives:
+  - Measure vocabulary masking overhead against unconstrained softmax
+  - Verify LoRA parameter counts against the r(in + out) formula
+  - Measure memory bandwidth drop from multi-adapter batch fragmentation
+  - Quantify prefix cache token and compute savings in multi-turn loops
+  - Size an RL rollout group on GPU memory and observe batch draining
+  - Calculate convolution arithmetic intensity and identify its roofline bound
+colab: 26-specialized-workloads.ipynb
+---
+
+Standard text generation assumes homogeneous requests, static weights, and memory-bound decode GEMMs. Production systems frequently serve workloads that break those assumptions: JSON schemas, multi-tenant LoRA adapters, multi-turn agent loops, batch RL rollouts, and diffusion denoising.
+
+In this lab, you test the governing equations of these workloads on a GPU, reconciling hardware timings with closed-form formulas.
+
+<Colab nb="26-specialized-workloads.ipynb" />
+
+<Callout type="try" title="Setup (2 minutes)">
+  Open the notebook in Google Colab, select **Runtime → Change runtime type → T4 GPU**, and run the cells with <kbd>Shift</kbd>+<kbd>Enter</kbd>. The notebook uses native PyTorch and runs offline without external downloads.
+</Callout>
+
+## Part 1 · Constrained decoding: vocabulary masking cost
+
+This part exercises [Structured output & tool calling](/learn/specialized-workloads/structured-output/).
+
+### What you run
+The notebook defines a 512-entry vocabulary, reserving 32 entries for structural punctuation. You benchmark `unconstrained_step()` (float16 softmax) against `constrained_step(mask)` (applying an allowed-token boolean mask via `masked_fill(~mask, float("-inf"))`) across four grammar states: free text (100%), string (62%), comma (0.04%), and enum (0.002%).
+
+### Expected output and how to read it
+Both steps execute in microseconds on the T4 GPU, with masking adding roughly 1% to 3% overhead.
+
+Crucially, masked latency does not vary with grammar tightness: elementwise masking touches the exact same bytes whether 62% or 0.04% of tokens are allowed.
+
+Constrained decoding emits zero extra tokens and runs zero extra forward passes. Latency overhead lives in host-side grammar transitions, never GPU tensor masks.
+
+<Callout type="mentor" title="Check yourself">
+  Why does applying a vocabulary mask add zero forward passes to decode, and why is mask evaluation a larger relative share of step time on small models than on large models?
+</Callout>
+
+## Part 2 · LoRA parameter arithmetic
+
+This part exercises [Multi-LoRA serving](/learn/specialized-workloads/multi-lora/).
+
+### What you run
+The notebook implements `LoRALinear(in_features, out_features, r=16)` with $in = 4096$ and $out = 4096$, decomposing $\Delta W$ into $A \in \mathbb{R}^{r \times in}$ and $B \in \mathbb{R}^{out \times r}$ with $B$ initialised to zero. After verifying the adapter starts as an identity, you sweep rank $r \in [1, 4, 8, 16, 32, 64]$.
+
+### Expected output and how to read it
+For a 4096 × 4096 projection, the base weight holds $in \cdot out = 16{,}777{,}216$ parameters. The rank-16 adapter holds:
+
+$$
+P_{\text{adapter}} = r(in + out) = 16 \times (4096 + 4096) = 131{,}072
+$$
+
+The count matches the formula exactly (0.781% of base) and scales linearly with $r$.
+
+Informally, people quote rank-16 on a 4096-wide model as $r/d = 0.391\%$. Because LoRA trains two matrices ($A$ and $B$), the true parameter share for a square projection is:
+
+$$
+\frac{r(in + out)}{in \cdot out} = \frac{2r}{d} = 0.781\%
+$$
+
+The shorthand understates the adapter footprint by exactly 2×.
+
+<Callout type="mentor" title="Check yourself">
+  For a feed-forward projection of shape 14336 × 4096 with rank $r = 16$, what is the exact adapter parameter count, and how does its percentage of the base matrix compare to the $r/d$ shorthand?
+</Callout>
+
+## Part 3 · Multi-adapter batch split and memory bandwidth
+
+This part exercises [Multi-LoRA serving](/learn/specialized-workloads/multi-lora/).
+
+### What you run
+You compute step memory traffic across 1 to 16 adapter groups for batch 32 at context 2048 (Llama-3.1-8B weights of 16.06 GB at BF16, 128 KB KV per token). Then you run `gemm_time(rows)` on the T4 as row count shrinks from 32 to 1 against a 4096 × 4096 weight tensor.
+
+### Expected output and how to read it
+Step memory traffic reads the KV cache plus base weights once per adapter group:
+
+$$
+\text{step\_bytes}(B, g) = B \cdot C \cdot b_{kv} + g \cdot W_{\text{weights}}
+$$
+
+A homogeneous batch ($g = 1$) moves 24.65 GB (8.59 GB KV plus 16.06 GB weights). Splitting 32 sequences across 4 adapter groups ($g = 4$) re-reads base weights per group, moving 72.83 GB—nearly 3× more traffic.
+
+Meanwhile, skinny GEMMs leave memory controllers underutilised, collapsing achieved bandwidth. Splitting a batch of 32 across 4 adapters moves the same weight bytes per sequence as batch 8, while running in a slower bandwidth regime.
+
+<Callout type="mentor" title="Check yourself">
+  Why does splitting a decode batch across 4 tenant adapters re-read base weights four times, and what routing policy prevents this tax?
+</Callout>
+
+## Part 4 · Prefix cache savings across conversations and agent loops
+
+This part exercises [Agents, multi-turn & reasoning models](/learn/specialized-workloads/agents-reasoning/).
+
+### What you run
+You run `conversation(800, 120, 6)` simulating a 6-turn chat (800-token prompt, 120-160 tokens added per turn, 16-token blocks), then run `agent_loop(800, 3000, turns)` appending 3,000-token observations across 20 turns.
+
+### Expected output and how to read it
+In the 6-turn chat, naive serving re-prefills the full history every turn (7,800 token-prefills). With prefix caching, only fresh tokens are prefilled (840 token-prefills), eliminating 89.2% of prefill work (125.3 TFLOP drops to 13.5 TFLOP on an 8B model).
+
+In the agent loop, uncached prefill grows quadratically:
+
+$$
+\text{prefill}_{\text{naive}}(T) = T s + o \frac{T(T + 1)}{2} = \mathcal{O}(T^2)
+$$
+
+By turn 20, uncached prefill reaches 646,000 tokens versus 60,000 cached (a 10.8× gap), asymptotically approaching 2T independent of model parameters.
+
+<Callout type="mentor" title="Check yourself">
+  Why is the uncached-to-cached work ratio in an agent loop approximately 2T independent of model size, and what change to a prompt destroys prefix cache hits?
+</Callout>
+
+## Part 5 · Sizing an RL rollout group and measuring batch draining
+
+This part exercises [Batch inference & RL rollouts](/learn/specialized-workloads/batch-rl-rollouts/).
+
+### What you run
+You size KV cache per token and per 4,096-token rollout for Qwen2.5-1.5B (28 KB/token), Qwen2.5-7B (56 KB/token), and Llama-3.1-8B (128 KB/token) via $b_{kv} = 2 L H_{kv} D b$. You compute rollouts fitting on a 16 GB T4, then benchmark `decode_step(batch)` from batch 1 to 2,048.
+
+### Expected output and how to read it
+At 4,096 tokens, Llama-3.1-8B needs 0.54 GB KV per rollout. On 8 H100s (640 GB total), 1,024 rollouts take 550 GB of KV (86% of memory), while weights take 129 GB (3%). Rollout clusters are sized by tokens in flight, not weights.
+
+On a 16 GB T4, Qwen2.5-1.5B fits roughly 100 rollouts, while an 8B model fits zero without offload or quantization.
+
+Throughput climbs steeply from batch 1 to 128 as weights amortise, then flattens above 128 as KV traffic catches up.
+
+As rollouts finish at ragged lengths, active batch size collapses, causing trailing sequences to run up to 4× slower.
+
+<Callout type="mentor" title="Check yourself">
+  Why must memory for RL rollouts be sized for the initial group size rather than average completion length, and why is an un-capped rollout generation loop dangerous?
+</Callout>
+
+## Part 6 · Convolution arithmetic intensity on the roofline
+
+This part exercises [Diffusion inference](/learn/specialized-workloads/diffusion/).
+
+### What you run
+You benchmark `time_conv(n, c=32, k=3)` across resolutions 256, 512, 1024, calculating arithmetic intensity against the T4 roofline ridge point ($R_{\text{ridge}} = 65\text{ TFLOP/s} / 320\text{ GB/s} \approx 203\text{ FLOP/byte}$) and batch-1 LLM decode. Finally, you calculate activation memory for Stable Diffusion 1.5 at 512 × 512.
+
+### Expected output and how to read it
+Sliding 2D convolution filters across thousands of pixels ($H \times W$) yields massive weight reuse. The arithmetic intensity is:
+
+$$
+I_{\text{conv}} = \frac{\text{FLOPs}}{\text{Bytes moved}} = \frac{2 C_{\text{out}} C_{\text{in}} K^2 H W}{2 N^2 C + 2 C^2 K^2 + 2 N^2 C}
+$$
+
+At standard channel depths (320 to 640), intensity reaches several hundred FLOP/byte, placing diffusion denoising firmly in the compute-bound zone above the T4 ridge.
+
+In contrast, batch-1 LLM decode reads weights once per token vector, yielding roughly 1 FLOP/byte—deep in the memory-bound zone.
+
+At 512 × 512 (FP16), one 320-channel feature map takes 168 MB. Six live tensors take 1.0 GB per image, while 860M U-Net weights take 1.72 GB total. Activations exceed weights at batch 2: diffusion memory is bounded by activations, not weights.
+
+<Callout type="mentor" title="Check yourself">
+  Why does spatial filter reuse place 2D convolutions on the compute-bound side of the roofline while autoregressive decode remains memory-bound, and why does diffusion OOM from activations rather than weights?
+</Callout>
+
+<KeyNotes>
+  1. Constrained decoding applies an allowed-token mask via an elementwise pass with 1% to 3% overhead, adding zero forward passes and zero extra tokens.
+  2. A LoRA adapter holds exactly $r(in + out)$ parameters; the informal $r/d$ shorthand halves the true parameter share for square matrices.
+  3. Splitting a decode batch across tenant adapters re-reads base weights per group and fragments GEMM rows, degrading memory bandwidth utilization.
+  4. Prefix caching eliminates quadratic prefill growth in multi-turn chats and agent loops, saving over 89% of prefill compute in standard conversations.
+  5. RL rollout clusters are sized by tokens in flight rather than model parameters, because KV cache occupies over 85% of cluster memory.
+  6. Ragged completions cause RL batches to drain, dropping active batch size off the roofline plateau and causing trailing sequences to run up to 4× slower.
+  7. Diffusion denoising convolutions achieve high arithmetic intensity via spatial weight reuse, making them compute-bound while activations surpass weights at batch 2.
+</KeyNotes>

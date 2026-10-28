@@ -161,6 +161,7 @@ export const modules: ModuleMeta[] = [
       L('start-vllm', 'Start vLLM & talk to it', 18),
       L('anatomy-of-a-request', 'Anatomy of a request inside vLLM', 22),
       L('tune-one-gpu', 'Metrics & tuning one GPU', 20),
+      L('optimization-plan', 'An optimization plan, end to end', 22),
       PROJECT('project-pytorch-vs-vllm', 'Project: PyTorch vs vLLM, then optimize one GPU', 90),
     ],
   },
@@ -357,6 +358,7 @@ export const modules: ModuleMeta[] = [
       L('agents-reasoning', 'Agents, multi-turn & reasoning models', 18),
       L('batch-rl-rollouts', 'Batch inference & RL rollouts', 16),
       L('diffusion', 'Diffusion inference', 18),
+      LAB('lab-specialized', 'Lab: Specialized workloads, measured', 50),
     ],
   },
   {

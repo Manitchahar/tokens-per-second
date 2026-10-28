@@ -1,0 +1,411 @@
+---
+title: 'An optimization plan, end to end'
+summary: 'Tuning an inference server is not trial and error. Master a repeatable seven-step optimization method: audit hardware, pin the workload, set strict SLOs, establish a baseline, isolate one knob at a time, and maintain an experimental ledger.'
+objectives:
+  - Derive the hardware bounds (weights, KV budget, and single-stream decode ceiling) for Qwen3-14B on an H100 GPU before starting the server
+  - Formulate a reproducible optimization plan across the seven core stations from hardware audit to keep-or-revert decisions
+  - Map the six primary vLLM engine knobs to their underlying physical bottlenecks
+  - Diagnose throughput, TTFT, and TPOT symptoms from benchmark results to isolate whether prefill, decode, or memory is the limiter
+  - Navigate the four core serving trade-offs (throughput vs latency, memory vs concurrency, quality vs speed, cost vs headroom) using an experimental results ledger
+---
+import OptimizationPlan from '@/components/viz/vllm/OptimizationPlan.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In [Metrics & tuning one GPU](file:///src/content/lessons/vllm/tune-one-gpu.mdx), you learned how vLLM divides memory between model weights, a runtime reserve, and the KV cache pool, and how capping batch size limits per-step latency.
+
+Yet when teams optimize real deployments, panic often replaces arithmetic. An engineer facing high latency changes four flags at once, runs an ad-hoc benchmark, sees raw throughput tick up 15%, and ships to production. Under real peak traffic, tail latency explodes, streams freeze, and the server runs out of memory. Changing four knobs at once taught them nothing about what broke.
+
+Inference engineering is an empirical science. Production optimization demands an <Term t="optimization-plan">optimization plan</Term>: seven deliberate stations that isolate variables and test hypotheses systematically. In this lesson, we derive the theoretical boundaries for serving **Qwen3-14B on an NVIDIA H100 SXM 80GB GPU**, establish an empirical baseline, and benchmark every change under a strict keep-or-revert rule.
+
+## The seven-station optimization method
+
+Optimization is an iterative cycle. Before touching a single flag, understand your hardware, lock your workload, and define acceptable performance.
+
+<Scrolly>
+  <OptimizationPlan client:visible slot="stage" />
+
+  <Step title="1. Examine the hardware">
+    Everything begins with the physical hardware. Run `nvidia-smi` to verify GPU architecture, HBM capacity, memory bandwidth, and interconnect topology. The laws of physics dictate your serving ceiling before you execute any code.
+  </Step>
+
+  <Step title="2. Define the workload">
+    You cannot optimize against a moving target. Fix the workload using a reproducible <Term t="traffic-generator">traffic generator</Term>. Lock down prompt and output length distributions, target request arrival rates, and request burstiness.
+  </Step>
+
+  <Step title="3. Define metrics and an SLO">
+    Raw throughput without latency constraints is a vanity metric. Establish explicit Service Level Objectives (<Term t="slo">SLOs</Term>) for Time to First Token (<Term t="ttft">TTFT</Term>) and Time Per Output Token (<Term t="tpot">TPOT</Term>), focusing on p95 and p99 tail latency from [Percentiles: why averages lie](file:///src/content/lessons/benchmarking/percentiles.mdx).
+  </Step>
+
+  <Step title="4. Deploy the default baseline server">
+    Launch the serving engine with clean default configuration parameters. Inspect the startup banner to log the exact memory allocations: model weights, system reserve, and the initialized KV cache pool.
+  </Step>
+
+  <Step title="5. Benchmark the baseline">
+    Send your reproducible test workload against the baseline server. Collect measured TTFT percentiles, TPOT distributions, raw throughput, and <Term t="goodput">goodput</Term>. This creates row zero of your optimization ledger.
+  </Step>
+
+  <Step title="6. Change ONE knob">
+    Formulate a concrete hypothesis and modify exactly one configuration variable (for instance, reducing `max_model_len` or bounding `max_num_seqs`). Never change two variables in the same experiment.
+  </Step>
+
+  <Step title="7. Record and decide (keep or revert)">
+    Re-benchmark under identical traffic and log the outcome. Apply the <Term t="keep-or-revert">keep-or-revert rule</Term>: if goodput improves while all SLO boundaries hold, keep the change; if latency violates your SLO or tail jitter spikes, revert immediately.
+  </Step>
+</Scrolly>
+
+## Station 1 · Examine the hardware
+
+Before touching configuration files, audit the host machine with `nvidia-smi`:
+
+```bash
+nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.free \
+  --format=csv,noheader
+```
+
+On a datacenter instance, this prints: `NVIDIA H100 80GB HBM3, 9.0, 81140 MiB, 81140 MiB`.
+
+Four hardware parameters govern your serving ceiling:
+
+1. **Total GPU memory (HBM capacity):** An 80 GB card sets a strict boundary. Every gigabyte allocated to weights or runtime scratch is a gigabyte taken away from the KV cache pool.
+2. **Memory bandwidth:** An H100 SXM delivers approximately 3.35 TB/s of theoretical HBM3 bandwidth. As proven in [Two speed limits: compute vs memory bandwidth](file:///src/content/lessons/gpu-first-principles/two-speed-limits.mdx), autoregressive decode is memory-bandwidth bound.
+3. **Compute throughput:** The H100 provides approximately 989 TFLOP/s of dense BF16 matrix compute. Prompt processing (prefill) is compute-bound and utilizes this math capacity.
+4. **Interconnect topology:** Verify whether GPUs communicate over high-speed NVLink (~900 GB/s per GPU) or PCIe Gen5 (~64 GB/s). Tensor parallelism requires NVLink; running tensor parallel groups across slow PCIe links destroys single-stream latency.
+
+<Callout type="mentor" title="Audit the machine before trusting the numbers">
+  Running `nvidia-smi` confirms no background processes occupy GPU memory, verifies that clocks run at performance state P0 rather than idle state P8, and ensures CUDA drivers match your serving engine container.
+</Callout>
+
+## Station 2 · Define the workload
+
+A benchmark is meaningless unless the traffic pattern is fixed and reproducible. As taught in [Workloads, warm-up & reproducible runs](file:///src/content/lessons/benchmarking/workloads-reproducibility.mdx), optimizing against variable traffic only measures noise.
+
+Production workloads fall into distinct categories:
+
+- **Conversational chat (ShareGPT):** Balanced prompts (100–500 tokens) and completions (150–400 tokens).
+- **Document summarization / RAG:** Large prompt contexts (2,000–32,000 tokens) and concise completions (100–300 tokens), heavily prefill-bound.
+- **Code generation / Reasoning:** Short prompts (50–200 tokens) and extensive completions (1,000–4,000 tokens), spending over 90% of execution time in decode.
+
+Benchmark using standard datasets like ShareGPT and dispatch traffic with a client-server harness under controlled arrival rates, rather than unrealistic sequential client loops.
+
+## Station 3 · Define metrics and an SLO
+
+In [SLOs & goodput](file:///src/content/lessons/benchmarking/slos-goodput.mdx), we established that raw throughput alone is dangerous. A server producing 2,000 tokens per second is worthless if users wait 12 seconds for the first token.
+
+Define your Service Level Objective (<Term t="slo">SLO</Term>) across four core metrics:
+
+1. **TTFT (Time to First Token):** Time from request dispatch until the first token streams back (queueing plus prefill). Target: e.g., p95 TTFT &lt; 200 ms.
+2. **TPOT (Time Per Output Token):** Average delay between consecutive streamed tokens during generation. Reading pace requires 20–30 ms per token (33–50 tokens/s). Target: e.g., p95 TPOT &lt; 40 ms.
+3. **Total throughput:** Aggregate tokens processed per second across all concurrent users.
+4. **Goodput:** Output tokens per second delivered strictly within your TTFT and TPOT SLO thresholds.
+
+## First principles: Qwen3-14B on one H100 80GB
+
+Let us calculate the physical performance limits for **Qwen3-14B** in BF16 on an **NVIDIA H100 SXM 80GB**, using public architecture specifications at the time of writing.
+
+### 1. Model weight memory footprint
+
+Qwen3-14B contains approximately 14.8 billion parameters ($N \approx 14.8 \times 10^9$). In standard 16-bit brain floating point (`bfloat16`, 2 bytes per weight):
+
+$$
+\text{Weights} = 14.8 \times 10^9 \times 2\ \text{bytes} \approx 29.6\ \text{GB}
+$$
+
+### 2. KV cache per token
+
+From Qwen3-14B's public configuration:
+- Transformer layers: $L = 40$
+- Key/Value attention heads: $n_{kv} = 8$ (Grouped-Query Attention)
+- Head dimension: $d_{head} = 128$
+- Data type: 2 bytes per element (`bfloat16`)
+
+Using the formula from [PagedAttention & KV Memory](file:///src/content/lessons/paged-attention/blocks-and-tables.mdx):
+
+$$
+\text{KV bytes per token} = 2 \times L \times n_{kv} \times d_{head} \times \text{bytes}
+$$
+
+$$
+\text{KV bytes per token} = 2 \times 40 \times 8 \times 128 \times 2 = 163{,}840\ \text{bytes} \approx 160\ \text{KB}
+$$
+
+Every token retained in the engine's memory pool requires 160 KB of HBM.
+
+### 3. KV cache pool budget at 90% utilization
+
+Deploying with `--gpu-memory-utilization 0.90` on an 80 GB card sets your budget:
+
+$$
+\text{Total budget} = 0.90 \times 80\ \text{GB} = 72.0\ \text{GB}
+$$
+
+Subtracting the weights (29.6 GB) and the runtime activation reserve (~4% of GPU memory, or ${}0.04 \times 80 = 3.2\ \text{GB}$ for CUDA context, peak activations, and workspace):
+
+$$
+\text{KV cache pool} = 72.0\ \text{GB} - 29.6\ \text{GB} - 3.2\ \text{GB} = 39.2\ \text{GB}
+$$
+
+In terms of token capacity:
+
+$$
+\text{Pool capacity} = \frac{39.2 \times 10^9\ \text{bytes}}{163{,}840\ \text{bytes/token}} \approx 239{,}257\ \text{tokens}
+$$
+
+Carved into 16-token blocks, this yields approximately 14,953 blocks.
+
+### 4. Maximum concurrent sequences at 4K context
+
+Setting `--max-model-len 4096` promises support for 4,096-token requests. In the worst case where every active request reaches this ceiling:
+
+$$
+\text{Worst-case KV per request} = 4{,}096 \times 163{,}840\ \text{bytes} \approx 671\ \text{MB}
+$$
+
+The safe concurrency ceiling is:
+
+$$
+\text{Max concurrency} = \frac{39.2\ \text{GB}}{0.671\ \text{GB}} \approx 58\ \text{sequences}
+$$
+
+Leaving `max_model_len` at 32,768 would reserve 5.37 GB per request, restricting concurrency to only 7 requests.
+
+### 5. Single-stream decode speed ceiling
+
+During single-user decode ($B = 1$), the GPU must stream all 29.6 GB of weights for every output token.
+
+With an H100 SXM theoretical bandwidth of 3.35 TB/s (${}3{,}350\ \text{GB/s}$), the absolute physical ceiling is:
+
+$$
+\text{Decode ceiling} = \frac{3{,}350\ \text{GB/s}}{29.6\ \text{GB}} \approx 113.17 \approx 113\ \text{tokens/s}
+$$
+
+No software can exceed 113 tok/s for unquantized single-stream Qwen3-14B on this hardware.
+
+In practice, memory controllers achieve roughly 80% bandwidth utilization (${}3{,}350 \times 0.8 \approx 2{,}680\ \text{GB/s}$). Adding ~1.5 ms of kernel launch and scheduling overhead:
+
+$$
+t_{\text{step}} = \frac{29.6\ \text{GB}}{2{,}680\ \text{GB/s}} + 1.5\ \text{ms} \approx 11.04\ \text{ms} + 1.5\ \text{ms} = 12.54\ \text{ms}
+$$
+
+$$
+\text{Realistic single-user speed} = \frac{1}{0.01254\ \text{s}} \approx 80\ \text{tokens/s}
+$$
+
+<Callout type="math" title="First-principles calculations prevent bad benchmarks">
+  Knowing your ceiling (113 tok/s upper bound, ~80 tok/s practical single-stream) prevents bad benchmarking. If a single-stream run reports 180 tok/s, your harness is measuring cached prefixes or calculating timing incorrectly.
+</Callout>
+
+## Station 4 · Deploy the baseline server
+
+Launch the baseline server using official native vLLM tooling:
+
+```bash
+vllm serve Qwen/Qwen3-14B \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --port 8000
+```
+
+Notice that every continued line ends with a trailing backslash `\`.
+
+Verify readiness with standard endpoints before generating load:
+
+```bash
+# Check model registration
+curl http://localhost:8000/v1/models
+
+# Send warm-up request
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3-14B", "prompt": "Hello", "max_tokens": 5}'
+```
+
+The startup logs confirm our math: ~29.6 GB weights and a ~39.2 GB KV pool (~239,000 tokens).
+
+## Station 5 · Benchmark the baseline
+
+Drive the server using vLLM's native benchmark utility: `vllm bench serve`. Avoid custom Python timing loops, which distort inter-token streaming measurements.
+
+```bash
+vllm bench serve \
+  --backend vllm \
+  --base-url "http://localhost:8000" \
+  --model Qwen/Qwen3-14B \
+  --dataset-name sharegpt \
+  --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 1000 \
+  --request-rate 10 \
+  --max-concurrency 64 \
+  --save-result \
+  --result-filename baseline_results.json
+```
+
+Under 1,000 ShareGPT prompts dispatched at 10 req/s, the benchmark produces baseline reference metrics:
+- Total throughput: 474 tok/s
+- Mean TTFT: 104 ms (p99: 185 ms)
+- Mean TPOT: 32 ms (p99: 38 ms)
+- Goodput: 445 tok/s (94% satisfied TTFT &lt; 200 ms and TPOT &lt; 40 ms).
+
+This establishes **Row 00 (Baseline)** in our ledger.
+
+## The six vLLM knobs and their physical bottlenecks
+
+Six primary flags in `vllm serve` map directly to physical bottlenecks:
+
+1. **`--max-num-seqs`**: Caps concurrent sequences in an iteration, directly bounding per-step decode latency and active KV allocations.
+2. **`--max-num-batched-tokens`**: Sets the per-iteration token budget across prefill and decode, chunking long prompts so they do not starve concurrent decode streams.
+3. **`--gpu-memory-utilization`**: Dictates the fraction of GPU memory vLLM may claim, expanding or shrinking the KV pool.
+4. **`--max-model-len`**: Sets the longest accepted context length, determining worst-case per-request memory reservations.
+5. **`--dtype`**: Defines numeric precision (`bfloat16`, `float16`), halving or doubling memory bandwidth requirements.
+6. **`--tensor-parallel-size`**: Shards weights across multiple GPUs, distributing memory bandwidth load and expanding aggregate memory.
+
+A tuned startup command looks like this:
+
+```bash
+vllm serve Qwen/Qwen3-14B \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 4096 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 2048 \
+  --tensor-parallel-size 1 \
+  --port 8000
+```
+
+Every continued line ends with a trailing backslash.
+
+## Station 6 · How to read results and diagnose bottlenecks
+
+Compare benchmark metrics against your SLO to pinpoint the bottleneck:
+
+### Symptom A: TTFT is bad, but TPOT is well within SLO
+- **Diagnosis:** Prefill and queueing bottleneck. Requests wait in queue, or oversized prompts monopolize iterations.
+- **Verification:** Inspect `/metrics` for high `num_requests_waiting` while `num_requests_running` is pinned at `max_num_seqs`.
+- **Next experiment:** If TPOT has headroom, increase `max_num_seqs` or lower `max_num_batched_tokens` to interleave prefill with decode.
+
+### Symptom B: TPOT degrades under concurrency, while TTFT is fine
+- **Diagnosis:** Decode batch too large. Reading KV cache for too many concurrent sequences pushes step time past your latency target.
+- **Verification:** Check `vllm:avg_decode_time_ms`.
+- **Next experiment:** Reduce `max_num_seqs` to restrict concurrency to the envelope where TPOT meets your SLO.
+
+### Symptom C: KV-cache usage pinned near 100% with climbing preemptions
+- **Diagnosis:** Memory pool starvation. The scheduler lacks blocks for new tokens and preempts active requests.
+- **Verification:** Inspect `vllm:num_preemptions_total` and `vllm:gpu_cache_usage_perc`.
+- **Next experiment:** Lower `max_model_len` to match your empirical p99 request length, or raise `gpu_memory_utilization` if headroom permits.
+
+<Callout type="pitfall" title="Never mistake raw throughput for product success">
+  Raising `max_num_seqs` from 64 to 512 increases raw throughput by amortizing weight transfers. But if per-token latency slips from 32 ms to 58 ms, users experience unacceptable lag. Raw throughput rose, but goodput collapsed.
+</Callout>
+
+## Station 7 · Record everything and the keep-or-revert rule
+
+Document every run in an experimental ledger. Each entry records the isolated change, throughput, latency percentiles, goodput, and an explicit **KEEP** or **REVERT** verdict:
+
+| Exp | Change (ONE knob) | Throughput | TTFT (p50/p99) | TPOT (p50/p99) | Goodput | Decision |
+|---|---|---|---|---|---|---|
+| **00** | *Baseline defaults (illustrative)* | 474 tok/s | 104 / 185 ms | 32 / 38 ms | 445 tok/s | **BASELINE** |
+| **01** | `--max-model-len 4096` | 582 tok/s | 98 / 172 ms | 31 / 37 ms | 548 tok/s | **✓ KEEP** |
+| **02** | `--max-num-seqs 512` | 695 tok/s | 165 / 310 ms | 44 / 58 ms | 210 tok/s | **✗ REVERT** |
+
+*(Note: Baseline figures above represent an illustrative reference measurement under the specified ShareGPT test traffic).*
+
+Analyzing these two experiments:
+
+- **Experiment 01:** Lowering `--max-model-len` to 4,096 tokens halved the worst-case KV footprint per sequence. This freed memory, prevented block exhaustion, and raised goodput from 445 to 548 tok/s (+23%) while strictly preserving latency SLOs. **Verdict: KEEP.**
+- **Experiment 02:** Doubling `--max-num-seqs` to 512 increased raw throughput to 695 tok/s. However, the larger batch pushed p50 TPOT to 44 ms and p99 TPOT to 58 ms, violating our 40 ms SLO. Goodput collapsed to 210 tok/s. **Verdict: REVERT immediately.**
+
+By following the keep-or-revert rule, you ensure the system never regresses.
+
+## The common trade-offs in LLM serving
+
+Every optimization sits on a trade-off curve:
+
+| Trade-off axis | Optimization choice | The gain | The compromise |
+|---|---|---|---|
+| **Throughput vs Latency** | Larger batch sizes (`max_num_seqs`) | Higher aggregate throughput, lower cost per token | Higher per-token latency and longer queue delays |
+| **Memory vs Concurrency** | Truncating context (`max_model_len`) | Dramatically higher safe concurrent request capacity | Rejection of very long prompts at the gateway |
+| **Quality vs Speed** | Quantization (preview: Module 11) | 2–3× memory reduction, larger KV pool, higher throughput | Slight loss in numerical precision or reasoning quality |
+| **Cost vs Headroom** | Pushing utilization to 95% (`gpu_memory_utilization`) | Maximum token output per hardware dollar | Vulnerability to OOM crashes during request spikes |
+
+## Looking ahead: techniques you will master
+
+In this module, our focus has been strictly on the **method**. In subsequent modules, you will explore architectural optimizations:
+
+- **Chunked prefill:** Splitting large prompt prefills into uniform chunks to eliminate decode stalls (you will master this in Module 10 · Prefill & Prefix Optimization).
+- **Prefix caching:** Reusing cached KV blocks across requests with shared prompts (you will master this in Module 10 · Prefill & Prefix Optimization).
+- **Model quantization:** Compressing weights to 4-bit and 8-bit formats like AWQ to double bandwidth efficiency (you will master this in Module 11 · Quantization).
+- **Speculative decoding:** Using small draft models to verify multiple tokens in parallel (you will master this in Module 16 · Speculative Decoding).
+- **Tensor parallelism:** Splitting model layers across multiple NVLink GPUs (you will master this in Module 18 · Multi-GPU Parallelism).
+
+The engineering method remains identical: audit hardware, define workload, benchmark the baseline, change one knob, and record everything.
+
+<KeyNotes>
+  1. Real inference optimization follows a disciplined 7-step loop: audit hardware, define workload, set SLO metrics, deploy baseline, benchmark, change one knob, and record decisions.
+  2. Qwen3-14B in BF16 requires 29.6 GB for weights (${}14.8\text{B} \times 2\text{ bytes}$) and 160 KB of KV cache per token (${}2 \times 40 \times 8 \times 128 \times 2\text{ bytes}$).
+  3. On an 80 GB H100 at 0.90 utilization, subtracting weights and a 3.2 GB reserve leaves a 39.2 GB KV pool, holding approximately 239,000 tokens (14,953 blocks of 16 tokens).
+  4. Single-stream decode on an H100 SXM (3.35 TB/s) has a theoretical physical ceiling of 113 tok/s (${}3{,}350 \div 29.6$), with real-world single-user speed around 80 tok/s due to memory bandwidth limits and overhead.
+  5. Never benchmark using ad-hoc timing loops; use official native benchmarking utilities like `vllm bench serve` with fixed distributions and controlled arrival rates.
+  6. The six core vLLM knobs (`--max-num-seqs`, `--max-num-batched-tokens`, `--gpu-memory-utilization`, `--max-model-len`, `--dtype`, `--tensor-parallel-size`) map directly to memory, compute, and latency bottlenecks.
+  7. Always follow the keep-or-revert rule: benchmark exactly one variable change at a time, keeping it only if goodput increases without violating your latency SLO.
+  8. Raw throughput is deceptive; goodput (tokens delivered strictly within TTFT and TPOT targets) is the only metric that measures true product success.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Qwen3-14B in BF16 has 29.6 GB of weights. On an 80 GB H100 with --gpu-memory-utilization 0.90 and a 3.2 GB reserve, how many gigabytes remain for the KV cache pool?',
+    numeric: true,
+    answer: 39,
+    tolerance: 1,
+    unit: 'GB',
+    why: 'Total budget is 0.90 × 80 = 72.0 GB. Subtracting 29.6 GB of weights and 3.2 GB of reserve leaves 72.0 - 29.6 - 3.2 = 39.2 GB for the KV cache pool.'
+  },
+  {
+    q: 'With a 39.2 GB KV cache pool and 163,840 bytes required per token, roughly how many concurrent requests can fit in the worst case if max_model_len is set to 4,096 tokens?',
+    numeric: true,
+    answer: 58,
+    tolerance: 3,
+    unit: 'sequences',
+    why: 'Each 4,096-token sequence requires 4,096 × 163,840 bytes ≈ 0.671 GB. Dividing 39.2 GB by 0.671 GB yields approximately 58 concurrent sequences.'
+  },
+  {
+    q: 'An H100 SXM GPU provides 3.35 TB/s of memory bandwidth. For Qwen3-14B with 29.6 GB of weights, what is the theoretical upper-bound decode speed for a single sequence in tokens per second?',
+    numeric: true,
+    answer: 113,
+    tolerance: 3,
+    unit: 'tokens/s',
+    why: 'Reading 29.6 GB of weights from memory on every step gives 3,350 GB/s ÷ 29.6 GB ≈ 113.17 tokens/s theoretical upper limit (assuming 100% bandwidth efficiency and 0 overhead).'
+  },
+  {
+    q: 'An experiment increases raw token throughput by 20%, but p99 TPOT degrades from 36 ms to 55 ms, violating your 40 ms SLO. What should you do according to the keep-or-revert rule?',
+    options: [
+      'Revert the change immediately, because goodput decreased despite higher raw throughput.',
+      'Keep the change, because higher raw throughput lowers GPU serving costs.',
+      'Double the benchmark request rate to see if the queue stabilizes.',
+      'Increase gpu_memory_utilization to compensate for the higher latency.'
+    ],
+    answer: 0,
+    why: 'Goodput measures tokens delivered within SLO. When a change violates your latency targets, the raw throughput gain is invalid and the change must be reverted.'
+  },
+  {
+    q: 'During a benchmark run, TTFT spikes severely while TPOT remains fast and stable. Which bottleneck is indicated?',
+    options: [
+      'Memory bandwidth saturation during autoregressive decode.',
+      'Admission queueing or prompt prefill bottleneck before generation starts.',
+      'An out-of-memory error caused by an undersized weight allocation.',
+      'CUDA graph replay launch overhead during detokenization.'
+    ],
+    answer: 1,
+    why: 'TTFT measures time before the first token appears (queueing plus prefill). Because TPOT is fast once generation begins, the delay is occurring in queueing or prefill scheduling.'
+  },
+  {
+    q: 'Why must an engineer change only ONE parameter at a time during an optimization iteration?',
+    options: [
+      'Serving engines fail to boot if more than one command-line argument is altered.',
+      'Modifying multiple interacting variables creates confounding effects, making it impossible to attribute performance changes to a single cause.',
+      'The GPU driver must recompile CUDA graphs for each altered parameter individually.',
+      'vLLM licensing restricts multi-variable command line execution.'
+    ],
+    answer: 1,
+    why: 'Serving flags interact heavily (e.g. batch size and memory limits). Changing multiple knobs at once produces multiple competing hypotheses with only a single benchmark data point.'
+  }
+]} />
