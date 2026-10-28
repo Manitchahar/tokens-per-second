@@ -44,7 +44,7 @@ $$
 \text{burn rate} = \frac{\text{fraction missing}}{\text{fraction allowed}}
 $$
 
-SLO p95 TTFT < 600 ms over 30 days → 5% may miss → budget 0.5%.
+SLO p95 TTFT < 600 ms over 30 days → 5% may miss → budget 5%.
 
 - Burn 1.0 = on budget. Burn 2.4 = a month gone in 13 days. Burn 14.4 = a month gone in 2 hours.
 - Alert on **two windows** (5 min + 1 h → page; 1 h + 6 h and 6 h + 3 d → ticket). Burn rate pages; the percentile dashboard explains.
@@ -77,7 +77,7 @@ $$
 | 80% | 4× S | | 95% | 19× S |
 
 - **A slot is held from prefill to the last token.** One 128k prompt is a capacity attack.
-- **Burst budget:** waiting room $= \text{excess} \times \text{tolerable wait}$. $(60 - 12.7)\times 30 = 1{,}419$ excess → a 2 s budget needs 2,838 slots. A room that large also permits multi-minute waits.
+- **Burst budget:** max queue $B = \mu \times W_{\text{tolerable}} = 12.7 \times 2 \approx 25$ requests. A 30 s burst at 60 req/s produces $(60 - 12.7)\times 30 \approx 1{,}419$ excess requests; queueing all of them means a $1{,}419 / 12.7 \approx 112\text{ s}$ wait. Shed the rest.
 - **Unbounded queues are never right**: they convert fast rejections into indefinite waits at full cost.
 
 ## Admission control and shedding
@@ -113,7 +113,7 @@ $$
 | Independent, mild | 0.05 | 2 | **1.05×** |
 | Independent, bad | 0.20 | 2 | **1.24×** |
 | Correlated (backend down) | ≈ 1 | 2 | **3×** |
-| Four layers, dead backend | ≈ 1 | 2 each | **64×** (or 256× at four) |
+| Three layers, dead backend | ≈ 1 | 2 each | **27×** (or 81× at four) |
 
 - Retries **multiply across layers**. Put them at **exactly one layer**.
 - **Retry budget:** at most $N \times (R-1)$ retries, $R \le 2$. 1,000 requests at $R = 1.25$ → 250 retries. Bucket empty → return the error.

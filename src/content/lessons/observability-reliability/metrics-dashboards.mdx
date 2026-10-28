@@ -226,7 +226,6 @@ class Metrics:
             for i, edge in enumerate(LATENCY_BUCKETS):
                 if ttft_s <= edge:
                     self.ttft_hist[i] += 1
-                    break
 
     def rate(self, counter_name: str, window_s: float = 60.0) -> float:
         # a counter read as a rate: an increase over the window, never the raw value

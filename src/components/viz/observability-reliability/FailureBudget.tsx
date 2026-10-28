@@ -24,7 +24,7 @@ const CAPTIONS = [
   'Five hops sharing a 2-second budget with a 20% safety margin gives 320 ms each. If any hop is allowed the full 2 s, the request can never fail before its own deadline.',
   'A retry is free if the failure is rare and independent. It is not free in latency, in load, or in the slot it holds while waiting.',
   'When a downstream dies, its failures are correlated — near 100%. Every client then retries at once, multiplying the offered load on a system that is already down.',
-  'Independent 5% failures with 2 retries cost 1.11× load. The same 2 retries against a dead backend cost 3× load. The retry policy is only safe under the first assumption.',
+  'Independent 5% failures with 2 retries cost 1.05× load. The same 2 retries against a dead backend cost 3× load. The retry policy is only safe under the first assumption.',
   'The standard fix: a client may spend at most a small multiple of its request count on retries. 100 requests with a ratio of 1.5 permits 50 retries — amplification is bounded by construction.',
   'Retries at four layers do not add; they multiply. Three retries at each of four layers is 4⁴ = 256× offered load. This is the classic cause of a self-inflicted outage.',
   'Five numbers, in a runbook, that decide the incident: the total deadline, the per-hop timeout, the max attempts, the retry budget ratio, and whether failures are independent.',

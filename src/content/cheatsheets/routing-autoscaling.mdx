@@ -143,8 +143,8 @@ forever and never serves a request.
 ## Sizing worked example
 
 Average 12 req/s, peak 36 req/s, 26 req/s per replica.
-Floor: $36/26 = 1.4 \Rightarrow 2$. Plus one spare ⇒ **3 replicas**.
-At 2 replicas each carries 18 req/s ⇒ ~70% goodput, multi-second p99.
+Floor: ${}36/26 = 1.4 \Rightarrow 2$. Plus one spare ⇒ **3 replicas**.
+At 2 replicas each carries 18 req/s ⇒ zero headroom, collapsing goodput at peak.
 
 ## Metrics worth a dashboard
 

@@ -30,7 +30,7 @@ const STEPS = [
   'When the model will not fit',
 ];
 const CAPTIONS = [
-  'A rented GPU is charged for every second it exists — busy or idle. So the first thing to know is not how fast it is, but what a second costs. At \$2.50 per hour, one second is \$0.00069.',
+  'A rented GPU is charged for every second it exists — busy or idle. So the first thing to know is not how fast it is, but what a second costs. At $2.50 per hour, one second is $0.00069.',
   'Prefill is the one phase that belongs to a single request alone: the prompt goes through the model in one parallel, compute-bound pass. Nobody shares it, so its cost is entirely yours.',
   'Decode is different. Each step reads all the weights and all the KV, but it produces one token for every sequence in the batch. So one request\'s share of a step is the step time divided by the batch.',
   'Add them and you have the machine time one request consumed: t_prefill + n_out × t_step / B. This is service time, but read as a quantity of machine rather than latency.',
