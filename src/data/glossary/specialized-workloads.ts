@@ -191,4 +191,19 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Training a diffusion model (or distilling one) to sample in 1–4 steps instead of 20–50 — as in SDXL-Turbo. It is the largest latency lever in the ecosystem, it produces a genuinely different image, and it is a training-time decision rather than a serving one.',
     lesson: 'specialized-workloads/diffusion',
   },
+  'tool-registry': {
+    term: 'Tool registry',
+    def: 'The list of tools an agent may call, each with a name, a description, a JSON schema for its arguments and the permissions needed to use it. Its text is pasted into the planner prompt, so it is part of the prefix: render it byte-identically, in a fixed order, or the prefix cache misses on every request.',
+    lesson: 'specialized-workloads/agents-reasoning',
+  },
+  'autonomy-level': {
+    term: 'Agent autonomy level',
+    def: 'Who decides an agent’s next step: nobody (a single call), your code (a fixed workflow), the model choosing a branch, the model choosing every step up to a cap, or the model planning freely. Each level up adds LLM calls, weakens prefix-cache sharing and lengthens the tail: with a 1% slow-call chance, a 20-call task hits at least one slow call 18% of the time.',
+    lesson: 'specialized-workloads/agents-reasoning',
+  },
+  'step-routing': {
+    term: 'Step routing',
+    def: 'Semantic routing applied to each step of an agent task instead of each request: easy steps such as reading a retrieved chunk go to a small model, hard steps such as planning and answering go to a large one. In the worked knowledge agent it cuts cost per task from 0.0100 to 0.00316 dollars. Route at call boundaries, because different models never share KV.',
+    lesson: 'specialized-workloads/agents-reasoning',
+  },
 };

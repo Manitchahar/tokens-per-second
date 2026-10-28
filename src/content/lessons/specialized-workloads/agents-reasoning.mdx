@@ -205,6 +205,93 @@ Cap $o$, bound $k$, keep $g$ as small as the task allows. That is three dials an
   The one caveat: if the trace is *not* appended to the context, you can cache a shorter prefix, which is a genuine server-side saving — but it only works for single-turn questions. Multi-turn reasoning conversations need the trace for coherence.
 </Callout>
 
+## Designing a knowledge agent
+
+Everything so far treated the agent as one growing context. A real system has more moving parts, and each part decides how many LLM calls a task makes, how well the prefix cache works, and how long the slowest user waits. Take the most common kind: a **knowledge agent** that answers questions from a company's documents.
+
+### The loop
+
+It has five parts, and only two of them are the LLM:
+
+1. **Planner.** An LLM call that reads the question and the list of tools and decides the next step: search for something, read a document, or answer.
+2. **Tool registry.** The list of tools the agent may use, each with a name, a description, a JSON schema for its arguments (the format from "Structured output & tool calling") and who is allowed to call it. The registry's text is pasted into the planner's prompt, so **it is part of the prefix**.
+3. **Executor.** Ordinary code, not an LLM. It checks the tool call against the schema and the caller's permissions, runs it with a timeout, and caps the size of the result before anything is appended.
+4. **Retrieval.** The most important tool: a search over the document index that returns the best-matching chunks. This is the RAG pipeline from [RAG, CAG & the serving bill](/learn/prefill-prefix/rag-cag/), called by the agent instead of always running once before the model.
+5. **Answer.** A final LLM call that writes the reply from the evidence gathered, with citations.
+
+The loop is planner → executor → retrieval → planner, again and again, until the planner says "answer" or a step cap is reached. Two serving rules fall out at once. The <Term t="tool-registry">tool registry</Term> must be rendered **byte-identically** every time — tools in a fixed order, no timestamps — or the first pitfall above destroys the cache for every request. And choosing a different subset of tools for each request (with the router from [Semantic caching & semantic routing](/learn/routing-autoscaling/semantic-caching/), for example) makes the prompt shorter but gives each subset its own prefix, so the cache is shared among fewer requests. That is a trade worth measuring, not assuming.
+
+### How much autonomy, and what it costs
+
+"Agent" covers everything from a fixed script to a model that plans its own work. The <Term t="autonomy-level">level of autonomy</Term> — who decides the next step — is the biggest single decision for the serving layer:
+
+| level | who decides the next step | LLM calls per task | prefix cache | tail latency |
+|---|---|---|---|---|
+| 0 · single call | nobody | 1 | system prompt shared by every request | one call |
+| 1 · fixed workflow | your code, same steps every time | fixed, e.g. 6 | the same templates for every task, so high hit rates across requests; independent steps can run in parallel | fixed: the sum of the slowest path |
+| 2 · routed workflow | the LLM picks a branch, your code runs it | fixed per branch | one shared prefix per branch | bounded by the longest branch |
+| 3 · bounded loop | the LLM picks every step, up to a cap $K$ | 1 to $K + 1$ | perfect reuse inside a task, only the system prompt across tasks | the p99 task runs into the cap |
+| 4 · fully autonomous | the LLM plans, replans, spawns sub-agents | no fixed number; only a budget stops it | each sub-agent starts a new prefix; summarising history invalidates the cache from the rewrite onward | set by the budget, not by the work |
+
+Every step up the table buys flexibility and pays in three currencies.
+
+**More calls.** A fixed workflow of 6 calls costs 6 calls. A bounded loop with $K = 8$ costs anywhere from 2 to 9, and the GPU must be sized for the mix, not the median.
+
+**More cache churn.** A fixed workflow has the best caching of all: the same templates for every task mean thousands of requests share each prefix. A loop keeps perfect reuse *within* a task, but each task's context is its own. An autonomous agent that summarises its history to save space throws the cache away at that point: if it compresses 24,800 tokens of history into a 6,000-token summary and then appends a 3,000-token observation, the next call prefills 9,000 tokens instead of 3,000 — three times the work for that step.
+
+**Worse tails.** This is the one people miss. Suppose each LLM call has a 1% chance of being slow (its own p99). A task finishes slowly if *any* of its calls is slow, so the chance a task of $n$ calls contains at least one slow call is
+
+$$
+1 - 0.99^{n}
+$$
+
+For one call that is 1%. For 6 calls it is 5.9%. For 20 calls it is **18.2%** — nearly one task in five hits a slow call. **An agent's p99 is not a call's p99**, and the more autonomous the agent, the larger $n$ gets and the less you control it. The levers are the ones from Module 24: tight per-call timeouts, a step cap, and a total time budget the executor enforces.
+
+<Callout type="mentor" title="Use the least autonomy that does the job">
+  Start at a fixed workflow. Move up a level only when you can name the questions the current level fails on. Most production knowledge agents are levels 1–3: the gain from full autonomy is real on open-ended research tasks, and its cost — unbounded calls, cold prefixes and long tails — lands on the serving layer whether or not the task needed it.
+</Callout>
+
+### Model selection: a router for steps
+
+Not every step needs the big model. Planning and writing the final answer are hard: they need judgment. Reading one retrieved chunk and pulling out the relevant sentences is easy. <Term t="step-routing">Step routing</Term> applies the semantic-routing idea to each step of a task instead of each request: easy steps go to a small model, hard steps to a large one.
+
+Here is a concrete task. The system prompt is cached on both fleets, so only the new tokens count:
+
+| call | what it does | new input tokens | output tokens |
+|---|---|---|---|
+| 1 | plan | 100 (the question) | 150 |
+| 2–5 | read one retrieved chunk each, write an extract | 1,600 each (question + 1,500-token chunk) | 100 each |
+| 6 | answer from the extracts | 650 (question + plan + 4 extracts) | 400 |
+
+Use illustrative prices for the cost of computing a token on each fleet: a **large** model at \$1.00 per million input tokens and \$3.00 per million output tokens, a **small** model at a tenth of that, \$0.10 and \$0.30.
+
+**All large.** Input is 100 + 4 × 1,600 + 650 = 7,150 tokens. Output is 150 + 4 × 100 + 400 = 950 tokens.
+
+$$
+7{,}150 \times \frac{1.00}{10^6} + 950 \times \frac{3.00}{10^6} = 0.00715 + 0.00285 = 0.0100 \text{ dollars per task}
+$$
+
+**Routed: reads on the small model.** The large model still does calls 1 and 6: 750 input and 550 output tokens, \$0.00075 + \$0.00165 = \$0.0024. The small model does the four reads: 6,400 input and 400 output tokens, \$0.00064 + \$0.00012 = \$0.00076.
+
+$$
+0.0024 + 0.00076 = 0.00316 \text{ dollars per task}
+$$
+
+That is 0.0100 / 0.00316 = **3.2× cheaper**, a saving of 1 − 0.00316 / 0.0100 = **68%**. At a million tasks a day, \$10,000 becomes \$3,160.
+
+Latency improves too. Give the large model a time to first token of 0.5 s and 30 ms per output token, and the small one 0.1 s and 10 ms. Running the steps one after another:
+
+- **All large:** plan 0.5 + 150 × 0.03 = 5.0 s; each read 0.5 + 100 × 0.03 = 3.5 s, four of them 14.0 s; answer 0.5 + 400 × 0.03 = 12.5 s. Total **31.5 s**, and the first answer token appears at 5.0 + 14.0 + 0.5 = 19.5 s.
+- **Routed:** plan 5.0 s; each read 0.1 + 100 × 0.01 = 1.1 s, four of them 4.4 s; answer 12.5 s. Total **21.9 s**, first answer token at 5.0 + 4.4 + 0.5 = 9.9 s — half the wait.
+
+Two cautions keep this honest. First, a small model will sometimes write a bad extract, and a wrong extract becomes a wrong answer. The fix is the cascade from the semantic-routing lesson: when the answer step finds an extract unclear, it re-runs that read on the large model. A large read costs 1,600 × \$1.00/M + 100 × \$3.00/M = \$0.0019. If 20% of the 4 reads escalate, that is 0.8 extra large reads, \$0.00152, so the task costs \$0.00316 + \$0.00152 = \$0.00468 — still **2.1× cheaper** than all large.
+
+Second, **route at call boundaries, not in the middle of one context.** The design above works because each reader starts its own short context. If one long agent context were handed from the small model to the large one, the large model's cache would hold none of it, and it would have to prefill the 6,000-plus tokens the small model had read — giving back most of the saving. Different models never share KV.
+
+<Callout type="real" title="Parallel reads beat routing on latency">
+  The four reads do not depend on each other, so a fixed workflow can run them at the same time. All large in parallel: 5.0 + 3.5 + 12.5 = 21.0 s. Routed in parallel: 5.0 + 1.1 + 12.5 = 18.6 s. Parallelism removes more latency than routing does, and only a workflow — not a free-running loop — knows in advance which steps are independent. Routing is the cost lever; structure is the latency lever.
+</Callout>
+
 <Callout type="try" title="Check yourself before continuing">
   1. A 6-turn conversation has contexts 960, 1080, 1240, 1360, 1520, 1640. What is the total prefill without a cache, and with a perfect one?
   2. An agent loop appends 3,000 tokens per turn from an 800-token system prompt. Without cache reuse, what is the total prefill after 20 turns, and what is the ratio to the cached case?
@@ -227,6 +314,7 @@ Cap $o$, bound $k$, keep $g$ as small as the task allows. That is three dials an
 <Quiz client:visible questions={[
   { q: 'A six-turn conversation has contexts 960, 1080, 1240, 1360, 1520, 1640 and adds 840 tokens in total. What fraction of prefill work does a perfect prefix cache remove?', numeric: true, answer: 89, tolerance: 3, unit: '%', why: 'Naive total = 960+1080+1240+1360+1520+1640 = 7,800 token-prefills. Cached = only the new tokens = 840. Saved = 1 - 840/7800 = 89.2%. In FLOPs on an 8B model that is 125 TFLOP down to 13.4.' },
   { q: 'An agent loop starts from an 800-token system prompt and appends 3,000 tokens per turn. Without cache reuse, how many tokens does it prefill by turn 20?', numeric: true, answer: 646000, tolerance: 6000, unit: 'tokens', why: 'Context at turn t is 800 + 3000t, so the total is Σ(800 + 3000t) for t=1..20 = 800·20 + 3000·(20·21/2) = 16,000 + 630,000 = 646,000. With a cache it is 60,000 — a factor of 10.8, and the ratio grows as roughly T/2.' },
+  { q: 'A knowledge agent makes 6 calls per task. On a large model it costs 0.0100 dollars per task. Routing the four chunk-reading steps to a small model at a tenth of the price brings it to 0.00316 dollars. What percentage of the cost does step routing save?', numeric: true, answer: 68, tolerance: 2, unit: '%', why: 'Saving = 1 − 0.00316 / 0.0100 = 0.684, about 68% (3.2× cheaper). The large model still plans and answers (750 input, 550 output tokens = 0.0024 dollars); the small model reads 6,400 input and writes 400 output tokens for 0.00076 dollars. With 20% of reads escalated back to the large model the task costs 0.00468 dollars, still 2.1× cheaper.' },
   { q: 'An 8B model in BF16 on an H100 (3.35 TB/s) decodes a 16,000-token reasoning trace at batch 32. KV is 128 KB per token and bandwidth utilisation is 85%. How many bytes does the final step read per token?', numeric: true, answer: 2.6, tolerance: 0.3, unit: 'GB', why: 'Weights are read once per step, so per token the weight cost is 8.03e9 x 2 / 32 = 0.50 GB. KV at token 16,000 is 16,000 x 128 KB = 2.05 GB. Total 2.55 GB per token, giving 2.55 / (3.35e12 x 0.85) = 0.90 ms per step, or about 1,096 tok/s. At 200 tokens the same batch reads only 0.53 GB, so the long trace runs 4.9x slower per token.' },
   { q: 'Why is long-trace cost an integral rather than mean-times-count?', options: ['Because the GPU batches asynchronously', 'Because the KV cache grows each step, so step time is not constant across the trace', 'Because sampling is stochastic', 'Because weights are read once, not per step'], answer: 1, why: 'Step t reads weights plus t·kv, so the per-step cost grows with t. Summing gives (wT + kvT²/2)/BW. Evaluating at the mean context kv·T/2 halves the KV term — a nearly 2× error that always flatters the result.' },
   { q: 'Which change most reliably restores prefix cache hit rate in an agent system?', options: ['Increasing the block size', 'Removing a live timestamp from the system prompt so prefixes are bit-identical', 'Enabling more aggressive eviction', 'Raising the GPU batch size'], answer: 1, why: 'A timestamp or request ID makes every request a unique prefix, so the cache can never hit — a 0% hit rate cannot be improved by eviction policy. Block size and batch size change the mechanics, not the hit rate. The hit rate comes from prefix determinism.' },

@@ -147,6 +147,92 @@ Two practices make this survivable. First, **warm the replica before it counts**
   Every routing policy in this module prefers the least-loaded replica, and a replica that has just started is the least loaded thing that exists. So your canary does not receive 5% of traffic — it receives whatever the router thinks is fair, which on a cold cache is often far more. Warm it first, or cap its share explicitly, or your 5% canary is really a 60% canary that you believed was 5%.
 </Callout>
 
+## The enterprise map: seven layers, top to bottom
+
+The five layers at the top of this lesson are what you deploy. A company that sells inference to many teams or customers needs a wider map, because three new jobs appear above the replicas — who may send what, how the GPUs are shared out, and which model answers — and the replica itself splits into three layers you tune in different ways.
+
+Here is the whole system, from the request coming in at the top down to the weights at the bottom. For each layer: what it does, what you tune there, and where this course teaches it.
+
+1. **Public API.** The front door clients see: it checks who is calling (authentication), which plan they are on (tiering), and whether they are under their quota and rate limit, and it rejects the rest before any GPU work happens. You tune the per-tier rate limits, the largest `max_tokens` and context a request may ask for, timeouts, and the error a rejected client gets back. Course: "Serving a model over HTTP", "Admission control, backpressure & load shedding" and "Securing an inference service".
+2. **Resource management.** Decides how the GPUs are shared out: which pool of GPUs each tier or team runs on, each tenant's quota, and how much spare capacity each pool keeps. You tune pool sizes, per-tenant concurrency caps and KV shares, and the headroom each pool holds. Course: "Capacity planning & headroom", "Autoscaling on the right signals" and "Admission control, backpressure & load shedding".
+3. **Model selection and orchestration.** Decides which model, version or adapter serves the request: a small model or a large one, the stable version or the canary, the base model or a tenant's LoRA. You tune routing thresholds, the escalation rate of a cascade, and canary share. Course: "Semantic caching & semantic routing", "Multi-model serving & Triton Inference Server", "Versioning, canaries, shadow traffic & rollbacks" and "Multi-LoRA serving".
+4. **Distributed serving.** Decides which copy of the chosen model runs the request, and how one model is spread over many GPUs. You tune the routing policy, the parallelism layout, and the prefill-to-decode ratio. Course: "Load balancing & queue-aware routing", "Prefix- & cache-aware routing", "Tensor parallelism", "Why separate prefill and decode" and this lesson.
+5. **Core inference engine.** The process on the GPU that batches requests step by step and manages the KV cache. You tune `max_num_seqs`, `max_num_batched_tokens`, `gpu_memory_utilization`, chunked prefill and prefix caching. Course: "Continuous batching", "The scheduler’s knobs: token budgets & limits", "Blocks, block tables & PagedAttention", "Prefix caching" and "Metrics & tuning one GPU".
+6. **Model optimization.** Makes each forward pass cheaper without changing what the model is: fewer bits, faster kernels, fewer launches, several tokens per step. You tune the quantization scheme, the attention backend, CUDA graphs and the draft length. Course: "W4A16, W8A8, FP8: choosing a scheme", "Decode attention & attention backends", "CUDA graphs: capture & replay" and "Draft & verify: the core trick".
+7. **The model itself.** The weights and the architecture, which fix the two numbers every layer above inherits: bytes of weights and bytes of KV per token. You choose the model size, the attention layout (GQA), dense or MoE, and the maximum context. Course: "Choosing an open model", "Multi-head attention, MQA & GQA", "How MoE works: routing tokens to experts" and "Memory math: weights, KV cache & concurrency".
+
+Read the list from the bottom up and every layer is a budget handed to the one above it. The model fixes bytes per token; optimization shrinks them; the engine turns them into concurrency; distributed serving multiplies that across GPUs; model selection decides which of those fleets a request lands on; resource management splits the fleets between customers; and the public API decides who gets in. **A problem at one layer is often cheapest to fix one layer lower** — a tenant blowing through its quota is a layer-1 problem, but if every tenant does, the fix is a cheaper model at layer 6.
+
+### Where the gateway ends and the router begins
+
+Layers 1 and 2 are usually one service, the <Term t="api-gateway">API gateway</Term>. Layer 4 is the router from the first lesson of this module. They are easy to blur, and blurring them causes real bugs, so draw the line by what each one needs to know.
+
+The **gateway** answers *may this request run, and at what priority?* It needs only the request and the tenant's own counters: the key, the tier, the tokens left in the quota, the request's size. It knows nothing about GPUs, so it scales like an ordinary web tier, and a rejection there costs nothing — a `429` sent before any prefill.
+
+The **router** answers *where does this admitted request run?* It needs live state from every replica — KV tokens in use, queue depth, which prefixes are cached — and nothing about who the tenant is beyond a priority label.
+
+Two failure modes follow. If the router enforces quotas, it must keep every tenant's counters in sync across router instances, and every rejection happens after the request has already been placed in a queue. If the gateway tries to balance load, it is back to counting connections, which is the problem Lesson 23.1 started with. Keep the gateway deciding *whether* and the router deciding *where*.
+
+### Isolation, quotas and audit are serving requirements
+
+On a shared fleet, three things a single-user server can ignore become part of serving:
+
+- **Isolation.** One tenant must not be able to slow down or read another. That means a per-tenant concurrency cap and KV share (so one tenant's long prompts cannot fill the pool) and a tenant ID in every cache key, as in "Securing an inference service". The cost is a little less sharing in the prefix cache; the alternative is a data leak.
+- **<Term t="token-quota">Quotas in tokens</Term>, not requests.** A request can be 40 tokens or 40,000, so a limit of "100 requests per minute" lets one tenant use a thousand times the GPU of another. Charge the quota in tokens — prompt plus output — because that is what the GPU actually spends.
+- **Audit.** Every request leaves one <Term t="audit-record">audit record</Term>: tenant, model and version, prompt and output token counts, the admission decision and the latency. Billing, quota enforcement and incident review all read it, so the gateway should count tokens once and feed all three from that count. The record holds counts and IDs, not raw prompts, unless a tenant has agreed otherwise.
+
+### A worked token bucket
+
+The standard way to enforce a token quota is a <Term t="token-bucket">token bucket</Term>. The bucket holds up to $b$ tokens. It refills at a steady rate $r$ tokens per second. Each request takes its cost out of the bucket when it is admitted; if the bucket does not hold enough, the request is rejected (or waits).
+
+Take a tenant on a plan of **60,000 tokens per minute** with a burst of **20,000**. Then:
+
+$$
+r = \frac{60{,}000}{60\ \text{s}} = 1{,}000\ \text{tokens/s}, \qquad b = 20{,}000\ \text{tokens}
+$$
+
+Each request has a 1,500-token prompt and asks for up to 500 output tokens. The gateway cannot know how many tokens the model will actually write, so it reserves the worst case at admission:
+
+$$
+c = 1{,}500 + 500 = 2{,}000\ \text{tokens per request}
+$$
+
+The tenant has been quiet, so the bucket is full. Then a batch job sends **30 requests at once**.
+
+- **At t = 0:** the bucket holds 20,000, enough for $\lfloor 20{,}000 / 2{,}000 \rfloor = 10$ requests. Ten are admitted and the bucket is empty. The other 20 get a `429`.
+- **After that:** the bucket refills 1,000 tokens a second, so a new request fits every 2,000 / 1,000 = 2 seconds. The 20 rejected requests need 20 × 2,000 = 40,000 tokens, which takes 40,000 / 1,000 = **40 seconds** to refill. If the client retries politely, the last request is admitted at t = 40 s.
+- **Over the first minute:** the 30 requests reserved 30 × 2,000 = 60,000 tokens in 40 seconds, faster than the plan's rate of 1,000 a second would allow (40,000 in 40 s), because the burst came first. Had the job kept sending, the tenant could have spent the 20,000 burst plus 60 seconds of refill, 60,000 — **80,000 tokens** in one minute. In general the most a tenant can spend in any window of $T$ seconds is
+
+$$
+b + rT
+$$
+
+That last line is the one capacity planning needs. A "60,000 tokens a minute" plan really allows 80,000 in the worst minute, and the 10 requests at t = 0 land on the GPUs as a single spike. Those 10 requests reserve 20,000 tokens of KV. At Llama-3.1-8B's 131,072 bytes per token that is 2.6 GB, about 5% of the 402,000-token pool from the quiz below — harmless for one tenant. But if 50 tenants on this plan burst at the same moment, that is 50 × 20,000 = 1,000,000 tokens, about 2.5 replicas' entire KV pools. **Per-tenant buckets protect tenants from each other; only a global admission limit and headroom protect the fleet from all of them at once.**
+
+```python
+# A token bucket for one tenant: 60,000 tokens/min, burst of 20,000.
+RATE = 60_000 / 60      # refill, tokens per second
+BURST = 20_000          # bucket capacity
+COST = 1_500 + 500      # prompt + max_tokens reserved per request
+
+tokens, admitted = BURST, []
+waiting = 30                       # 30 requests arrive at t = 0
+for t in range(0, 61):             # one tick per second
+    if t > 0:
+        tokens = min(BURST, tokens + RATE)
+    while waiting and tokens >= COST:
+        tokens -= COST
+        waiting -= 1
+        admitted.append(t)
+
+print(admitted.count(0), "admitted at t=0")             # 10
+print("last of the 30 admitted at t =", admitted[-1])   # 40
+```
+
+<Callout type="pitfall" title="Reserving max_tokens punishes generous clients">
+  Because the gateway reserves the prompt plus `max_tokens` up front, a client that sets `max_tokens` to 4,096 for answers that are really about 200 tokens reserves about 20 times the output it uses (4,096 / 200 ≈ 20), and hits its limit long before it has spent its quota. Good gateways refund the unused part when the request finishes. Good clients set `max_tokens` close to what they need. Both matter, and the refund is what makes the quota mean what the plan says.
+</Callout>
+
 <KeyNotes>
   1. Every LLM deployment is five layers: app, routing, scaling, replicas, GPU. The technologies differ in which layers they own.
   2. A GPU inference replica breaks four pod assumptions: small state, fast start, cheap replacement, one process per GPU.
@@ -165,4 +251,5 @@ Two practices make this survivable. First, **warm the replica before it counts**
   { q: 'A serving pod needs to be able to serve its prefill and decode without them interfering. Which scheduling concern does a generic scheduler not express?', options: ['How many CPUs to give it', 'Placing prefill-heavy and decode-heavy workloads on appropriately specialised GPUs, and keeping prefix-affine work near the cache holding it', 'Which node has the most RAM', 'Whether to use HTTPS'], answer: 1, why: 'This is the Module 21 disaggregation and Lesson 23.2 cache-locality problem. A generic scheduler balances CPU, memory and GPU count; it has no concept that this workload has phases and cache state worth co-locating. That gap is exactly what llm-d exists to fill.' },
   { q: 'Llama-3.1-8B weights in BF16 take about 16 GB. An 80 GB H100 leaves roughly 56 GB of KV pool after weights, CUDA context and workspace. At 131,072 bytes of KV per token, how many KV tokens does that pool hold?', numeric: true, answer: 402, tolerance: 15, unit: 'thousand tokens', why: '56 GB = 56 × 10⁹ bytes. Dividing by 131,072 bytes per token gives 427,000 — and after reserving for fragmentation the usable pool is about 402,000 tokens. That is 392 users at a 1,024-token context, or 49 at 8,250. The pool size is the first half of every capacity calculation in this module.' },
   { q: 'You deploy 4 replicas and roll a new model version. An H100 holds about 402,374 KV tokens; a warm replica holds 100,000 tokens while the new cold replica holds 0. What percentage of its pool is occupied on the warm replica?', numeric: true, answer: 25, tolerance: 1, unit: '%', why: '100,000 / 402,374 ≈ 0.2485 (about 25%), while the new replica sits at 0.00 (0%). Because a zero-load replica wins every comparison, a least-loaded router routes an outsized share of traffic to the cold replica unless it is pre-warmed or has its traffic capped.' },
+  { q: 'A tenant’s token bucket refills at 60,000 tokens per minute and holds at most 20,000. The gateway reserves 2,000 tokens per request (prompt plus max_tokens). With the bucket full, 30 requests arrive at once and the client retries each rejected one as soon as it would fit. How many seconds after the burst is the last request admitted?', numeric: true, answer: 40, tolerance: 1, unit: 's', why: 'The refill rate is 60,000 / 60 = 1,000 tokens/s. The full bucket admits 20,000 / 2,000 = 10 requests at once. The other 20 need 20 × 2,000 = 40,000 tokens, which take 40,000 / 1,000 = 40 s to refill. A tenant that kept sending could spend b + rT = 20,000 + 60,000 = 80,000 tokens in its first minute, not 60,000.' },
 ] } />

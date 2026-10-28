@@ -119,6 +119,32 @@ $$
 - Kill the cache hit rate with: a timestamp in the prompt, non-deterministic tool output, swapping adapters mid-conversation.
 - Three levers: cap observations, cache the prefix, truncate/summarise old turns.
 
+### Designing a knowledge agent
+
+Loop: **planner** (LLM) → **tool registry** (in the prefix: render byte-identically) → **executor** (code: schema, permissions, timeout, result cap) → **retrieval** (RAG as a tool) → back to planner, until **answer** (LLM) or the step cap.
+
+| autonomy level | LLM calls | prefix cache | tail |
+|---|---|---|---|
+| 0 single call | 1 | shared by all requests | one call |
+| 1 fixed workflow | fixed | same templates for every task; parallel steps | fixed |
+| 2 routed workflow | fixed per branch | one prefix per branch | longest branch |
+| 3 bounded loop | 1 to $K+1$ | reuse within a task only | p99 at the cap |
+| 4 autonomous | budget-bound | sub-agents and summaries start new prefixes | set by the budget |
+
+$$
+P(\text{task hits a slow call}) = 1 - 0.99^{n}
+$$
+
+$n$ = 6 ⇒ 5.9%; $n$ = 20 ⇒ **18.2%**. Summarising 24,800 tokens to 6,000 then adding 3,000 ⇒ next call prefills 9,000, not 3,000 (3×).
+
+**Step routing** (illustrative prices: large \$1.00/\$3.00 per M in/out, small \$0.10/\$0.30). Plan 100 in/150 out, 4 reads 1,600 in/100 out each, answer 650 in/400 out:
+
+- All large: 7,150 in + 950 out ⇒ \$0.00715 + \$0.00285 = **\$0.0100** per task.
+- Reads small: large \$0.0024 + small \$0.00076 = **\$0.00316** ⇒ 3.2× cheaper, **68% saved**.
+- 20% of reads escalate to large (\$0.0019 each): + \$0.00152 ⇒ \$0.00468, still **2.1×** cheaper.
+- Latency, sequential (large 0.5 s TTFT + 30 ms/token, small 0.1 s + 10 ms): 31.5 s → 21.9 s; first answer token 19.5 s → 9.9 s. Parallel reads: 21.0 s → 18.6 s.
+- Route at **call boundaries**: different models never share KV.
+
 ## 5 · Batch inference & RL rollouts
 
 $$

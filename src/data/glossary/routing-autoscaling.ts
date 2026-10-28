@@ -182,4 +182,24 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Running a new cache or router on real traffic while still serving the normal answer, logging what the new component would have done. It exposes would-be hits and would-be false hits with no user impact, and it is the cheapest way to earn the right to turn the component on.',
     lesson: 'routing-autoscaling/semantic-caching',
   },
+  'api-gateway': {
+    term: 'API gateway',
+    def: 'The public front door of a shared inference service. It authenticates the caller, finds their tier, checks their quota and rate limit, validates the request size and writes the audit record, then admits or rejects the request before any GPU work. It decides whether a request may run; the router behind it decides where.',
+    lesson: 'routing-autoscaling/orchestration',
+  },
+  'token-bucket': {
+    term: 'Token bucket',
+    def: 'A rate limiter that holds up to b tokens and refills at r tokens per second; each request removes its cost when admitted and is rejected if the bucket is short. It allows a burst of b and a long-run rate of r, so the most a tenant can spend in T seconds is b + rT. A 60,000 tokens/min plan with a 20,000 burst allows 80,000 in the worst minute.',
+    lesson: 'routing-autoscaling/orchestration',
+  },
+  'token-quota': {
+    term: 'Token quota',
+    def: 'A tenant limit counted in tokens (prompt plus output) rather than requests, because a request can be 40 tokens or 40,000 and the GPU spends tokens. The gateway usually reserves prompt plus max_tokens at admission and refunds the unused output when the request finishes.',
+    lesson: 'routing-autoscaling/orchestration',
+  },
+  'audit-record': {
+    term: 'Audit record',
+    def: 'One log entry per request: tenant, model and version, prompt and output token counts, the admission decision and the latency. Billing, quota enforcement and incident review all read it, so the tokens are counted once and feed all three. It holds counts and IDs, not raw prompts.',
+    lesson: 'routing-autoscaling/orchestration',
+  },
 };

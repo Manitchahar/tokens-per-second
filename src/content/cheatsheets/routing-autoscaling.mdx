@@ -140,6 +140,33 @@ spec:
 Use a **startupProbe**. A liveness probe during weight loading restarts the pod
 forever and never serves a request.
 
+## The enterprise map: seven layers
+
+| # | Layer | What you tune |
+|---|---|---|
+| 1 | Public API: auth, quotas, rate limits, tiering | per-tier limits, max `max_tokens` and context, timeouts |
+| 2 | Resource management: tenant quotas, GPU pools | pool sizes, per-tenant caps and KV share, headroom |
+| 3 | Model selection & orchestration | routing thresholds, cascade escalation, canary share |
+| 4 | Distributed serving | routing policy, TP/PP layout, prefill:decode ratio |
+| 5 | Core inference engine | `max_num_seqs`, `max_num_batched_tokens`, chunked prefill, prefix caching |
+| 6 | Model optimization | quantization scheme, attention backend, CUDA graphs, draft length |
+| 7 | The model | size, GQA, dense vs MoE, max context |
+
+- **Gateway** (layers 1–2) decides *whether* and at what priority, from the request and tenant counters only. **Router** (layer 4) decides *where*, from live replica state.
+- Quota in **tokens**, not requests. Isolate tenants with per-tenant caps, KV shares and a tenant ID in every cache key. One **audit record** per request feeds billing, quotas and incident review.
+
+### Token bucket
+
+$$
+r = \frac{\text{tokens per minute}}{60}, \qquad \text{admitted at once} = \left\lfloor \frac{b}{c} \right\rfloor, \qquad \text{max spend in } T \text{ s} = b + rT
+$$
+
+Worked: 60,000 tokens/min ⇒ $r$ = 1,000 tokens/s, burst $b$ = 20,000, cost $c$ = 1,500 + 500 = 2,000 per request.
+30 requests at once ⇒ **10 admitted** at t = 0, the other 20 need 40,000 / 1,000 = **40 s** of refill.
+Worst minute = 20,000 + 60,000 = **80,000 tokens**, not 60,000.
+50 tenants bursting together = 1,000,000 KV tokens ≈ **2.5 H100 pools** of 402,000 ⇒ also enforce a global admission limit.
+`max_tokens` 4,096 for 200-token answers reserves ~20× the real output; refund the unused part.
+
 ## Sizing worked example
 
 Average 12 req/s, peak 36 req/s, 26 req/s per replica.
