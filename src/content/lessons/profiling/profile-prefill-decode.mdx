@@ -176,11 +176,11 @@ $$
 At long context the attention bar is no longer a rounding error. From Module 02, attention intensity grows linearly with $T$ while the GEMMs' intensity is fixed by their shape, so eventually attention's *compute* term becomes the floor too.
 
 $$
-t_{\text{attn}} \approx \frac{4 T^2 d}{\text{peak} \times \text{MFU}}, \qquad
-t_{\text{GEMM}} \approx \frac{2Pd}{\text{peak} \times \text{MFU}}
+t_{\text{attn}} \approx \frac{2 L d T^2}{\text{peak} \times \text{MFU}}, \qquad
+t_{\text{GEMM}} \approx \frac{2PT}{\text{peak} \times \text{MFU}}
 $$
 
-They are equal when 4T²d = 2Pd, i.e. at $T = \sqrt{P/2}$. For Llama-3.1-8B that is $\sqrt{4\times 10^9} \approx 63{,}000$ tokens of pure FLOPs. In practice attention becomes the *bandwidth* problem far earlier — at 8k context it is already the second-longest bar, and the standard fixes are the ones in Module 14: FlashAttention to cut its memory traffic, and decode-specific attention kernels that exploit $q$ having one row.
+They are equal when $2 L d T^2 = 2PT$, i.e. at $T = \frac{P}{L d}$ (for causal attention; $\frac{P}{2 L d} \approx 30{,}600$ non-causal). For Llama-3.1-8B ($L=32, d=4096$) that is $\frac{8.03\times 10^9}{32 \times 4096} \approx 61{,}000$ tokens of pure FLOPs. In practice attention becomes the *bandwidth* problem far earlier — at 8k context it is already the second-longest bar, and the standard fixes are the ones in Module 14: FlashAttention to cut its memory traffic, and decode-specific attention kernels that exploit $q$ having one row.
 
 <Callout type="pitfall" title="The optimization that helps prefill and hurts decode">
   **Fusing the SiLU and the multiply** (Module 13) is a clear win in prefill: you save a launch and a round trip.

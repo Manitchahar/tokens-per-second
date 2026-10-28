@@ -27,7 +27,7 @@ Now put 64 sequences in the batch. The weights are read **once for all 64** — 
   So the two techniques are substitutes, not complements: <Term t="speculation-saves-weights">batching and speculation are substitutes</Term>. **The more you have already batched, the less speculation has left to give you.** At batch 64 there is essentially nothing left, which is why a throughput-optimised serving deployment should not expect much from it, while an interactive low-latency deployment can expect a lot.
 </Callout>
 
-## The regime that helps: large per-step overhead
+## The regime that hurts: large per-step overhead
 
 Module 15 taught you that a decode step is not only memory and math — it is also **launches and Python**. Sampling, the scheduler, kernel launches, and the gaps between them add up to a fixed cost per step. At small batch on a fast GPU this can be a large fraction of the step.
 

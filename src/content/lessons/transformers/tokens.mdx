@@ -148,14 +148,14 @@ $$
 \text{KV cache bytes} = T \times 2 \times 32 \times 8 \times 128 \times 2 = T \times 131{,}072 \text{ bytes}
 $$
 
-so a 4,000-token prompt holds 4,000 × 131,072 = **512 MiB** of KV cache. And 4,000 tokens of English prose is about 16,000 characters: roughly four paragraphs.
+so a 4,000-token prompt holds 4,000 × 131,072 = **500 MiB** of KV cache. And 4,000 tokens of English prose is about 16,000 characters: roughly four paragraphs.
 
 | Prompt | Characters | Tokens | KV cache (Llama-3.1-8B) |
 |---|---|---|---|
 | A one-line question | 60 | 15 | 1.9 MiB |
-| A code review request | 2,400 | 960 | 123 MiB |
-| A long document | 16,000 | 4,000 | 512 MiB |
-| The same document in Chinese | 4,000 chars | ~5,500 | 704 MiB |
+| A code review request | 2,400 | 960 | 120 MiB |
+| A long document | 16,000 | 4,000 | 500 MiB |
+| The same document in Chinese | 4,000 chars | ~5,500 | 688 MiB |
 
 **The multiply you will do in production.** $T = 8{,}192$ tokens × 131,072 bytes = **1.07 GB** of KV cache for one user. On an 80 GB H100 with 16.1 GB of Llama-3.1-8B weights, that is 1.07 GB per concurrent sequence — about 58 sequences before the card is full. Module 05 is entirely about that arithmetic, and it is the arithmetic that decides how many users one GPU can serve.
 
@@ -217,7 +217,7 @@ Real tokenizers add one thing: they never let a merge cross a category boundary.
   { q: 'How many characters are in the string "the transformer reads tokens"?', numeric: true, answer: 28, tolerance: 0, why: '"the" is 3, a space 1, "transformer" is 11, a space 1, "reads" is 5, a space 1, "tokens" is 6: 3+1+11+1+5+1+6 = 28.' },
   { q: 'If that sentence tokenizes to 7 tokens, what is the characters-per-token ratio?', numeric: true, answer: 4, tolerance: 0.05, why: '28 ÷ 7 = 4.00 characters per token, which is exactly the English average.' },
   { q: 'Llama-3.1’s vocabulary holds 128,256 entries. Why is that number exactly divisible by 256?', options: ['It is a power of two, like every vocabulary', 'The base of every BPE vocabulary is one token per possible byte value, and the learned merges come in multiples of that', 'Because 256 is the largest vocabulary that fits in a 16-bit ID', 'Because 256 is the number of characters in the Latin alphabet'], answer: 1, why: 'BPE starts from the 256 possible byte values, then adds learned merges. 128,256 = 256 × 501. It guarantees that any input can be spelled, so no "unknown" token is needed — Llama-2 had one, Llama-3 does not.' },
-  { q: 'A prompt is 4,000 tokens on Llama-3.1-8B. How much KV cache does it hold, in MiB?', numeric: true, answer: 512, tolerance: 8, unit: 'MiB', why: '4,000 × 131,072 bytes = 524,288,000 bytes = 500 MiB, conventionally 512 MiB using the exact per-token figure of 128 KiB.' },
+  { q: 'A prompt is 4,000 tokens on Llama-3.1-8B. How much KV cache does it hold, in MiB?', numeric: true, answer: 500, tolerance: 10, unit: 'MiB', why: '4,000 × 131,072 bytes = 524,288,000 bytes = 500 MiB (4,000 × 128 KiB ÷ 1,024 KiB/MiB).' },
   { q: 'Why does code usually produce more tokens per character than English prose?', options: ['Code is always longer', 'Code is full of rare symbols and short pieces with no natural word structure, so the vocabulary covers it less efficiently', 'Tokenizers skip whitespace in code', 'Because code contains more uppercase letters'], answer: 1, why: 'The 4 characters-per-token figure is measured on English prose. Source code mixes rare identifiers, operators and digits, so the merge table covers it less well — typically 2.5–3 characters per token.' },
   { q: 'A Chinese prompt and an English prompt express the same information. The Chinese one uses 2,500 tokens, the English one 1,000. Why?', options: ['Chinese models are lower quality', 'Han characters usually cost about one token each, so the same meaning needs more tokens', 'The tokenizer was trained only on English', 'Chinese text has more punctuation'], answer: 1, why: 'One Han character carries roughly the meaning of an English *word*, so the same information needs ~2.5× the characters, and Han characters are not well covered by merge patterns. Budget per-language, not per-character.' },
 ] } />

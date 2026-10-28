@@ -1,4 +1,4 @@
-﻿---
+---
 title: 'Attention from scratch: Q, K and V'
 summary: 'The mechanism the whole architecture is named after, built in six steps: project, score, scale, mask, softmax, mix. Every number is small enough to check by hand, and every step is a place an inference engineer later has to optimise.'
 objectives:
@@ -164,8 +164,8 @@ So per layer, attention is $F_{\text{decode}} = 4\,T\,d_{\text{model}}$ FLOPs fo
 
 | Phase | Tokens | Attention FLOPs | Weight bytes |
 |---|---|---|---|
-| Decode, 1 token | $T = 1{,}000$ | 5.2 G | 83.9 MB/layer |
-| Decode, 1 token | $T = 8{,}192$ | **43.0 G** | 83.9 MB/layer |
+| Decode, 1 token | $T = 1{,}000$ | 0.52 G | 83.9 MB/layer |
+| Decode, 1 token | $T = 8{,}192$ | **4.3 G** | 83.9 MB/layer |
 | Prefill, $T = 8{,}192$ | | **5.5 T** | 2.68 GB |
 | Prefill, $T = 32{,}768$ | | **88.0 T** | 2.68 GB |
 
@@ -234,7 +234,7 @@ PyTorch's fused `scaled_dot_product_attention` does the same thing, and at the t
   { q: 'For the visual’s query q = [0.9, 0.2, −0.2, 1.3] and key k = [1.1, 0.1, −0.1, 1.2], what is q · k?', numeric: true, answer: 2.59, tolerance: 0.02, why: '0.9×1.1 + 0.2×0.1 + (−0.2)(−0.1) + 1.3×1.2 = 0.99 + 0.02 + 0.02 + 1.56 = 2.59.' },
   { q: 'Attention scores for a real head are divided by √d_head. At d_head = 128, about what is that divisor?', numeric: true, answer: 11.31, tolerance: 0.2, unit: 'FLOP-free', why: '√128 = 11.3137. It is a fixed softmax temperature: without it the scores are too large, softmax goes one-hot, and other keys get zero gradient.' },
   { q: 'Why does the causal mask use minus infinity rather than zero?', options: ['It is faster on the GPU', 'Because e^(−∞) = 0, so future keys get exactly zero share, whereas a 0 would give them e^0 = 1 and steal attention', 'Because zero is not a valid number in BF16', 'Because softmax cannot handle zeros'], answer: 1, why: 'Masked positions are removed by making their exponential zero. Adding 0 would leave them competing on equal footing with a real score of 0.' },
-  { q: 'Llama-3.1-8B: attention costs 4·T·d_model FLOPs per layer for one decode step. At T = 8,192, how many FLOPs, in GFLOPs, for all 32 layers?', numeric: true, answer: 43, tolerance: 2, unit: 'GFLOP', why: '4 × 8,192 × 4,096 = 134.2 MFLOP per layer, × 32 layers = 4.29 GFLOP ≈ 43 GFLOP. Small against 15 GFLOP of dense weights per token — attention is not the bottleneck at this length.' },
+  { q: 'Llama-3.1-8B: attention costs 4·T·d_model FLOPs per layer for one decode step. At T = 8,192, how many FLOPs, in GFLOPs, for all 32 layers?', numeric: true, answer: 4.3, tolerance: 0.2, unit: 'GFLOP', why: '4 × 8,192 × 4,096 = 134.2 MFLOP per layer, × 32 layers = 4.29 GFLOP ≈ 4.3 GFLOP. Small against 15 GFLOP of dense weights per token — attention is not the bottleneck at this length.' },
   { q: 'At roughly what context length does attention overtake the weight matrices in FLOPs for Llama-3.1-8B?', options: ['~500 tokens', '~5,300 tokens', '~53,000 tokens', '~530,000 tokens'], answer: 2, why: 'Set 2T²·d·L = 2·T·P_layer, so T = P_layer/(d·L) = 6.979e9/(4096 × 32) ≈ 53,200 tokens. Below that attention is cheaper than the weights; above it, attention dominates.' },
   { q: 'How many bytes of KV cache does one token occupy in Llama-3.1-8B, in KiB?', numeric: true, answer: 128, tolerance: 2, unit: 'KiB', why: '2 (K and V) × 32 layers × 8 KV heads × 128 head_dim × 2 bytes = 131,072 bytes = 128 KiB per token per sequence.' },
 ] } />

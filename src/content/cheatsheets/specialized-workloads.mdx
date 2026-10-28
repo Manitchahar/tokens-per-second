@@ -99,7 +99,7 @@ $$
 \text{agent prefill without cache} = \sum_{t=1}^{T}(s + to) = Ts + o\frac{T(T+1)}{2} = O(T^2)
 $$
 
-8 turns, $s=800$, $o=3000$: 24,000 (cached) vs 114,400 → **4.8×**; 20 turns → 646,000 → **10.8×**. Ratio $\approx 2T$.
+8 turns, $s=800$, $o=3000$: 24,000 (cached) vs 114,400 → **4.8×**; 20 turns → 646,000 → **10.8×**. Ratio $\approx T/2$.
 
 $$
 \text{trace total} = \frac{wT/B + kv\,T^2/2}{\text{BW}\cdot\text{MBU}}
@@ -135,9 +135,9 @@ $$
 
 | group (4,096 tok) | total KV | share | GPUs of 8 |
 |---|---|---|---|
-| 512 | 0.27 TB | 43% | 1 |
-| 1,024 | 0.55 TB | 86% | 2 |
-| 4,096 | 2.20 TB | 344% | won't fit |
+| 512 | 0.27 TB | 43% | 5 |
+| 1,024 | 0.55 TB | 86% | 9 (won't fit) |
+| 4,096 | 2.20 TB | 344% | 35 (won't fit) |
 
 Decode throughput, 8B on one H100 at 4,096 context:
 
@@ -147,7 +147,7 @@ Decode throughput, 8B on one H100 at 4,096 context:
 | 64 | 50 GB | 3,614 tok/s | 56 tok/s |
 | 512 | 291 GB | 5,011 tok/s | 10 tok/s |
 
-- **KV is the constraint, not weights** (86% vs 3%). Size by **tokens in flight**, not parameters.
+- **KV is the constraint, not weights** (86% vs 20%). Size by **tokens in flight**, not parameters.
 - **Peak memory = group size**, never average. Sizing for average OOMs at step start.
 - Batch drains → tail runs at ~¼ peak throughput (that is the batch-8 regime).
 - **Cap generation at ~75% of context**, leaving 25% for the reward pass. No cap → the run wedges.
@@ -173,21 +173,21 @@ $$
 \text{BW utilisation} = \frac{\text{bytes / peak BW}}{\text{step time}}
 $$
 
-SD 1.5, 512², A100 (2.0 TB/s): 2.7 GB per step, 55 ms → 1.35 ms of bandwidth → **2.5% → compute-bound**.
+SD 1.5, 512², A100 (2.0 TB/s): 1.74 GB per step, 55 ms → 0.87 ms of bandwidth → **1.6% → compute-bound**.
 
 | workload | BW utilisation | bound by |
 |---|---|---|
 | LLM decode batch 1 | 20–35% | memory |
 | LLM decode batch 32 | 60–80% | memory |
-| **diffusion step** | **~2%** | **compute** |
+| **diffusion step** | **~1.6%** | **compute** |
 
 Memory (SD 1.5, 512², FP16):
 
 $$
-\text{widest tensor} = 320 \times 512 \times 512 \times 2 = 168\text{ MB};\quad \times 6 \approx 1.0\text{ GB/image}
+\text{widest tensor} = 320 \times 64 \times 64 \times 2 = 2.62\text{ MB};\quad \times 6 \approx 15.7\text{ MB/image}
 $$
 
-2.1 GB of weights → **activations overtake weights at batch 2.**
+2.1 GB weights; latent compression avoids the 168 MB/tensor (1.0 GB/image) pixel-space tax.
 
 | model | steps | s/image (A100) |
 |---|---|---|
@@ -237,7 +237,7 @@ $$
 
 Llama-3.2-3B (28 layers, 8 KV heads × 128, 16-bit): 112 KB/token → 229 MB at 2K, 918 MB at 8K.
 
-NPU arithmetic: one token costs $2P$, which is 6.4 GFLOP. At an effective 9 TOP/s that is 0.7 ms, against 50 ms of memory time — the NPU is busy **1.4%** of the step. Prefill of 500 tokens is 3.2 TFLOP → **357 ms**, which is where TOPS finally matters.
+NPU arithmetic: one token costs ${}2P$, which is 6.4 GFLOP. At an effective 9 TOP/s that is 0.7 ms, against 50 ms of memory time — the NPU is busy **1.4%** of the step. Prefill of 500 tokens is 3.2 TFLOP → **357 ms**, which is where TOPS finally matters.
 
 Thermal: at 55% of burst clock, 60 × 0.6 × 0.55 ÷ 1.81 = 11 tok/s. Twenty becomes eleven.
 

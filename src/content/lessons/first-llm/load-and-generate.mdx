@@ -104,7 +104,7 @@ Everything else in the course is an optimisation of one loop. Let us name it, be
 </Scrolly>
 
 <Callout type="math" title="Why decode is slower than it looks">
-  Prefill of 8 tokens and decode of 1 token do almost the **same number of FLOPs per token**: both pass every token through all 32 layers. But prefill amortises the weight reads across 8 tokens, while decode pays for them alone. On a T4, decoding Qwen2.5-0.5B costs about 2–3 ms per step, almost entirely spent waiting for bytes:
+  Prefill of 8 tokens and decode of 1 token do almost the **same number of FLOPs per token**: both pass every token through all 24 layers. But prefill amortises the weight reads across 8 tokens, while decode pays for them alone. On a T4, decoding Qwen2.5-0.5B costs about 2–3 ms per step, almost entirely spent waiting for bytes:
 
   $$
   t_{\text{decode}} \approx \frac{\text{weights} + \text{KV cache}}{\text{bandwidth}} + \text{overhead}

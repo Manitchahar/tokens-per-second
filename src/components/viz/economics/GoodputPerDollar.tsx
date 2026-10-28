@@ -40,7 +40,7 @@ const CAPTIONS = [
   'Decode is memory-bound, so a card that makes tokens cheap is a card with a low price per unit of bandwidth. From the A100 to the B200 that number barely moves — which is a real and under-appreciated finding.',
   'Prefill is compute-bound, so for a prompt-heavy job the ranking is by price per unit of FLOP/s. And here the newer cards pull clearly ahead: the H100 is about half the cost per FLOP of an A100.',
   'The two rankings disagree. The card that wins a decode-heavy product is not necessarily the card that wins a summarization product — and most real traffic is a mixture, so the honest answer depends on the mixture.',
-  'The break-even test is simple enough to do in your head: a cheaper card wins if it is proportionally slower than it is cheaper. A100 is 1.6x slower than an H100 and 1.56x cheaper — it is a wash, and it does not fit.',
+  'The break-even test is simple enough to do in your head: a cheaper card wins if it is proportionally slower than it is cheaper. A100 is 1.6x slower than an H100 and 1.56x cheaper — it is essentially a wash on value.',
   'Plot every candidate configuration on cost against speed and keep the ones nothing else beats. In a real decision you get a set, not a winner, and the constraints you already know — memory, tail latency, minimum batch — pick from it.',
 ];
 

@@ -47,7 +47,7 @@ export default function SpecMethods() {
   const r = block(a, m.rho, gamma, verifyPass(machine, gamma).total, tDecode);
   const sp = useTween(r.speedup, 450);
 
-  // the plane: a on x, rho on y (inverted, so cheap is up)
+  // the plane: a on x, rho on y
   const PX = 96, PY = 56, PW = 300, PH = 190;
   const AMIN = 0, AMAX = 0.95;
   const RMIN = 0, RMAX = 0.32;
@@ -88,12 +88,12 @@ export default function SpecMethods() {
         </>
       }
     >
-      <svg viewBox="0 0 640 392" role="img" aria-label="A scatter plot with acceptance rate on the horizontal axis and draft cost ratio on the vertical axis, showing six speculative decoding methods as labelled points and a diagonal break-even line where acceptance equals cost. Points above and to the right of the line are faster than plain decoding.">
+      <svg viewBox="0 0 640 392" role="img" aria-label="A scatter plot with acceptance rate on the horizontal axis and draft cost ratio on the vertical axis, showing six speculative decoding methods as labelled points and a diagonal break-even line where acceptance equals cost. Points below and to the right of the line are faster than plain decoding.">
         {/* ── axes ─────────────────────────────────────────── */}
         <Label x={PX} y={34} tone={2} size={11} mono={false} bold>The plane every method lives on</Label>
         <Label x={PX + PW} y={PY - 8} anchor="end" size={9.5} tone={2}>acceptance rate a →</Label>
         <Label x={PX - 10} y={PY + 4} anchor="end" size={9.5} tone={2}>cost rho →</Label>
-        <Label x={PX - 10} y={PY + 17} anchor="end" size={8.5} tone={3}>(up = cheap)</Label>
+        <Label x={PX - 10} y={PY + 17} anchor="end" size={8.5} tone={3}>(down = cheap)</Label>
 
         {/* grid */}
         {[0.2, 0.4, 0.6, 0.8].map((g) => (
@@ -109,8 +109,8 @@ export default function SpecMethods() {
         {/* ── the break-even diagonal a = rho ───────────────── */}
         <line x1={px(0)} y1={py(0)} x2={px(RMAX)} y2={py(RMAX)} stroke="var(--memory)" strokeWidth={2} />
         <Label x={px(0.175)} y={py(0.175) + 4} size={9} kind="memory" bold>a = ρ</Label>
-        <Label x={px(0.055)} y={py(0.055) - 8} size={8.5} kind="token" anchor="middle">win</Label>
-        <Label x={px(0.28)} y={py(0.28) + 14} size={8.5} kind="error" anchor="middle">lose</Label>
+        <Label x={px(0.055)} y={py(0.055) - 8} size={8.5} kind="error" anchor="middle">lose</Label>
+        <Label x={px(0.28)} y={py(0.28) + 14} size={8.5} kind="token" anchor="middle">win</Label>
 
         {/* ── the methods ──────────────────────────────────── */}
         {METHODS.map((x) => {

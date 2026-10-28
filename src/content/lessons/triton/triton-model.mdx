@@ -113,17 +113,17 @@ Let me take each piece, because each one answers a question you would otherwise 
 `BLOCK_SIZE` is the only real tuning knob in this kernel, and its effect is easy to derive.
 
 <Callout type="math" title="Worked example: launch overhead versus useful work">
-  Each launch costs about five microseconds of CPU-side time. Our vector is $N = 128$ FP16 elements, so moving it means reading 256 bytes and writing 256 bytes: 512 bytes. A T4 has about 320 GB/s, so the data itself takes $\frac{512}{320 \times 10^9} \approx 1.6\ \mu s$ — call it about 2 µs.
+  A GPU kernel launch costs about five microseconds (~5 µs) of CPU-side overhead. Our vector is $N = 128$ FP16 elements, so moving it means reading 256 bytes and writing 256 bytes: 512 bytes. A T4 has about 320 GB/s, so the data movement itself takes $\frac{512}{320 \times 10^9} \approx 1.6\ \text{ns}$ ($0.0016\ \mu\text{s}$) — thousands of times faster than a single launch!
 
-  Now price three block sizes:
+  In Triton, the entire grid executes in **one single kernel launch** (~5 µs host overhead). But compare that to dispatching operations in separate op-by-op launches, or choosing poor block sizes:
 
-  | `BLOCK_SIZE` | Programs | Launch overhead | Data time | Total |
+  | Execution style | Programs / Launches | Host launch overhead | Data time | Bottleneck |
   |---|---|---|---|---|
-  | 1 | 128 | 640 µs | 1.6 µs | ~640 µs |
-  | 8 | 16 | 80 µs | 1.6 µs | ~82 µs |
-  | 128 | 1 | 5 µs | 1.6 µs | ~7 µs |
+  | Separate op per element (`N=128`) | 128 launches | ~640 µs | 1.6 ns | CPU launch overhead (99.8% waste) |
+  | Separate op per 8 elements | 16 launches | ~80 µs | 1.6 ns | CPU launch overhead |
+  | Triton kernel (`BLOCK_SIZE = 128`) | 1 launch (1 program) | ~5 µs | 1.6 ns | Fixed launch overhead (~5 µs) |
 
-  Same arithmetic. Same bytes. The first row spends **99.8% of its time launching kernels**. And note the total is not simply `programs × 5 µs` — launches are asynchronous and overlap, so the real cost lands between the two extremes. The shape is what matters, and the shape was wrong.
+  In Triton, the entire grid executes in **one single kernel launch** (~5 µs host overhead). However, if you set `BLOCK_SIZE = 1`, all 128 programs still launch together in one kernel, but each program runs on a warp where 31 of 32 threads sit idle and 32-byte cache sectors are fetched for just 2 bytes of data (16× memory waste). Sizing `BLOCK_SIZE` properly ensures full warp utilization and coalesced memory access.
 </Callout>
 
 This is not a toy problem. It is the same failure you measured in Module 02, when a decode GEMM turned out to be memory-bound: the GPU finished the math long before the bytes arrived. `BLOCK_SIZE` is how you give it enough work per program to amortize the setup, and enough programs to keep every SM busy.
@@ -212,7 +212,7 @@ The notebook has the whole exercise, plus a correctness check against PyTorch an
   3. `tl.arange(0, BLOCK_SIZE)` builds the offsets within a block. `pid * BLOCK_SIZE + arange(...)` gives that program's global offsets — a vector expression, not a loop.
   4. **Always mask**, with the *same* mask on load and store. A grid that divides the length evenly still needs it for the general case, and a mismatched store corrupts memory.
   5. `BLOCK_SIZE: tl.constexpr` is a compile-time constant. Changing it compiles a new kernel — which is exactly what autotuning exploits later.
-  6. Block size decides launch overhead versus register pressure. Too small and you spend all your time launching; too large and registers spill to slower memory.
+  6. Block size decides SM occupancy and coalescing versus register pressure. Too small and warp lanes sit idle while memory access uncoalesces; too large and registers spill to slower memory.
   7. Contiguous `arange` offsets matter: they coalesce into the 128-byte fetches from Module 02. A program *is* a warp-wide cooperative operation; you just never manage the warp.
   8. Kernels are **just-in-time compiled** — the first call with a new signature pays a compile cost. Warm up before you time anything.
 </KeyNotes>
@@ -221,7 +221,7 @@ The notebook has the whole exercise, plus a correctness check against PyTorch an
   { q: 'A Triton kernel launches 32 programs on a vector of 512 elements. What is BLOCK_SIZE?', options: ['16', '32', '512', '1,024'], answer: 0, why: 'Programs × BLOCK_SIZE must cover N, so 32 × 16 = 512. With BLOCK_SIZE = 32 the grid would cover 1,024 elements and half the lanes would be masked off.' },
   { q: 'In the vector-add kernel, what does tl.program_id(0) return?', options: ['The thread number within the warp', 'The index of this program in the launch grid', 'The address the program should load from', 'The number of elements per block'], answer: 1, why: 'It returns the calling program’s position in the grid — 0, 1, 2, ... That is how a program learns which slice of the data it owns.' },
   { q: 'You launch a Triton kernel over 1,048,576 elements with BLOCK_SIZE = 1024. How many programs are in the grid?', numeric: true, answer: 1024, unit: 'programs', why: '1,048,576 / 1024 = 1,024 programs exactly — a power-of-two grid, so no program is masked off at the edge.' },
-  { q: 'Moving a 512-element FP16 vector means reading 1,024 bytes and writing 1,024 bytes. On a T4 at roughly 320 GB/s, how many microseconds does the data movement alone take? (Answer to about 3 significant figures.)', numeric: true, answer: 6.4, tolerance: 0.5, unit: 'µs', why: '2,048 bytes total ÷ 320e9 bytes/s = 6.4e-9 s = 6.4 µs. Compare that to the ~5 µs cost of one launch: at this size the launch is most of the time.' },
+  { q: 'Moving a 512-element FP16 vector means reading 1,024 bytes and writing 1,024 bytes. On a T4 at roughly 320 GB/s, how many nanoseconds does the data movement alone take? (Answer to about 2 significant figures.)', numeric: true, answer: 6.4, tolerance: 0.3, unit: 'ns', why: '2,048 bytes total ÷ 320e9 bytes/s = 6.4e-9 s = 6.4 ns. Compare that to the ~5 µs (5,000 ns) CPU launch overhead: at this size the host launch overhead dwarfs data movement by ~800×.' },
   { q: 'Why must the same mask be used on tl.load and tl.store?', options: ['It makes the kernel faster', 'Triton requires it syntactically', 'A masked load skips out-of-range lanes, but an unmasked store would still write them, corrupting memory past the end', 'It lets the kernel skip the mask on the next call'], answer: 2, why: 'The mask is what prevents the kernel from touching addresses outside the tensor. Load without it and you read past the end; store without it and you write past the end, which silently corrupts another tensor.' },
   { q: 'Which change would NOT reduce the launch overhead of a Triton kernel?', options: ['Increase BLOCK_SIZE so fewer programs launch', 'Pre-compile / warm up the kernel before timing', 'Remove the mask to shorten the index arithmetic', 'Cache the compiled kernel so the JIT is not re-run'], answer: 2, why: 'Removing the mask does not reduce the number of launches or the compile cost — it just makes the kernel wrong for any length that is not a multiple of BLOCK_SIZE.' },
 ] } />

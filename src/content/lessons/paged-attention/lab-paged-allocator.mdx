@@ -163,7 +163,7 @@ Answer these in your notes, with the arithmetic shown.
 </KeyNotes>
 
 <Quiz client:visible questions={[
-  { q: 'A pool has 64 blocks of 16 tokens. Eight requests are each holding 32 tokens. How many tokens of the pool are committed?', numeric: true, answer: 128, tolerance: 0, unit: 'tokens', why: '32 tokens is exactly two blocks, so eight requests commit 16 blocks = 128 tokens of the 1,024-token pool.' },
+  { q: 'A pool has 64 blocks of 16 tokens. Eight requests are each holding 32 tokens. How many tokens of the pool are committed?', numeric: true, answer: 256, tolerance: 0, unit: 'tokens', why: '32 tokens is exactly two blocks, so eight requests commit 16 blocks = 256 tokens of the 1,024-token pool.' },
   { q: 'In a paged allocator, growing a request past its last block costs how many bytes of copying?', numeric: true, answer: 0, tolerance: 0, unit: 'bytes', why: 'The engine pops a free block id and appends it to the block table. Blocks were never individually allocated, so nothing has to move.' },
   { q: 'A contiguous allocator reserves max_len = 4096 per request and the average request ends at 800 tokens. What fraction of the reservation is wasted?', numeric: true, answer: 80, tolerance: 5, unit: '%', why: 'Waste = 1 − 800/4096 = 1 − 0.195 ≈ 80.5%. This is what the red bar in the simulator is showing.' },
   { q: 'Two requests share a 320-token prefix with a block size of 16. How many blocks must the second request copy under copy-on-write?', numeric: true, answer: 0, tolerance: 0, unit: 'blocks', why: 'Sharing itself copies nothing. A copy happens only when the second request needs to WRITE past a shared block; if its own tokens continue the prefix, no copy is needed at all.' },

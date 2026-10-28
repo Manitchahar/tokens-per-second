@@ -141,7 +141,7 @@ $$
 \mathrm{RMSNorm}(\mathbf{x}) = \mathbf{g}\odot\frac{\mathbf{x}}{\sqrt{\mathrm{mean}(\mathbf{x}^2)+\varepsilon}},\quad \varepsilon=10^{-5}
 $$
 
-No mean subtraction (that is LayerNorm), no bias. Output RMS = 1 always. **2L + 1 = 33 norms**, 135,168 params, 0.0017% of the model.
+No mean subtraction (that is LayerNorm), no bias. Output RMS = 1 always. **2L + 1 = 65 norms**, 266,240 params, 0.0033% of the model.
 
 **Residual stream:** one vector per token, written **1 + 2L = 65 times**. Adds cannot cancel. Magnitude grows with depth; RMSNorm divides it back to 1 before every sublayer.
 
@@ -160,7 +160,7 @@ On an H100: 5.80 ms of memory vs 27.6 µs of math — **memory-bound by 210×**.
 | 32 blocks × attention matrices | 17.3% |
 | output head | 6.8% |
 | KV cache at 4K | 3.4% |
-| 33 norms + one embedding row | ~0% |
+| 65 norms + one embedding row | ~0% |
 
 | Phase | Bytes | FLOPs | Intensity | Bound |
 |---|---|---|---|---|

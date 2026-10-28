@@ -114,9 +114,9 @@ $$
 With a perfect prefix cache it is just $T \cdot o$ — **linear**. At 20 turns the gap is 646,000 versus 60,000 tokens, a factor of **10.8**.
 
 <Callout type="math" title="Why the quadratic term hurts more as context grows">
-  The ratio is $\dfrac{2T \cdot o + s}{o \cdot T} \approx 2T + \dfrac{s}{o}$. It does not depend on the model, the GPU, or the framework — it is pure bookkeeping.
+  The ratio is $\dfrac{Ts + o\frac{T(T+1)}{2}}{o \cdot T} = \dfrac{s}{o} + \dfrac{T+1}{2} \approx \dfrac{T}{2} + \dfrac{s}{o}$. It does not depend on the model, the GPU, or the framework — it is pure bookkeeping.
 
-  So the cost of not caching an agent loop is **about $2T$**. Ten turns, 20× the necessary prefill. Twenty turns, 40×. Any agent framework that ships without prefix caching for a 20-turn loop has a performance bug, not a tuning problem.
+  So the cost of not caching an agent loop is **about $T/2$**. Ten turns, ~6× the necessary prefill. Twenty turns, ~11×. Any agent framework that ships without prefix caching for a 20-turn loop has a performance bug, not a tuning problem.
 </Callout>
 
 Note the shape of the fix. Because turn $t$ only ever *appends*, the entire prefix from turn $t-1$ is still valid. This is the ideal case for a <Term t="prefix-caching">prefix cache</Term> — but it requires that the observation be appended verbatim and that the system prompt be *bit-identical* across turns.
@@ -143,7 +143,7 @@ $$
 \text{bytes}(t) = \frac{w}{B} + t \cdot kv
 $$
 
-Note the $w/B$. The weight set is read once per step, not once per token, so in a batch of $B$ sequences each token only pays $1/B$ of the weight read. The KV term, by contrast, is genuinely per token.
+Note the $w/B$. The weight set is read once per step, not once per token, so in a batch of $B$ sequences each token only pays ${}1/B$ of the weight read. The KV term, by contrast, is genuinely per token.
 
 The total time to emit a trace of length $T$ is therefore an **integral**, not a mean times a count:
 
@@ -208,7 +208,7 @@ Cap $o$, bound $k$, keep $g$ as small as the task allows. That is three dials an
 <Callout type="try" title="Check yourself before continuing">
   1. A 6-turn conversation has contexts 960, 1080, 1240, 1360, 1520, 1640. What is the total prefill without a cache, and with a perfect one?
   2. An agent loop appends 3,000 tokens per turn from an 800-token system prompt. Without cache reuse, what is the total prefill after 20 turns, and what is the ratio to the cached case?
-  3. Why is that ratio approximately $2T$? Which variable does it depend on, and which does it not?
+  3. Why is that ratio approximately $T/2$? Which variable does it depend on, and which does it not?
   4. An 8B model emits a 16,000-token reasoning trace. What fraction of peak bandwidth does the final token's step use, and why is that worse than at 200 tokens?
   5. Name three things that silently destroy prefix cache hit rate in an agent system. For each, say which fix applies.
 </Callout>
@@ -216,7 +216,7 @@ Cap $o$, bound $k$, keep $g$ as small as the task allows. That is three dials an
 <KeyNotes>
   1. A multi-turn conversation is a growing prefix that repeats perfectly, which is the ideal case for prefix caching — better reuse than almost any production traffic.
   2. In a six-turn chat, a cache removes **89%** of prefill work: 7,800 token-prefills become 840, and 125 TFLOP becomes 13.
-  3. Agent loops grow context linearly but, without cache reuse, prefill work grows as $O(T^2)$: at 20 turns, 646,000 tokens versus 60,000 — a factor of about $2T$.
+  3. Agent loops grow context linearly but, without cache reuse, prefill work grows as $O(T^2)$: at 20 turns, 646,000 tokens versus 60,000 — a factor of about $T/2$.
   4. A timestamp, request ID, or non-deterministic tool result in the prefix destroys cache hit rate entirely. **Fix these before tuning eviction policy.**
   5. Reasoning models change token counts, not machinery. Because the trace joins the context, decode slows as it goes — at batch 32 an 8B model drops from 5,392 tok/s at 200 tokens to 1,096 tok/s at 16,000.
   6. Long-trace cost must be **integrated**, not averaged: $t_{total} = (wT/B + kvT^2/2)/BW$. Using the mean context halves the KV term and flatters the result by nearly 2×.
@@ -226,7 +226,7 @@ Cap $o$, bound $k$, keep $g$ as small as the task allows. That is three dials an
 
 <Quiz client:visible questions={[
   { q: 'A six-turn conversation has contexts 960, 1080, 1240, 1360, 1520, 1640 and adds 840 tokens in total. What fraction of prefill work does a perfect prefix cache remove?', numeric: true, answer: 89, tolerance: 3, unit: '%', why: 'Naive total = 960+1080+1240+1360+1520+1640 = 7,800 token-prefills. Cached = only the new tokens = 840. Saved = 1 - 840/7800 = 89.2%. In FLOPs on an 8B model that is 125 TFLOP down to 13.4.' },
-  { q: 'An agent loop starts from an 800-token system prompt and appends 3,000 tokens per turn. Without cache reuse, how many tokens does it prefill by turn 20?', numeric: true, answer: 646000, tolerance: 6000, unit: 'tokens', why: 'Context at turn t is 800 + 3000t, so the total is Σ(800 + 3000t) for t=1..20 = 800·20 + 3000·(20·21/2) = 16,000 + 630,000 = 646,000. With a cache it is 60,000 — a factor of 10.8, and the ratio grows as roughly 2T.' },
+  { q: 'An agent loop starts from an 800-token system prompt and appends 3,000 tokens per turn. Without cache reuse, how many tokens does it prefill by turn 20?', numeric: true, answer: 646000, tolerance: 6000, unit: 'tokens', why: 'Context at turn t is 800 + 3000t, so the total is Σ(800 + 3000t) for t=1..20 = 800·20 + 3000·(20·21/2) = 16,000 + 630,000 = 646,000. With a cache it is 60,000 — a factor of 10.8, and the ratio grows as roughly T/2.' },
   { q: 'An 8B model in BF16 on an H100 (3.35 TB/s) decodes a 16,000-token reasoning trace at batch 32. KV is 128 KB per token and bandwidth utilisation is 85%. How many bytes does the final step read per token?', numeric: true, answer: 2.6, tolerance: 0.3, unit: 'GB', why: 'Weights are read once per step, so per token the weight cost is 8.03e9 x 2 / 32 = 0.50 GB. KV at token 16,000 is 16,000 x 128 KB = 2.05 GB. Total 2.55 GB per token, giving 2.55 / (3.35e12 x 0.85) = 0.90 ms per step, or about 1,096 tok/s. At 200 tokens the same batch reads only 0.53 GB, so the long trace runs 4.9x slower per token.' },
   { q: 'Why is long-trace cost an integral rather than mean-times-count?', options: ['Because the GPU batches asynchronously', 'Because the KV cache grows each step, so step time is not constant across the trace', 'Because sampling is stochastic', 'Because weights are read once, not per step'], answer: 1, why: 'Step t reads weights plus t·kv, so the per-step cost grows with t. Summing gives (wT + kvT²/2)/BW. Evaluating at the mean context kv·T/2 halves the KV term — a nearly 2× error that always flatters the result.' },
   { q: 'Which change most reliably restores prefix cache hit rate in an agent system?', options: ['Increasing the block size', 'Removing a live timestamp from the system prompt so prefixes are bit-identical', 'Enabling more aggressive eviction', 'Raising the GPU batch size'], answer: 1, why: 'A timestamp or request ID makes every request a unique prefix, so the cache can never hit — a 0% hit rate cannot be improved by eviction policy. Block size and batch size change the mechanics, not the hit rate. The hit rate comes from prefix determinism.' },

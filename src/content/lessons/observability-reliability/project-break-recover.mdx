@@ -23,11 +23,11 @@ A service with the parts this module taught you, and a harness that can break ea
 | Component | What it does | Lesson |
 |---|---|---|
 | **Concurrency pool** | A semaphore; a slot is held from prefill to the last token | *Admission control, backpressure & load shedding* |
-| **Bounded waiting room** | A second semaphore with a hard cap; past it, a fast 503 | *Load shedding* |
-| **Timeouts** | Queue timeout, generation timeout, client deadline, per-attempt timeout | *Timeouts, retries, recovery* |
-| **Retry budget** | A shared token bucket limiting retries to a ratio of requests | *Retry amplification* |
-| **Metrics endpoint** | Counters, gauges, one histogram with a bucket edge at the SLO | *Metrics & dashboards* |
-| **Fault endpoint** | Change pool size, room size, timeouts, or kill the process mid-stream | *Chaos testing* |
+| **Bounded waiting room** | A second semaphore with a hard cap; past it, a fast 503 | *Admission control, backpressure & load shedding* |
+| **Timeouts** | Queue timeout, generation timeout, client deadline, per-attempt timeout | *Timeouts, retries, recovery & chaos testing* |
+| **Retry budget** | A shared token bucket limiting retries to a ratio of requests | *Timeouts, retries, recovery & chaos testing* |
+| **Metrics endpoint** | Counters, gauges, one histogram with a bucket edge at the SLO | *Metrics & dashboards that matter* |
+| **Fault endpoint** | Change pool size, room size, timeouts, or kill the process mid-stream | *Timeouts, retries, recovery & chaos testing* |
 
 Seven experiments, each with a **written hypothesis before you run it** and a **verdict after**. The hypothesis discipline is the point; the numbers are just the evidence.
 

@@ -17,7 +17,7 @@ The hardware schedules **blocks** onto SM slots. It never schedules threads.
 | Waves | blocks ÷ (blocks resident per SM × SMs) |
 | Wave efficiency | $W / \lceil W \rceil$ |
 | Registers per block | $T \times \text{regs/thread}$ |
-| Blocks per SM (register limit) | $65536 / (T \times \text{regs/thread})$ |
+| Blocks per SM (register limit) | ${}65536 / (T \times \text{regs/thread})$ |
 | Occupancy | resident warps ÷ SM max warps |
 
 - Block sizes: 32, 64, 128, 256, 512, 1024. **Use 128–512.**
@@ -45,7 +45,7 @@ $$
 | `x[i]` | 2 | 64 B | 64 B | **1×** |
 | `x[2i]` | 4 | 64 B | 128 B | **2×** |
 | `x[8i]` | 16 | 64 B | 512 B | **8×** |
-| `x[16i]` | 16 | 64 B | 512 B | **8×** (saturates) |
+| `x[16i]` | 32 | 64 B | 1,024 B | **16×** (saturates) |
 | `x[i][j]` (matrix column) | 32 | 64 B | 1,024 B | **16×** |
 
 - Damage **saturates at 16×** — extra stride past one sector per lane costs nothing.
@@ -61,9 +61,9 @@ t \ge \max\left(\frac{F}{\text{peak FLOP/s}},\ \frac{B}{\text{bandwidth}}\right)
 \qquad I_{\text{ridge}} = \frac{\text{peak FLOP/s}}{\text{bandwidth}}
 $$
 
-| GPU | Peak (BF16) | Bandwidth | Ridge |
+| GPU | Peak (BF16 / FP16) | Bandwidth | Ridge |
 |---|---|---|---|
-| T4 | 65 TFLOP/s | 0.32 TB/s | ~203 |
+| T4 (FP16) | 65 TFLOP/s | 0.32 TB/s | ~203 |
 | L4 | 121 TFLOP/s | 0.30 TB/s | ~403 |
 | A100 80GB | 312 TFLOP/s | 2.0 TB/s | ~156 |
 | H100 SXM | 989 TFLOP/s | 3.35 TB/s | ~295 |

@@ -17,7 +17,7 @@ export const gemmBytes = (m: number) => (m * K + K * N + m * N) * BYTES;
 
 /** Llama-3.1-8B attention at context T, in BF16: FLOPs per byte of KV read. */
 const KV_BYTES_PER_TOKEN = 2 * 32 * 8 * 128 * BYTES;
-const attnIntensity = (t: number) => (4 * t * t * K) / (t * KV_BYTES_PER_TOKEN);
+const attnIntensity = (t: number) => (32 * 4 * t * t * K) / (t * KV_BYTES_PER_TOKEN);
 
 const STEPS = [
   'Two numbers',
@@ -57,7 +57,7 @@ const REFS = [
   { name: 'activation (SiLU, add)', I: 0.3, kind: 'memory' as const },
   { name: 'write the new KV', I: 0.5, kind: 'memory' as const },
   { name: 'decode GEMM', I: gemmIntensity(1), kind: 'memory' as const },
-  { name: 'attention, 1k ctx', I: attnIntensity(1024), kind: 'memory' as const },
+  { name: 'attention, 64 ctx', I: attnIntensity(64), kind: 'memory' as const },
   { name: 'prefill GEMM', I: gemmIntensity(512), kind: 'compute' as const },
 ];
 

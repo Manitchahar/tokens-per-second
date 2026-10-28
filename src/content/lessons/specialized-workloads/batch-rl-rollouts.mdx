@@ -93,14 +93,14 @@ $$
 
 | group size | total KV | share of cluster | GPUs needed |
 |---|---|---|---|
-| 512 | 0.27 TB | 43% | 1 of 8 |
-| 1,024 | 0.55 TB | 86% | 2 of 8 |
-| 4,096 | 2.20 TB | 344% | 5 of 8 — **does not fit** |
+| 512 | 0.27 TB | 43% | 5 of 8 |
+| 1,024 | 0.55 TB | 86% | 9 of 8 — **does not fit** |
+| 4,096 | 2.20 TB | 344% | 35 of 8 — **does not fit** |
 
 <Callout type="math" title="The parameter count is nearly irrelevant">
-  Compare the two constraints. The weights are 16 GB — **3% of the cluster**. The KV cache at a 1,024-rollout group is 550 GB — **86% of the cluster**.
+  Compare the two constraints. Replicated weights are 129 GB — **20% of the cluster**. The KV cache at a 1,024-rollout group is 550 GB — **86% of the cluster**.
 
-  So a rollout cluster is sized by *tokens in flight*, not by model size. The corollary is useful and slightly counterintuitive: **doubling the model size barely changes your cluster requirement, while doubling the sequence length doubles it.** Every lever an inference engineer normally reaches for — quantisation, tensor parallelism — is aimed at the 3%.
+  So a rollout cluster is sized by *tokens in flight*, not by model size. The corollary is useful and slightly counterintuitive: **doubling the model size barely changes your cluster requirement, while doubling the sequence length doubles it.** Every lever an inference engineer normally reaches for — quantisation, tensor parallelism — is aimed at the 20%.
 </Callout>
 
 Which model you pick still matters, but through a different channel — the KV-head count:
@@ -180,7 +180,7 @@ At a 4,096 context that is a 3,072-token generation cap with 1,024 tokens of sla
 
 | cap as % of context | generation budget | headroom | verdict |
 |---|---|---|---|
-| 100% | 3,072 | 0 | **broken** — no room for the reward pass |
+| 100% | 4,096 | 0 | **broken** — no room for the reward pass |
 | 75% | 3,072 | 1,024 | sensible default |
 | 50% | 2,048 | 2,048 | safe; check your truncation rate |
 | 25% | 1,024 | 3,072 | too aggressive for hard tasks |
@@ -199,7 +199,7 @@ Pull it together for Llama-3.1-8B, 1,024 rollouts at 4,096 tokens, 75% generated
 |---|---|
 | KV per rollout | 0.54 GB |
 | total KV | 550 GB (86% of the cluster) |
-| weights | 129 GB (3%) |
+| weights | 129 GB (20%) |
 | peak rollouts per GPU | ~64 |
 | generated tokens | 3.1M |
 | aggregate throughput at peak batch | ~5,000 tok/s |
@@ -281,7 +281,7 @@ def invariance_check(engine, prompts, tol=1e-3):
 
 <KeyNotes>
   1. RL rollouts are batch inference with no SLO: thousands of whole sequences resident at once, draining to completion at different times. Every other property follows from that.
-  2. KV, not weights, is the binding constraint. At a 1,024-rollout group on 8 H100s, KV is 86% of cluster memory and weights are 3%.
+  2. KV, not weights, is the binding constraint. At a 1,024-rollout group on 8 H100s, KV is 86% of cluster memory and weights are 20%.
   3. So rollout clusters are sized by **tokens in flight**, not model size. Doubling sequence length doubles the requirement; doubling model size barely moves it.
   4. The KV-head count, not the parameter count, decides rollout economics — Llama-3.1-8B has 5× the parameters of Qwen2.5-1.5B and 4.5× the KV per token, which is why GQA is mandatory here.
   5. Without an SLO, batch as large as memory allows: throughput rises 4.5× from batch 8 to 512 while the per-sequence rate falls 14×, and none of that matters when nobody is waiting.
@@ -292,7 +292,7 @@ def invariance_check(engine, prompts, tol=1e-3):
 
 <Quiz client:visible questions={[
   { q: 'Llama-3.1-8B has 32 layers, 8 KV heads of 128 dims, BF16. How many bytes of KV cache does one token cost?', numeric: true, answer: 131072, tolerance: 2000, unit: 'bytes', why: '2 × 32 × 8 × 128 × 2 = 131,072 B = 128 KB per token. This is the Module 05 formula with nothing changed. At 4,096 tokens per rollout it becomes 0.54 GB per sequence.' },
-  { q: 'On 8 H100s (640 GB) with 16.06 GB of weights per GPU, how many 4,096-token Llama-3.1-8B rollouts fit?', numeric: true, answer: 952, tolerance: 30, unit: 'rollouts', why: 'Free memory is 640 - 8 × 16.06 = 511 GB. Each rollout needs 4,096 × 131,072 = 0.54 GB. So 511 / 0.54 ≈ 950 rollouts. Note the shape of the answer: weights are 3% of the cluster and KV is the rest, which is why rollout clusters are sized by tokens in flight rather than by parameter count.' },
+  { q: 'On 8 H100s (640 GB) with 16.06 GB of weights per GPU, how many 4,096-token Llama-3.1-8B rollouts fit?', numeric: true, answer: 952, tolerance: 30, unit: 'rollouts', why: 'Free memory is 640 - 8 × 16.06 = 511 GB. Each rollout needs 4,096 × 131,072 = 0.54 GB. So 511 / 0.54 ≈ 950 rollouts. Note the shape of the answer: weights are 20% of the cluster and KV is the rest, which is why rollout clusters are sized by tokens in flight rather than by parameter count.' },
   { q: 'A decode step moves 20 GB at batch 8 and 291 GB at batch 512. By what factor does aggregate throughput improve?', options: ['About 4.5×', 'About 8×', 'About 64×', 'About 256×'], answer: 0, why: 'Throughput improves only 4.5× (1,119 → 5,011 tok/s) for a 64× batch increase, because bytes per token rise with the batch. The weight read is fixed at 16 GB, so its share of traffic falls from 80% at batch 8 to 5.5% at batch 512. Past the roofline knee, extra batch buys throughput very poorly and mostly costs memory.' },
   { q: 'Rollouts complete at different lengths. Why must you provision memory for the full group size rather than the average?', options: ['Because the KV cache is compressed only after completion', 'Because all rollouts are resident at the start of the step, so the peak is the group size', 'Because weights grow with batch size', 'Because throughput improves with more resident rollouts'], answer: 1, why: 'The batch starts with every rollout alive, so peak occupancy equals the group size. Sizing for average occupancy OOMs at the start of every step. Finished rollouts free blocks as the batch drains, but by then the damage would already have happened.' },
   { q: 'A rollout context is 4,096 tokens with 75% generated. Using a 75% cap, how many tokens are left for the reward pass?', numeric: true, answer: 1024, tolerance: 40, unit: 'tokens', why: 'Cap = 0.75 × 4,096 = 3,072, leaving 25% = 1,024 tokens of headroom. A rollout that reaches the context limit has no room for the reward model’s own forward pass or a retry, which is why the cap sits below the context limit rather than at it.' },

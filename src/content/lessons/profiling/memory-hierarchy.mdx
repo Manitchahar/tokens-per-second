@@ -99,7 +99,7 @@ $$
   | Contiguous | `x[i]` | 2 | 64 B | 64 B | **1×** |
   | Stride 2 | `x[2i]` | 4 | 64 B | 128 B | **2×** |
   | Stride 8 | `x[8i]` | 16 | 64 B | 512 B | **8×** |
-  | Stride 16 | `x[16i]` | 16 | 64 B | 512 B | **8×** (sector-capped) |
+  | Stride 16 | `x[16i]` | 32 | 64 B | 1,024 B | **16×** (sector-capped) |
   | Column of a row-major matrix | `x[i][j]` | 32 | 64 B | 1,024 B | **16×** |
 
   Note the cap at stride 16: once every lane is in its own sector, extra stride costs nothing more, because the sectors were already being fetched. **The damage is done by the first factor of 16, and it saturates.** This is why "make it contiguous" is the fix and "make the stride a power of two" is not.

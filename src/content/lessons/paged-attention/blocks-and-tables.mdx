@@ -87,7 +87,7 @@ $$
 | 32 | 128 KiB | 31 tokens (0.8%) | 128 |
 | 256 | 1 MiB | 255 tokens (6.2%) | 16 |
 
-Wait — those block bytes look too small. They are, **per layer**. The pool holds all 32 layers, so a block that covers all layers is 32 × the number above: 1 MiB, 2 MiB or 4 MiB for $B$ of 16, 32 or 64. Be careful about which one you are quoting.
+Wait — those block bytes look too small. They are, **per layer**. The pool holds all 32 layers, so a block that covers all layers is 32 × the number above: 2 MiB, 4 MiB or 8 MiB for $B$ of 16, 32 or 64. Be careful about which one you are quoting.
 
 <Callout type="math" title="Sizing the pool, end to end">
   Llama-3.1-8B, BF16, $B = 16$, H100 with 80 GB. Budget 40 GB for weights (the model is 16 GB, so 24 GB to spare for activations and fragmentation — you will set this properly with `--gpu-memory-utilization`, but 50% is a reasonable first guess).

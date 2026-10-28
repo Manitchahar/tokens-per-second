@@ -33,9 +33,9 @@ $$
 The **ridge point** <Term t="ridge-point">$I_{\text{ridge}}$</Term> is the intensity at which the two floors are equal. Below it you are memory-bound; above it you are compute-bound. Plotting achievable performance against intensity gives the roofline: a slope of bandwidth on the left, a flat ceiling of peak FLOP/s on the right.
 
 <Callout type="math" title="Ridge points, all of them">
-  | GPU | Peak (BF16 dense) | Bandwidth | Ridge point |
+  | GPU | Peak (BF16 / FP16 dense) | Bandwidth | Ridge point |
   |---|---|---|---|
-  | T4 (free Colab) | 65 TFLOP/s | 0.32 TB/s | ~203 FLOP/byte |
+  | T4 (FP16, free Colab) | 65 TFLOP/s | 0.32 TB/s | ~203 FLOP/byte |
   | L4 | 121 TFLOP/s | 0.30 TB/s | ~403 FLOP/byte |
   | A100 80GB | 312 TFLOP/s | 2.0 TB/s | ~156 FLOP/byte |
   | H100 SXM | 989 TFLOP/s | 3.35 TB/s | ~295 FLOP/byte |
@@ -94,7 +94,7 @@ $$
 
 Two details matter enormously in an inference context:
 
-**Flops "actually executed" counts padding.** A tiled GEMM with a 128×128 tile computes a 4,096×4,096 matrix in 1,024 tiles; the edge tiles compute rows and columns that do not exist in a ragged batch and the hardware still does the arithmetic. Nsight reports the padded number. For a well-shaped prefill this is a few percent. For a **decode** GEMM — $m=1$ or 32 against $K=N=4096$ — the padding *dominates*: you report ~137 GFLOP for what is mathematically 33.5 MFLOP, and your "MFU" becomes a fiction.
+**Flops "actually executed" counts padding.** A tiled GEMM with a 128×128 tile computes a 4,096×4,096 matrix in 1,024 tiles; the edge tiles compute rows and columns that do not exist in a ragged batch and the hardware still does the arithmetic. Nsight reports the padded number. For a well-shaped prefill this is a few percent. For a **decode** GEMM — $m=1$ or 32 against $K=N=4096$ — the padding *dominates*: you report ~4.3 GFLOP for what is mathematically 33.5 MFLOP, and your "MFU" becomes a fiction.
 
 **The honest decode metric is MBU.** Which is exactly why production inference teams quote achieved bandwidth for decode and MFU for prefill, rather than one number for both.
 
@@ -148,7 +148,7 @@ $$
 
 Compute-bound, sitting on the flat top. That single GEMM takes 17.2 ÷ (989 × 0.6) = 0.029 ms at 60% MFU — a rounding error, because one matrix is a small part of a model.
 
-Scale it to the **whole model**: Llama-3.1-8B has 8.03B parameters, so a 512-token chunk is \$2 \cdot 512 \cdot 8.03\times 10^9 = 8.2$ TFLOP, which at 60% MFU is 13.8 ms of pure GEMM. That is the number Module 10's chunk-size formula was built from, and Lesson 12.5 adds attention and the elementwise passes to land near 21 ms.
+Scale it to the **whole model**: Llama-3.1-8B has 8.03B parameters, so a 512-token chunk is ${}2 \cdot 512 \cdot 8.03\times 10^9 = 8.2$ TFLOP, which at 60% MFU is 13.8 ms of pure GEMM. That is the number Module 10's chunk-size formula was built from, and Lesson 12.5 adds attention and the elementwise passes to land near 21 ms.
 
 <Callout type="pitfall" title="The unit mistake everyone makes once">
   A single `[512 × 4096] · [4096 × 4096]` multiply is **17.2 GFLOP**. The whole model's prefill at the same $m$ is **8.2 TFLOP** — 480× more, because there are 32 layers and several matrices in each. Carrying the GFLOP number into a whole-model timing calculation makes you out by three orders of magnitude, and the result looks plausible enough to ship.

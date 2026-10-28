@@ -187,7 +187,7 @@ print("H100:        989 TFLOP/s, 3.35 TB/s, ridge ~295 FLOP/byte.")
 # %% [markdown]
 # ## 5. Is it memory-bound or compute-bound? Decide with arithmetic
 #
-# For a matrix multiply of `[m x 4096] @ [4096 x 4096]` in BF16:
+# For a matrix multiply of `[m x 4096] @ [4096 x 4096]` in FP16:
 #
 # ```
 # FLOPs = 2 * m * 4096 * 4096

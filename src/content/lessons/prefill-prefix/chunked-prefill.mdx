@@ -62,7 +62,7 @@ Read that as: **29.5 microseconds per prompt token.**
 A 32K prompt — a book, a huge code file, an agent with a long history — takes **almost a second of the entire GPU**. The 31 ms number in the last row is on the T4 you get free in Colab, which is why interactive coding assistants feel unusable on small GPUs.
 
 <Callout type="math" title="Where the 29.5 µs comes from">
-  You already built this. The prefill of $n$ tokens is one matrix multiply with $n$ rows, so it costs $2 \cdot n \cdot d^2$ FLOPs per projection, and $2Pn$ FLOPs for the whole model. Divide by the achieved FLOP/s and you have the time. There is no new physics here — only Module 01's arithmetic and Module 02's ceiling.
+  You already built this. The prefill of $n$ tokens is one matrix multiply with $n$ rows, so it costs ${}2 \cdot n \cdot d^2$ FLOPs per projection, and ${}2Pn$ FLOPs for the whole model. Divide by the achieved FLOP/s and you have the time. There is no new physics here — only Module 01's arithmetic and Module 02's ceiling.
 </Callout>
 
 Now put the two phases next to each other. Thirty-two users decoding at 8K context need one decode step every **20 ms** to feel instant. A single 2,000-token prompt needs **59 ms** of GPU — three whole decode steps' worth. Every one of those three steps, the thirty-two users get nothing.
@@ -179,7 +179,7 @@ for n in [512, 2000, 8000, 32000]:
 </Callout>
 
 <KeyNotes>
-  1. Prefill costs $2Pn$ FLOP, so its time is **linear in prompt length**: 29.5 µs per token for Llama-3.1-8B on an H100 at 55% MFU. An 8K prompt is 236 ms of the entire GPU; a 32K prompt is nearly a second.
+  1. Prefill costs ${}2Pn$ FLOP, so its time is **linear in prompt length**: 29.5 µs per token for Llama-3.1-8B on an H100 at 55% MFU. An 8K prompt is 236 ms of the entire GPU; a 32K prompt is nearly a second.
   2. One engine step is one thing. A prefill step cannot also decode, so a long prefill is a **total** freeze for everyone else — head-of-line blocking.
   3. The damage shows up as a TPOT regression, not just TTFT. A 236 ms prefill on a 20 ms decode step drops every other user's token rate to about 8%.
   4. Prefill is not atomic. Chunking it changes **when** FLOPs run, never how many, so the result is bitwise identical.

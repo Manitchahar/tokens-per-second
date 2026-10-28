@@ -111,27 +111,27 @@ Divisibility is why published expert counts are large powers of two. Mixtral's 8
 $$
 f_{\text{remote}} = \Big(1 - \tfrac{1}{g}\Big)\cdot I
 \qquad
-\text{bytes}_{\text{dispatch}} = T \cdot f_{\text{remote}} \cdot d \cdot b
+\text{bytes}_{\text{dispatch}} = k \cdot T \cdot f_{\text{remote}} \cdot d \cdot b
 $$
 
 $$
-\boxed{\text{bytes}_{\text{step}} = 2 \cdot T \cdot f_{\text{remote}} \cdot d \cdot b \cdot L_{\text{moe}}}
+\boxed{\text{bytes}_{\text{step}} = 2 \cdot k \cdot T \cdot f_{\text{remote}} \cdot d \cdot b \cdot L_{\text{moe}}}
 $$
 
-Mixtral, $g{=}8$, $T{=}256$, $d{=}4096$, BF16, $L_{\text{moe}}{=}31$, $I{=}1$:
+Mixtral, $g{=}8$, $k{=}2$, $T{=}256$, $d{=}4096$, BF16, $L_{\text{moe}}{=}31$, $I{=}1$:
 
-$$f_{\text{remote}} = 0.875, \quad 256 \times 0.875 \times 4096 \times 2 = 1.84\ \text{MB/layer} \;\Rightarrow\; 114\ \text{MB/step} \approx 0.38\ \text{ms at NVLink}$$
+$$f_{\text{remote}} = 0.875, \quad 2 \times 256 \times 0.875 \times 4096 \times 2 = 3.67\ \text{MB/layer} \;\Rightarrow\; 228\ \text{MB/step} \approx 1.5\ \text{ms at NVLink}$$
 
-$$\frac{\text{comm bytes}}{\text{FLOPs}} = \frac{f_{\text{remote}} \cdot d \cdot b}{P_{\text{active}}} = 5.7\times 10^{-7}\ \text{B/FLOP}$$
+$$\frac{\text{comm bytes}}{\text{FLOPs}} = \frac{k \cdot f_{\text{remote}} \cdot d \cdot b}{P_{\text{active}}} = 1.14\times 10^{-6}\ \text{B/FLOP}$$
 
-**Batch $T$ cancels.** The comm-to-compute ratio is a property of the model and topology, not your traffic. Budget: $\sim 5.6$ GB/s of free wire before the all-to-all binds.
+**Batch $T$ cancels.** The comm-to-compute ratio is a property of the model and topology, not your traffic. Budget: $\sim 11.3$ GB/s of free wire before the all-to-all binds.
 
 | batch | all-to-all | share of a step |
 |---|---|---|
-| 1 | ~0.5 MB | absolute cost tiny, **latency exposed** |
-| 32 | 14 MB | ~1% |
-| 256 | 114 MB | ~0.6% |
-| 2048 | 912 MB | ~1% |
+| 1 | ~0.9 MB | absolute cost tiny, **latency exposed** |
+| 32 | 28 MB | ~1.5% |
+| 256 | 228 MB | ~2.4% |
+| 2048 | 1.8 GB | ~3% |
 
 Low batch hurts for a reason the percentage hides: **the all-to-all is a serialisation point.** Expert $j$ cannot start until its tokens arrive. At batch 1 the fixed weight read dominates and the collective's latency is fully exposed.
 
@@ -214,9 +214,9 @@ The first three are derived here from published configs and match the published 
 |---|---|
 | PCIe 4.0 x16 | ~25 GB/s |
 | PCIe 5.0 x16 | ~50 GB/s |
-| NVLink 3 (Hopper) | ~300 GB/s |
-| NVLink 4 (Blackwell) | ~450 GB/s |
-| NVSwitch (NVL72) | ~900 GB/s aggregate |
+| NVLink 3 (Ampere) | ~300 GB/s |
+| NVLink 4 (Hopper) | ~450 GB/s |
+| NVLink 5 (Blackwell) | ~900 GB/s |
 
 An all-to-all achieves roughly **half** the peak link rate — it is a ring, not a memcpy.
 

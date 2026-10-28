@@ -43,7 +43,7 @@ $$
 \text{experts per GPU} = \frac{E}{g}
 $$
 
-For Mixtral with $E = 8$ on $g = 2$: 4 experts each, $4 \times 176$M = 705M parameters, 1.41 GB per card. Total resident across the pair is unchanged; that is the point.
+For Mixtral with $E = 8$ on $g = 2$: 4 experts each, ${}4 \times 176$M = 705M parameters, 1.41 GB per card. Total resident across the pair is unchanged; that is the point.
 
 The constraint that catches people is divisibility. **$g$ must divide $E$.** Mixtral's 8 experts give you $g \in \{1,2,4,8\}$. Qwen3-30B-A3B's 128 experts give you any power of two up to 128. A model with 6 experts and 8 GPUs has no valid EP degree except 1 or 2, and you are stuck tensor-parallelising the rest. This is a reason expert counts in real MoE models are almost always large powers of two.
 
@@ -88,14 +88,14 @@ The constraint that catches people is divisibility. **$g$ must divide $E$.** Mix
 The collective has two halves. **Dispatch** sends each token's hidden vector to every GPU that owns one of its $k$ experts. **Return** sends the combined expert output back to the token's home GPU. They are the same size, so:
 
 $$
-\text{bytes}_{\text{dispatch}} = \underbrace{T}_{\text{tokens}} \times \underbrace{f_{\text{remote}}}_{\text{fraction needing to travel}} \times \underbrace{d \cdot b}_{\text{one BF16 activation}}
+\text{bytes}_{\text{dispatch}} = \underbrace{k}_{\text{top-}k} \times \underbrace{T}_{\text{tokens}} \times \underbrace{f_{\text{remote}}}_{\text{fraction needing to travel}} \times \underbrace{d \cdot b}_{\text{one BF16 activation}}
 $$
 
 $$
 \text{bytes}_{\text{step}} = 2 \cdot \text{bytes}_{\text{dispatch}} \cdot L_{\text{moe}}
 $$
 
-The fraction that has to travel is the interesting term. Under **perfectly balanced** routing with $g$ ranks, each rank owns $1/g$ of the experts, so a uniformly-random token has probability $1 - 1/g$ of needing to leave:
+The fraction that has to travel is the interesting term. Under **perfectly balanced** routing with $g$ ranks, each rank owns ${}1/g$ of the experts, so a uniformly-random token has probability ${}1 - 1/g$ of needing to leave:
 
 $$
 f_{\text{remote}} = 1 - \frac{1}{g}
@@ -108,28 +108,28 @@ f_{\text{remote}} = \Big(1 - \tfrac{1}{g}\Big) \cdot I
 $$
 
 <Callout type="math" title="Worked example: Mixtral, 8 GPUs, NVLink, batch 256, balance 1.0">
-  $T = 256$ tokens, $g = 8$, $d = 4096$, BF16 ($b = 2$), $L_{\text{moe}} = 31$ blocks.
+  $T = 256$ tokens, $k = 2$, $g = 8$, $d = 4096$, BF16 ($b = 2$), $L_{\text{moe}} = 31$ blocks.
 
   $f_{\text{remote}} = 1 - \tfrac{1}{8} = 0.875$
 
-  Dispatch: $256 \times 0.875 \times 4096 \times 2 = 1{,}835{,}008$ B $\approx 1.84$ MB **per MoE block**
+  Dispatch: ${}2 \times 256 \times 0.875 \times 4096 \times 2 = 3{,}670{,}016$ B $\approx 3.67$ MB **per MoE block**
 
-  Both directions: $2 \times 1.84 = 3.67$ MB per block
+  Both directions: ${}2 \times 3.67 = 7.34$ MB per block
 
-  All 31 blocks: $3.67 \times 31 = 113.8$ MB **per decode step**
+  All 31 blocks: ${}7.34 \times 31 = 227.5$ MB **per decode step**
 
-  At NVLink 3's 300 GB/s, and an all-to-all achieving about half that (it is a ring, not a memcpy): $1.84\text{ MB} \div 150\text{ GB/s} = \boxed{12.2\ \mu\text{s}}$ for the dispatch half of one block, and about **$0.38$ ms** summed over all 31 blocks.
+  At NVLink 3's 300 GB/s, and an all-to-all achieving about half that (it is a ring, not a memcpy): ${}3.67\text{ MB} \div 150\text{ GB/s} = \boxed{24.5\ \mu\text{s}}$ for the dispatch half of one block, and about **${}0.76$ ms** summed over all 31 blocks (or **${}1.52$ ms** for both directions).
 </Callout>
 
-Now put that next to the compute. From last lesson, one decode step's active compute was about 14.8 ms of FLOP time and 15.8 ms of memory time for batch 32. Scale the batch to 256 and the per-step time goes to roughly $4 \times 15.8 = 63$ ms of memory time. Communication adds 0.38 ms.
+Now put that next to the compute. From last lesson, one decode step's active compute was about 14.8 ms of FLOP time and 15.8 ms of memory time for batch 32. Scale the batch to 256 and the per-step time goes to roughly ${}4 \times 15.8 = 63$ ms of memory time. Communication adds 1.5 ms.
 
-**So at batch 256, the all-to-all costs about 0.6% of the step.** That is the good case, and it is the case most people quote.
+**So at batch 256, the all-to-all costs about 2.4% of the step.** That is the good case, and it is the case most people quote.
 
 <Callout type="pitfall" title="Now do the same arithmetic at batch 1">
   Communication scales linearly with tokens. So does compute per step — but **compute per token does not**, and the step time is dominated by reading active weights, which is independent of batch. At batch 1:
 
   - Active weight bytes: still 25.2 GB, still $\approx 9.4$ ms on an H100
-  - All-to-all: $256 \to 1$ token, so $\approx 1.5$ µs
+  - All-to-all: ${}256 \to 1$ token, so $\approx 1.5$ µs
 
   Communication looks even cheaper. But that is the wrong comparison, because at batch 1 the GPU is mostly idle waiting for the all-to-all to complete before the expert GEMMs can start. **The all-to-all is a serialisation point**: you cannot compute expert $j$ until its tokens arrive, and the latency of the collective is exposed, not amortised.
 
@@ -141,10 +141,10 @@ Now put that next to the compute. From last lesson, one decode step's active com
 You can size the all-to-all without deriving anything, from two ratios:
 
 $$
-\frac{\text{comm bytes}}{\text{compute FLOPs}} = \frac{2 \cdot T \cdot f_{\text{remote}} \cdot d \cdot b}{2 \cdot P_{\text{active}} \cdot T} = \frac{f_{\text{remote}} \cdot d \cdot b}{P_{\text{active}}}
+\frac{\text{comm bytes}}{\text{compute FLOPs}} = \frac{2 \cdot k \cdot T \cdot f_{\text{remote}} \cdot d \cdot b}{2 \cdot P_{\text{active}} \cdot T} = \frac{k \cdot f_{\text{remote}} \cdot d \cdot b}{P_{\text{active}}}
 $$
 
-Batch size $T$ **cancels**. The ratio is a property of the model and the topology only. For Mixtral: $0.875 \times 4096 \times 2 / 12.6\text{e}9 = 5.7 \times 10^{-7}$ bytes per FLOP. H100's ridge point is about $989\text{e}12 / 3.35\text{e}12 \approx 295$ FLOP/byte, so the model has a communication budget of roughly $5.7\text{e-7} \times 989\text{e}12 \approx 5.6$ GB/s of "free" wire before the all-to-all becomes the bottleneck.
+Batch size $T$ **cancels**. The ratio is a property of the model and the topology only. For Mixtral ($k = 2$): ${}2 \times 0.875 \times 4096 \times 2 / 12.6\text{e}9 = 1.14 \times 10^{-6}$ bytes per FLOP. H100's ridge point is about ${}989\text{e}12 / 3.35\text{e}12 \approx 295$ FLOP/byte, so the model has a communication budget of roughly ${}1.14\text{e-6} \times 989\text{e}12 \approx 1.13$ TB/s of "free" wire before the all-to-all becomes the bottleneck.
 
 **MoE inference is communication-bound when that budget is exceeded**, and it is exceeded exactly when the interconnect is slow. PCIe at 25 GB/s is under budget for this model; a heavily oversubscribed network is not.
 
@@ -209,9 +209,9 @@ $$
 
 Worked example, Qwen3-30B-A3B on 8 H100s: $E = 128$, expert intermediate 768, 48 blocks.
 
-- One expert: $3 \times 2048 \times 768 = 4.72$M parameters. The whole bank: $128 \times 4.72$M = 604M per block.
-- $g_{\text{EP}} = 8$ divides 128 → 16 experts per card → $16 \times 4.72\text{M} = 75.5$M per block, $\times\,48 = 3.62$B parameters per card, or **7.25 GB in BF16**.
-- Total weights across the group: $30.5\text{B} \times 2 = 61$ GB, about 7.6 GB per card once attention, the shared expert and embeddings are added. Comfortable.
+- One expert: ${}3 \times 2048 \times 768 = 4.72$M parameters. The whole bank: ${}128 \times 4.72$M = 604M per block.
+- $g_{\text{EP}} = 8$ divides 128 → 16 experts per card → ${}16 \times 4.72\text{M} = 75.5$M per block, $\times\,48 = 3.62$B parameters per card, or **7.25 GB in BF16**.
+- Total weights across the group: ${}30.5\text{B} \times 2 = 61$ GB, about 7.6 GB per card once attention, the shared expert and embeddings are added. Comfortable.
 - Expert intermediate is only 768. Splitting that 2 ways gives a 384-wide GEMM, which is inefficient — so $g_{\text{TP}} = 1$ and the eight cards are entirely dedicated to expert sharding.
 
 So: $g_{\text{EP}} = 8$, $g_{\text{TP}} = 1$, 8 GPUs, every constraint satisfied without a single tensor-parallel split.
@@ -238,7 +238,7 @@ The general lesson: **narrow experts favour wide EP; wide experts force TP.** Th
   3. Sharding moves the tokens away from their experts, which is what the all-to-all solves: one collective per MoE block, dispatch out and results back.
   4. The dispatch volume is $T \cdot f_{\text{remote}} \cdot d \cdot b$, doubled for the return, times the number of MoE blocks. Under balanced routing $f_{\text{remote}} = 1 - 1/g$; imbalance multiplies it by the load ratio $I$.
   5. Batch size cancels out of the ratio of communication bytes to compute FLOPs, so the comm-to-compute balance is a property of the model and the topology — not of your traffic.
-  6. At batch 256 on NVLink the Mixtral all-to-all costs about 0.6% of the step; at batch 1 the absolute number is far smaller but the collective is serialised, so its latency is exposed instead of amortised.
+  6. At batch 256 on NVLink the Mixtral all-to-all costs about 2.4% of the step; at batch 1 the absolute number is far smaller but the collective is serialised, so its latency is exposed instead of amortised.
   7. A hot expert breaks three things at once: it increases traffic, it makes one card the straggler that sets everyone's latency, and it overflows fixed buffers. The straggler effect is usually the most damaging.
   8. The capacity factor $C = \lceil c \cdot Tk/E \rceil$ converts a ragged problem into a rectangular one by dropping or overflowing tokens beyond capacity. $c = 1.25$ is the common default; raising it wastes memory, lowering it costs quality.
   9. Expert parallelism cannot shard a single expert, so hybrid EP × TP is the real deployment shape: narrow experts favour wide EP, wide experts force TP inside.
@@ -247,7 +247,7 @@ The general lesson: **narrow experts favour wide EP; wide experts force TP.** Th
 
 <Quiz client:visible questions={[
   { q: 'Under perfectly balanced routing across g ranks, what fraction of a token’s expert activations must cross a device boundary?', options: ['1.0 — every token uses an expert on another device', '1 − 1/g — because 1/g of experts are local', '1/g', '0 — because routing is balanced'], answer: 1, why: 'Each rank owns 1/g of the experts, so a uniformly-random token finds a local expert with probability 1/g and must travel otherwise. At g = 8 that is 87.5% of tokens travelling — which is why the all-to-all is the dominant collective in an MoE layer.' },
-  { q: 'Mixtral, 8 GPUs, batch 256, balanced, BF16, 31 MoE blocks, hidden 4096. Roughly how many bytes cross the fabric per decode step, both directions?', numeric: true, answer: 114000000, tolerance: 12000000, unit: 'bytes', why: 'Dispatch = 256 × 0.875 × 4096 × 2 = 1.835 MB per block. Both directions = 3.67 MB. Times 31 blocks = 113.8 MB ≈ 114 MB per step. At NVLink’s 300 GB/s reaching about half, that is roughly 0.38 ms — under 1% of a batch-256 step.' },
+  { q: 'Mixtral, 8 GPUs, batch 256, balanced, BF16, 31 MoE blocks, hidden 4096. Roughly how many bytes cross the fabric per decode step, both directions?', numeric: true, answer: 228000000, tolerance: 15000000, unit: 'bytes', why: 'With top-2 routing (k=2), dispatch = 2 × 256 × 0.875 × 4096 × 2 = 3.67 MB per block. Both directions = 7.34 MB. Times 31 blocks = 227.5 MB ≈ 228 MB per step. At NVLink’s 300 GB/s reaching about half, that is roughly 1.5 ms for both directions.' },
   { q: 'A model has 6 experts and you have 8 GPUs. What is the largest valid expert-parallel degree?', numeric: true, answer: 2, tolerance: 0.1, unit: 'GPUs', why: 'The EP degree must divide the expert count. 2 divides 6; 4 does not; 8 does not. So you shard 2 ways and must cover the remaining 4 cards with tensor parallelism inside each expert. This is exactly why production MoE models use expert counts that are large powers of two.' },
   { q: 'Why does an overloaded expert hurt more than an underloaded one?', options: ['It uses more memory bandwidth, and memory is always the bottleneck', 'Every rank waits for the slowest in a synchronous step, so the straggler sets the whole step’s latency and erases the MoE speedup', 'Dropped tokens corrupt the KV cache', 'It increases the vocabulary size'], answer: 1, why: 'Decode is a barrier-synchronised batched operation: a rank cannot proceed until all ranks arrive. Imbalance makes the maximum work per rank larger than the mean, and the step time follows the maximum. This is the same straggler effect as pipeline bubbles, except here the schedule is data-dependent and cannot be balanced ahead of time.' },
   { q: 'You use capacity factor c = 1.25 and your hot expert holds I = 2× its balanced share. Roughly what fraction of that expert’s tokens overflow?', numeric: true, answer: 37.5, tolerance: 4, unit: '%', why: 'Overflow fraction = max(0, 1 − c/I) = 1 − 1.25/2 = 1 − 0.625 = 0.375, so 37.5%. Those tokens are dropped or sent to another expert — which costs quality. To get overflow to zero you need c ≥ I = 2.0.' },

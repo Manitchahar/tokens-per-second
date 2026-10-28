@@ -6,7 +6,7 @@ objectives:
   - Build a workload from a real prompt and output-length distribution, not one sentence
   - 'Control the variables that silently change a measurement: seed, versions, clocks, other tenants'
   - Decide how many repeats a given effect size needs
-  - Recognise when two numbers are not comparable and say why'
+  - Recognise when two numbers are not comparable and say why
 ---
 
 import RunVariance from '@/components/viz/benchmarking/RunVariance.tsx';
@@ -195,5 +195,5 @@ The second one is a finding. The first is a vibe.
   { q: 'Which is the strongest reason to sweep prompt length rather than benchmark a single fixed prompt?', options: ['It is faster to run', 'Prompt length drives prefill cost and KV memory, and long prompts dominate the tail of real traffic', 'Long prompts always return more tokens', 'Fixed prompts disable the KV cache'], answer: 1, why: 'Prefill scales with prompt length (attention superlinearly at long context), and KV memory per request scales with it too — so prompt length sets both TTFT and your concurrency ceiling. Real traffic has a long tail of long prompts.' },
   { q: 'You time 20 requests including a 300 ms first-call warm-up and the rest are 7 ms. What is wrong with reporting the mean?', options: ['The mean is always too low', 'The mean is inflated by the warm-up outlier, describing a startup cost that does not exist in production', 'Nothing, the mean is fine', 'The mean cannot be computed from timing data'], answer: 1, why: 'The mean mixes a one-time startup cost into every steady-state sample, overstating steady-state time. Discard warm-up iterations; steady state is the mean of the remaining 19 (~7 ms).' },
   { q: 'Two engines are benchmarked: engine A first for 10 minutes, then engine B for 10 minutes. B measures slower. What is the most likely confound?', options: ['B is a worse engine', 'The GPU is hotter by the time B runs, so its clocks are lower — a thermal bias against whichever runs second', 'B used a smaller batch', 'The tokenizer ran slower for B'], answer: 1, why: 'Sequential A-then-B blocks bias against the second arm through heat and clock ramp. Interleave in short bursts, or lock clocks, so both arms see the same conditions.' },
-  { q: 'How many tokens of KV cache does a single request use at 8,192 total context for Llama-3.1-8B in BF16 (128 KB/token)?', numeric: true, answer: 1.05, tolerance: 0.08, unit: 'GB', why: '8192 tokens × 128 KB = 1,048,576 KB ≈ 1.05 GB. This is per request; at high concurrency it is what fills (or overflows) the GPU.' },
+  { q: 'How much KV cache (in GB) does a single request use at 8,192 total context for Llama-3.1-8B in BF16 (128 KB/token)?', numeric: true, answer: 1.05, tolerance: 0.08, unit: 'GB', why: '8192 tokens × 128 KB = 1,048,576 KB ≈ 1.05 GB. This is per request; at high concurrency it is what fills (or overflows) the GPU.' },
 ]} />

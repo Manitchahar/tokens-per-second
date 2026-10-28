@@ -108,7 +108,7 @@ def release(block_id):
 
   With $R$ concurrent requests sharing a prefix of $P$ tokens, memory for the prefix goes from $R \times P \times 128$ KiB to $P \times 128$ KiB. It is a constant, not a per-request cost — so the *marginal* cost of one more request's shared prefix is **zero**.
 
-  Check it at $R = 32$: one 900-token prefix costs about 118 MB, and it costs that whether 2 requests are live or 200. Thirty-two separate copies would be about 3.77 GB. Saving: **92%**.
+  Check it at $R = 32$: one 900-token prefix costs about 118 MB, and it costs that whether 2 requests are live or 200. Thirty-two separate copies would be about 3.77 GB. Saving: **87%**.
 </Callout>
 
 ## Finding the prefix: the walk
@@ -207,7 +207,7 @@ This is why multi-turn chat is the single most prefix-friendly workload in exist
   3. **Copy-on-write** is the only safety rule: a block with refcount above 1 is read-only, and a writer takes a private copy first.
   4. A copy happens only at a genuine divergence block, never at share time and never on read.
   5. The prefix walk compares block-sized runs of token ids down a prefix tree. 900 tokens = 57 blocks = 912 integer comparisons, against a prefill costing tens of milliseconds.
-  6. A 900-token shared system prompt saves 92% of its memory at 32 concurrent requests, because the marginal cost of one more request's prefix is zero.
+  6. A 900-token shared system prompt saves 87% of its memory at 32 concurrent requests, because the marginal cost of one more request's prefix is zero.
   7. Sharing is only valid for an **exact token prefix**: change one token and every KV value after it changes too.
   8. Prefix caching pays for constant prefixes (system prompts, multi-turn history, tool schemas) and does nothing for distinct documents per request.
 </KeyNotes>

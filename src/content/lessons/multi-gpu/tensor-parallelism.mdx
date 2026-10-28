@@ -172,20 +172,20 @@ $$
   Time on NVLink 4 (450 GB/s, $\eta = 0.85$, $t_{lat} = 0.9$ µs):
 
   $$
-  t = 0.9\ \mu s + \frac{3.93\times 10^6}{450\times 10^9 \times 0.85} = 0.9\ \mu s + 10.3\ \mu s \approx 11.2\ \mu s
+  t = 160 \times 0.9\ \mu s + \frac{3.93\times 10^6}{450\times 10^9 \times 0.85} = 144\ \mu s + 10.3\ \mu s \approx 154.3\ \mu s
   $$
 
   Memory time it replaces: each GPU now holds 141/4 = 35.3 GB, read at 3.35 TB/s × 0.8 = **13.2 ms**.
 
-  **Collectives are 0.085% of the step.** TP=4 over NVLink is essentially free, and you should use it.
+  **Collectives are 1.2% of the step.** TP=4 over NVLink is cheap, and you should use it.
 
   Now the same thing over PCIe 4.0 (32 GB/s, $\eta = 0.8$, $t_{lat} = 2.5$ µs):
 
   $$
-  t = 2.5\ \mu s + \frac{3.93\times 10^6}{32\times 10^9 \times 0.8} = 2.5\ \mu s + 153.5\ \mu s = 156\ \mu s
+  t = 160 \times 2.5\ \mu s + \frac{3.93\times 10^6}{32\times 10^9 \times 0.8} = 400\ \mu s + 153.5\ \mu s = 553.5\ \mu s \approx 554\ \mu s
   $$
 
-  That is 1.2% of the step — still small, but 14x worse. **And that is with 160 messages.** At batch 32 the payload is 512 KB, the latency term vanishes into the bandwidth term, and PCIe costs about 6.4% against NVLink's 0.5%. The lesson: PCIe works for TP at small batch and hurts at large batch.
+  That is 4.2% of the step — 3.6x worse, because PCIe pays 400 µs of latency across 160 messages plus 15x slower transfer. **Notice that latency dominates bandwidth at batch 1.** At batch 32 the payload is 512 KB, the latency term vanishes into the bandwidth term, and PCIe costs about 6.4% against NVLink's 0.5%. The lesson: PCIe works for TP at small batch and hurts at large batch.
 </Callout>
 
 <Callout type="intuition" title="Why 80 layers of tiny messages is cheaper than 2 layers of big ones">
@@ -299,8 +299,8 @@ The next lesson takes that bubble apart: what a forward-only pipeline actually l
 <KeyNotes>
   1. A matrix splits two ways: by output columns (each GPU gets a slice of the result, free) or by input rows (each GPU gets a partial sum, needs an all-reduce).
   2. The Megatron block is column-parallel then row-parallel: **one all-gather in, one all-reduce out**, repeated for every layer. Llama-8B pays 64 collectives per forward pass.
-  3. TP communication per forward pass is `2 * layers * 2(t-1)/t * B * T * hidden * 2` bytes. For Llama-70B at t=4, batch 1, that is 3.93 MB — about 0.085% of the step over NVLink.
-  4. The same 3.93 MB over PCIe costs 1.2% of the step, and at batch 32 it is 6.4%. Small-batch TP is more forgiving than large-batch TP.
+  3. TP communication per forward pass is `2 * layers * 2(t-1)/t * B * T * hidden * 2` bytes. For Llama-70B at t=4, batch 1, that is 3.93 MB — about 1.2% of the step over NVLink (mostly the 160 × 0.9 µs message latency).
+  4. The same 3.93 MB over PCIe costs 4.2% of the step, and at batch 32 it is 6.4%. Small-batch TP is more forgiving than large-batch TP.
   5. TP memory falls as 1/t for both weights and KV cache (each rank holds whole KV heads). TP *time* does not, because the collective payload is independent of t — speedup is sublinear.
   6. Legal TP degrees must divide query heads, KV heads and MLP intermediate size. GQA's small KV head count is usually the binding constraint, not the weight shapes.
   7. Attention under TP is column-parallel Q/K/V plus a row-parallel output projection, so it costs the same one all-reduce per layer as the MLP.

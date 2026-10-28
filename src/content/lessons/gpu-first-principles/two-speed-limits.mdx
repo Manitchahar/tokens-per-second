@@ -119,14 +119,14 @@ That ratio is the **ridge point**: the intensity at which the two limits are exa
   For Llama-3.1-8B in BF16 at context length $T$:
 
   $$
-  F \approx 4 T^2 \cdot 4096, \qquad B = T \times (2 \times 32 \times 8 \times 128 \times 2) = T \times 131{,}072
+  F \approx 32 \times 4 T^2 \cdot 4096 = 524{,}288\, T^2, \qquad B = T \times (2 \times 32 \times 8 \times 128 \times 2) = 131{,}072\, T
   $$
 
   $$
-  I = \frac{4 T^2 \cdot 4096}{131{,}072\, T} = \frac{T}{8}
+  I = \frac{524{,}288\, T^2}{131{,}072\, T} = 4T
   $$
 
-  At 1,024 tokens the intensity is 128: still memory-bound. At 8,192 it is 1,024: compute-bound. A single formula tells you that **long contexts make attention expensive in a different way from the weights**, and Module 05 and Module 20 will both be about managing that.
+  At 64 tokens the intensity is 256: still memory-bound. At 1,024 it is 4,096: compute-bound. A single formula tells you that **long contexts make attention expensive in a different way from the weights**, and Module 05 and Module 20 will both be about managing that.
 </Callout>
 
 ## So why not just buy a faster GPU?
@@ -145,7 +145,7 @@ And the fix that costs nothing is arithmetic, not hardware. Decode sits at 1 FLO
   3. **Arithmetic intensity** is FLOPs per byte. It alone decides which limit you hit.
   4. The **ridge point** is compute ceiling ÷ bandwidth: 295 FLOP/byte on H100, 156 on A100, 203 on T4. Left of it, memory-bound; right of it, compute-bound.
   5. Decode runs at ~1 FLOP/byte (memory-bound). Prefill at $m = 512$ runs at ~410 (compute-bound). Intensity grows almost exactly linearly in $m$, because the weight matrix dominates the bytes and does not change.
-  6. Attention intensity is $T/8$ for Llama-3.1-8B in BF16: memory-bound under ~2,400 tokens of context, compute-bound above.
+  6. Attention intensity is ${}4T$ for Llama-3.1-8B in BF16: memory-bound under ~74 tokens of context, compute-bound above.
   7. If the job is memory-bound, buy **bandwidth**, not FLOP/s. If it is compute-bound, buy FLOP/s. Check the roofline first.
   8. Real kernels reach ~80% of peak bandwidth and ~50–70% of peak FLOP/s. The gap between the roof and your point is the entire optimization budget.
 </KeyNotes>
@@ -156,6 +156,6 @@ And the fix that costs nothing is arithmetic, not hardware. Decode sits at 1 FLO
   { q: 'Which change raises arithmetic intensity most directly?', options: ['Loading weights in FP32 instead of BF16', 'Batching 64 tokens into one matrix multiply', 'Running at a lower clock speed', 'Using a smaller GPU'], answer: 1, why: 'The weight bytes stay fixed while FLOPs grow linearly with the number of rows, so intensity grows with batch size. Lower precision *lowers* bytes, which helps — but FP32 raises them.' },
   { q: 'A decode step on a GPU with 1 TB/s of bandwidth must read 16 GB of weights. What is the fastest it could possibly finish, in milliseconds?', numeric: true, answer: 16, tolerance: 1, unit: 'ms', why: '16 × 10⁹ bytes ÷ 1 × 10¹² bytes/s = 16 ms. This is a hard floor; no amount of arithmetic capacity changes it.' },
   { q: 'Your service is decode-heavy and memory-bound on an A100. You switch to an H100. Roughly how much faster does it get?', options: ['About 3.2×, matching the compute ratio', 'About 1.7×, matching the bandwidth ratio', 'About 10×', 'No change, since both are memory-bound'], answer: 1, why: 'A memory-bound job is limited by bytes per second: 3.35 ÷ 2.0 ≈ 1.7×. The 3.2× extra compute is unusable until you change the workload.' },
-  { q: 'For Llama-3.1-8B in BF16, attention arithmetic intensity is about T/8 FLOP per byte. At what context length does it cross the H100 ridge of ~295?', numeric: true, answer: 2360, tolerance: 180, unit: 'tokens', why: 'Set T/8 = 295, so T = 2,360 tokens. Below that attention is memory-bound; above it, compute-bound.' },
+  { q: 'For Llama-3.1-8B in BF16, attention arithmetic intensity is about 4T FLOP per byte. At what context length does it cross the H100 ridge of ~295?', numeric: true, answer: 74, tolerance: 4, unit: 'tokens', why: 'Set 4T = 295, so T = 295/4 = 73.75 ≈ 74 tokens. Below that attention is memory-bound; above it, compute-bound.' },
   { q: 'A kernel achieves 250 TFLOP/s on a GPU with a 989 TFLOP/s ceiling. What is its MFU?', options: ['About 25%', 'About 40%', 'About 75%', 'It cannot be computed without the bandwidth'], answer: 0, why: 'MFU = achieved FLOP/s ÷ peak FLOP/s = 250/989 ≈ 25%. Well below the 50–70% a good GEMM reaches.' },
 ]} />

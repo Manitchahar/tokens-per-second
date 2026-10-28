@@ -183,8 +183,8 @@ class KVCache:
 
     def prefill(self, layer, k, v, p):
         """k, v: [n_kv, prompt, d_head]. Fills rows 0..p-1 in one copy."""
-        self.k[layer, 0, :, :p] = k
-        self.v[layer, 0, :, :p] = v
+        self.k[layer, :, :p, :] = k
+        self.v[layer, :, :p, :] = v
         self.t = p
 
 

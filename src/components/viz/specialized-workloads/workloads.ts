@@ -1077,8 +1077,8 @@ export const diffusionById = (id: string): DiffusionModel => DIFFUSION_MODELS.fi
  * activations, not weights, decide whether you fit.
  *
  * The dominant term is the U-Net's widest feature map. At 512x512 the highest-
- * resolution blocks carry 320 channels, so one tensor is 320 x 512 x 512 x 2 B =
- * 168 MB, and a handful of them live at once for the backward-free inference pass.
+ * resolution blocks carry 320 channels, so one tensor is 320 x 64 x 64 x 2 B =
+ * 2.62 MB, and a handful of them live at once for the backward-free inference pass.
  * Per image that is on the order of a gigabyte — *more than the weights themselves*.
  */
 export interface DiffusionBatch {
@@ -1109,7 +1109,7 @@ export function diffusionBatch(m: DiffusionModel, g: Gpu, size = 512, batch = 4)
   const latentSide = size / m.downsample;
   const latentTokens = m.latentChannels * latentSide * latentSide;
   // 320 channels at full resolution, FP16.
-  const widestTensor = 320 * size * size * 2;
+  const widestTensor = 320 * latentSide * latentSide * 2;
   // ~6 live tensors at the widest stage is a reasonable inference-pass footprint.
   const actBytesPerImage = widestTensor * 6;
   const weightBytes = (m.unetParams + m.vaeParams + m.textParams) * 2;
@@ -1190,7 +1190,7 @@ export function diffusionStep(m: DiffusionModel, g: Gpu, size = 512, batch = 4):
 
   // Bytes touched by a step: every weight (it is re-read each time) plus the widest
   // live activation tensors, which are what actually fills the card.
-  const bytesPerStep = m.unetParams * 2 + 320 * size * size * 2 * 6;
+  const bytesPerStep = m.unetParams * 2 + 320 * (size / m.downsample) * (size / m.downsample) * 2 * 6;
   // What the same bytes would cost at 100% of peak bandwidth.
   const memFloorS = bytesPerStep / g.bw;
   const bandwidthUtil = memFloorS / stepS;

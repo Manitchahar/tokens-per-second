@@ -17,7 +17,7 @@ const STEPS = [
 ];
 const CAPTIONS = [
   'Everything prefill computed has to reach the decode instance. That payload is the KV cache: two bytes times layers times KV heads times head dimension, per token.',
-  'Move those bytes across a link and the time is just bytes divided by bandwidth. On a fast interconnect a 4K prompt costs about a millisecond — a rounding error. On 25 GbE it costs twenty.',
+  'Move those bytes across a link and the time is just bytes divided by bandwidth. On a fast interconnect a 4K prompt costs about a millisecond — a rounding error. On 25 GbE it costs 172 ms.',
   'The payload is linear in context length, which means the transfer cost is too. Long-context traffic is the case where disaggregation stops being free.',
   'Size the prefill pool by FLOPs, because that is what prefill is bound by. Arrivals per second times prompt tokens times seconds per token gives GPU-seconds per second, and you round up.',
   'Size the decode pool by two constraints at once: the throughput it can deliver, and the KV memory it can hold. Whichever binds first sets the count.',
@@ -44,7 +44,7 @@ export default function KVTransfer() {
 
   // Chart of transfer time vs context, log scale.
   const CX0 = 100, CX1 = 610, CY1 = 214, CY0 = 344;
-  const cmax = 34.0; // ms at 25GbE, 32k ctx
+  const cmax = 1400.0; // ms at 25GbE, 32k ctx
   const cy = (ms: number) => CY0 - Math.min(1, Math.log10(Math.max(0.05, ms) + 0.05) / Math.log10(cmax + 0.05)) * (CY0 - CY1);
   const cx = (c: number) => CX0 + Math.log2(c / 1024) / 5 * (CX1 - CX0);
   const wireAt = (c: number) => handoffBytes(c) / link * 1e3;
@@ -64,7 +64,7 @@ export default function KVTransfer() {
       readout={
         <Readout items={[
           { label: 'KV payload', value: fmt.bytes(bytes), kind: 'memory', note: `${fmt.int(ctx)} tokens` },
-          { label: 'On the wire', value: `${(tWire * 1e3).toFixed(2)} ms`, kind: 'comm', note: `${(link / 1e9).toFixed(0)} GB/s link` },
+          { label: 'On the wire', value: `${(tWire * 1e3).toFixed(2)} ms`, kind: 'comm', note: `${(link / 1e9).toFixed(1)} GB/s link` },
           { label: 'Share of a decode step', value: `${(share * 100).toFixed(1)}%`, kind: share > 0.15 ? 'error' : 'comm', note: `step is ${(dec.t * 1e3).toFixed(1)} ms` },
           { label: 'Sequences per decode GPU', value: fmt.int(maxB), kind: 'memory', note: `${fmt.bytes(seqKvBytes(ctx))} of KV each` },
         ]} />
@@ -86,9 +86,9 @@ export default function KVTransfer() {
             value={link}
             options={[
               { value: 900e9, label: 'NVLink' },
-              { value: 400e9, label: '400G' },
-              { value: 100e9, label: '100G' },
-              { value: 25e9, label: '25G' },
+              { value: 400e9, label: '8×400G' },
+              { value: 12.5e9, label: '100G' },
+              { value: 3.125e9, label: '25G' },
             ]}
             onChange={setLink}
           />

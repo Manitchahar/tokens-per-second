@@ -49,7 +49,7 @@ Crossover $S^* = t_{lat} \cdot B \cdot \eta$: **~344 KB on NVLink 4.** Above it,
 | Reduce-scatter | sum, keep 1/$P$ | $(P-1)/P$ |
 | All-gather | shards → all | $(P-1)/P$ |
 | **All-reduce** | sum → identical everywhere | $\frac{2(P-1)}{P}$ |
-| All-to-all | permutation | $\frac{2(P-1)}{P}$ |
+| All-to-all | permutation | $\frac{P-1}{P}$ |
 
 **All-reduce = reduce-scatter + all-gather.** Ring factor: 1 (P=2), 1.5 (P=4), 1.75 (P=8), → 2.
 Ring is bandwidth-optimal, latency $O(P)$; tree is $O(\log P)$ depth and bandwidth-suboptimal. Small messages want tree.
@@ -156,7 +156,7 @@ are not repeated per rank. Cheap: one all-gather or all-reduce per region.
 
 $$t \times P \times R \leq \text{GPUs}, \qquad \text{throughput} = R \times \text{per-replica}$$
 
-**Memory per GPU** = $\frac{\text{weights}}{tP} + \frac{\text{KV}}{t}$ for a $t \times P$ grid.
+**Memory per GPU** = $\frac{\text{weights}}{tP} + \frac{\text{KV}}{tP}$ for a $t \times P$ grid.
 
 ## Reference numbers (H100 SXM, NVLink 4, BF16)
 

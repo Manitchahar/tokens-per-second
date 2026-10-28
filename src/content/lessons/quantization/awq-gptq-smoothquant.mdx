@@ -99,7 +99,7 @@ $$
 
 - $\alpha = 0$: no smoothing (normal W8A8; activations keep their outliers).
 - $\alpha = 1$: migrate everything (bad: weights inherit all the outliers).
-- $\alpha \approx 0.5$–$1.8$ for W8A8; the paper's sweet spot for hard quantisation (INT4/INT3) is higher, pushing *most* of the difficulty into the weights.
+- $\alpha \approx 0.5$–${}0.8$ for W8A8; the paper's sweet spot for hard quantisation (INT4/INT3) is higher, pushing *most* of the difficulty into the weights.
 
 <Callout type="math" title="Why SmoothQuant is exact where AWQ and GPTQ are approximate">
   AWQ scales the weights and **lets the output change slightly** (it approximates — it accepts a little output error in exchange for protecting the salient channels). GPTQ scales nothing but **changes the weights** to compensate rounding (also approximate). SmoothQuant's transformation is an **exact algebraic identity** — the layer computes the identical function in infinite precision — and its only approximation is the ordinary quantization that follows.

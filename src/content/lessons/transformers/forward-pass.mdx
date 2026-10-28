@@ -25,7 +25,7 @@ For Llama-3.1-8B, with $L = 32$:
 |---|---|---|---|---|---|
 | 1 | Embedding lookup | `[T, 4096]` | 1 row of 525.3 M | **8 KB** | 0 |
 | 2 | 32 × block | `[T, 4096]` | 6.979 B | **13.96 GB** | 13.96 G |
-| 3 | Final RMSNorm | `[T, 4096]` | 135 K gains | **0.26 MB** | 0.00026 M |
+| 3 | RMSNorms | `[T, 4096]` | 266 K gains | **0.53 MB** | 0.00053 M |
 | 4 | Output head | `[T, 128256]` | 525.3 M | **1.05 GB** | 1.05 G |
 | 5 | Sampling | `[128256]` | none | 1.03 MB | 0.5 M |
 | | **Total** | | **8.03 B** | **15.55 GB** | **15.01 G** |
@@ -129,7 +129,7 @@ Read the numbers as a budget, because that is how you will think about them for 
 | 32 blocks × attention matrices | 2.68 GB | 17.3% |
 | Output head `lm_head` | 1.05 GB | 6.8% |
 | KV cache at 4,096 tokens | 0.54 GB | 3.4% |
-| All 33 RMSNorm gains + the embedding row | 0.26 MB | ~0% |
+| All 65 RMSNorm gains + the embedding row | 0.54 MB | ~0% |
 
 Two consequences an inference engineer should take away immediately.
 

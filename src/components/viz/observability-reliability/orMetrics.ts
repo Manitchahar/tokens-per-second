@@ -40,7 +40,7 @@ export function histogram(samples: number[], edges: number[]): Histogram {
   const counts = new Array(edges.length).fill(0);
   for (const v of samples) {
     for (let i = 0; i < edges.length; i++) {
-      if (v <= edges[i]) { counts[i]++; break; }
+      if (v <= edges[i]) { counts[i]++; }
     }
   }
   return { edges, counts };
@@ -53,7 +53,7 @@ export function histogram(samples: number[], edges: number[]): Histogram {
  */
 export function quantileFromHistogram(h: Histogram, q: number, total?: number): number {
   const { edges, counts } = h;
-  const n = total ?? counts.reduce((a, b) => a + b, 0);
+  const n = total ?? counts[counts.length - 1] ?? 0;
   if (!n) return 0;
   const target = q * n;
   let prevCount = 0;

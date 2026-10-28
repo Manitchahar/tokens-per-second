@@ -44,7 +44,7 @@ Divide the two numbers you just measured, being careful with units. The T4 refer
 
 ### 6. Sweep m from 1 to 2048
 
-For each m, measure a `[m × 4096] · [4096 × 4096]` multiply in BF16 and report the measured time, the floor implied by your two limits, your efficiency as a percentage, TFLOP/s, GB/s, and arithmetic intensity.
+For each m, measure a `[m × 4096] · [4096 × 4096]` multiply in FP16 and report the measured time, the floor implied by your two limits, your efficiency as a percentage, TFLOP/s, GB/s, and arithmetic intensity.
 
 Read the table before going further. The measured time should be almost **flat** from m = 1 to m = 32. That flatness is the empirical fact underneath the whole of Module 07: the first few dozen users of a batch cost you nearly nothing, because they are all reading the same weights at the same time.
 

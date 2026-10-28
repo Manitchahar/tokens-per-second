@@ -151,7 +151,7 @@ export default function BlockViz() {
             <Label x={330} y={230} tone={2} size={9.5}>flow through it untouched.</Label>
             <Label x={330} y={262} tone={1} size={9.5}>Every model in this course is pre-norm.</Label>
             <Label x={330} y={284} tone={3} size={9}>and there is one final RMSNorm before the</Label>
-            <Label x={330} y={300} tone={3} size={9}>output head — 33 norms in total.</Label>
+            <Label x={330} y={300} tone={3} size={9}>output head — 65 norms in total.</Label>
           </g>
         )}
 

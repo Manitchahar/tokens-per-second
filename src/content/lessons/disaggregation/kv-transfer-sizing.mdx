@@ -88,10 +88,10 @@ For Llama-3.1-8B at 4,096 context on an H100 with a 20.3 ms decode step at batch
 |---|---|---|---|
 | NVLink 4 | 900 GB/s | 0.60 ms | 3% |
 | 8×400 GbE | 400 GB/s | 1.34 ms | 7% |
-| 100 GbE | 100 GB/s | 5.37 ms | 26% |
-| 25 GbE | 25 GB/s | 21.5 ms | 106% |
+| 100 GbE | 12.5 GB/s | 43 ms | 212% |
+| 25 GbE | 3.1 GB/s | 172 ms | 847% |
 
-Read the last row again. At 25 GbE the transfer is **longer than the decode step it is feeding** — the pipeline spends more time shipping the cache than using it. Disaggregation there is strictly worse than not disaggregating.
+Read the last two rows again. At 100 GbE and 25 GbE the transfer is **longer than the decode step it is feeding** (43 ms and 172 ms vs 20.3 ms) — the pipeline spends more time shipping the cache than using it. Disaggregation there is strictly worse than not disaggregating.
 
 <Callout type="math" title="The 10% rule, and why it exists">
   Keep the transfer under about **10% of a decode step** and it is invisible in steady state, because you pay it once per request while decode pays its step thousands of times.
@@ -132,7 +132,7 @@ N_{\text{throughput}} = \left\lceil \frac{\lambda \cdot m}{\text{tokens/s per in
 N_{\text{memory}} = \left\lceil \frac{C_{\text{concurrency}}}{\text{sequences per instance}} \right\rceil
 $$
 
-For the same workload — 20 req/s, 256-token answers, 512 concurrent users at 4,096 context — an H100 holds 113 sequences (16.1 GB of weights plus workspace leaves about 63.8 GB of KV, and $63.8\text{ GB} \div 537\text{ MB}$ is 113), and each delivers about 3,751 tok/s:
+For the same workload — 20 req/s, 256-token answers, 512 concurrent users at 4,096 context — an H100 holds 113 sequences (16.1 GB of weights plus workspace leaves about 63.8 GB of KV, and ${}63.8\text{ GB} \div 537\text{ MB}$ is 113), and each delivers about 3,751 tok/s:
 
 $$
 N_{\text{throughput}} = \left\lceil \frac{20 \times 256}{3751} \right\rceil = 2,
@@ -215,9 +215,9 @@ Two sentences, and they are enough to size a whole system:
 And one consequence worth stating plainly: **both pools must be sized for p99, not mean.** Prefill is bursty in a way decode is not, because it is driven by prompt length rather than by streaming rate. A fleet sized on mean prefill length will look comfortable in your dashboard and fall over on the day someone pastes in a 30-page document.
 
 <KeyNotes>
-  1. The payload is exactly the KV cache: $2 \times \text{layers} \times \text{KV heads} \times \text{head dim} \times \text{bytes}$ per token, times context length. Nothing else crosses the wire — not the weights, which each instance loads itself.
+  1. The payload is exactly the KV cache: ${}2 \times \text{layers} \times \text{KV heads} \times \text{head dim} \times \text{bytes}$ per token, times context length. Nothing else crosses the wire — not the weights, which each instance loads itself.
   2. Divide by real link bandwidth and compare against one decode step, not against a round-trip time. Transfer happens once per request; decode happens once per token.
-  3. Keep the transfer under **~10% of a decode step**. That gives $C \le 0.1 \, B_{\text{link}} \, t_{\text{decode}} / b_{\text{kv}}$ — about 62K tokens on 400 GbE for 8B, but only ~3.9K on 25 GbE.
+  3. Keep the transfer under **~10% of a decode step**. That gives $C \le 0.1 \, B_{\text{link}} \, t_{\text{decode}} / b_{\text{kv}}$ — about 62K tokens on 8×400 GbE (400 GB/s) for 8B, but only ~480 tokens on 25 GbE.
   4. Size the prefill pool from arrivals times prompt tokens times per-token prefill time: $\lceil \lambda n t_{\text{tok}} \rceil$. Size it from **p99** prompt length, not the mean.
   5. Size the decode pool twice — by throughput **and** by KV residency — and take the larger. In the worked example throughput wanted 2 GPUs and KV memory wanted 5; sizing by throughput alone ships an OOM.
   6. The split buys roughly **2× TPOT and 2× decode capacity** for three extra GPUs here, plus burst absorption a shared fleet cannot provide. It is a cost decision with a checkable technical claim.
@@ -227,7 +227,7 @@ And one consequence worth stating plainly: **both pools must be sized for p99, n
 
 <Quiz client:visible questions={[
   { q: 'Llama-3.1-70B has 80 layers, 8 KV heads, head dim 128, BF16. How many bytes of KV cache does 16,384 tokens of context occupy?', numeric: true, answer: 5368709120, tolerance: 300000000, unit: 'bytes', why: 'Per token: 2 × 80 × 8 × 128 × 2 = 327,680 bytes (320 KiB). Times 16,384 tokens = 5,368,709,120 bytes ≈ 5.0 GiB.' },
-  { q: 'Llama-3.1-70B hands off a 16K-context request (5.0 GiB of KV) across a single 100 GbE link. How long does the transfer take, and is that acceptable against a 30 ms decode step?', options: ['About 5 ms — fine', 'About 54 ms — most of two decode steps, probably too slow', 'About 430 ms — unusable', 'About 1.4 s — completely unviable'], answer: 1, why: '5.37e9 bytes ÷ 100e9 B/s ≈ 54 ms per link, which is about 1.8× a 30 ms decode step. That already fails a 10% budget badly. On 25 GbE it would be 215 ms. The fix is a faster fabric or a smaller payload (GQA, KV quantisation), not a better router.' },
+  { q: 'Llama-3.1-70B hands off a 16K-context request (5.0 GiB of KV) across a single 100 GbE link. How long does the transfer take, and is that acceptable against a 30 ms decode step?', options: ['About 5 ms — fine', 'About 54 ms — if 100 GbE were 100 GB/s', 'About 430 ms — unusable', 'About 1.7 s — completely unviable'], answer: 2, why: '100 GbE is 12.5 GB/s. 5.37e9 bytes ÷ 12.5e9 B/s ≈ 430 ms per link, which is more than 14× a 30 ms decode step. On 25 GbE (3.125 GB/s) it would be 1.7 s. The fix is a faster fabric or a smaller payload (GQA, KV quantisation), not a better router.' },
   { q: 'Your decode instances can each hold 113 sequences at 4K context, and you need 512 concurrent users. Throughput sizing says 2 instances, memory sizing says 5. How many decode GPUs do you provision?', numeric: true, answer: 5, tolerance: 0, unit: 'GPUs', why: 'Take the max of the two constraints. KV memory binds at 5. Provisioning by throughput alone (2) would OOM the moment real concurrency arrived — the constraint that binds is the one you must honour.' },
   { q: 'Which statement about the decode router is correct?', options: ['Least-loaded routing is always sufficient, since a GPU with free memory can take any request', 'Routing is bin-packing: filter by whether the instance can hold this context, then rank by fragmentation', 'Decode routing matters only when there is more than one decode instance', 'The router should send requests to whichever instance finished its prefill fastest'], answer: 1, why: 'Slots are reserved per request size. An instance can be "least loaded" and still have no slot that fits a 32K request. Filter by fit first, pack tightly second, and use least-loaded only as the tiebreak.' },
   { q: 'You move to a 25 GbE fabric. Which workload below makes disaggregation clearly unviable?', options: ['Llama-3.1-8B, 2K context, 200-token answers', 'Llama-3.1-8B, 8K context, 200-token answers', 'Llama-3.1-70B, 16K context, 300-token answers', 'Llama-3.1-8B, 32K context, 50-token answers'], answer: 2, why: 'A 70B at 16K ships 5.0 GiB. On 25 GbE that is 1.7 s per request — far more than the decode steps it will ever feed. The others are 0.1–1.2 GiB, which stay tolerable. Payload, not model size alone, is what kills it.' },

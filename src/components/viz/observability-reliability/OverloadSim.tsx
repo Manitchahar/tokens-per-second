@@ -22,7 +22,7 @@ const CAPTIONS = [
   'One server with a concurrency pool of 40 slots. Each request occupies a slot for its whole duration — from prefill through the last token — not just while it needs the GPU.',
   'Three sliders: offered load in requests per second, the number of concurrent slots, and how many requests may wait before the door is closed.',
   'At 8 req/s against 40 slots, occupancy is around 25%. Almost every request starts immediately. Queue wait is effectively zero.',
-  'Past 21 req/s — which is where 40 slots ÷ 1.89 s puts capacity — the pool is full. Requests start waiting, and because service times vary (some are 8-second summaries, some are 0.8-second chats) the queue fills unevenly and the tail appears.',
+  'Past 12.7 req/s — which is where 24 slots ÷ 1.89 s puts capacity — the pool is full. Requests start waiting, and because service times vary (some are 8-second summaries, some are 0.8-second chats) the queue fills unevenly and the tail appears.',
   'The waiting room is a buffer, not a solution. A buffer of 200 holds the burst and flattens the p95 — but it cannot make the server faster, and it converts rejection into waiting.',
   'Unbounded queues are this panel with the buffer removed. Requests are all admitted, nobody is ever rejected, and latency grows without limit while throughput stays flat.',
   'Load shedding means refusing new work immediately and retryably. The shed requests cost you nothing; the queued ones cost you everything and still miss.',
