@@ -40,7 +40,7 @@ const JIT_MS = 180;                       // one-time compile
 const L2_SPEEDUP = 3.1;                   // cached reads are ~3x faster
 const NOISE_US = 55;                      // a single jittered measurement
 
-const gpu = { name: 'H100 SXM', bw: 3200 };  // GB/s, for the "% of peak" readout
+const gpu = { name: 'H100 SXM', bw: 3350 };  // GB/s, for the "% of peak" readout
 
 export default function BenchHarness() {
   const ref = useRef<HTMLDivElement>(null);

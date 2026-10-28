@@ -29,13 +29,13 @@ Both appear in the literature under the name "alpha". Never let a paper's alpha 
 
 ## Step one: how many tokens leave a block?
 
-Drafting stops at the first token the target rejects. So if drafts are accepted with probability $a$ independently, the number of drafts you actually pay for is $\min(k+1, \gamma)$ where $k$ is the accepted run length — geometric with mean
+In speculative decoding, the target checks all of the drafted tokens in one parallel pass and keeps them only up to the first rejection. In our foundational model, we evaluate the expected accepted drafts $\min(k+1, \gamma)$ where $k$ is the accepted run length — geometric with mean
 
 $$
 \mathbb{E}[\text{drafts}] = \sum_{i=1}^{\gamma} \Pr[\text{at least } i \text{ drafts}] = \sum_{i=1}^{\gamma} a^{i-1} = \frac{1 - a^{\gamma}}{1 - a}
 $$
 
-Note the truncation. If $\gamma$ is large and $a$ is high, this tends to $\frac{1}{1-a}$ — the infinite-series sum. If $a$ is low, it is dominated by the first term. Either way you never pay to draft tokens after a rejection.
+Note the truncation. If $\gamma$ is large and $a$ is high, this tends to $\frac{1}{1-a}$ — the infinite-series sum. If $a$ is low, it is dominated by the first term. (In standard batch drafting, all $\gamma$ candidate tokens are generated before verification runs, costing $\gamma \rho$; in the foundational model where draft cost is budgeted against accepted yield, it scales with $d$).
 
 Each accepted draft yields one token, and the final position yields the bonus token. So the block's <Term t="tokens-per-block">tokens per block</Term> is
 
@@ -81,7 +81,7 @@ $$
 \text{speedup} > 1 \iff 1 + a\,d > 1 + \rho\,d \iff a > \rho
 $$
 
-**$\gamma$ cancels entirely.** The break-even condition is simply that your acceptance rate exceeds your draft cost ratio.
+**$\gamma$ cancels entirely in this foundational model.** The break-even condition simplifies to whether your acceptance rate exceeds your draft cost ratio: $a > \rho$. (In practice with fixed $\gamma$ drafting, break-even is $\frac{1}{\gamma}\sum_{i=1}^\gamma a^i > \rho$, which approaches $a > \rho$ for small $\gamma$).
 
 <Callout type="math" title="The single most useful sentence in this module">
   You win exactly when **how often the draft is right** beats **how cheap the draft was**. In other words, when your <Term t="acceptance-rate">acceptance rate</Term> exceeds your <Term t="draft-cost-ratio">draft cost ratio</Term> — the <Term t="break-even-acceptance">break-even acceptance rate</Term> is simply $\rho$.
@@ -288,7 +288,7 @@ There is always a sweet spot, and it is hardware-dependent. The next lesson is a
   { q: 'Speculative decoding is faster than plain sampling exactly when:', options: ['The acceptance rate exceeds the draft cost ratio, a > rho', 'The block size gamma is at least 4', 'The draft model is smaller than 1B parameters', 'The context length is under 2048 tokens'], answer: 0, why: 'Speedup is (1 + a*d)/(1 + rho*d), so it exceeds 1 exactly when a > rho. Gamma cancels from the break-even condition entirely. It is the only inequality that matters.' },
   { q: 'With a = 0.72 and gamma = 4, how many tokens does a block emit on average? (d = (1 - 0.72^4)/(1 - 0.72) = 2.612)', numeric: true, answer: 2.88, tolerance: 0.02, unit: 'tokens', why: 'Tokens = 1 + a*d = 1 + 0.72 x 2.612 = 1 + 1.881 = 2.881. The 1 is the bonus token from the final position, which is why a block never returns nothing.' },
   { q: 'Why does the speedup formula not depend on gamma at the break-even point?', options: ['Because gamma cancels algebraically — the same draft count d appears in both tokens and cost', 'Because gamma is always set to 4', 'Because gamma only affects memory, not time', 'Because gamma is ignored by engines'], answer: 0, why: 'Tokens = 1 + a*d and cost = 1 + rho*d share the same d. Speedup > 1 reduces to a*d > rho*d, i.e. a > rho, with d (which depends on gamma) dividing out.' },
-  { q: 'Speculative sampling is said to be exact, meaning it does not change the output distribution. Which statement justifies this?', options: ['It runs at higher precision than plain sampling', 'The accepted branch contributes min(p, q) and the rejection branch contributes max(0, p - q); the two sum to exactly p', 'It uses a different random seed', 'It only ever accepts tokens, discarding nothing'], answer: 0, why: 'min(p,q) + max(0, p-q) = p term by term, because max(0, p-q) = p - min(p,q). This is a proof, not an empirical observation, which is why the technique is safe to enable unconditionally.' },
+  { q: 'Speculative sampling is said to be exact, meaning it does not change the output distribution. Which statement justifies this?', options: ['It runs at higher precision than plain sampling', 'The accepted branch contributes min(p, q) and the rejection branch contributes max(0, p - q); the two sum to exactly p', 'It uses a different random seed', 'It only ever accepts tokens, discarding nothing'], answer: 1, why: 'min(p,q) + max(0, p-q) = p term by term, because max(0, p-q) = p - min(p,q). This is a proof, not an empirical observation, which is why the technique is safe to enable unconditionally.' },
   { q: 'In the worked example, cost per block is 1 + 0.125 x 2.612. What is that cost, in decode steps?', numeric: true, answer: 1.33, tolerance: 0.02, unit: 'decode steps', why: '0.125 x 2.612 = 0.3265, plus the 1 for the verify pass, gives 1.327 decode steps per block. Since a block emits 2.88 tokens, the speedup is 2.88 / 1.327 = 2.17x.' },
-  { q: 'Why does an extremely large gamma eventually reduce the speedup?', options: ['The draft model runs out of memory', 'The verification pass does gamma times the FLOPs of a decode step, so past the compute/memory knee it is no longer free', 'The KV cache stops working past a certain size', 'The target model can only attend to a fixed number of positions'], answer: 0, why: 'Verification is free only while it is memory-bound. As gamma grows, the arithmetic grows proportionally and eventually dominates. That is why there is an optimal gamma rather than "as many drafts as possible".' },
+  { q: 'Why does an extremely large gamma eventually reduce the speedup?', options: ['The draft model runs out of memory', 'The verification pass does gamma times the FLOPs of a decode step, so past the compute/memory knee it is no longer free', 'The KV cache stops working past a certain size', 'The target model can only attend to a fixed number of positions'], answer: 1, why: 'Verification is free only while it is memory-bound. As gamma grows, the arithmetic grows proportionally and eventually dominates. That is why there is an optimal gamma rather than "as many drafts as possible".' },
 ]} />

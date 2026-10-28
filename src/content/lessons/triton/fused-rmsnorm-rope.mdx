@@ -109,12 +109,14 @@ out_hi = lo * s + hi * c
 
 ## Fusing them: the actual lesson
 
-Now the point. Written in PyTorch, these are separate operations and each is a separate kernel launch:
+Now the point. In models with **QK-norm** (such as Qwen3, Gemma 3 and OLMo 2), or when applying normalization directly to query/key head vectors before rotary embedding, written naively in PyTorch these are separate operations and each is a separate kernel launch:
 
 ```python
-x = rmsnorm(x, weight)          # launch 1: read x, write x_norm
-q, k = apply_rope(q, k, pos)    # launch 2 and 3: read x_norm, write q', k'
+q_norm = rmsnorm(q, weight)       # launch 1: read q, write q_norm
+q_rot  = apply_rope(q_norm, pos)  # launch 2: read q_norm, write q_rot
 ```
+
+*(Note: in baseline Llama without QK-norm, input RMSNorm precedes the QKV GEMM, and RoPE applies after projection because matrix multiplication does not commute with positional rotation: $R_\Theta(x W) \neq R_\Theta(x) W$. But in architectures with QK-norm like Gemma 2 or when fusing head states, normalization feeds directly into RoPE).*
 
 A **round trip to HBM** sits between them. The intermediate, one token of 4,096 FP16 values, is 8 KB. Let me price that precisely, because the numbers are what make the case.
 
@@ -169,6 +171,7 @@ The fused kernel is unremarkable to write, which is the best sign:
 ```python
 @triton.jit
 def fused_rmsnorm_rope(x_ptr, out_ptr, w_ptr, cos_ptr, sin_ptr, n_cols, pos, BLOCK: tl.constexpr):
+    # Fused QK-norm + RoPE: normalizes head states and rotates pairs in registers
     row = tl.program_id(0)
     half = tl.arange(0, BLOCK // 2)
     mask = half < (n_cols // 2)

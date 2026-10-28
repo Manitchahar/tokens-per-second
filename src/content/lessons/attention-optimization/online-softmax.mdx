@@ -82,10 +82,10 @@ $$
 At $T = 8{,}192$, $n_q = 32$, $b = 2$, $d = 128$:
 
 $$
-B_{\text{real}} = 4 \times 8{,}192^2 \times 32 \times 2 = 17.2\ \text{GB per layer}, \qquad F = 4 T^2 d n_q = 1.37\ \text{TFLOP}
+B_{\text{real}} = 4 \times 8{,}192^2 \times 32 \times 2 = 17.2\ \text{GB per layer}, \qquad F = 4 T^2 d n_q = 1.10\ \text{TFLOP}
 $$
 
-On an H100, moving those 17.2 GB takes $B/P = 5.1$ ms, while the arithmetic takes $F/P = 1.4$ ms. **The memory move is 3.8× longer than the math.** The workload is memory-bound, not compute-bound, and the roofline's $T/8$ is a lie caused entirely by the intermediate.
+On an H100, moving those 17.2 GB takes $B/\text{bw} \approx 5.1$ ms, while the arithmetic takes $F/\text{peak} \approx 1.1$ ms. **The memory move is 4.6× longer than the math.** The workload is memory-bound, not compute-bound, and the roofline's $T/8$ is a lie caused entirely by the intermediate.
 
 <Scrolly>
   <AttentionMemory client:visible slot="stage" />
@@ -218,7 +218,7 @@ Take Llama-3.1-8B, one layer, $T = 8{,}192$, 32 heads, BF16.
 |---|---|---|---|
 | Peak extra memory | 8.59 GB | 67 MB ($O$ + tile) | **128×** |
 | HBM traffic, intermediate | 17.2 GB | 0 | — |
-| Arithmetic | 1.37 TFLOP | 1.37 TFLOP | 1× |
+| Arithmetic | 1.10 TFLOP | 1.10 TFLOP | 1× |
 
 The traffic reduction is total: **the intermediate is never written, so it is never read**. What remains in HBM is exactly $Q$, $K$, $V$ and $O$ — the tensors that genuinely have to be somewhere.
 

@@ -27,10 +27,10 @@ Llama-3.1-8B, one layer, $n_q = 32$, $d = 128$, BF16:
 
 | $T$ | $S+P$ peak (1 layer) | traffic (1 layer) | whole KV cache (32 layers) |
 |---|---|---|---|
-| 2,048 | 1.07 GB | 2.15 GB | 268 MB |
-| 4,096 | 4.29 GB | 8.59 GB | 537 MB |
-| 8,192 | 17.2 GB | 34.4 GB | 1.07 GB |
-| 16,384 | 68.7 GB | 137 GB | 2.15 GB |
+| 2,048 | 537 MB | 1.07 GB | 268 MB |
+| 4,096 | 2.15 GB | 4.29 GB | 537 MB |
+| 8,192 | 8.59 GB | 17.2 GB | 1.07 GB |
+| 16,384 | 34.4 GB | 68.7 GB | 2.15 GB |
 
 - The intermediate for **one layer** is 8× the entire KV cache at $T = 8{,}192$.
 - Each tensor is read **exactly once**, so this is not redundant traffic — it is traffic for a tensor that should never have existed.
@@ -74,9 +74,9 @@ O /= l                                     # once, at the end
 
 | $B_r$ / $B_c$ | Tile bytes | Peak extra, one program |
 |---|---|---|
-| 32 | 4 KB | ~25 KB |
-| **64** | **8 KB** | **~45 KB** |
-| 128 | 32 KB | ~100 KB (occupancy cost) |
+| 32 | 4 KB | ~74 KB |
+| **64** | **8 KB** | **~147 KB** |
+| 128 | 32 KB | ~295 KB (occupancy cost) |
 
 $$
 \text{peak} \approx B_r d \cdot 2 + 2 B_c d \cdot 2 + 3 B_r d \cdot 4
@@ -152,7 +152,7 @@ $$
 
 1. **`m` initialised to 0, not $-\infty$.** Passes on positive scores, silently wrong on negative ones. Always $-\infty$.
 2. **FP16 accumulator.** Rounding over thousands of tiles reads as a quality regression, not a bug. Keep `acc`, `m`, `l` in FP32.
-3. **Missing the scaling factor.** Dropping $1/\sqrt{d}$ in the score. Output is finite and plausible; quality just quietly worse.
+3. **Missing the scaling factor.** Dropping $\frac{1}{\sqrt{d}}$ in the score. Output is finite and plausible; quality just quietly worse.
 4. **Missing causal mask.** No crash, especially not in decode. Silently broken causality.
 5. **Copying a tile size between GPUs.** Register budgets differ; occupancy collapses. Tune per architecture.
 6. **Quoting eager attention as the baseline for decode.** There is no $T^2$ to remove — you will measure ~0% and conclude fusion is pointless *for decode*, which is true and not a general conclusion.
@@ -165,7 +165,7 @@ $$
 | H100 ridge point | ~295 FLOP/byte |
 | Decode intensity, Llama-3.1-8B | 4 FLOP/byte (**74× below ridge**) |
 | KV read, 8,192 tok, 32 layers | 1.07 GB → 320 µs on an H100 |
-| Fused peak, $B_r = B_c = 64$ | ~45 KB, independent of $T$ |
+| Fused peak, $B_r = B_c = 64$ | ~147 KB, independent of $T$ |
 | Paged gather overhead | ~1% of a decode step |
-| Eager peak, 8,192 tok, 1 layer | 17.2 GB (**8× the whole KV cache**) |
+| Eager peak, 8,192 tok, 1 layer | 8.59 GB (**8× the whole KV cache**) |
 | Causal FLOP saving | ~50% |

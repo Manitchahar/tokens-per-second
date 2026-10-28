@@ -106,10 +106,10 @@ Two separate wins, and they grow at different rates.
 **Memory.** Peak extra memory per program is $O(B_r d + B_c d)$, independent of $T$:
 
 $$
-B_r d \cdot 2 + 2 B_c d \cdot 2 + 3 B_r d \cdot 4 \approx 45\ \text{KB} \text{ at } B_r = B_c = 64,\ d = 128
+B_r d \cdot 2 + 2 B_c d \cdot 2 + 3 B_r d \cdot 4 \approx 147.5\ \text{KB (144 KiB)} \text{ at } B_r = B_c = 64,\ d = 128
 $$
 
-The eager version needed $n_q \times 2 \times T^2 \times 2 = 2 \times 32 \times T^2 \times 2$ bytes for all heads. At $T = 4{,}096$ that is 2.15 GB. The fused version needs 45 KB. **The memory win is independent of context length** — it is a constant that never grows. That is why a 100,000-token prefill does not OOM.
+The eager version needed $n_q \times 2 \times T^2 \times 2 = 2 \times 32 \times T^2 \times 2$ bytes for all heads. At $T = 4{,}096$ that is 2.15 GB. The fused version needs ~148 KB. **The memory win is independent of context length** — it is a constant that never grows. That is why a 100,000-token prefill does not OOM.
 
 **Bandwidth (IO).** Eager moves $B_{\text{eager}} = 4 T^2 n_q b$ bytes; fused moves only $O, K, V$, which is $B_{\text{fused}} = 3 T n_q d b$. At $T = 4{,}096$, fused is faster because it does far less work per output number.
 
@@ -229,7 +229,7 @@ That is the next lesson.
   1. A FlashAttention program owns one tile of query rows ($B_r \approx 64$) and keeps it in SRAM for its entire life. That residency is what makes fusion possible.
   2. The forward pass is a loop over key tiles: load $K_j$, compute $S_j = Q_j K_j^\top$ in SRAM, merge into $(m, \ell, O)$ with the online softmax, discard the tile.
   3. It is **exact**, not approximate. The merge is associative and the division by $\ell$ happens once, so reassociating the arithmetic does not change the result — only the floating-point order.
-  4. Peak extra memory is $O(B_r d + B_c d) \approx 45$ KB per program, **independent of context length**. A 100,000-token prefill does not OOM because of it.
+  4. Peak extra memory is $O(B_r d + B_c d) \approx 148$ KB per program, **independent of context length**. A 100,000-token prefill does not OOM because of it.
   5. Bytes drop from $B_{\text{eager}} = 4T^2 n_q b$ to $B_{\text{fused}} = O(T n_q d b)$, while FLOPs stay $O(T^2)$. So fused attention's arithmetic intensity *improves* with context length — the roofline lesson made concrete.
   6. The causal mask saves about half the FLOPs for free (triangular tiles), and is a correctness constraint you get paid for.
   7. The backward pass needs $\delta S$, which requires the full score row, so it **recomputes** $S$ from $Q, K, V$ and the saved $(m, \ell)$ instead of storing it — the same store-the-statistics / recompute-the-rest trade as the KV cache.
@@ -238,7 +238,7 @@ That is the next lesson.
 
 <Quiz client:visible questions={[
   { q: 'In the FlashAttention forward pass, what is stored between loop iterations?', options: ['The full T x T score matrix', 'The query tile Q and the three state vectors m, ℓ, O', 'Only the current key tile', 'Nothing — the kernel is stateless'], answer: 1, why: 'The query tile and the running state persist. The score tile and the K/V tiles are recomputed or evicted each iteration and never written to HBM.' },
-  { q: 'With BR = BC = 64 and D = 128, how many key tiles does the causal loop iterate for a context of 1024 tokens, counting only the non-skipped tiles of query tile 0?', numeric: true, answer: 16, tolerance: 1, unit: 'tiles', why: 'A full context of 1024 tokens is 1024/64 = 16 key tiles. Query tile 0 can see all of them (it is the first block), so it runs 16 iterations.' },
+  { q: 'With BR = BC = 64 and D = 128, how many key tiles does the causal loop iterate for a context of 1024 tokens, counting only the non-skipped tiles of query tile 0?', numeric: true, answer: 1, tolerance: 0, unit: 'tiles', why: 'In causal attention, query tile 0 covers tokens 0..63 and can only attend to key tile 0 (j ≤ i). All later key tiles 1..15 represent future tokens and are skipped, so it iterates only 1 tile.' },
   { q: 'For a causal attention with square tiles over T tokens, what fraction of the full square FLOPs is actually computed (as the context gets large)?', options: ['About 25%', 'About 50%', 'About 75%', 'All of them'], answer: 1, why: 'Tiles computed = n(n+1)/2 of n² tiles, which tends to 1/2. The mask is a free constant-factor saving, and it grows with context.' },
   { q: 'Why is FlashAttention exact while sparse attention is not?', options: ['FlashAttention uses lower precision', 'FlashAttention only reassociates the arithmetic; sparse attention drops connections the model was trained to use', 'FlashAttention runs in FP32', 'They are both exact'], answer: 1, why: 'Every token still attends to every earlier token. Fusion changes only the order of floating-point operations, which the associative merge makes equivalent. Sparse attention genuinely removes interactions, which is a model change.' },
   { q: 'The backward pass cannot simply use the forward algorithm. Why does it need to recompute S from Q, K, V?', options: ['Because S was never saved, and recovering the softmax gradient needs the full score row', 'Because the forward pass lost the query tile', 'Because gradients must be computed in FP32 and S was BF16', 'Because K and V are freed after the forward pass'], answer: 0, why: 'The softmax Jacobian couples every entry in a row, so δS cannot be produced from the output and the three state vectors alone. FlashAttention recomputes S rather than store it, keeping only (m, ℓ) between passes.' },
