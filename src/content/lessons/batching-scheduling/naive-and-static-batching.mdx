@@ -1,6 +1,6 @@
 ---
 title: 'Why naive serving breaks & static batching'
-summary: One GPU serving many people looks like it should be simple, but a naive server throws away almost all of it. Here is the first honest fix — put everyone in one batch — and exactly why it still wastes a third of the machine.'
+summary: 'One GPU serving many people looks like it should be simple, but a naive server throws away almost all of it. Here is the first honest fix — put everyone in one batch — and exactly why it still wastes a third of the machine.'
 objectives:
   - Explain why decoding one request at a time wastes almost the whole GPU
   - Compute the step time and throughput of a batch of any size from the memory-bandwidth model

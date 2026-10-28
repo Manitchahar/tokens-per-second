@@ -53,8 +53,8 @@ $$
 | | **Prefill** | **Decode** |
 |---|---|---|
 | Tokens per step | $T$ | 1 |
-| FLOPs | $2PT + 4T^2 d L$ | $2P + 4T d L$ |
-| Bytes | $2Pb + T b_{kv}$ + activations | $2Pb + T b_{kv}$ |
+| FLOPs | ${}2PT + 4T^2 d L$ | ${}2P + 4T d L$ |
+| Bytes | ${}2Pb + T b_{kv}$ + activations | ${}2Pb + T b_{kv}$ |
 | Intensity | $\approx T$ | $\approx 1$ |
 | Limited by (H100) | compute, above ~300 prompt tokens | memory, at any context |
 | Llama-8B, T=512, H100 | ~15 ms | ~7.5 ms |
@@ -111,7 +111,7 @@ $$
 
 ## Reference numbers
 
-| GPU | Peak BF16 | Bandwidth | Memory | Ridge |
+| GPU | Peak (FP16/BF16) | Bandwidth | Memory | Ridge |
 |---|---|---|---|---|
 | T4 (free Colab) | 65 TFLOP/s | 320 GB/s | 16 GiB | ~203 |
 | A100 80GB | 312 TFLOP/s | 2.0 TB/s | 80 GB | ~156 |
@@ -145,7 +145,7 @@ model.generate(..., use_cache=False)                    # the naive reference
 
 | Term | Meaning |
 |---|---|
-| token-forward | One token pushed through the whole model, $2P$ FLOPs |
+| token-forward | One token pushed through the whole model, ${}2P$ FLOPs |
 | prefill | Process the whole prompt in one batched pass; compute-bound |
 | decode | One token per step; memory-bound |
 | KV cache | Stored K and V of every previous token, per layer |

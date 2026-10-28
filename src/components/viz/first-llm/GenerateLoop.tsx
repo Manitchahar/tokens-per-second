@@ -129,7 +129,7 @@ export default function GenerateLoop() {
         </Fade>
         <Fade show={st < 2}>
           <rect x={68} y={140} width={266} height={42} rx={3} fill="none" stroke="var(--rule-2)" strokeDasharray="3 3" />
-          <text x={201} y={165} textAnchor="middle" className="v-label t3" style={{ fontSize: 10 }}>32 layers run here</text>
+          <text x={201} y={165} textAnchor="middle" className="v-label t3" style={{ fontSize: 10 }}>{`${M.layers} layers run here`}</text>
         </Fade>
 
         {/* the KV cache growing beside the model */}
