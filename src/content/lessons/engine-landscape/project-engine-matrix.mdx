@@ -50,14 +50,14 @@ $$
 
 Worked, from the notebook: **Llama-3.1-8B, BF16, on a T4.**
 
-- weights = $8.03\times 10^9 \times 2 = 16.06$ GB
-- reserve = $0.04 \times 16 = 0.64$ GB
-- kv per token = $2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes
-- pool = $16 - 16.06 - 0.64 = -0.70$ GB → **negative**
+- weights = ${}8.03\times 10^9 \times 2 = 16.06$ GB
+- reserve = ${}0.04 \times 16 = 0.64$ GB
+- kv per token = ${}2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes
+- pool = ${}16 - 16.06 - 0.64 = -0.70$ GB → **negative**
 
 It does not fit. Not "it will be slow" — it will not load. And a T4 is 16 GB, so this is a hard constraint that eliminates the candidate before any benchmark exists.
 
-Now **the same model on an A100 (80 GB)**: pool = $80 - 16.06 - 3.2 = 60.7$ GB, so $\frac{60.7\times 10^9}{131{,}072} \approx 463{,}000$ tokens of context. At 2,048 tokens per request that is **226 concurrent streams**; at 16,384 it is 28.
+Now **the same model on an A100 (80 GB)**: pool = ${}80 - 16.06 - 3.2 = 60.7$ GB, so $\frac{60.7\times 10^9}{131{,}072} \approx 463{,}000$ tokens of context. At 2,048 tokens per request that is **226 concurrent streams**; at 16,384 it is 28.
 
 <Callout type="math" title="Context is a matrix column, not a footnote">
   The same model on the same GPU supports an 8× range of batch capacity depending only on how long the context is. A matrix with a single "max batch" number and no context stated is not describing a system — it is describing one point in a 2-D space, and the point it chose may be the one where your engine loses.

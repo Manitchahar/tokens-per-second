@@ -29,7 +29,7 @@ This lesson builds the vocabulary and the arithmetic. The next three apply it.
 
 At the bottom, a <Term t="pcie">PCIe</Term> slot. PCIe 4.0 x16 moves about 32 GB/s in one direction; PCIe 5.0 x16 about 64 GB/s. Every GPU you own is attached to the host this way, whether or not anything else is, and the host bridge is what you push data through when a GPU talks to the CPU or to another machine.
 
-Above it, <Term t="nvlink">NVLink</Term>, a chip-to-chip link that bypasses PCIe entirely. On an 8-GPU SXM node there is a full mesh: every GPU can talk to every other at 450 GB/s on H100, 900 GB/s on B200, both quoted bidirectional so half that in each direction. This is a different machine from eight PCIe-attached cards, and the difference is not incremental.
+Above it, <Term t="nvlink">NVLink</Term>, a chip-to-chip link that bypasses PCIe entirely. On an 8-GPU SXM node there is a full mesh: every GPU can talk to every other at 450 GB/s on H100, 900 GB/s on B200 in each direction (900 GB/s and 1,800 GB/s bidirectional). This is a different machine from eight PCIe-attached cards, and the difference is not incremental.
 
 Above that, <Term t="infini-band">InfiniBand</Term> and Ethernet, which leave the node. InfiniBand NDR is about 50 GB/s per port — fast, and a third of NVLink. Everything inside the box is faster than everything outside it, which is the single fact that shapes all of Module 18.
 
@@ -41,7 +41,7 @@ Above that, <Term t="infini-band">InfiniBand</Term> and Ethernet, which leave th
   </Step>
 
   <Step title="2. Bandwidth first">
-    Bandwidth is bytes per second, and it is the number you will use most. A tensor-parallel all-reduce moves the whole hidden state — 8 KB at batch 1 for Llama-3.1-8B — and Llama has 32 layers with two of those per layer. Small, but 128 times per forward pass.
+    Bandwidth is bytes per second, and it is the number you will use most. A tensor-parallel all-reduce moves the whole hidden state — 8 KB at batch 1 for Llama-3.1-8B — and Llama has 32 layers with two of those per layer. Small, but 64 times per forward pass.
   </Step>
 
   <Step title="3. Latency is not zero">
@@ -127,7 +127,7 @@ Every multi-GPU scheme in this module reduces to combinations of five operations
 | <Term t="reduce-scatter">Reduce-scatter</Term> | everyone reduces, each GPU keeps 1/$P$ | ring | the second half of an all-reduce |
 | <Term t="all-gather">All-gather</Term> | every GPU's shard → everyone has all of it | ring | row-parallel MLP, then all-reduce |
 | <Term t="all-reduce">All-reduce</Term> | sum across GPUs, identical result everywhere | reduce-scatter + all-gather | row-parallel linear layers |
-| <Term t="all-to-all">All-to-all</Term> | every GPU sends a slice to every other | — | MoE dispatch (Module 19), context parallelism |
+| <Term t="all-to-all">All-to-all</Term> | every GPU sends a slice to every other | — | MoE dispatch (Module 19 · Mixture-of-Experts Inference), context parallelism |
 
 The structural fact is worth memorising because it lets you price anything:
 
@@ -252,8 +252,8 @@ The next lesson takes the smallest possible unit of sharding — one matrix — 
 <Quiz client:visible questions={[
   { q: 'An all-reduce on NVLink 4 (450 GB/s unidirectional, 0.9 µs latency, 85% efficiency) moves a 256 KB payload. How long does it take?', numeric: true, answer: 1.6, tolerance: 0.2, unit: 'µs', why: 't = 0.9 µs + 262,144 / (450e9 × 0.85) = 0.9 + 0.69 = 1.59 µs. Latency is more than half the cost — at this size you are paying for the conversation.' },
   { q: 'A ring all-reduce across 8 GPUs: how many times the payload does each GPU send?', numeric: true, answer: 1.75, tolerance: 0.02, unit: 'x payload', why: '2(P-1)/P = 2·7/8 = 1.75. Reduce-scatter moves 7/8, then all-gather moves 7/8 more. The factor grows with P, so communication never falls as you add GPUs.' },
-  { q: 'Why does an 8-GPU NVLink node beat 8 PCIe-attached GPUs so decisively for tensor parallelism?', options: ['It has more HBM', 'The aggregate link bandwidth is roughly 28x higher, so rho = memory bandwidth / link bandwidth drops from ~105 to ~7', 'PCIe adds an extra copy of the weights', 'Tensor cores require NVLink'], answer: 1, why: 'The weights and HBM are identical. What changes is rho — the price of a remote byte relative to a local one. At rho ≈ 7, 128 small all-reduces per forward pass are affordable; at rho ≈ 105 they are ruinous.' },
-  { q: 'Which collective is NOT built out of reduce-scatter plus all-gather?', options: ['All-reduce', 'All-gather', 'Reduce-scatter', 'All-to-all'], answer: 3, why: 'All-to-all has no reduction: each GPU sends a distinct slice to each peer. It is a permutation, not a fold, which is why Module 19 (MoE dispatch) needs it and cannot get away with an all-reduce.' },
+  { q: 'Why does an 8-GPU NVLink node beat 8 PCIe-attached GPUs so decisively for tensor parallelism?', options: ['It has more HBM', 'The aggregate link bandwidth is roughly 28x higher, so rho = memory bandwidth / link bandwidth drops from ~105 to ~7', 'PCIe adds an extra copy of the weights', 'Tensor cores require NVLink'], answer: 1, why: 'The weights and HBM are identical. What changes is rho — the price of a remote byte relative to a local one. At rho ≈ 7, 64 small all-reduces per forward pass are affordable; at rho ≈ 105 they are ruinous.' },
+  { q: 'Which collective is NOT built out of reduce-scatter plus all-gather?', options: ['All-reduce', 'All-gather', 'Reduce-scatter', 'All-to-all'], answer: 3, why: 'All-to-all has no reduction: each GPU sends a distinct slice to each peer. It is a permutation, not a fold, which is why Module 19 (Mixture-of-Experts Inference) needs it and cannot get away with an all-reduce.' },
   { q: 'Llama-3.1-8B at batch 32 sends 64 all-reduce messages per forward pass, each 256 KB. Over NVLink 4 the collective total is about 102 µs; over PCIe 4.0 it is about 815 µs. Why is PCIe 8x worse when the byte count is identical?', options: ['PCIe packets are corrupted and need retransmission', 'PCIe has 14x lower bandwidth AND higher per-message latency, and 64 small messages pay that latency 64 times', 'PCIe cannot carry floating point', 'The GPU reads weights more slowly over PCIe'], answer: 1, why: 'Cost is latency + bytes/(bandwidth x efficiency). Bandwidth differs by 14x; latency by 2.8x. With 64 separate messages, the latency term is paid 64 times instead of once, so small-message collectives are punished doubly.' },
   { q: 'An H100 reads its own HBM at about 3,350 GB/s. What is rho = memory bandwidth / link bandwidth for a GPU attached over PCIe 4.0 at 32 GB/s?', numeric: true, answer: 105, tolerance: 5, unit: 'x', why: '3350 / 32 ≈ 105. Every byte moved to a neighbour costs as much as 105 bytes of local memory traffic. At that rho, only coarse-grained sharding — pipeline boundaries, whole layers — can hide communication.' },
 ] } />

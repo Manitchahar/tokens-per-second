@@ -102,13 +102,13 @@ $$
 32.8\times 10^9 \times 0.5 = 16.4\ \text{GB}
 $$
 
-Now add a 4% reserve for the CUDA context, graphs and workspace, about 1 GB, and 16.4 + 1.0 = 17.4 GB against 24 GB. There is room left for roughly 6.6 GB of KV cache. At Qwen2.5-32B's 64 layers, 8 KV heads and head dim 128 in BF16, that is 131,072 bytes per token, so:
+Now add a 4% reserve for the CUDA context, graphs and workspace, about 1 GB, and 16.4 + 1.0 = 17.4 GB against 24 GB. There is room left for roughly 6.6 GB of KV cache. At Qwen2.5-32B's 64 layers, 8 KV heads and head dim 128 in BF16, that is 262,144 bytes per token (${}2 \times 64 \times 8 \times 128 \times 2$), so:
 
 $$
-\text{pool} = \frac{6.6\times 10^9}{131{,}072} \approx 50{,}000\ \text{tokens of context}
+\text{pool} = \frac{6.6\times 10^9}{262{,}144} \approx 25{,}000\ \text{tokens of context}
 $$
 
-About 48 full 1,024-token conversations, or a handful of long ones. It fits, and it is the difference between a working feature and a refusal.
+About 24 full 1,024-token conversations, or a handful of long ones. It fits, and it is the difference between a working feature and a refusal.
 
 <Callout type="pitfall" title="4-bit buys memory, not speed, and the two are not the same claim">
   Halving the weight bytes halves the *weight traffic*, which at batch 1 is the whole step — so on a memory-bound decode it does look like a big speedup. But 4-bit quantization also needs dequantisation work on the way in, and it changes the output. Greedy decoding at 4 bits will not produce the same tokens as FP16. So "quantized is faster" and "quantized is accurate enough" are two separate claims, and the second is the one from Module 11 that you have to earn.

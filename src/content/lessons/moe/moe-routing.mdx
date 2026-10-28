@@ -23,13 +23,13 @@ That is why a 70B model on one H100 is unpleasant, and why a 7B model on the sam
 
 A <Term t="mixture-of-experts">mixture-of-experts</Term> layer keeps the attention exactly as it was and replaces only the feed-forward network. Instead of one wide network, the block holds a **bank of <Term t="expert">experts</Term>** — each one the same shape as the network it replaces, but each narrower — plus a **router** that decides which few of them this token uses.
 
-For a block of width $d$ with intermediate width $4d$, the dense network is:
+For a block of width $d$ with intermediate width ${}4d$, the dense network is:
 
 $$
 \underbrace{W_{\text{up}} \in \mathbb{R}^{4d \times d}}_{4d^2} \qquad \underbrace{W_{\text{down}} \in \mathbb{R}^{d \times 4d}}_{4d^2} \qquad \Rightarrow \qquad 8d^2 \ \text{parameters}
 $$
 
-An MoE layer with $E$ experts of intermediate width $4d/E$ holds:
+An MoE layer with $E$ experts of intermediate width ${}4d/E$ holds:
 
 $$
 E \times \Big( \tfrac{4d}{E} \cdot d + d \cdot \tfrac{4d}{E} \Big) = 8d^2 \quad \text{— identical}
@@ -42,7 +42,7 @@ $$
 $$
 
 <Callout type="intuition" title="Why the router is nearly free">
-  The router costs $E \cdot d$ parameters per layer and reads them once per token. For Mixtral that is $8 \times 4096 = 32{,}768$ parameters — about 33 thousand — against the 100 million a single expert holds. The routing decision costs **three ten-thousandths** of the expert it is choosing. You can afford to be lavish here; the router is not where the cost lives.
+  The router costs $E \cdot d$ parameters per layer and reads them once per token. For Mixtral that is ${}8 \times 4096 = 32{,}768$ parameters — about 33 thousand — against the 100 million a single expert holds. The routing decision costs **three ten-thousandths** of the expert it is choosing. You can afford to be lavish here; the router is not where the cost lives.
 </Callout>
 
 ## Top-1, top-2, top-k
@@ -61,7 +61,7 @@ How many experts a token uses is the design's main dial, and it is a real trade,
   </Step>
 
   <Step title="2. Replace it with a bank of experts">
-    Delete that one network and put $E$ narrower ones in its place. They add up to exactly the same parameter count — but now they are separate, and a token does not have to use all of them.
+    Delete that one network and put a bank of $E$ experts in its place. Total capacity multiplies — in Mixtral, eight experts hold 8× the parameters of the dense FFN — but now they are separate, and a token only activates $k$ of them.
   </Step>
 
   <Step title="3. The router picks k of them">
@@ -95,7 +95,7 @@ How many experts a token uses is the design's main dial, and it is a real trade,
 
 ## Deriving Mixtral's numbers from its config
 
-Mixtral 8x7B is the cleanest case to work through, because its configuration is public and small enough to hold in your head: 32 blocks, hidden width $d = 4096$, intermediate $14336$, 8 experts per block, top-2, no shared experts, first block dense.
+Mixtral 8x7B is the cleanest case to work through, because its configuration is public and small enough to hold in your head: 32 blocks, hidden width $d = 4096$, intermediate ${}14336$, 8 experts per block, top-2, no shared experts, first block dense.
 
 **Attention and embeddings** (whole model):
 
@@ -104,7 +104,7 @@ $$
 = 1{,}073{,}741{,}824 + 268{,}435{,}456 + 131{,}072{,}000 \approx 1.47\text{B}
 $$
 
-**One expert bank**, per MoE block: eight experts, each three matrices of $4096 \times 14336$:
+**One expert bank**, per MoE block: eight experts, each three matrices of ${}4096 \times 14336$:
 
 $$
 8 \times 3 \times 4096 \times 14336 = 1{,}409{,}286{,}336 \approx 1.41\text{B} \quad \text{per block}
@@ -193,11 +193,11 @@ $$
 
 Worked example: Mixtral 8x7B, BF16 weights, batch 32, 4,096 tokens of context, on an H100 (3.35 TB/s peak, taking 0.8 memory-bound utilisation → 2.68 TB/s effective).
 
-- Active weight bytes: $12.6\text{e}9 \times 2 = 25.2$ GB
-- KV cache: $32 \times 4096 \times 131{,}072 = 17.18$ GB
-- Bytes per step: $25.2 + 17.18 = 42.4$ GB
-- Time: $42.4 / 2.68 = 15.8$ ms
-- FLOPs: $2 \times 12.6\text{e}9 \times 32 = 8.1$ TFLOP; at $989 \times 0.55 = 544$ TFLOP/s that is $14.8$ ms
+- Active weight bytes: ${}12.6\text{e}9 \times 2 = 25.2$ GB
+- KV cache: ${}32 \times 4096 \times 131{,}072 = 17.18$ GB
+- Bytes per step: ${}25.2 + 17.18 = 42.4$ GB
+- Time: ${}42.4 / 2.68 = 15.8$ ms
+- FLOPs: ${}2 \times 12.6\text{e}9 \times 32 = 8.1$ TFLOP; at ${}989 \times 0.55 = 544$ TFLOP/s that is ${}14.8$ ms
 
 So $\max(15.8,\ 14.8) = \boxed{15.8\text{ ms}}$, memory-bound — before any communication, which does not exist yet because we assumed one GPU could hold the thing.
 
@@ -227,15 +227,15 @@ If you are deploying one of these, the choice you actually make is $E$ and $k$.
 More experts with the same $k$ raises total parameters and sparsity without raising per-token FLOPs — but it makes each expert smaller, and below some width the per-expert GEMM stops being efficient on the hardware. There is a floor, and it is a hardware floor, not a modelling one.
 
 <Callout type="try" title="Check yourself before continuing">
-  1. Mixtral has 8 experts of intermediate width 14336. A dense block of width 4096 has intermediate 14336. Why do eight of the experts together equal exactly one dense block? Show the arithmetic.
+  1. Mixtral has 8 experts of intermediate width 14336. A dense block of width 4096 has intermediate 14336. Why is each individual expert equal in parameter count to the dense block, so eight of them together are 8× larger? Show the arithmetic.
   2. Compute Mixtral's sparsity from the derived numbers. Now compute it if top-2 were changed to top-4. Which way does it move, and why?
-  3. The router for Mixtral is $9 \times 4096$ parameters. Express that as a fraction of one expert's $3 \times 4096 \times 14336$. Why does this ratio make top-2048 routing affordable?
+  3. The router for Mixtral is ${}9 \times 4096$ parameters. Express that as a fraction of one expert's ${}3 \times 4096 \times 14336$. Why does this ratio make top-2048 routing affordable?
   4. In the decode-step model above, 41% of the bytes moved are KV cache. If the model served 32k context instead of 4k, roughly what fraction of bytes would be KV? What does that do to the argument for MoE at long context?
   5. An MoE has perfect, perfectly balanced routing. Give one argument for why that would be a *worse* model, and one reason it would be a *faster* server.
 </Callout>
 
 <KeyNotes>
-  1. An MoE layer replaces only the block's feed-forward network with $E$ narrower experts plus a router of shape $(E+1)\times d$. Attention is untouched, and the expert bank totals exactly the parameters of the network it replaced.
+  1. An MoE layer replaces only the block's feed-forward network with $E$ experts plus a router of shape $(E+1)\times d$. Attention is untouched, and in Mixtral each expert has the parameter count of the dense network it replaced, so the whole bank is $E\times$ that count.
   2. The router costs $E \cdot d$ parameters — for Mixtral about 33 thousand against an expert's 100 million. Routing decisions are essentially free, which is why designs like top-1-of-2048 are viable at all.
   3. $k$ is the main quality-versus-work dial: top-1 keeps dense FLOPs, top-2 doubles expert work and holds quality better, top-8 buys a much smaller active footprint at eight experts of communication per token.
   4. Sparsity is total parameters divided by active parameters — about 3.6× for Mixtral 8x7B, 5.4× for DeepSeek-MoE-16B, 9.3× for Qwen3-30B-A3B. Higher sparsity means more parameters than the compute reaches, not a slower model.

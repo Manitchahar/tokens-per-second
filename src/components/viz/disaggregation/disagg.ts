@@ -68,8 +68,8 @@ export const transferSec = (ctx: number, bw: number, model: Model = m8) => hando
 export const LINKS: { id: string; label: string; bw: number }[] = [
   { id: 'nvlink', label: 'NVLink 4 (900 GB/s)', bw: 900e9 },
   { id: '400g', label: '8×400 GbE (400 GB/s)', bw: 400e9 },
-  { id: '100g', label: '100 GbE (100 GB/s)', bw: 100e9 },
-  { id: '25g', label: '25 GbE (25 GB/s)', bw: 25e9 },
+  { id: '100g', label: '100 GbE (12.5 GB/s)', bw: 12.5e9 },
+  { id: '25g', label: '25 GbE (3.125 GB/s)', bw: 3.125e9 },
 ];
 
 /** The arithmetic ridge point: intensity at which a job stops being memory-bound. */
