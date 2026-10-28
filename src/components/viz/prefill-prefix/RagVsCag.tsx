@@ -326,12 +326,12 @@ export default function RagVsCag() {
             })}
           <Label x={16} y={243} size={8.5} tone={3}>prompt tokens →</Label>
 
-          <Bar x={80} y={250} w={520} h={14} frac={tMs / 300} kind="compute" label="prefill" value={`${tMs.toFixed(0)} ms`} />
+          <Bar x={80} y={250} w={490} h={14} frac={tMs / 300} kind="compute" label="prefill" value={`${tMs.toFixed(0)} ms`} />
           <Label x={80} y={272} size={8.5} tone={3}>
             {`${fmt.int(P)} tokens × 2 × 8.03B FLOP ÷ (989 TFLOP/s × 0.55) = ${(2 * PARAMS * P / 1e12).toFixed(0)} TFLOP`}
           </Label>
 
-          <Bar x={80} y={284} w={520} h={14} frac={tKv / 2} kind="memory" label="KV" value={`${tKv.toFixed(2)} GB`} />
+          <Bar x={80} y={284} w={490} h={14} frac={tKv / 2} kind="memory" label="KV" value={`${tKv.toFixed(2)} GB`} />
           <Label x={80} y={306} size={8.5} tone={3}>
             {`${fmt.int(P)} tokens × 128 KiB per token = ${(kv * 1000).toFixed(0)} MB, freed when the request ends`}
           </Label>

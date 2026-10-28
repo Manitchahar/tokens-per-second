@@ -140,7 +140,7 @@ export default function MultiModelServer() {
           ][s.step]}
         </Label>
         <Label x={614} y={22} anchor="end" tone={3} size={9}>
-          {s.step === 0 ? '20 GPUs · ≈ \$16/h' : s.step === 1 ? '2 GPUs · ≈ \$1.60/h' : 'one pool · 20 models'}
+          {s.step === 0 ? '20 GPUs · ≈ $16/h' : s.step === 1 ? '2 GPUs · ≈ $1.60/h' : 'one pool · 20 models'}
         </Label>
 
         {/* ── step 0: twenty dedicated GPUs, almost all idle ───────────── */}
@@ -165,8 +165,9 @@ export default function MultiModelServer() {
             );
           })}
           <Label x={40} y={296} size={10.5} bold tone={2}>Twenty cards, twenty weights files, twenty idle stories</Label>
-          <Label x={40} y={314} size={9.5} tone={3}>Each GPU is about 12% full of weights and about 3% busy on compute. The hatched area is capacity you pay for and do not use.</Label>
-          <Label x={40} y={332} size={9.5} kind="error">Cost ≈ 20 × \$0.80/h = \$16/h, for aggregate compute under one GPU’s worth.</Label>
+          <Label x={40} y={312} size={9.5} tone={3}>Each GPU is about 12% full of weights and about 3% busy on compute.</Label>
+          <Label x={40} y={326} size={9.5} tone={3}>The hatched area is capacity you pay for and do not use.</Label>
+          <Label x={40} y={344} size={9.5} kind="error">Cost ≈ 20 × $0.80/h = $16/h, for aggregate compute under one GPU’s worth.</Label>
         </Fade>
 
         {/* ── step 1: packed onto two GPUs ─────────────────────────────── */}
@@ -193,9 +194,11 @@ export default function MultiModelServer() {
             );
           })}
           <Label x={40} y={286} size={10.5} bold tone={2}>Same models, same traffic, one tenth of the fleet</Label>
-          <Label x={40} y={304} size={9.5} tone={3}>Thirteen models are resident; M07 has a second replica on GPU B because it is hot. The other seven are on CPU RAM or disk.</Label>
-          <Label x={40} y={322} size={9.5} kind="memory">Weights 35.5 GB of a 43.2 GB usable pool. Compute is the easy part; model memory is what limits the packing.</Label>
-          <Label x={40} y={340} size={9.5} kind="token">Cost ≈ 2 × \$0.80/h = \$1.60/h. A resident request is served by the same kernels as before.</Label>
+          <Label x={40} y={302} size={9.5} tone={3}>Thirteen models are resident; M07 has a second replica on GPU B because it is hot.</Label>
+          <Label x={40} y={316} size={9.5} tone={3}>The other seven are on CPU RAM or disk.</Label>
+          <Label x={40} y={332} size={9.5} kind="memory">Weights 35.5 GB of a 43.2 GB usable pool.</Label>
+          <Label x={40} y={346} size={9.5} kind="memory">Compute is the easy part; model memory is what limits the packing.</Label>
+          <Label x={40} y={362} size={9.5} kind="token">Cost ≈ 2 × $0.80/h = $1.60/h. A resident request is served by the same kernels as before.</Label>
         </Fade>
 
         {/* ── steps 2-4: the cache tiers ───────────────────────────────── */}
@@ -339,7 +342,8 @@ export default function MultiModelServer() {
           <Label x={40} y={288} size={9.5} kind="compute">M07 (hot) → GPU A + GPU B · 2 replicas · route to either</Label>
           <Label x={40} y={306} size={9.5} kind="memory">M04 → GPU A · 1 replica · already resident, so serve now</Label>
           <Label x={40} y={324} size={9.5} kind="error">M18 (cold) → GPU B · no replica resident · pay ≈ 14.6 s first</Label>
-          <Label x={40} y={344} size={9} tone={3}>A request routed to a host without the model is not an error; it is a load. The router’s job is to know that in advance.</Label>
+          <Label x={40} y={338} size={9} tone={3}>A request routed to a host without the model is not an error; it is a load.</Label>
+          <Label x={40} y={352} size={9} tone={3}>The router’s job is to know that in advance.</Label>
         </Fade>
       </svg>
     </Stage>
