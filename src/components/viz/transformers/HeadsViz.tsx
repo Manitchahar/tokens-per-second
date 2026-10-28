@@ -43,7 +43,7 @@ const CAPTIONS = [
   'But every head needs keys and values to look at, and those must be stored for every earlier token. That is where the memory goes, and it is where the design freedom is.',
   'Multi-query attention: one shared key and value head for all 32 queries. The KV cache collapses to 1/32 of full multi-head attention, and quality falls a little.',
   'Grouped-query attention, the compromise almost every current open model uses: 32 query heads sharing 8 key/value heads, four to one. Between MHA and MQA.',
-  'GQA changes bytes, not FLOPs. Every query head still scores every key, so the arithmetic is identical — but eight times fewer key and value bytes are read and stored.',
+  'GQA changes bytes, not FLOPs. Every query head still scores every key, so the arithmetic is identical — but four times fewer key and value bytes are read and stored.',
   'KV cache per token = 2 × layers × KV heads × 128 × 2. Qwen2.5-32B has 64 layers but 8 KV heads, so it holds less than Llama-3.1-70B from half the parameters.',
 ];
 

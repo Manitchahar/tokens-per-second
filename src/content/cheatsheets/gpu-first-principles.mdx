@@ -54,7 +54,7 @@ Use the **dense** number. Spec sheets often quote the 2:4-sparsity figure, which
 | Elementwise (SiLU, add) | ~0.3 |
 | KV cache write | ~0.5 |
 | **Decode GEMM (m = 1)** | **~1** |
-| Attention, context T (Llama-8B BF16) | **T / 8** |
+| Attention, context T (Llama-8B BF16) | **4T** |
 | Prefill GEMM (m = 512) | ~410 |
 
 For `[m × 4096] · [4096 × 4096]` in BF16:

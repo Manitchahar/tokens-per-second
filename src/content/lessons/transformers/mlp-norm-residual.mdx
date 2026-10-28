@@ -1,4 +1,4 @@
-﻿---
+---
 title: 'The MLP, RMSNorm & the residual stream'
 summary: 'The other half of a transformer block. Three matrices hold 70% of the model, a normalisation keeps 32 layers numerically sane, and a single running vector is what ties the whole thing together.'
 objectives:
@@ -58,7 +58,7 @@ The original 2017 Transformer normalised *after* the residual add. Every modern 
 - **Post-norm:** the stream is normalised after every add, so information written by layer 1 passes through 32 normalisation operations before it reaches the output. Deep post-norm models needed careful initialisation and warm-up.
 - **Pre-norm:** the path from the embedding to the output is a straight line of identity operations with additions along it. Gradients flow back through that line unchanged.
 
-**Counting the norms.** Pre-norm with $L$ blocks uses **$N = 2L + 1$** RMSNorms: two per block plus one final norm before the output head. Llama-3.1-8B: $N = 2 \times 32 + 1 = 33$, and at 4,096 gains each that is $N_{\text{norm}} = 135{,}168$ parameters — **0.0017%** of the model's 8.03 B. The cheapest part of the model, and the part that keeps the rest of it working.
+**Counting the norms.** Pre-norm with $L$ blocks uses **$N = 2L + 1$** RMSNorms: two per block plus one final norm before the output head. Llama-3.1-8B: $N = 2 \times 32 + 1 = 65$, and at 4,096 gains each that is $N_{\text{norm}} = 266{,}240$ parameters — **0.0033%** of the model's 8.03 B. The cheapest part of the model, and the part that keeps the rest of it working.
 
 <Scrolly>
   <BlockViz client:visible slot="stage" />
@@ -72,7 +72,7 @@ The original 2017 Transformer normalised *after* the residual add. Every modern 
   </Step>
 
   <Step title="3. RMSNorm, exactly">
-    Divide by the root-mean-square, then multiply by a learned gain. **33 norms in Llama-3.1-8B, 135,168 parameters, 0.0017% of the model.** Drag the slider: change the incoming RMS by 60× and the output does not move at all.
+    Divide by the root-mean-square, then multiply by a learned gain. **65 norms in Llama-3.1-8B, 266,240 parameters, 0.0033% of the model.** Drag the slider: change the incoming RMS by 60× and the output does not move at all.
   </Step>
 
   <Step title="4. Attention writes its result back">
@@ -214,7 +214,7 @@ Two details worth noticing. Every `nn.Linear` has `bias=False` — the residual 
   3. The break-even MLP width for three matrices is $r = 8/3 \approx 2.67\times$ hidden; Llama-3.1-8B chose **3.5×**, deliberately fatter.
   4. **The MLP is 176.16 M of a 218.10 M block — 80.8%** — and 70.2% of the whole model. Attention is the minority of the weights and a minority of the bytes.
   5. `RMSNorm(x) = g ⊙ x / √(mean(x²) + ε)`: no mean subtraction, no bias, ε = 1e-5, plus 4,096 learned gains. It discards the vector's scale completely.
-  6. Pre-norm leaves an unbroken identity path from input to output. Every model in this course is pre-norm, with **$N = 2L + 1 = 33$** norms totalling 135,168 parameters — 0.0017%.
+  6. Pre-norm leaves an unbroken identity path from input to output. Every model in this course is pre-norm, with **$N = 2L + 1 = 65$** norms totalling 266,240 parameters — 0.0033%.
   7. The **residual stream** is one vector per token, written $N_w = 1 + 2L = 65$ times for Llama-3.1-8B. Adds cannot cancel, so early layers' contributions survive.
   8. Per token per block: MLP reads 352.3 MB of weights, attention 83.9 MB, and all the glue together about 96 KB. The norms are free; the MLP is the cost.
 </KeyNotes>
@@ -222,7 +222,7 @@ Two details worth noticing. Every `nn.Linear` has `bias=False` — the residual 
 <Quiz client:visible questions={[
   { q: 'Llama-3.1-8B’s MLP has three matrices: gate, up and down. How many parameters is that per layer?', numeric: true, answer: 176160768, tolerance: 3000000, why: '3 × 4096 × 14336 = 176,160,768. That is 80.8% of the block’s 218.10 M and 70.2% of the whole model.' },
   { q: 'A vector is [0.9, −2.1, 1.4, 0.3, −0.8, 2.2, 0.6, −1.1]. What is its RMS? (mean of squares, then square root.)', numeric: true, answer: 1.338, tolerance: 0.01, why: 'Squares sum to 14.32, mean is 1.79, √1.79 = 1.338. RMSNorm divides by exactly this, so the output always has RMS 1.' },
-  { q: 'A 32-layer pre-norm transformer uses how many RMSNorms?', numeric: true, answer: 33, tolerance: 0, why: 'Two per block (one before attention, one before the MLP) plus one final norm before the output head: 2 × 32 + 1 = 33. At 4,096 gains each that is 135,168 parameters, 0.0017% of Llama-3.1-8B.' },
+  { q: 'A 32-layer pre-norm transformer uses how many RMSNorms?', numeric: true, answer: 65, tolerance: 0, why: 'Two per block (one before attention, one before the MLP) plus one final norm before the output head: 2 × 32 + 1 = 65. At 4,096 gains each that is 266,240 parameters, 0.0033% of Llama-3.1-8B.' },
   { q: 'For Llama-3.1-8B, the MLP intermediate width is 14,336 and hidden size is 4,096. What is the ratio, and why is it above the break-even of 8/3?', numeric: true, answer: 3.5, tolerance: 0.05, why: '14,336 / 4,096 = 3.5. SwiGLU needs three matrices where the original used two, so matching budgets would need 8/3 ≈ 2.67. Llama chose a fatter MLP on purpose — that is where the extra capacity went.' },
   { q: 'What fraction of a Llama-3.1-8B block’s parameters sit in attention (q, k, v, o)?', options: ['About 20%', 'About 35%', 'About 50%', 'About 81%'], answer: 0, why: '41.94 M of 218.10 M = 19.2%. The MLP holds the other 80.8%. This is the number that decides which matrices a quantizer or a kernel author should attack first.' },
   { q: 'Llama-3.1-8B: how many bytes of weights does one token’s MLP read during one decode step, per layer?', numeric: true, answer: 352321536, tolerance: 8000000, unit: 'bytes', why: '176,160,768 weights × 2 bytes = 352.3 MB. Compare attention’s 83.9 MB per layer: the MLP moves 4.2× as many bytes, which is exactly why decode is memory-bound and why the MLP dominates.' },
