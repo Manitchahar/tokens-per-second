@@ -53,7 +53,7 @@ Use **Qwen2.5-0.5B-Instruct**. It has 0.49B parameters, so a 1,024-token prefill
 
 The notebook times:
 
-1. Prefill at 128, 256, 512, 1024 tokens, in BF16 and in FP32 — confirming prefill time scales with tokens and shrinks with precision.
+1. Prefill at 128, 256, 512, 1024 tokens, in FP16 and in FP32 — confirming prefill time scales with tokens and shrinks with precision.
 2. Decode for batches of 1, 8, 32, 64 — confirming decode is memory-bound and nearly flat in batch size.
 3. The **crossover chunk size**: the chunk at which prefill time equals one decode step. This is the chunk-size formula from the lesson, measured rather than assumed.
 4. The interference penalty: time a decode step alone, then time a step that also does an 8,192-token prefill, and record the ratio.

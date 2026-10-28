@@ -125,7 +125,7 @@ export default function BlocksAndTables() {
           { label: 'Pool', value: `${POOL_BLOCKS} blocks`, kind: 'memory', note: `allocated once at startup` },
           { label: 'Block size', value: `${bs} tokens`, kind: 'text', note: `${(bs * 131072 / 1e6).toFixed(1)} MB per block` },
           { label: `Request ${focus}`, value: `${usedBlocks} blocks`, kind: focus === 'A' ? 'memory' : focus === 'B' ? 'token' : 'compute', note: `${fmt.int(focusTokens)} tokens of context` },
-          { label: 'Free blocks', value: `${POOL_BLOCKS - Math.round(anim)}`, kind: 'idle', note: 'popped one at a time' },
+          { label: 'Free blocks', value: `${Math.round(anim)}`, kind: 'idle', note: 'popped one at a time' },
         ]} />
       }
       controls={

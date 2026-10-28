@@ -130,7 +130,7 @@ $$
 
   On an H100 with effective prefill $P = 20{,}000$ tok/s: $\frac{B_{\text{pcie}}}{262{,}144} < 20{,}000 \Rightarrow B_{\text{pcie}} < 5.2$ **GB/s**.
 
-  PCIe Gen4 x16 is ~24 GB/s, Gen5 ~50 GB/s — both **above** 5.2. So for a model that prefills at 20k tok/s, swap's PCIe link is fast enough that **swap usually wins**, no matter the victim length. On a slower prefill GPU (or a much smaller model with lower $P$) the picture flips toward recompute. The takeaway: it is not about victim length at all — it is about **your prefill throughput versus your link bandwidth**.
+  PCIe Gen4 x16 is ~24 GB/s, Gen5 ~50 GB/s — both **above** 5.2. So for a model that prefills at 20k tok/s, swap's PCIe link is fast enough that **swap usually wins**, no matter the victim length. On a faster prefill GPU (or a much smaller model with higher $P$) the picture flips toward recompute. The takeaway: it is not about victim length at all — it is about **your prefill throughput versus your link bandwidth**.
 </Callout>
 
 That cancellation is the interesting part, and it corrects the intuition the visual gave. The victim's length scales both costs identically. What decides it is a property of the *machine*: how fast you can recompute (FLOP/s, via $P$) versus how fast you can copy (bytes/s, via $B_{\text{pcie}}$).

@@ -16,7 +16,7 @@ Last lesson ended with a number: BF16 weights have 7 mantissa bits of precision,
 
 ## The algorithm, in full
 
-You have a real-valued weight $v$ that you want to store in $b$ bits. A $b$-bit unsigned integer has $1^b$ values, so it can represent $1, 1, \dots, 2^b - 1$. Signed, add a zero-point and you get a range centred on zero.
+You have a real-valued weight $v$ that you want to store in $b$ bits. A $b$-bit unsigned integer has ${}2^b$ values, so it can represent $0, 1, \dots, 2^b - 1$. Signed, add a zero-point and you get a range centred on zero.
 
 $$
 q = \operatorname{clamp}\!\left( \operatorname{round}\!\left( \frac{v - z}{s} \right) + z,\ 0,\ 2^b - 1 \right)
@@ -34,7 +34,7 @@ Read it slowly. There are exactly four operations:
 Dequantization is the first three steps backwards, and it is **exact**: given $q$ and $s$ and $z$, $\hat{v}$ is the same number every time, on any machine, forever. The error was introduced by the round, and it is baked in at that moment.
 
 <Callout type="intuition" title="Why the zero-point exists at all">
-  Without it you would store $q = \operatorname{round}(v/s)$ clamped to $[0, 2^b-1]$. That grid runs from $1$ to $1^b-1$, all non-negative. The smallest representable magnitude is $s/2$, so the entire negative half of your distribution lands on a single value — zero. Signed integers put their resolution where the data is, which is the point.
+  Without it you would store $q = \operatorname{round}(v/s)$ clamped to $[0, 2^b-1]$. That grid runs from 0 to ${}2^b-1$, all non-negative. The smallest representable magnitude is $s/2$, so the entire negative half of your distribution lands on a single value — zero. Signed integers put their resolution where the data is, which is the point.
 </Callout>
 
 ## Choosing the scale: the one decision that matters
@@ -55,7 +55,7 @@ $$
 
 Work it for a tensor whose largest weight is 0.61 (the outlier matrix below):
 
-| Bits | $1^{b-1}-1$ | Grid step $s$ | Worst-case error | As a fraction of 0.61 |
+| Bits | ${}2^{b-1}-1$ | Grid step $s$ | Worst-case error | As a fraction of 0.61 |
 |---|---|---|---|---|
 | 8 | 127 | 0.0048 | 0.0024 | 0.4% |
 | 4 | 7 | 0.0871 | 0.0436 | 7.1% |
@@ -65,7 +65,7 @@ Work it for a tensor whose largest weight is 0.61 (the outlier matrix below):
 That is a *worst case*. The expected error is smaller, because most values are not exactly halfway between grid points — but this bound is why INT8 is nearly free and 2-bit is a disaster.
 
 <Callout type="math" title="Where INT8's near-losslessness comes from, exactly">
-  BF16 keeps 7 mantissa bits, so two nearby weights that differ in their 8th significant bit are represented distinctly. A tensor with $\max|v| = 0.61$ has grid step $1.61/127 = 0.0048$ at INT8, and typical weight gaps are larger than that. So an INT8 grid is **finer than the BF16 representation over most of the range**, and rounding to it loses nothing at all for most weights.
+  BF16 keeps 7 mantissa bits, so two nearby weights that differ in their 8th significant bit are represented distinctly. A tensor with $\max|v| = 0.61$ has grid step ${}0.61/127 = 0.0048$ at INT8, and typical weight gaps are larger than that. So an INT8 grid is **finer than the BF16 representation over most of the range**, and rounding to it loses nothing at all for most weights.
 
   At INT4 the grid step is 17× coarser, so weights that BF16 told apart now collapse. That is the entire difference between the two schemes — not "lower precision is worse" in the abstract, but a concrete number: 0.0048 versus 0.087.
 </Callout>
@@ -127,8 +127,8 @@ Three choices, in increasing order of granularity, all visible in the visual abo
 | Scheme | Scales needed for an $[m \times n]$ matrix | Metadata | Typical error, 4-bit |
 |---|---|---|---|
 | **Per tensor** | 1 | negligible | worst — outliers kill small weights |
-| **Per channel** (row) | $m$ | $1m$ bytes | good — channels differ in scale |
-| **Per group** (contiguous run of $g$) | $\lceil n/g \rceil m$ | $1\lceil n/g \rceil m$ bytes | best per byte — adapts within a row |
+| **Per channel** (row) | $m$ | ${}4m$ bytes | good — channels differ in scale |
+| **Per group** (contiguous run of $g$) | $\lceil n/g \rceil m$ | ${}4\lceil n/g \rceil m$ bytes | best per byte — adapts within a row |
 
 And the metadata bill, derived:
 
@@ -200,7 +200,7 @@ Bias matters more than it might seem. If rounding always goes the same direction
   2. The scale is set by the maximum magnitude, so worst-case error is $\max|v| / (2(2^{b-1}-1))$. This one formula predicts the quality of every scheme.
   3. One scale per tensor fails on outlier weights: the grid is stretched to reach the outlier and small weights round to zero. The damage lands on most of the matrix.
   4. Granularity fixes it. Per-group and per-channel scales each cost 4 bytes per group and drop the error by a large factor.
-  5. Metadata overhead is $12/(gb)$: group 128 at 4 bits is 6.25%, so a "4-bit" model is really 4.25 bits per weight. Group size cannot go to 1.
+  5. Metadata overhead is ${}32/(gb)$: group 128 at 4 bits is 6.25%, so a "4-bit" model is really 4.25 bits per weight. Group size cannot go to 1.
   6. Independent per-layer errors accumulate as $\sqrt{L}$, not $L$. For 32 layers, 6% per-weight becomes ~34% in the worst case — which is why structured methods exist.
   7. Round-to-nearest-even avoids directional bias. Stochastic rounding matters for activations quantized every step, not for weights quantized once.
   8. FP8 needs no group scale because its exponent carries the range. That is a different mechanism, not a narrower INT8 — which is the next lesson.

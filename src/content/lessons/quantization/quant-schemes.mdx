@@ -37,7 +37,7 @@ So the honest taxonomy is not "more bits = better". It is a set of four differen
 | **BF16** | 16-bit float | 16-bit float | BF16 | no (baseline) |
 | **FP8** | 8-bit float | 8-bit float | FP8 | yes (standardised) |
 | **W8A8** | 8-bit integer | 8-bit integer | INT8 | yes |
-| **W4A16** | 4-bit integer | 16-bit float | INT8 (after dequant) | yes |
+| **W4A16** | 4-bit integer | 16-bit float | BF16 (after dequant) | yes |
 
 ## W4A16: shrink what you store, not what you compute
 
@@ -100,7 +100,7 @@ Consequences:
 |---|---|---|
 | Range | set by the scale | built in, per element |
 | Needs group scales | yes | **no** |
-| Metadata overhead | $12/(gb)$ | **zero** |
+| Metadata overhead | ${}32/(gb)$ | **zero** |
 | Outlier tolerance | poor without fine groups | good, like BF16 |
 | Relative precision | $\approx 2^{-b}$ uniform | $\approx 2^{-3}$ near each value |
 

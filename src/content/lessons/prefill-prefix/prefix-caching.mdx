@@ -128,7 +128,7 @@ From Module 08, the KV cache is a pool of fixed-size blocks, with a table mappin
 <Callout type="math" title="How big is the prize in bytes">
   The cached prefix occupies memory whether or not you reuse it, so the question is not "does it cost memory" but "how much of your memory is idle copies of the same tokens".
 
-  Llama-3.1-8B in BF16 uses $2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes of KV per token — 128 KiB. So:
+  Llama-3.1-8B in BF16 uses ${}2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes of KV per token — 128 KiB. So:
 
   | Shared prefix | Memory per request | 100 concurrent users |
   |---|---|---|

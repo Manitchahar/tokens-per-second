@@ -9,9 +9,9 @@ Two numbers dominate everything. Activations are rounding errors next to them.
 
 | | count | bytes | Llama-3.1-8B in BF16 |
 |---|---|---|---|
-| Weights | $P$ | $2P$ | 16.06 GB |
-| KV cache / token | $2LH_{kv}D$ | $2\cdot2LH_{kv}D$ | 131,072 B = 128 KiB |
-| Activations / token | ~$5d_{model}$ | ~$10\,d_{model}$ | ~41 kB — negligible |
+| Weights | $P$ | ${}2P$ | 16.06 GB |
+| KV cache / token | ${}2LH_{kv}D$ | ${}2\cdot2LH_{kv}D$ | 131,072 B = 128 KiB |
+| Activations / token | ~${}5d_{model}$ | ~${}10\,d_{model}$ | ~41 kB — negligible |
 
 ## The algorithm
 
@@ -106,7 +106,7 @@ Large batch + short context → weights dominate → quantize the weights first.
 | BF16 | 16 | 16 | BF16 | 1× | 1× | none |
 | FP8 | 8 | 8 | FP8 (Hopper+) | up to 2× | ~1.5× | low |
 | W8A8 | 8 | 8 | INT8 | up to 2× | ~2× | moderate |
-| **W4A16** | 4 | 16 | INT8 after dequant | **1×** | ~3× | low |
+| **W4A16** | 4 | 16 | BF16 (after dequant) | **1×** | ~3× | low |
 | W4A16 unfused | 4 | 16 | BF16 | **slower** | **slower** | — |
 
 - **W4A16**: weights only. 4× less weight memory, ~3–4× shorter decode step, prefill unchanged.
@@ -183,7 +183,7 @@ Failure signatures:
 
 **Domination:** A dominates B if A ≥ B on every axis and > B on one. Delete the dominated points; the survivors are the frontier.
 
-Quality index ≈ $1 - (\varepsilon_w + 0.6\,\varepsilon_{kv})\sqrt{L}$.
+Quality index ≈ ${}1 - (\varepsilon_w + 0.6\,\varepsilon_{kv})\sqrt{L}$.
 
 Pick by **quality budget**:
 

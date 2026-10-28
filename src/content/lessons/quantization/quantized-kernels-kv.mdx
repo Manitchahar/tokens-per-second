@@ -104,7 +104,7 @@ Read that table as an engineer, because the last three rows are where people get
   \frac{\text{KV bytes}}{\text{weight bytes}} = \frac{B\,T \cdot 2LH_{kv}D \cdot (b_{kv}/8)}{P\,(b_w/8)}
   $$
 
-  KV dominates at **small batch, long context**. At $B = 8$, $T = 32{,}000$, the KV cache for Llama-8B is $1 \times 32{,}000 \times 131{,}072 = 33.6$ GB — twice the BF16 weights. In that regime, weight quantization buys you very little and KV quantization buys you everything.
+  KV dominates at **small batch, long context**. At $B = 8$, $T = 32{,}000$, the KV cache for Llama-8B is ${}8 \times 32{,}000 \times 131{,}072 = 33.6$ GB — twice the BF16 weights. In that regime, weight quantization buys you very little and KV quantization buys you everything.
 
   Weights dominate at **large batch, short context**. At $B = 512$, $T = 512$, KV is only 34 GB for a batch of 512 — hmm, still large; but the *per-user* KV is small, so what actually limits you is the weights and the compute term, and W8A8/FP8 is the right lever.
 
