@@ -108,7 +108,7 @@ export function count(n: number) {
   for (const [v, s] of u) {
     if (n >= v) {
       const x = n / v;
-      return `${x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1).replace(/\.0$/, '') : x.toFixed(2).replace(/0$/, '').replace(/\.$/, '')}${s}`;
+      return `${x >= 100 ? x.toFixed(0) : x >= 10 ? String(parseFloat(x.toFixed(1))) : String(parseFloat(x.toFixed(2)))}${s}`;
     }
   }
   return n.toFixed(0);

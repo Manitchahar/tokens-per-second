@@ -1,0 +1,231 @@
+---
+title: 'GPT-3: learning from the prompt'
+summary: 'GPT-2 could do a little of everything, badly, and the fix of the day was to finetune a separate model for every task. GPT-3 tried something else: make the model 100 times bigger and just show it a few examples in the prompt. This lesson takes the paper apart: the architecture, the data, zero-, one- and few-shot learning, what scale bought, and what it cost.'
+objectives:
+  - Explain zero-, one- and few-shot prompting and why none of them changes a single weight
+  - Rebuild GPT-3’s 175 billion parameters from its layer count and width
+  - Read GPT-3’s training mix and say how often each source was seen
+  - Describe how the benefit of in-context examples grows with model size
+  - Price a few-shot prompt in prefill FLOPs and name GPT-3’s main limitations
+---
+import InContext from '@/components/viz/scaling/InContext.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In Module 3A you watched GPT-2 play the next-word game, and you saw something odd: a model trained only to continue web text could, if you phrased the question right, translate a little, answer a little, summarize a little. Nobody had taught it any of those tasks.
+
+"A little" is the honest word, though. Asked trivia questions with no help, GPT-2 got about **4%** of Natural Questions exactly right. Translating French to English it scored 11.5 BLEU, when the best dedicated systems scored over 30. Interesting, not useful.
+
+The standard fix in 2019 was **finetuning**: take the pretrained model, collect thousands of labelled examples of the one task you care about, and run more gradient descent on them. It works, and it has an ugly shape. Every new task needs its own labelled dataset, its own training run, and its own copy of the weights to store and serve. And it is nothing like how you learned to do things: nobody needed ten thousand examples to learn to turn a word into its plural. A sentence of instructions and two examples were enough.
+
+GPT-3 asked whether a big enough model could do the same: learn the task **from the prompt**, with its weights untouched.
+
+## Same model, different prompts
+
+<Scrolly>
+  <InContext client:visible slot="stage" />
+
+  <Step title="1. The old way: one finetuned model per task">
+    Here is the world GPT-3 walked into. Three tasks mean three labelled datasets, three runs of gradient descent and **three copies of the weights**, each good at one thing.
+
+    For a 1.5B-parameter model in 16-bit numbers, every copy is 3 GB of memory you have to store and load. For anything bigger, the bill is worse.
+  </Step>
+
+  <Step title="2. Zero-shot: just describe the task">
+    Now take one frozen model and only change its input. The prompt says what to do, *"Remove the symbols to get the word"*, and then poses the question.
+
+    This is **zero-shot**: zero solved examples. The model must infer what you want from the description alone. The dashed curve is how often that works, across GPT-3's eight sizes. It is low everywhere.
+  </Step>
+
+  <Step title="3. One-shot: show one solved example">
+    Add a single solved example above the question. It tells the model things a description cannot: what format the answer takes, how long it is, where it stops.
+
+    This is **one-shot**. For the biggest model, that one example is worth more than the whole description.
+  </Step>
+
+  <Step title="4. Few-shot: show K examples">
+    Now add more: **K solved examples**, as many as fit. Drag the slider. For the 175B model accuracy keeps climbing as K grows, roughly with the logarithm of K: each doubling of examples buys a similar step.
+
+    This is **few-shot**. The paper used K between 10 and 100 for most tasks, whatever fitted in the window.
+  </Step>
+
+  <Step title="5. The weights never change">
+    Here is the part that makes this strange. Between zero-shot and few-shot, **nothing in the model changed**. No gradient was computed, no weight was updated. The examples are only input text.
+
+    The model reads them in its forward pass, and when the answer is done they are gone. Send the next prompt without examples and you are back to zero-shot. This is **in-context learning**: learning that lives entirely in the activations of one forward pass.
+  </Step>
+
+  <Step title="6. Bigger models learn more from the prompt">
+    Compare the ends of the curves. At 125M parameters, 32 examples barely move the needle. At 175B the same 32 examples lift accuracy by tens of points.
+
+    That widening gap is the paper's central finding. The ability to use examples in the prompt is not a trick you can apply to any model; **it is something scale buys**.
+  </Step>
+
+  <Step title="7. The context window caps K">
+    Examples are not free. Each one costs tokens, and GPT-3 could read 2,048 tokens at once. With ~16-token examples about 126 fit; push past that and the oldest are cut off.
+
+    Worse for an inference engineer: every example is **prefill work on every single query**. The readout prices it: 2N FLOPs per prompt token, paid again for each request.
+  </Step>
+</Scrolly>
+
+The curves in the visual are **illustrative**: their shapes follow the paper's Figures 1.2 and 1.3 (flat for small models, a few-shot advantage that widens with size, accuracy rising with the logarithm of K), but the exact percentages are ours. The real numbers come next.
+
+## What GPT-3 actually was
+
+### The architecture: GPT-2, scaled up
+
+GPT-3 is, almost exactly, the decoder-only transformer you built in Module 03: pre-norm blocks, learned position embeddings, a vocabulary of 50,257 tokens (the GPT-2 tokenizer), and a context of **2,048 tokens**. The one change is that its attention layers alternate between ordinary dense attention and a "locally banded" sparse pattern, where a token attends only to nearby positions, to save compute.
+
+The paper trained **eight** sizes on the same data, so that every result could be plotted against scale:
+
+| Model | Parameters | Layers | $d_{\text{model}}$ | Heads | $d_{\text{head}}$ |
+|---|---|---|---|---|---|
+| GPT-3 Small | 125M | 12 | 768 | 12 | 64 |
+| GPT-3 Medium | 350M | 24 | 1,024 | 16 | 64 |
+| GPT-3 Large | 760M | 24 | 1,536 | 16 | 96 |
+| GPT-3 XL | 1.3B | 24 | 2,048 | 24 | 128 |
+| GPT-3 2.7B | 2.7B | 32 | 2,560 | 32 | 80 |
+| GPT-3 6.7B | 6.7B | 32 | 4,096 | 32 | 128 |
+| GPT-3 13B | 13B | 40 | 5,140 | 40 | 128 |
+| GPT-3 175B | 175B | 96 | 12,288 | 96 | 128 |
+
+*(From the paper's Table 2.1, as printed. Two rows do not quite multiply out: 24 × 128 ≠ 2,048 and 40 × 128 ≠ 5,140. Published tables have typos too; the habit of multiplying things out is how you catch them.)*
+
+You can rebuild the 175B from three numbers. In Module 03 you counted a transformer block: attention has four $d \times d$ matrices ($W_q, W_k, W_v, W_o$), and GPT-3's MLP expands to $4d$ and back, two matrices of $d \times 4d$. That is $4d^2 + 8d^2 = 12d^2$ per layer.
+
+<Callout type="math" title="Worked: where 175 billion comes from">
+  $$
+  12 \times n_{\text{layer}} \times d_{\text{model}}^2 = 12 \times 96 \times 12{,}288^2 = 173.9 \times 10^9
+  $$
+
+  Add the token embedding table, 50,257 × 12,288 = 0.62 × 10⁹, and the position table, 2,048 × 12,288 = 0.03 × 10⁹:
+
+  $$
+  173.9 + 0.62 + 0.03 = 174.6 \times 10^9
+  $$
+
+  Exactly the 174.6B the paper uses in its compute table, the number that gave 3.14 × 10²³ FLOPs in the last lesson. (Biases and norm gains add a few million more; at this scale they round away.)
+</Callout>
+
+Hold on to two numbers from this table: **96 layers** and **$d_{\text{model}}$ = 12,288**. Stored in 16-bit numbers, 174.6B parameters are 349 GB of weights. An 80 GB GPU cannot hold them; you need at least five, before the KV cache takes a single byte. GPT-3 was a model that, by its size alone, could only be served across several GPUs, which is the subject of Module 18.
+
+### The data: 300 billion tokens, sampled by quality
+
+GPT-3 trained on **300 billion tokens**, drawn from five sources. The interesting part is that the sources were not mixed in proportion to their size. Higher-quality text was sampled more often:
+
+| Source | Size (tokens) | Weight in the mix | Times seen in 300B tokens |
+|---|---|---|---|
+| Common Crawl (filtered) | 410B | 60% | 0.60 × 300 ÷ 410 ≈ 0.44 |
+| WebText2 | 19B | 22% | 0.22 × 300 ÷ 19 ≈ 3.5 |
+| Books1 | 12B | 8% | 0.08 × 300 ÷ 12 ≈ 2.0 |
+| Books2 | 55B | 8% | 0.08 × 300 ÷ 55 ≈ 0.44 |
+| Wikipedia | 3B | 3% | 0.03 × 300 ÷ 3 ≈ 3.0 |
+
+*(Sizes and weights from the paper's Table 2.2. The last column is our arithmetic from the rounded figures, so it differs a little from the paper's own count; the weights themselves sum to 101% because of rounding.)*
+
+Common Crawl, a scrape of the whole public web, is by far the biggest source, but less than half of it was ever read: after filtering, it was still noisy. WebText2 (pages linked from well-upvoted Reddit posts, the successor of GPT-2's WebText) and Wikipedia were read several times over. This is the first appearance of an idea that dominates lesson 5: **high-quality text is scarce**, and even in 2020 the best of it was being reused rather than replaced.
+
+### The training run
+
+The 175B model was trained with a batch of 3.2 million tokens on V100 GPUs, on a cluster Microsoft provided. You already know its compute: 6 × 174.6 × 10⁹ × 300 × 10⁹ = **3.14 × 10²³ FLOPs**, which the paper also writes as 3,640 petaflop/s-days. (One petaflop/s-day is 10¹⁵ FLOP/s for 86,400 seconds, 8.64 × 10¹⁹ FLOPs; 3.14 × 10²³ ÷ 8.64 × 10¹⁹ ≈ 3,634. The small difference is rounding.)
+
+## In-context learning, precisely
+
+Now the vocabulary, defined carefully, because these words get used loosely.
+
+- **<Term t="zero-shot">Zero-shot</Term>**: the prompt contains a natural-language description of the task and the input. No solved examples.
+- **One-shot**: the same, plus exactly one solved example.
+- **<Term t="few-shot">Few-shot</Term>**: the same, plus $K$ solved examples, typically 10 to 100, as many as fit in the 2,048-token window.
+
+In all three, **the weights are frozen**. What changes is only the text the model conditions on. The paper calls the whole phenomenon <Term t="in-context-learning">in-context learning</Term>, and frames it as two loops. The outer loop is pretraining: hundreds of billions of tokens of gradient descent, during which the model picks up a huge range of skills and patterns. The inner loop happens inside one forward pass: the examples in the prompt steer which of those skills the model applies.
+
+<Callout type="intuition" title="Why examples help a next-word predictor">
+  Think about what the pretraining text looks like. The web is full of lists: a word and its plural, a question and its answer, a sentence and its translation, repeated with the same pattern. To predict the next token of such a list well, a model has to notice the pattern from the items above and apply it to the next one.
+
+  So "continue the pattern in the context" is a skill that next-word prediction *rewards*. A few-shot prompt is just a short list, ending where the answer should go. The bigger the model, the better it has learned to spot patterns from few items, and that is exactly the curve in the visual.
+</Callout>
+
+## What scale bought
+
+The paper's evaluation covers dozens of benchmarks. A few results show the shape of the whole.
+
+| Task (175B model) | Zero-shot | One-shot | Few-shot | For comparison |
+|---|---|---|---|---|
+| LAMBADA (predict the last word of a passage), accuracy | 76.2% | 72.5% | 86.4% | previous best 68.0% |
+| TriviaQA (closed book: no documents given), accuracy | 64.3% | 68.0% | 71.2% | |
+| SuperGLUE (8 language-understanding tasks), score | | | 71.8 | finetuned BERT-Large 69.0, finetuned best 89.0 |
+
+Three things to read from this table.
+
+First, on some tasks a frozen model with a few examples **beat everything before it**: LAMBADA few-shot improved on the previous best by 18 points. On closed-book trivia it answered without being given any documents, out of what it had absorbed in training.
+
+Second, on others it beat an old finetuned model but **stayed far below the finetuned state of the art**: SuperGLUE few-shot (with 32 examples per task) passed a finetuned BERT-Large and was still 17 points short of the best finetuned systems.
+
+Third, the scale trend. The paper's Figure 1.3 averages 42 benchmarks: at 125M parameters zero-, one- and few-shot are close together; by 175B few-shot sits well above one-shot, which sits above zero-shot. Arithmetic shows it sharply. The 175B model, few-shot, added two-digit numbers correctly 100% of the time and three-digit numbers about 80% of the time, while the smaller models were far behind. It then fell off quickly at four and five digits.
+
+<Callout type="pitfall" title="One-shot can be worse than zero-shot">
+  Look at the LAMBADA row again: one-shot (72.5%) scored *below* zero-shot (76.2%). Prompts are sensitive to format. The paper used a fill-in-the-blank format for one- and few-shot that the model only "got" once it had seen several examples of it.
+
+  The lesson generalizes, and Module B1 is built on it: a prompt is an input to a function you did not write. Small changes to its wording and format move the output, so you measure, you do not assume.
+</Callout>
+
+## The limitations, and the bill
+
+The paper is unusually frank about what did not work, and it is worth knowing before you build on the idea.
+
+- **Comparing two pieces of text was weak.** On WiC (do two sentences use a word in the same sense?), few-shot GPT-3 scored 49.4%, on a task where guessing gets 50%. Tasks that ask whether one sentence implies another were similarly hard.
+- **Long generations drift.** Over long passages the model repeats itself, loses coherence and contradicts earlier sentences.
+- **Is it learning, or recognizing?** The paper itself says it is unclear whether few-shot prompting teaches a genuinely new task at inference time or helps the model recognize one it already met during pretraining. Probably both, in different proportions for different tasks.
+- **Contamination.** A model trained on a crawl of the web may have seen the benchmark questions. The authors measured the overlap and found that a bug had let some through; retraining at this cost was not an option, so they analysed its effect instead (Section 4).
+- **Cost.** 3.14 × 10²³ FLOPs to train, 349 GB of weights to serve, and $2N$ = 349 GFLOPs for every token, prompt or output.
+
+That last line deserves an inference engineer's full attention, because few-shot prompting moved cost from training to serving.
+
+<Callout type="math" title="Worked: what a few-shot prompt costs at serving time">
+  A few-shot prompt with 32 examples of about 50 tokens each is 1,600 tokens. Prefill reads it once per query at $2N$ FLOPs per token:
+
+  $$
+  2 \times 175 \times 10^9 \times 1{,}600 = 5.6 \times 10^{14}\ \text{FLOPs per query}
+  $$
+
+  On an H100 at 989 TFLOP/s and 55% utilization (Module 05's prefill assumption), that is 5.6 × 10¹⁴ ÷ (989 × 10¹² × 0.55) ≈ **1.0 second of a whole GPU**, before the model writes one word of its answer. And it is the same 1,600 tokens on every request.
+</Callout>
+
+Finetuning paid for the task once, in training. Few-shot prompting pays for it on every query, in prefill. That trade, and the fact that the examples are an identical prefix shared by every request, is why **prefix caching** (Module 10) exists: compute the KV cache of the shared examples once, and reuse it for every query that starts with them.
+
+<Callout type="real" title="Now read the paper">
+  **Brown et al., "Language Models are Few-Shot Learners", 2020.** [arXiv:2005.14165](https://arxiv.org/abs/2005.14165).
+
+  It is 75 pages; you do not need all of them. **Read** Section 1 (the introduction, and Figures 1.1 to 1.3, the in-context learning curves this lesson's visual imitates), Section 2 through 2.3 (Table 2.1 is the model-size table above, Table 2.2 the data mix), Section 3.1 (LAMBADA), Section 3.9.1 (arithmetic) and Section 5 (limitations). **Skim** the rest of Section 3; read the first page of each subsection and its main figure. **Skip** Sections 6 and 7 unless you are curious about societal impact and related work, and all appendices except Table D.1, the compute table.
+
+  You will now recognise the 12 × 96 × 12,288² that makes 175B, the 3.14 × 10²³ FLOPs, the quality-weighted data mix, and the widening gap between few-shot and zero-shot as models grow.
+</Callout>
+
+## Why an inference engineer cares
+
+GPT-3 changed what a "request" to a model is. Before it, a request was a short input to a specialised model. After it, a request is a **prompt**: instructions, examples, documents, conversation, often thousands of tokens of context in front of a short question. Everything about how you serve models follows from that:
+
+- Prompts are long, so **prefill** is a large share of serving cost (Module 05 and Module 25).
+- Prompts share prefixes (the same instructions and examples on every call), so **prefix caching** pays off (Module 10).
+- Context windows matter, because they cap how much the model can be told (Module 20).
+
+Module B1 turns this lesson into practice: how to write zero- and few-shot prompts that work, and how to measure them. The next lesson asks the question GPT-3's eight sizes set up: if bigger keeps being better, **how much better, and can you predict it before you pay for it?**
+
+<KeyNotes>
+  1. Before GPT-3, each task meant a labelled dataset, a finetuning run and its own copy of the weights.
+  2. Zero-shot gives the model only a description of the task; one-shot adds one solved example; few-shot adds K, typically 10 to 100, as many as fit in the 2,048-token window.
+  3. In-context learning changes no weights: the examples are input text, read in one forward pass and forgotten afterwards.
+  4. GPT-3 175B has 96 layers and $d_{\text{model}}$ = 12,288: 12 × 96 × 12,288² ≈ 173.9B in the blocks plus 0.65B of embeddings = 174.6B parameters.
+  5. It trained on 300B tokens, mixed by quality: Common Crawl 60% of the mix (seen less than once), WebText2 22%, Books1 8%, Books2 8%, Wikipedia 3%.
+  6. The benefit of examples grows with size: across eight models from 125M to 175B, the few-shot gap over zero-shot widens with scale.
+  7. GPT-3 was still weak at comparing two texts, drifted in long generations, and stayed below finetuned state of the art on many tasks.
+  8. Few-shot moves cost from training to serving: every example is prefill at 2N FLOPs per token on every query, which is what prefix caching later attacks.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What changes inside GPT-3 between a zero-shot and a few-shot prompt for the same task?', options: ['Its weights are updated by a few steps of gradient descent on the examples', 'Nothing in the weights: only the input text (and so the activations) differs', 'A task-specific head is attached to the last layer', 'The model switches to a different, finetuned checkpoint'], answer: 1, why: 'In-context learning uses frozen weights. The examples are part of the prompt, read in the forward pass, and gone when the request ends.' },
+  { q: 'Using 12 × layers × d_model², how many billion parameters are in GPT-3 175B’s transformer blocks (96 layers, d_model = 12,288)?', numeric: true, answer: 173.9, tolerance: 3, unit: 'billion', why: '12 × 96 × 12,288² = 12 × 96 × 150,994,944 = 173,946,175,488 ≈ 173.9 billion. The embeddings add about 0.65B more, giving 174.6B.' },
+  { q: 'Common Crawl was 410B tokens and 60% of a 300B-token training mix. How many times was it read, on average?', numeric: true, answer: 0.44, tolerance: 0.02, unit: 'times', why: '0.60 × 300B = 180B tokens drawn from Common Crawl. 180 ÷ 410 ≈ 0.44, so less than half of it was ever seen.' },
+  { q: 'A few-shot prompt is 2,000 tokens long. How many FLOPs does prefill cost on GPT-3 175B, in units of 10¹⁴?', numeric: true, answer: 7, tolerance: 0.2, unit: '× 10¹⁴ FLOPs', why: '2N × tokens = 2 × 175e9 × 2,000 = 7.0e14 FLOPs, paid again on every query that carries the same prompt.' },
+  { q: 'What did GPT-3’s eight model sizes show about few-shot prompting?', options: ['All sizes gain about the same from examples', 'Small models gain more from examples because they know less', 'The gain from examples grows with model size: small models barely use them, 175B uses them a lot', 'Few-shot only works after finetuning'], answer: 2, why: 'At 125M, zero-, one- and few-shot are close together; at 175B few-shot is far above zero-shot. The ability to learn from the prompt is something scale buys.' },
+  { q: 'GPT-3 175B in 16-bit numbers (2 bytes per parameter) on 80 GB GPUs: what is the minimum number of GPUs just to hold the weights?', numeric: true, answer: 5, tolerance: 0.1, unit: 'GPUs', why: '174.6e9 × 2 bytes = 349 GB. 349 ÷ 80 = 4.4, so at least 5 GPUs, before any KV cache or activations.' },
+]} />
