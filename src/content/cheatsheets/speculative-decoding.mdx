@@ -12,32 +12,34 @@ Never confuse these. Both are called "alpha" in the literature.
 | **Acceptance rate** | $a$ | how often a drafted token is one the target would also produce | your **text** and model pair |
 | **Draft cost ratio** | $\rho$ | one drafted token ÷ one target decode step | your **hardware** and model sizes |
 
-**Win exactly when $a > \rho$.** $\gamma$ cancels from this condition.
+**Win exactly when the keep rate beats $\rho$**: the fraction of drafted tokens accepted, $(a + a^2 + \dots + a^{\gamma})/\gamma$. At $\gamma = 1$ that is $a > \rho$; longer blocks need more.
 
 ## The block
 
-1. **Draft** $\gamma$ tokens with something cheap (stops at the first rejection).
+1. **Draft** all $\gamma$ tokens with something cheap, one after another. All $\gamma$ are paid for, kept or not.
 2. **Verify** all $\gamma+1$ positions in **one** forward pass on the target.
 3. **Accept** the longest prefix matching the target's own predictions; discard the first disagreement and everything after.
-4. **Bonus token** from the final position — never predicted by the draft, so free. Every block emits ≥ 1 token.
+4. **One token from the target**: a corrected token at the first rejection, or a bonus token from position $\gamma+1$ if all drafts were accepted. Every block emits ≥ 1 token.
 
 ## The formulas
 
 $$
-d = \mathbb{E}[\text{drafts paid}] = \frac{1 - a^{\gamma}}{1 - a}
+K = \mathbb{E}[\text{kept drafts}] = a + a^2 + \dots + a^{\gamma} = \frac{a\,(1 - a^{\gamma})}{1 - a}
 $$
 
 $$
-\mathbb{E}[\text{tokens per block}] = 1 + a\,d
+\mathbb{E}[\text{tokens per block}] = 1 + K = \frac{1 - a^{\gamma+1}}{1 - a}
 \qquad\qquad
-\text{cost} = 1 + \rho\,d \quad \text{(decode-step units)}
+\text{cost} = 1 + \gamma\,\rho \quad \text{(decode-step units)}
 $$
 
 $$
-\boxed{\ \text{speedup} = \frac{1 + a\,d}{1 + \rho\,d}\ >\ 1 \iff a > \rho\ }
+\boxed{\ \text{speedup} = \frac{1 + K}{1 + \gamma\,\rho}\ >\ 1 \iff \frac{K}{\gamma} > \rho\ }
 $$
 
-Forward passes per delivered token: $\;\dfrac{\gamma+1}{\mathbb{E}[\text{tokens}]}$
+Best $\gamma$: add a draft while $a^{\gamma+1} > \rho \times \text{speedup}(\gamma)$. Usually 3–6.
+
+Papers report $\tau$ = tokens per target forward pass = tokens per block. It is an upper bound on speedup; divide by ${}1 + \gamma\rho$.
 
 Tokens per block ceiling: $\;1/(1-a)$ — set by predictability, not by $\gamma$.
 
@@ -87,14 +89,20 @@ Greedy decoding needs its own rule: accept iff draft == target argmax.
 Llama-3.1-8B, Llama-3.2-1B draft, $a = 0.72$, $\rho = 0.125$, $\gamma = 4$:
 
 $$
-d = \frac{1-0.72^{4}}{0.28} = 2.612 \quad
-\text{tokens} = 1 + 0.72(2.612) = 2.88 \quad
-\text{cost} = 1 + 0.125(2.612) = 1.327
+K = 0.72 + 0.72^2 + 0.72^3 + 0.72^4 = 1.880 \quad
+\text{tokens} = 2.88 \quad
+\text{cost} = 1 + 4 \times 0.125 = 1.5
 $$
 
 $$
-\text{speedup} = \frac{2.88}{1.327} = \mathbf{2.17\times}
+\text{speedup} = \frac{2.88}{1.5} = \mathbf{1.92\times} \qquad \text{keep rate } 47\% \gg \rho = 12.5\%
 $$
+
+| $\gamma$ | 1 | 2 | 3 | **4** | 6 | 8 | 16 |
+|---|---|---|---|---|---|---|---|
+| speedup | 1.53× | 1.79× | 1.90× | **1.92×** | 1.84× | 1.69× | 1.19× |
+
+Break-even acceptance at $\rho = 0.125$: 12.5% ($\gamma$=1), 20.7% (2), 33.6% (4), 50.1% (8).
 
 ## Where it wins, and where it does not
 
@@ -114,7 +122,7 @@ $$
 
 1. Measure $a$ on **your** traffic (few hundred real prompts).
 2. Measure $\rho$ on **your** card at your batch size.
-3. $a > \rho$? Sweep $\gamma$ once, take the flat part of the curve, enable.
+3. Keep rate $> \rho$ (at $\gamma = 1$: $a > \rho$)? Sweep $\gamma$ once, take the peak (usually 3–6), enable. Low acceptance → shorter blocks.
 4. Not for a neural drafter? Try prompt lookup / n-gram — $\rho \approx 0$ needs almost any acceptance to win.
 
 ## Pitfalls
@@ -135,8 +143,9 @@ $$
 | Weights, Llama-3.1-8B BF16 | 16.06 GB → 4.8 ms at 3.35 TB/s |
 | Verify/decode ratio, $\gamma \le 16$, H100 | ~1.00× |
 | Decode step, H100 / T4 (8B, ctx 2K) | ~7.6 ms / ~65 ms |
-| Tokens per block, $a = 0.72$ | 1.72 ($\gamma$=1) → 3.57 (ceiling) |
-| Break-even acceptance | $= \rho$, independent of $\gamma$ |
+| Tokens per block, $a = 0.72$ | 1.72 ($\gamma$=1) → 2.88 ($\gamma$=4) → 3.57 (ceiling) |
+| Break-even acceptance | keep rate $= \rho$: $a^\star = \rho$ at $\gamma = 1$, 0.336 at $\gamma = 4$ ($\rho = 0.125$) |
+| Engine-logged "draft acceptance rate" | accepted ÷ drafted = the keep rate at your $\gamma$, not $a$ |
 
 ## In the engines
 

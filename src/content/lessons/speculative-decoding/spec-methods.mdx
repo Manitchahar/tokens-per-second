@@ -17,7 +17,7 @@ The previous lesson reduced speculative decoding to two numbers: how often a dra
 - **A small draft model** sits mid-plane: a real forward pass, a high acceptance rate.
 - **Medusa, EAGLE and MTP** cluster on the right: each trades training work or architectural complexity for a higher acceptance rate at a controlled cost.
 
-The break-even line $a = \rho$ cuts across it. Which side a method lands on depends on your text as much as on the method — which is exactly why the same engine should not enable speculation for every request.
+The break-even curve cuts across it: the points where the keep rate, the fraction of drafted tokens accepted, equals $\rho$. With one draft per block it is the diagonal $a = \rho$; with the usual four it bends below the diagonal, so a method needs a clearly higher $a$ than its $\rho$. Which side a method lands on depends on your text as much as on the method — which is exactly why the same engine should not enable speculation for every request.
 
 ## The free methods
 
@@ -55,7 +55,7 @@ So acceptance is not a property of a model alone, nor of a task label alone. It 
 <Callout type="try" title="Measure it the cheap way first">
   Before you wire anything up, take 200 real completions from your own logs, strip the returned text down to token ids, and for each position record whether the model's top-1 token was also in its top-5. That is a crude upper bound on what *any* drafter could have achieved, computable in one offline pass with no second model.
 
-  If that ceiling is below about 0.5, no drafter will get you above the break-even line for a $\rho$ of 0.125, and you have learned something valuable for the cost of an afternoon.
+  If that ceiling is below about 0.5, no drafter will get you far above the break-even line for a $\rho$ of 0.125 (at four drafts per block that line sits at $a \approx 0.34$), and you have learned something valuable for the cost of an afternoon.
 </Callout>
 
 ## Medusa: heads on the target
@@ -64,7 +64,7 @@ So acceptance is not a property of a model alone, nor of a task label alone. It 
   <SpecMethods client:visible slot="stage" />
 
   <Step title="1. One plane, six points">
-    Every method is a point: acceptance across, cost up. The diagonal is $a = \rho$, the line where speculation exactly breaks even. Anything to its lower-right wins; anything to its upper-left loses.
+    Every method is a point: acceptance across, cost up. The blue curve is where speculation exactly breaks even at your block size: the keep rate equals $\rho$. At $\gamma = 1$ it is the diagonal $a = \rho$; drag $\gamma$ up and it sags, because later drafts are kept less often. Anything to its lower-right wins; anything to its upper-left loses.
   </Step>
 
   <Step title="2. The free methods">
@@ -72,7 +72,7 @@ So acceptance is not a property of a model alone, nor of a task label alone. It 
   </Step>
 
   <Step title="3. The small draft model">
-    A 1B drafting an 8B costs about $\rho = 0.125$ of a target step and is accepted around 72% of the time. Comfortably past the line, which is why this is the default choice.
+    A 1B drafting an 8B costs about $\rho = 0.125$ of a target step and is accepted around 72% of the time, so at four drafts per block it keeps 47% of what it drafts. Comfortably past the line, which is why this is the default choice.
   </Step>
 
   <Step title="4. Medusa">
@@ -146,10 +146,10 @@ A practical order, cheapest commitment first:
 4. **If you can afford the training and need the last 20%, EAGLE.** Highest acceptance among cheap methods.
 5. **If you are training the model anyway, ship MTP heads.** Free drafting cost at inference, and the heads come with the checkpoint.
 
-Whichever you choose, the two numbers from the last lesson still do the deciding: $a$ comes from your traffic, $\rho$ comes from your hardware, and you win exactly when $a > \rho$.
+Whichever you choose, the two numbers from the last lesson still do the deciding: $a$ comes from your traffic, $\rho$ comes from your hardware, and you win exactly when the fraction of drafted tokens you keep beats $\rho$ (at one draft per block, simply $a > \rho$).
 
 <KeyNotes>
-  1. Every drafting method reduces to a point on one plane: acceptance rate $a$ across, draft cost ratio $\rho$ up. The diagonal $a = \rho$ is the break-even line.
+  1. Every drafting method reduces to a point on one plane: acceptance rate $a$ across, draft cost ratio $\rho$ up. The break-even curve is where the keep rate equals $\rho$: the diagonal $a = \rho$ at $\gamma = 1$, sagging below it for longer blocks.
   2. Prompt lookup and n-gram drafting run no network at all, so their $\rho$ is nearly zero and they only need a little accuracy to win — on repetitive, extractive or template-like traffic they can be surprisingly effective.
   3. A small draft model from the same family is the general-purpose choice: $\rho \approx 0.125$ for 1B drafting 8B, acceptance around 0.72, no training required.
   4. Medusa adds trained heads to the target that predict future tokens from the final hidden state, saving the memory of a second model but predicting from less context.
@@ -160,10 +160,10 @@ Whichever you choose, the two numbers from the last lesson still do the deciding
 </KeyNotes>
 
 <Quiz client:visible questions={[
-  { q: 'Every speculative decoding method can be characterised by which pair of numbers?', options: ['Parameters and context length', 'Acceptance rate a and draft cost ratio rho', 'Gamma and batch size', 'Accuracy and recall'], answer: 1, why: 'The whole design space reduces to how often the draft is right and what one drafted token costs. Speedup > 1 exactly when a > rho, so those two numbers determine everything.' },
-  { q: 'A 1B model drafts an 8B model. The cost ratio rho is about 0.125. For speculation to be faster, the acceptance rate must be:', numeric: true, answer: 12.5, tolerance: 1.5, unit: '%', why: 'The rule is a > rho. rho = 0.125 = 12.5%, so the acceptance rate must exceed 12.5%. A real 1B drafting an 8B gets around 70%, far above this line, which is why the configuration works.' },
+  { q: 'Every speculative decoding method can be characterised by which pair of numbers?', options: ['Parameters and context length', 'Acceptance rate a and draft cost ratio rho', 'Gamma and batch size', 'Accuracy and recall'], answer: 1, why: 'The whole design space reduces to how often the draft is right and what one drafted token costs. With the block size gamma they fix the speedup, and speculation wins exactly when the fraction of drafts kept beats rho.' },
+  { q: 'A 1B model drafts an 8B model with ONE draft per block (gamma = 1). The cost ratio rho is about 0.125. For speculation to be faster, the acceptance rate must exceed what percentage?', numeric: true, answer: 12.5, tolerance: 1.5, unit: '%', why: 'At gamma = 1 the keep rate is a itself, so the rule is a > rho = 12.5%. With four drafts per block the bar rises to about 34%, because later drafts are kept less often. A real 1B drafting an 8B gets around 70%, far above both, which is why the configuration works.' },
   { q: 'Why is prompt lookup decoding particularly effective on tasks like editing an existing document?', options: ['It uses less GPU memory than any other method', 'The replacement text usually already appears in the context, so a retrieval step is close to a perfect predictor', 'It runs the target model twice', 'It uses greedy decoding'], answer: 1, why: 'Prompt lookup finds the longest matching suffix and copies what followed. When the answer already exists in the context, copying is correct by construction. That is why extractive and template tasks favour it over any neural drafter.' },
   { q: 'What does EAGLE predict that Medusa does not?', options: ['A larger number of tokens per block', 'The next hidden state rather than the next token', 'The attention weights', 'A different sampling temperature'], answer: 1, why: 'EAGLE drafts by predicting the hidden state the next layer consumes, which carries more information than a token id. The target then verifies a block built from predicted states. That extra information is why its acceptance rate is the highest of the cheap methods.' },
   { q: 'What is the main advantage of MTP over a small draft model?', options: ['Higher acceptance rate at any cost', 'All gamma drafts come from one forward pass instead of gamma sequential steps, so drafting cost stops scaling with gamma', 'It requires no training', 'It works without a GPU'], answer: 1, why: 'A small draft model must run sequentially because each draft needs the previous one. MTP heads emit several future tokens from a single hidden state in one pass, so the draft cost is roughly one step no matter how many tokens you propose.' },
-  { q: 'An n-gram drafter runs on code and structured output with acceptance around 0.8, but on open-ended creative prose with acceptance around 0.25. With rho = 0.01 for n-gram, which traffic should you enable it on?', options: ['Only on code and structured output', 'Both streams, because both clear the 0.01 break-even threshold (though code wins more)', 'Neither stream, because n-gram is too inaccurate', 'Only on open-ended prose'], answer: 1, why: 'On code, a = 0.8 is far above rho = 0.01. On prose, a = 0.25 still comfortably clears rho = 0.01, so both streams benefit and should enable it, though code benefits far more. Only traffic with a < rho (under 1%) would be slowed down.' },
+  { q: 'An n-gram drafter runs on code and structured output with acceptance around 0.8, but on open-ended creative prose with acceptance around 0.25. With rho = 0.01 for n-gram, which traffic should you enable it on?', options: ['Only on code and structured output', 'Both streams, because both clear the 0.01 break-even threshold (though code wins more)', 'Neither stream, because n-gram is too inaccurate', 'Only on open-ended prose'], answer: 1, why: 'At rho = 0.01 the bar is tiny. On code, a = 0.8 keeps about 59% of drafts at four per block; on prose, a = 0.25 still keeps about 8%, well above 1%. Both streams win, code by far more, so enable it on both and expect most of the gain on code.' },
 ]} />

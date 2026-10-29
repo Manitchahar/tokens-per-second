@@ -9,7 +9,8 @@
 # 2. Measure the acceptance rate on real text with two different drafters.
 # 3. Measure what a verify pass actually costs versus one decode step.
 # 4. Measure the cost ratio rho on your GPU.
-# 5. Check the formula: tokens-per-block, speedup, and the break-even line a = rho.
+# 5. Check the formula: tokens-per-block, speedup, and the break-even rule
+#    (the fraction of drafted tokens kept must beat rho).
 # 6. Find where speculation loses, and confirm the model predicts it.
 # #
 # Runtime → Change runtime type → **T4 GPU**. Then Shift + Enter through the cells.
@@ -57,7 +58,9 @@ def speculative_step(target_p, draft_p, draft_tokens):
     draft_tokens      : the gamma tokens the drafter actually emitted,
                         each sampled from the corresponding draft distribution.
 
-    Returns (emitted_tokens, n_accepted, n_drafted).
+    Returns (emitted_tokens, n_accepted, n_tested). n_tested counts the drafts the
+    target actually examined, up to and including the first rejection. All gamma
+    drafts were generated, and paid for, before this function ran.
 
     Three details that make this EXACT rather than approximate — get any of them
     wrong and the output distribution silently changes:
@@ -122,15 +125,15 @@ counts = torch.zeros(V, device=DEV)
 n_blocks = N // 20
 n_emitted = 0
 n_accepted = 0
-n_drafted = 0
+n_tested = 0
 for _ in range(n_blocks):
     draft_tokens = torch.multinomial(draft_p, 1, replacement=True).squeeze(-1)  # [gamma]
-    toks, acc, drafted = speculative_step(target_p, draft_p, draft_tokens)
+    toks, acc, tested = speculative_step(target_p, draft_p, draft_tokens)
     for tk in toks:
         counts[tk] += 1
     n_emitted += len(toks)
     n_accepted += acc
-    n_drafted += drafted
+    n_tested += tested
 
 print(f"{n_blocks} blocks produced {n_emitted} tokens ({n_emitted/n_blocks:.3f} per block)\n")
 print("token   target     speculative   diff")
@@ -153,50 +156,54 @@ print(f"\nlargest deviation: {worst:.4f}  (sampling noise at N=200k is ~{3/math.
 
 # %%
 # the analytic prediction, compared with what we just measured
-a_rate = n_accepted / n_drafted
-d_geom = (1 - a_rate**GAMMA) / (1 - a_rate)
+a_rate = n_accepted / n_tested              # per-draft acceptance: accepted / drafts examined
+kept = a_rate * (1 - a_rate**GAMMA) / (1 - a_rate)   # a + a^2 + ... + a^g
 print("Acceptance and tokens per block")
 print(f"  observed a              = {a_rate:.4f}")
-print(f"  predicted tokens/block  = 1 + a*(1-a^g)/(1-a) = {1 + a_rate*d_geom:.4f}")
+print(f"  predicted tokens/block  = 1 + (a + a^2 + ... + a^g) = {1 + kept:.4f}")
 print(f"  observed tokens/block   = {n_emitted/n_blocks:.4f}")
-print(f"  predicted drafts paid   = (1-a^g)/(1-a) = {d_geom:.4f}")
-print(f"  observed  drafts paid   = {n_drafted/n_blocks:.4f}")
+print(f"  predicted keep rate     = kept / g = {kept/GAMMA:.4f}")
+print(f"  observed  keep rate     = {n_accepted/(n_blocks*GAMMA):.4f}")
+print(f"  drafts paid per block   = {GAMMA}  (every draft, kept or not)")
 
 # %% [markdown]
 # ## 3. The formula, checked against the simulation
 # #
 # The lesson derived:
 #
-#     E[drafts]        = (1 - a^g) / (1 - a)
-#     E[tokens/block]  = 1 + a * E[drafts]
-#     cost (steps)     = 1 + rho * E[drafts]
+#     E[kept]          = a + a^2 + ... + a^g = a (1 - a^g) / (1 - a)
+#     E[tokens/block]  = 1 + E[kept]
+#     cost (steps)     = 1 + rho * g        (all g drafts are paid for)
 #     speedup          = E[tokens] / cost
-#     break-even       : a = rho
+#     break-even       : keep rate E[kept]/g = rho   (a = rho only when g = 1)
 
 # %%
 def predict(a, rho, gamma):
-    d = (1 - a**gamma) / (1 - a) if a < 1 else gamma
-    tokens = 1 + a * d
-    cost = 1 + rho * d
-    return d, tokens, cost, tokens / cost
+    kept = a * (1 - a**gamma) / (1 - a) if a < 1 else gamma
+    tokens = 1 + kept
+    cost = 1 + rho * gamma
+    return kept, tokens, cost, tokens / cost
 
 
 print("gamma sweep at a=0.72, rho=0.125")
-print(" g   E[drafts]  tokens  cost   speedup")
+print(" g   E[kept]   tokens  cost   speedup")
 for g in [1, 2, 3, 4, 6, 8, 12]:
     d, tk, c, sp = predict(0.72, 0.125, g)
     print(f"{g:2d}   {d:8.3f}  {tk:6.3f}  {c:5.3f}  {sp:6.3f}")
 
 print("\nbreak-even: a at which speedup == 1 (idealised model)")
 for rho in [0.02, 0.125, 0.3]:
-    lo, hi = 0.0, 0.999
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        if predict(mid, rho, 4)[3] < 1:
-            lo = mid
-        else:
-            hi = mid
-    print(f"  rho={rho:.3f} -> a* = {(lo+hi)/2:.4f}   (theory: a* = rho)")
+    for g in [1, 4]:
+        lo, hi = 0.0, 0.999
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if predict(mid, rho, g)[3] < 1:
+                lo = mid
+            else:
+                hi = mid
+        print(f"  rho={rho:.3f} gamma={g} -> a* = {(lo+hi)/2:.4f}")
+print("theory: a* = rho at gamma = 1; higher at gamma = 4, because every draft is")
+print("paid for and later drafts are kept less often (expect ~0.074, 0.336, 0.574).")
 
 # %% [markdown]
 # ## 4. Measure it on a real model
@@ -240,6 +247,7 @@ ids = tok(PROMPT, return_tensors="pt").to(DEV)
 @torch.no_grad()
 def measure_acceptance(prompt_ids, gamma=4, n_tokens=120):
     accepted_total = 0
+    tested_total = 0
     blocks = 0
     cur = prompt_ids.clone()
 
@@ -268,16 +276,20 @@ def measure_acceptance(prompt_ids, gamma=4, n_tokens=120):
             else:
                 break
         accepted_total += ok
+        tested_total += ok + (1 if ok < gamma else 0)   # drafts the target examined
         blocks += 1
         cur = torch.cat([ctx, block[:, :ok]], dim=1)
         if cur.shape[1] > 400:
             break
 
-    return accepted_total / max(1, blocks * gamma), blocks
+    a = accepted_total / max(1, tested_total)          # per-draft acceptance
+    keep = accepted_total / max(1, blocks * gamma)     # fraction of drafted tokens kept
+    return a, keep, blocks
 
 
-a_measured, nblocks = measure_acceptance(ids, gamma=4)
+a_measured, keep_measured, nblocks = measure_acceptance(ids, gamma=4)
 print(f"measured acceptance a = {a_measured:.3f} over {nblocks} blocks")
+print(f"measured keep rate    = {keep_measured:.3f}  (accepted / all drafted, gamma = 4)")
 print(f"(greedy drafting on a translate task — expect a fairly high rate)")
 
 # %% [markdown]
@@ -369,20 +381,22 @@ for g in [1, 2, 4, 8, 16]:
 
 # %%
 GAMMA = 4
-d, tokens, cost, speedup = predict(a_measured, rho_measured, GAMMA)
+kept, tokens, cost, speedup = predict(a_measured, rho_measured, GAMMA)
 print(f"measured a   = {a_measured:.3f}")
 print(f"measured rho = {rho_measured:.3f}")
 print(f"gamma        = {GAMMA}")
 print()
-print(f"E[drafts]       = {d:.3f}")
+print(f"E[kept]         = {kept:.3f}   keep rate = {kept/GAMMA:.3f}")
 print(f"E[tokens/block] = {tokens:.3f}")
 print(f"cost (steps)    = {cost:.3f}")
 print(f"speedup         = {speedup:.3f}x")
 print()
-if a_measured > rho_measured:
-    print(f"a > rho, so speculation WINS — expected {speedup:.2f}x on this task.")
+if kept / GAMMA > rho_measured:
+    print(f"keep rate > rho, so speculation WINS — expected {speedup:.2f}x on this task.")
 else:
-    print(f"a < rho, so speculation LOSES ({speedup:.2f}x). Do not enable it here.")
+    print(f"keep rate < rho, so speculation LOSES ({speedup:.2f}x) at gamma = {GAMMA}.")
+    best = max(range(1, 9), key=lambda g: predict(a_measured, rho_measured, g)[3])
+    print(f"best gamma for these numbers: {best} -> {predict(a_measured, rho_measured, best)[3]:.2f}x")
     print("On a T4 with these two models this is the likely outcome — which is")
     print("itself the finding: measure rho before you trust any paper's speedup.")
 
@@ -392,11 +406,11 @@ else:
 # Three checks that each flip the sign. Run them and see which ones bite.
 
 # %%
-print("A. Acceptance below rho")
+print("A. Keep rate below rho")
 for a in [0.1, 0.3, 0.5, 0.7, 0.9]:
-    _, tk, c, sp = predict(a, rho_measured, GAMMA)
+    kp, tk, c, sp = predict(a, rho_measured, GAMMA)
     verdict = "win " if sp >= 1 else "LOSS"
-    print(f"   a={a:.2f}  rho={rho_measured:.3f}  speedup={sp:.3f}x  {verdict}")
+    print(f"   a={a:.2f}  keep={kp/GAMMA:.3f}  rho={rho_measured:.3f}  speedup={sp:.3f}x  {verdict}")
 
 print("\nB. Batch size kills the memory-bound premise")
 # at batch B the weight read is amortised across the batch, so bytes per token fall as 1/B
@@ -532,7 +546,8 @@ print("  3. bonus token is sampled from p               (not p.argmax())")
 #    plain sampling; nothing was approximated. Section 11 showed how easily that
 #    property is lost to a one-word change.
 # 2. The whole decision is two numbers: **a** (acceptance, measured in §5) and
-#    **rho** (draft cost, measured in §6). Win exactly when a > rho.
+#    **rho** (draft cost, measured in §6). Win exactly when the fraction of
+#    drafted tokens kept beats rho; at gamma = 1 that is simply a > rho.
 # 3. The verify pass really is nearly free on a small GPU (§7) — that is what
 #    makes the trick work, and it is measurable.
 # 4. On a T4, **rho for a neural drafter is much higher than its parameter
@@ -547,7 +562,7 @@ print("  3. bonus token is sampled from p               (not p.argmax())")
 # ## Going further
 # %
 # - Sweep `gamma` with the real models and find where the measured speedup peaks.
-#   Does it match the formula's prediction of where it flattens?
+#   Does it match the formula's prediction of the peak?
 # - Measure acceptance on your *own* prompts and watch it vary by task type.
 # - Try the same experiment with `torch.compile` + CUDA graphs (Module 15) and see
 #   whether a lower fixed overhead improves rho enough to matter.
