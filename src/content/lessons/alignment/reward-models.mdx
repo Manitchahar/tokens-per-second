@@ -91,7 +91,7 @@ where $\succ$ reads "is preferred to" and $\sigma$ is the sigmoid you met as the
 
 ### The loss is just maximum likelihood
 
-We have a dataset of comparisons where people chose $y_w$ over $y_l$. A good reward model makes those choices likely. Maximising the probability of the observed choices, or equivalently minimising its negative log, gives the loss for one comparison:
+We have a dataset of comparisons where people chose $y_w$ over $y_l$. A good reward model makes those choices likely. Maximising the probability of the observed choices, or equivalently minimising its negative log, gives the <Term t="bradley-terry-loss">Bradley-Terry loss</Term> for one comparison:
 
 $$
 \mathcal{L}(\theta) = -\log \sigma\big(r_\theta(x, y_w) - r_\theta(x, y_l)\big) .

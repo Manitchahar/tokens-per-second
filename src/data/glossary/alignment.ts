@@ -43,9 +43,9 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'A transformer whose vocabulary head is replaced by a single output, trained on preference data to score how much people would like an answer to a prompt. Only differences between its scores for the same prompt carry meaning.',
     lesson: 'alignment/reward-models',
   },
-  'bradley-terry': {
-    term: 'Bradley-Terry model',
-    def: 'P(A preferred to B) = σ(r_A − r_B): scores are log-odds, and their difference sets the odds of winning. Its negative log-likelihood, −log σ(r_w − r_l), is the standard reward-model loss.',
+  'bradley-terry-loss': {
+    term: 'Bradley-Terry loss',
+    def: '−log σ(r_w − r_l): the negative log-likelihood of a human choice under the Bradley-Terry model P(A preferred to B) = σ(r_A − r_B). The standard reward-model loss, and with the policy’s implicit reward plugged in, the DPO loss.',
     lesson: 'alignment/reward-models',
   },
   'pairwise-accuracy': {

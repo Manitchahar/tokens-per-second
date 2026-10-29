@@ -1,0 +1,119 @@
+---
+title: 'Module 3C · From Autocomplete to Assistant'
+module: alignment
+---
+
+## Base model vs assistant
+
+A **base model** (pretraining only) continues documents. A question is the first line of a document, so it often continues with more questions.
+
+For one context with data mix $q$, pretraining loss is
+
+$$
+-\sum_i q_i \log p_i = H(q) + \mathrm{KL}(q\,\|\,p),
+$$
+
+minimised only at $p = q$: the objective rewards imitating the mix, not helpfulness.
+
+| Worked: $q$ = 55% question / 30% answer / 15% options | Loss |
+|---|---|
+| imitate the mix, $p = q$ | 0.975 nats |
+| helpful-leaning, $p$ = 10 / 85 / 5% | 1.765 nats (+0.79 = KL) |
+
+- Prompt tricks (`Q: … A:`) make an answer likely but cannot teach **stopping**, cannot beat the quality of the imitated pages, and are fragile.
+- Base and instruct checkpoints share config, size and per-token cost; they differ in output length and whether they stop.
+- A model that never stops runs to `max_new_tokens`: every extra token is a full forward pass.
+
+## The three stages (InstructGPT-175B)
+
+| Stage | Data | Teaches | PF-days | Share |
+|---|---|---|---|---|
+| Pretraining | ~300B tokens | knowledge, language | 3,640 | 98.2% |
+| SFT | 12,725 prompts + demonstrations | format, role, stopping | 4.9 | 0.13% |
+| RLHF (PPO-ptx) | 33,207 ranked prompts; 31,144 RL prompts | which answers people prefer | 60 | 1.6% |
+
+- 1 PF-day = ${}10^{15} \times 86{,}400 = 8.64 \times 10^{19}$ FLOPs.
+- Check: ${}6ND = 6 \times 175\text{B} \times 300\text{B} = 3.15 \times 10^{23}$ FLOPs = 3,646 PF-days.
+- Total 3,704.9 PF-days; post-training under 2%.
+
+## Supervised finetuning
+
+$$
+\mathcal{L}_{\text{SFT}} = -\frac{1}{|R|}\sum_{t \in R} \log p_\theta(x_t \mid x_{<t}) \qquad R = \text{response positions}
+$$
+
+- **Loss masking:** prompt labels = −100 (PyTorch `ignore_index`). Masked tokens still go through the forward pass.
+- Worked: prompt 13 positions, 22.71 nats; response 5 positions, 3.20 nats. Unmasked mean 25.91 ÷ 18 = 1.44 (prompt = 87.6% of the sum); masked mean 3.20 ÷ 5 = **0.64**.
+- RAG-style: 3,000-token prompt + 100-token answer → prompt is 96.8% of positions unmasked.
+- The **end-of-turn token is a target**: that is where stopping is learned. Bug to avoid: `pad = eos` and masking all pad ids also masks the real stop token.
+- Shift by one: logits at $t$ predict token $t+1$. Check the template is prefix-stable before masking.
+- Data sizes: LIMA 1,000; InstructGPT 12,725; Llama 2-Chat 27,540.
+- **LIMA** (65B, 1,000 examples, no RL): equal or better than GPT-4 43%, Bard 58%, DaVinci003 65%. **Superficial alignment hypothesis:** knowledge from pretraining; alignment teaches format. Variety and quality beat quantity.
+- InstructGPT SFT: 16 epochs; validation loss overfits after 1 epoch while human ratings improve. Judge by generations.
+- SFT cannot exceed its demonstrators, never sees its own mistakes, and teaches confident answering.
+
+## Preference data & reward models
+
+- Record: $(x, y_w, y_l)$. Comparing is faster and more consistent than writing; labeler agreement ≈ 73–77%.
+- Ranking $K$ answers → $\binom{K}{2} = K(K-1)/2$ pairs: K = 4 → 6, K = 9 → 36. Train a prompt's pairs as one batch element (avoids overfitting; K passes instead of 2·C(K,2): 9 vs 72).
+- **Bradley-Terry:** $P(A \succ B) = \sigma(r_A - r_B)$; odds = $e^{r_A - r_B}$.
+- **Loss:** $-\log\sigma(r_w - r_l)$. Gradient on each score: $\pm(1 - \sigma(\Delta))$.
+
+| Gap $\Delta$ | σ(Δ) | Loss if right | Loss if wrong |
+|---|---|---|---|
+| 0 | 0.500 | 0.693 | 0.693 |
+| 0.8 | 0.690 | 0.371 | 1.171 |
+| 2 | 0.881 | 0.127 | 2.127 |
+
+- Architecture: transformer with vocabulary head → 1 output, read at the last token (decoder). InstructGPT: one **6B** RM from the SFT model; 175B less stable.
+- Rewards are **shift-invariant**: normalise (InstructGPT: demonstrations average 0), never compare across prompts, never threshold raw scores.
+- **Pairwise accuracy**: 50% = chance; ceiling ≈ human agreement.
+- **Best-of-N:** N generations + N RM passes; selects for RM biases (length).
+- HH-RLHF: ~160,800 train / 8,552 test pairs.
+- Use `F.logsigmoid`, not `log(sigmoid())`.
+
+## RLHF (InstructGPT)
+
+$$
+\mathbb{E}_{x,\,y\sim\pi^{\text{RL}}}\Big[r_\theta(x,y) - \beta\log\frac{\pi^{\text{RL}}(y\mid x)}{\pi^{\text{SFT}}(y\mid x)}\Big] + \gamma\,\mathbb{E}_{x\sim D_{\text{pretrain}}}\big[\log\pi^{\text{RL}}(x)\big]
+$$
+
+- Log-ratio = sum over tokens. Worked: r = 1.8, Σ log-ratio = 2.25 nats, β = 0.02 → 1.755; β = 0.2 → 1.35.
+- InstructGPT: β around 0.01–0.02 worked best; γ > 0 = **PPO-ptx**.
+- **Reward hacking:** proxy score keeps rising with $d = \sqrt{\mathrm{KL}}$; true quality peaks and falls (Gao et al., 2022). Toy: reward $d$, penalty $\beta d^2$ → $d^* = 1/(2\beta)$.
+- **PPO:** advantage = reward − value baseline; ratio $\rho$ clipped to $[1-\varepsilon, 1+\varepsilon]$, ε = 0.2. Worked: ρ = 1.5, A = 0.5 → clipped 0.6.
+- Four models: policy, reference, RM, value. 175/175/6/6B in 16-bit = **724 GB** of weights. RLHF wall-clock is dominated by generation.
+- **Alignment tax:** PPO regressed SQuAD, DROP, HellaSwag, WMT Fr→En; PPO-ptx removed most of it.
+- Results: 1.3B InstructGPT preferred to 175B GPT-3 (>100× params); 175B wins 85 ± 3% vs GPT-3, 71 ± 4% vs few-shot GPT-3; TruthfulQA truthful+informative ~2×; closed-domain made-up info ~21% vs 41%; toxicity −25% only when asked to be respectful; bias unchanged.
+
+## DPO
+
+- Optimum of $\max_\pi \mathbb{E}[r] - \beta\,\mathrm{KL}(\pi\|\pi_{\text{ref}})$: $\pi^* = \pi_{\text{ref}}\,e^{r/\beta}/Z$.
+- Worked: ref (0.5, 0.3, 0.2), r (0, 1, 2), β = 1 → Z = 2.793, π* = (0.179, 0.292, 0.529). β = 0.5 → (0.037, 0.163, 0.801).
+- Implicit reward: $\hat r = \beta\log(\pi/\pi_{\text{ref}})$; $Z(x)$ cancels in $r_w - r_l$.
+
+$$
+\mathcal{L}_{\text{DPO}} = -\log\sigma\Big(\beta\log\frac{\pi(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)} - \beta\log\frac{\pi(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\Big)
+$$
+
+- Worked: ratios +1.0 / −0.5, β = 0.1 → margin 0.15, loss 0.621. At init: ln 2 = 0.693.
+- Gradient weight $\sigma(-\text{margin})$: confident pairs fade out.
+- 2 models, no generation: 7B → 28 GB of 16-bit weights vs 56 GB for PPO. Reference log-probs can be precomputed.
+- Default β = 0.1 (TL;DR: 0.5). TL;DR win rate ~61% (DPO) vs ~57% (PPO).
+- Gives up: online exploration; trains only the gap (chosen log-probs often fall); inherits data biases.
+
+## Hallucination
+
+- Fluent, confident, false. Causes: pretraining rewards plausibility; early tokens commit the answer (**snowballing**); SFT on unknown facts teaches guessing; 0/1 grading rewards guessing.
+- Path probability = product of conditionals. Worked: 0.55 × 0.92 × 0.84 × 0.88 = 0.374 (false) vs 0.45 × 0.71 × 0.66 × 0.97 = 0.205 (true). Greedy picks the false path; low temperature does not help.
+- Models recognise their own snowballed errors when asked separately: 67% (ChatGPT), 87% (GPT-4).
+- Arbitrary facts seen once: base-model error rate ≥ roughly the fraction seen once (20% → ≥ 20%).
+- Scoring: 0/1 → answer scores $p$, abstain 0: always guess. Confidence target $t$, wrong = $-t/(1-t)$ → answer iff $p > t$. Penalties: t = 0.5 → 1, 0.75 → 3, 0.9 → 9. Worked: p = 0.3, t = 0.75 → −1.8.
+- Fixes (none add knowledge): retrieval (B3), abstention training, verification (tools, separate pass), reason-first prompting and multi-sample agreement (B1). Facts → retrieval; behaviour → finetuning.
+
+## Lab: reward model on a T4
+
+- `distilroberta-base` + 1-output head, HH-RLHF helpful-base, 4,000 pairs × 2 epochs, AdamW 2e-5, FP16 autocast + `GradScaler`.
+- `truncation_side = "left"` or pairs become identical. Loss stuck at 0.693 = coin flip.
+- Compare with “longer reply wins”. Expect held-out accuracy ~high 50s to mid 60s.
+- Best-of-4 on Qwen2.5-0.5B-Instruct: picked reward rises by construction; check length. Four batched answers cost ~1.1–1.5× one.
