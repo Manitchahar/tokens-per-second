@@ -88,8 +88,8 @@ Large models help too, but by a different route: a large target is expensive to 
 Four situations produce a real loss, not just a disappointing gain:
 
 1. **Large batch, compute-bound.** The premise of the technique is gone.
-2. **Very low acceptance.** When the fraction of drafts you keep falls below $\rho$, you are slower than not speculating. That bar is $a > \rho$ at one draft per block and higher for longer blocks (about $a > 0.34$ at four drafts when $\rho = 0.125$), so the first fix for low acceptance is a shorter block. With a well-matched draft model this means the text is genuinely unpredictable.
-3. **A draft model too close in size.** If $\rho$ approaches the keep rate, the margin vanishes. A 7B drafting a 70B is fine; a 60B drafting a 70B is not.
+2. **Very low acceptance.** Below roughly $\rho$, you are slower than not speculating. With a well-matched draft model this means the text is genuinely unpredictable.
+3. **A draft model too close in size.** If $\rho$ approaches $a$, the margin vanishes. A 7B drafting a 70B is fine; a 60B drafting a 70B is not.
 4. **Very short outputs.** Speculation pays off in steady state. If the answer is three tokens, you pay the draft cost and the verify cost for one or two blocks and never amortise — and you have likely made TTFT *worse*, because the first block must be drafted before the first token can be produced. **This is the trap most likely to bite you in production**, because chat traffic has a long tail of "yes"-style one-token answers.
 
 ## A worked decision
@@ -97,11 +97,11 @@ Four situations produce a real loss, not just a disappointing gain:
 You run Llama-3.1-8B on one A100, serving an internal assistant. Traffic is mostly code questions and short factual answers; median output is 120 tokens, with a long tail under 10 tokens.
 
 - **Acceptance:** estimate from a quick offline run — call it $a = 0.7$. Code and templated answers accept well.
-- **Cost ratio:** Llama-3.2-1B drafting, so take $\rho \approx 0.125$. At four drafts per block that keeps $(0.7 + 0.49 + 0.343 + 0.240)/4 = 44\%$ of drafts, far above 12.5%: worth enabling.
+- **Cost ratio:** Llama-3.2-1B drafting, so $\rho \approx 0.125$. $a > \rho$: worth enabling.
 - **Batch:** you are optimising interactivity, so batch stays low — 4 to 16. The step is still memory-bound.
 - **Overhead:** measure it. If it is 10% of the step, speculation is fine. If it is 40%, fix Module 15 first.
 
-Conclusion: enable speculation with a 1B draft model, $\gamma$ around 4. Expect roughly **1.8×** on long outputs ($2.77$ tokens per block for $1.5$ steps of cost). For the short-output tail, consider disabling speculation below some output-length threshold — or accept a small TTFT regression there, since those requests were never going to amortise a block.
+Conclusion: enable speculation with a 1B draft model, $\gamma$ around 4. Expect roughly **2×** on long outputs. For the short-output tail, consider disabling speculation below some output-length threshold — or accept a small TTFT regression there, since those requests were never going to amortise a block.
 
 ## How it moves the numbers you already track
 
@@ -139,13 +139,11 @@ Is the step memory-bound at your operating batch size?
          └─ yes → Is your per-step overhead < ~20% of a step?
                   ├─ no  → Fix Module 15 first (compile, CUDA graphs).
                   └─ yes → Measure a on this traffic and rho on this card.
-                           ├─ keep rate <= rho even at gamma = 1 (a <= rho)
-                           │     → STOP for a neural drafter.
-                           │     → but try prompt lookup / n-gram (rho ~ 0).
-                           └─ keep rate > rho → Enable. Pick the method with the
-                                 lowest rho that clears your a, set gamma near
-                                 the peak (usually 3-6), and re-measure ITL at
-                                 p95 and p99.
+                           ├─ a <= rho → STOP for a neural drafter.
+                           │            → but try prompt lookup / n-gram (rho ~ 0).
+                           └─ a > rho → Enable. Pick the method with the lowest
+                                        rho that clears your a, set gamma ~4,
+                                        and re-measure ITL at p95 and p99.
 ```
 
 Two of those gates deserve emphasis because they are the ones people skip:
@@ -164,7 +162,7 @@ Two measurements, and they take under an hour together:
 1. **$a$ on your real traffic.** Run a few hundred production-like prompts with a draft model, count accepted drafts. Do not use a benchmark's prompts; acceptance is a property of your content.
 2. **$\rho$ on your card.** Time one decode step of the target and of the draft at your operating batch size.
 
-Then check that the keep rate beats $\rho$ (at one draft per block that is just $a > \rho$). If yes, sweep $\gamma$ once, pick the peak of the curve, and enable it. If no, do not — and remember the free methods from the previous lesson have a $\rho$ near zero, so "no" for a neural drafter is often "yes" for prompt lookup.
+Then check $a > \rho$. If yes, sweep $\gamma$ once, pick the flat part of the curve, and enable it. If no, do not — and remember the free methods from the previous lesson have a $\rho$ near zero, so "no" for a neural drafter is often "yes" for prompt lookup.
 
 <KeyNotes>
   1. Speculation is a **latency** technique. It reduces per-token step cost for one user; it does not raise aggregate throughput across many concurrent requests.
@@ -172,16 +170,16 @@ Then check that the keep rate beats $\rho$ (at one draft per block that is just 
   3. A block is $\gamma+1$ passes, so large fixed per-step overhead is multiplied rather than hidden. Do the Module 15 compile/graph work before speculating.
   4. Speculation's margin is largest for small models and large target-to-draft asymmetry, where the weight read dominates the step and verification really is nearly free.
   5. Acceptance rate is a property of your prompts. Code, extraction, templated output and agent loops accept far more than novel prose.
-  6. The four outright-loss cases are: large compute-bound batch, a keep rate below $\rho$ (acceptance too low for the block size), a draft model too close in size to the target, and very short outputs.
+  6. The four outright-loss cases are: large compute-bound batch, acceptance below $\rho$, a draft model too close in size to the target, and very short outputs.
   7. Short outputs are the most likely production trap: the first token cannot be produced until a block has been drafted, so speculation can **worsen** TTFT on one-token answers.
-  8. Before enabling: measure $a$ on your traffic and $\rho$ on your card. Check that the keep rate beats $\rho$, sweep $\gamma$ once, and pick the peak of the curve.
+  8. Before enabling: measure $a$ on your traffic and $\rho$ on your card. Check $a > \rho$, sweep $\gamma$ once, and pick the flat part of the curve.
 </KeyNotes>
 
 <Quiz client:visible questions={[
   { q: 'Why is speculative decoding described as a latency technique rather than a throughput technique?', options: ['It reduces the per-token cost of a decode step, which is what a single user feels', 'It cannot run at high batch sizes', 'It reduces memory usage', 'It uses less power'], answer: 0, why: 'Speculation attacks the fixed per-step cost by amortising the weight read across several tokens. That improves the latency of one stream, not the aggregate throughput of many. For throughput, batching already amortises the same term.' },
   { q: 'Why does batching reduce or eliminate the benefit of speculative decoding?', options: ['Batching makes the acceptance rate drop', 'Both techniques amortise the weight read, so batching removes the wall that speculation exploits', 'Batching changes the dtype', 'Speculation requires batch size 1'], answer: 1, why: 'At large batch the weights are read once for all sequences, so the step is compute-bound and running gamma positions together saves nothing — the FLOPs are unchanged. Batching and speculation are substitutes for the same saving.' },
   { q: 'A decode step is 3 ms, of which 1.2 ms is fixed per-step overhead (launches, scheduling). What is the overhead share?', numeric: true, answer: 40, tolerance: 1, unit: '%', why: '1.2 / 3 = 0.40 = 40%. At that share, speculation is risky: a block is gamma+1 passes, so it multiplies the overhead. Reduce the overhead with torch.compile and CUDA graphs before enabling it.' },
-  { q: 'A draft model achieves an acceptance rate of 0.10 while costing rho = 0.15 per token. What happens?', options: ['It still helps because verification is nearly free', 'It loses, because a < rho means the block costs more than it returns', 'It is exactly break-even', 'It helps only at batch 1'], answer: 1, why: 'Even with one draft per block the keep rate is a = 0.10, below rho = 0.15, and longer blocks keep an even smaller fraction. Every block costs more in draft time than it returns in saved decode steps, so speculation makes the model slower at any gamma.' },
+  { q: 'A draft model achieves an acceptance rate of 0.10 while costing rho = 0.15 per token. What happens?', options: ['It still helps because verification is nearly free', 'It loses, because a < rho means the block costs more than it returns', 'It is exactly break-even', 'It helps only at batch 1'], answer: 1, why: 'The rule is a > rho. Here 0.10 < 0.15, so every block costs more in draft time than it returns in saved decode steps. Speculation would make the model slower.' },
   { q: 'Speculation is enabled, and TTFT has regressed while steady-state throughput improved. On which kind of request does this pattern occur?', options: ['Long generations at high batch', 'Very short outputs, where the first block must be drafted before the first token can be produced', 'Requests with high acceptance', 'Requests using prompt lookup'], answer: 1, why: 'For short outputs the draft cost and the verify pass are never amortised over enough tokens to pay off, and TTFT worsens because nothing can be emitted until the first block is drafted and verified. The steady-state gain on long outputs is real, but it does not apply here.' },
   { q: 'A batch of 64 sequences makes the step compute-bound. Roughly what benefit can speculation still provide at that batch size?', numeric: true, answer: 0, tolerance: 0.5, unit: 'x', why: 'Approximately none. Speculation relies on the verify pass being nearly free because the step is memory-bound. Once the step is compute-bound, checking gamma+1 positions in one pass does the same FLOPs as before, so there is nothing to save.' },
 ]} />

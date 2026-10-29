@@ -35,7 +35,7 @@ export const terms: Record<string, GlossaryEntry> = {
   },
   'bonus-token': {
     term: 'Bonus token',
-    def: 'The extra token the target emits when every draft in a block is accepted: it comes from position γ+1, which the draft never predicted, scored in the same verification pass. When a draft is rejected the target emits a corrected token at that position instead. Either way every block emits at least one token.',
+    def: 'The token from the last position of a speculative block. The draft never predicted it, so the target gets it right for free — which is why every block emits at least one token even when nothing is accepted.',
     lesson: 'speculative-decoding/draft-and-verify',
   },
   'rejection-sampling-correction': {
@@ -45,12 +45,12 @@ export const terms: Record<string, GlossaryEntry> = {
   },
   'tokens-per-block': {
     term: 'Tokens per block',
-    def: '1 + a·(1 - a^γ)/(1 - a) = (1 - a^(γ+1))/(1 - a): the expected tokens a speculative block emits, the accepted drafts plus one token from the target. It rises with γ and saturates at 1/(1 - a), a ceiling set by how predictable the text is rather than by the block size.',
+    def: '1 + a·(1 - a^γ)/(1 - a) — the expected tokens a speculative block emits. It rises with γ and saturates at 1/(1 - a), a ceiling set by how predictable the text is rather than by the block size.',
     lesson: 'speculative-decoding/spec-math',
   },
   'break-even-acceptance': {
     term: 'Break-even acceptance rate',
-    def: 'The acceptance rate at which speculation exactly pays for itself. With verification costing about one decode step, that is where the keep rate (the fraction of the γ drafted tokens that are accepted) equals the draft cost ratio ρ. At γ = 1 it is simply a = ρ; it rises with γ, to about 0.34 at γ = 4 when ρ = 0.125.',
+    def: 'The acceptance rate at which speculation exactly pays for itself. In the idealised model it equals the draft cost ratio ρ, independent of block size — so a paper claiming a speedup is really claiming a > ρ.',
     lesson: 'speculative-decoding/spec-math',
   },
   'lookahead-decoding': {

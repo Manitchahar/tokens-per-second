@@ -3,11 +3,10 @@ import { Stage, Readout, Segmented, Slider } from '../lib/Stage';
 import { useStep } from '../lib/useStep';
 import { useTween } from '../lib/tween';
 import { Label, Span, Arrow, Chip, Fade, Dim, Bar, fmt } from '../lib/svg';
-import { block, decodeStep, verifyPass, expectedAccepted, LLAMA8B, METHODS, type Machine } from './specModel';
+import { block, decodeStep, verifyPass, LLAMA8B, METHODS, type Machine } from './specModel';
 
 // Every drafting method is a point on one plane: acceptance rate a on one axis,
-// draft cost rho on the other. The break-even curve is where the keep rate (the
-// fraction of drafted tokens accepted) equals rho; at gamma = 1 it is the diagonal a = rho.
+// draft cost rho on the other. The diagonal a = rho is the break-even line.
 // Everything about choosing a method follows from where a method sits.
 
 const STEPS = [
@@ -22,7 +21,7 @@ const STEPS = [
 ];
 
 const CAPTIONS = [
-  'Strip away the implementations and every drafting method answers the same two questions: how often is it right, and what does one drafted token cost? Plot those and the whole design space collapses to a plane with one meaningful curve on it: break-even, where the fraction of drafted tokens you keep equals what a draft costs.',
+  'Strip away the implementations and every drafting method answers the same two questions: how often is it right, and what does one drafted token cost? Plot those and the whole design space collapses to a plane with one meaningful diagonal on it.',
   'The cheapest methods use no network at all. An n-gram table memorises what followed similar contexts before; prompt lookup finds a matching span in the prompt or earlier output and copies from it. Both are nearly free, which means they win on almost anything — and lose the moment the text stops repeating.',
   'A small model drafting a large one is the general case. It is always right often enough because it is genuinely the same model, just smaller. Its cost is a real forward pass, so it sits at a fixed fraction of the target weight read. This is the workhorse configuration.',
   'Medusa keeps the target model and adds a few small linear heads that jump straight from the final hidden state to the next few tokens, bypassing most of the network. It is cheap and has no second model, but it must be trained, and it sees less context than a full forward pass.',
@@ -54,18 +53,6 @@ export default function SpecMethods() {
   const RMIN = 0, RMAX = 0.32;
   const px = (av: number) => PX + (av / AMAX) * PW;
   const py = (rv: number) => PY + PH - (rv / RMAX) * PH;
-  // break-even: rho equal to the keep rate, keep(a) = expected accepted drafts / gamma
-  const keepAt = (av: number) => expectedAccepted(av, gamma) / gamma;
-  const bePts: string[] = [];
-  let beMid = 0;
-  for (let i = 0; i <= 60; i++) {
-    const av = (AMAX * i) / 60;
-    const k = keepAt(av);
-    if (k > RMAX) break;
-    if (k <= 0.16) beMid = av;
-    bePts.push(`${i ? 'L' : 'M'}${px(av).toFixed(1)},${py(k).toFixed(1)}`);
-  }
-  const beCurve = bePts.join(' ');
 
   return (
     <Stage
@@ -74,10 +61,10 @@ export default function SpecMethods() {
       steps={STEPS}
       captions={CAPTIONS}
       legend={[
-        ['token', 'methods that win at this γ'],
+        ['token', 'methods that win (a > rho)'],
         ['error', 'methods that lose'],
         ['text', 'the chosen method'],
-        ['memory', 'break-even: keep rate = ρ'],
+        ['memory', 'break-even line a = rho'],
       ]}
       {...s}
       readout={
@@ -119,15 +106,15 @@ export default function SpecMethods() {
           <Label key={g} x={PX - 8} y={py(g) + 3} anchor="end" tone={3} size={8.5}>{g}</Label>
         ))}
 
-        {/* ── the break-even curve: keep rate = rho ─────────── */}
-        <path d={beCurve} fill="none" stroke="var(--memory)" strokeWidth={2} />
-        <Label x={px(beMid) - 6} y={py(0.16) - 4} anchor="end" size={9} kind="memory" bold>{gamma === 1 ? 'a = ρ' : `break-even, γ = ${gamma}`}</Label>
-        <Label x={px(0.06)} y={py(0.2)} size={8.5} kind="error" anchor="middle">lose</Label>
-        <Label x={px(0.8)} y={py(0.06)} size={8.5} kind="token" anchor="middle">win</Label>
+        {/* ── the break-even diagonal a = rho ───────────────── */}
+        <line x1={px(0)} y1={py(0)} x2={px(RMAX)} y2={py(RMAX)} stroke="var(--memory)" strokeWidth={2} />
+        <Label x={px(0.175)} y={py(0.175) + 4} size={9} kind="memory" bold>a = ρ</Label>
+        <Label x={px(0.055)} y={py(0.055) - 8} size={8.5} kind="error" anchor="middle">lose</Label>
+        <Label x={px(0.28)} y={py(0.28) + 14} size={8.5} kind="token" anchor="middle">win</Label>
 
         {/* ── the methods ──────────────────────────────────── */}
         {METHODS.map((x) => {
-          const win = block(x.a, x.rho, gamma, verifyPass(machine, gamma).total, tDecode).speedup >= 1;
+          const win = x.a > x.rho;
           const on = x.id === sel;
           // prompt-lookup and n-gram sit almost on top of each other on this
           // plane, so the second label is lifted and given a leader line
@@ -164,9 +151,9 @@ export default function SpecMethods() {
             {sp >= 1 ? `${sp.toFixed(2)}x faster` : `${((1 - sp) * 100).toFixed(0)}% slower`}
           </Label>
           <Label x={PX + PW + 34} y={PY + 124} tone={3} size={9}>{`${r.tokens.toFixed(2)} tokens per block`}</Label>
-          <Label x={PX + PW + 34} y={PY + 137} tone={3} size={9}>{`${r.draftSteps} drafted, ${r.wasted.toFixed(2)} wasted`}</Label>
-          <Label x={PX + PW + 34} y={PY + 157} size={9} kind={r.keepRate > m.rho ? 'token' : 'error'}>
-            {r.keepRate > m.rho ? `keep ${(r.keepRate * 100).toFixed(0)}% > ρ: worth it` : `keep ${(r.keepRate * 100).toFixed(0)}% < ρ: not worth it`}
+          <Label x={PX + PW + 34} y={PY + 137} tone={3} size={9}>{`${r.draftSteps.toFixed(2)} draft steps, ${r.wasted.toFixed(2)} wasted`}</Label>
+          <Label x={PX + PW + 34} y={PY + 157} size={9} kind={a > m.rho ? 'token' : 'error'}>
+            {a > m.rho ? `a > ρ: win by ${((a / m.rho - 1) * 100).toFixed(0)}%` : 'a < ρ: not worth it'}
           </Label>
           <Label x={PX + PW + 34} y={PY + 174} tone={3} size={8.5}>{`on your traffic, a ≈ ${(a * 100).toFixed(0)}%`}</Label>
         </Fade>
@@ -175,18 +162,18 @@ export default function SpecMethods() {
         <Fade show={s.step >= 2}>
           <Label x={PX} y={PY + PH + 52} tone={2} size={11} mono={false} bold>How the methods order up</Label>
           {[
-            ['No network', 'lookup, n-gram', 0.005, 0.35],
-            ['Smaller model', '1B drafting 8B', 0.125, 0.72],
-            ['Extra heads', 'Medusa', 0.1, 0.6],
-            ['Hidden-state draft', 'EAGLE', 0.15, 0.78],
+            ['No network at all', 'lookup, n-gram', 0.005, 0.35],
+            ['A second, smaller network', '1B drafting 8B', 0.125, 0.72],
+            ['Extra heads on the target', 'Medusa', 0.1, 0.6],
+            ['Predict the hidden state', 'EAGLE', 0.15, 0.78],
             ['Train for blocks', 'MTP', 0.2, 0.8],
           ].map((row, i) => {
             const [what, who, cost, acc] = row as [string, string, number, number];
             return (
               <g key={who}>
-                <Label x={40 + i * 120} y={PY + PH + 72} tone={2} size={9}>{what}</Label>
-                <Label x={40 + i * 120} y={PY + PH + 85} tone={1} size={9} bold>{who}</Label>
-                <Label x={40 + i * 120} y={PY + PH + 98} tone={3} size={8.5}>{`ρ ${cost.toFixed(3)} · a ${(acc * 100).toFixed(0)}%`}</Label>
+                <Label x={PX + 12 + i * 116} y={PY + PH + 72} tone={2} size={9}>{what}</Label>
+                <Label x={PX + 12 + i * 116} y={PY + PH + 85} tone={1} size={9} bold>{who}</Label>
+                <Label x={PX + 12 + i * 116} y={PY + PH + 98} tone={3} size={8.5}>{`ρ ${cost.toFixed(3)} · a ${(acc * 100).toFixed(0)}%`}</Label>
               </g>
             );
           })}

@@ -15,7 +15,7 @@ const STEPS = [
   'The guesses are guesses',
   'The target checks all of them at once',
   'Accept the prefix, cut at the first rejection',
-  'The target always adds one token',
+  'The last position is a bonus token',
   'One pass, many tokens',
   'Why the check is nearly free',
 ];
@@ -23,10 +23,10 @@ const STEPS = [
 const CAPTIONS = [
   'Ordinary decode is strictly serial: token n+1 cannot be computed until token n has been sampled and fed back. Each step is a full read of the weights to produce exactly one token. That is the wall this module is about.',
   'So let something cheaper take a guess. A small draft model — or a table, or a few extra heads — proposes gamma tokens ahead. These are the target model not being asked, so they carry no guarantee of any kind.',
-  'The draft tokens are usually right and sometimes badly wrong. Here the run of guesses agrees with the target for two tokens and then breaks. Being wrong costs only the time spent drafting — they were never going to be output.',
+  'The draft tokens are usually right and sometimes badly wrong. Here the run of guesses agrees with the target for two tokens and then breaks. Nothing is lost by being wrong — they were never going to be output.',
   'The target model now runs ONCE over the whole block: gamma drafts plus the position after them. One forward pass, because every position is independent given the context to its left. The weights are read once.',
   'Walk the block left to right and keep the tokens that match the target\'s own prediction. The accepted prefix is the longest one; everything from the first disagreement onward is discarded, including the draft that disagreed.',
-  'The target scored every position in the same pass, so where the run breaks it already has its own token: it emits that corrected token in place of the rejected draft. Had every draft been accepted, it would emit a bonus token from the extra last position instead. Either way every block gets at least one token.',
+  'The last position is different: it is a position the draft never claimed to have predicted. Whatever the target samples there is correct by construction, and it is free. Every block gets at least one token.',
   'One pass over gamma+1 positions has produced several tokens. Compare the work: the alternative was several serial passes, each reading the weights again. The weights are the cost, and we read them once.',
   'Decode is memory-bound, so its time is set by weight traffic — and weight traffic does not depend on how many positions the step handles. That is the entire trick. The block does gamma times the FLOPs, which is the only thing that ever makes it stop being free.',
 ];
@@ -45,7 +45,7 @@ export default function DraftVerify() {
   const verifyT = useTween(verify.total, 600);
   const decodeT = useTween(tDecode, 600);
 
-  // this example accepts 2 drafts then breaks: tokens out = 2 accepted + 1 corrected token from the target
+  // this example accepts 2 drafts then breaks: tokens out = 2 accepted + 1 bonus
   const accepted = 2;
   const G = Math.min(gamma, DRAFT.length);
   const speedup = block(0.72, 0.125, G, verify.total, tDecode).speedup;
@@ -73,7 +73,7 @@ export default function DraftVerify() {
         <Readout items={[
           { label: 'One decode step', value: `${(decodeT * 1e3).toFixed(2)} ms`, kind: 'memory', note: '1 token, Llama-3.1-8B on an H100' },
           { label: `Verify ${G + 1} positions`, value: `${(verifyT * 1e3).toFixed(2)} ms`, kind: 'compute', note: `${(verify.total / tDecode).toFixed(2)}x a decode step` },
-          { label: 'Tokens from the block', value: `${accepted + 1}`, kind: 'token', note: `${accepted} accepted + 1 from the target` },
+          { label: 'Tokens from the block', value: `${accepted + 1}`, kind: 'token', note: `${accepted} accepted + 1 bonus` },
           { label: 'vs. decoding them', value: `${((accepted + 1) * tDecode * 1e3).toFixed(2)} ms`, kind: 'error', note: 'serial passes, weights re-read' },
         ]} />
       }
@@ -133,7 +133,7 @@ export default function DraftVerify() {
             <Chip key={`a${i}`} x={CX + i * rowW} y={232} text={DRAFT[i]} kind="token" w={CHIP_W} size={9.5} />
           ))}
           <Chip x={CX + accepted * rowW} y={232} text={TARGET[accepted]} kind="compute" w={CHIP_W} size={9.5} />
-          <Label x={CX + (accepted + 1) * rowW + 10} y={240} size={9.5} kind="compute" bold>target’s token</Label>
+          <Label x={CX + (accepted + 1) * rowW + 10} y={240} size={9.5} kind="compute" bold>bonus token</Label>
           <Label x={CX + (accepted + 1) * rowW + 10} y={252} tone={3} size={9}>never predicted by</Label>
           <Label x={CX + (accepted + 1) * rowW + 10} y={263} tone={3} size={9}>the draft, so free</Label>
           <Dim x1={CX} x2={CX + (accepted + 1) * rowW - GAP} y={280} label={`${accepted + 1} tokens`} kind="token" />

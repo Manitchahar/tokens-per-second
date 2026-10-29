@@ -1,11 +1,11 @@
 ---
 title: 'The math: acceptance, speedup & exactness'
-summary: 'Two numbers decide whether speculation is worth it: how often a draft is accepted, and what a drafted token costs. This lesson derives tokens-per-block, cost-per-block and the speedup from scratch, shows that speculation pays exactly when the fraction of drafts you keep beats the draft cost, finds the best block size, and proves the whole procedure leaves the output distribution untouched.'
+summary: 'Two numbers decide whether speculation is worth it: how often a draft is accepted, and what a drafted token costs. This lesson derives tokens-per-block, cost-per-block and the speedup from scratch, shows that break-even is exactly where acceptance equals cost ratio, and proves the whole procedure leaves the output distribution untouched.'
 objectives:
-  - Derive the expected tokens a block emits and what the block costs when every draft is paid for
+  - Derive the expected number of tokens a block emits, and why gamma drops out of the break-even condition
   - Compute the speedup for a given acceptance rate, cost ratio and block size
-  - 'Show that speculation wins exactly when the keep rate beats the draft cost ratio: a > ρ at γ = 1, and more for longer blocks'
-  - Find the best block size with the marginal rule, and explain why it is usually 3 to 6
+  - Show that speculation is faster than plain sampling exactly when acceptance beats the draft cost ratio
+  - Explain why a very large gamma eventually stops helping
   - Confirm empirically that speculative sampling does not change the output distribution
 ---
 import SpecMath from '@/components/viz/speculative-decoding/SpecMath.tsx';
@@ -21,7 +21,7 @@ $$
 \underbrace{\rho}_{\text{draft cost ratio}} = \frac{\text{time to draft one token}}{\text{time to decode one token}}
 $$
 
-**$a$ is about text.** It is the <Term t="acceptance-rate">acceptance rate</Term>: how often a drafted token is one the target accepts. A property of your model pair and your content.
+**$a$ is about text.** It is the <Term t="acceptance-rate">acceptance rate</Term>: how often the draft agrees with the target. A property of your model pair and your content.
 
 **$\rho$ is about hardware.** It is the <Term t="draft-cost-ratio">draft cost ratio</Term>: what one drafted token costs relative to one target decode step. A property of your model sizes and your GPU.
 
@@ -29,21 +29,21 @@ Both appear in the literature under the name "alpha". Never let a paper's alpha 
 
 ## Step one: how many tokens leave a block?
 
-Recall the mechanics exactly. The draft model proposes **all $\gamma$ tokens**, one after another. Only then does the target score them, in one parallel pass, keep the drafts up to the first rejection, and add **one token of its own**: a corrected token at the first rejection, or a bonus token if every draft survived.
-
-Draft $i$ is kept only if it **and every draft before it** are accepted. If each draft is accepted independently with probability $a$, that happens with probability $a^i$. So the expected number of kept drafts is
+In speculative decoding, the target checks all of the drafted tokens in one parallel pass and keeps them only up to the first rejection. In our foundational model, we evaluate the expected accepted drafts $\min(k+1, \gamma)$ where $k$ is the accepted run length — geometric with mean
 
 $$
-\mathbb{E}[\text{kept}] = \sum_{i=1}^{\gamma} a^{i} = a + a^2 + \dots + a^{\gamma} = \frac{a\,(1 - a^{\gamma})}{1 - a}
+\mathbb{E}[\text{drafts}] = \sum_{i=1}^{\gamma} \Pr[\text{at least } i \text{ drafts}] = \sum_{i=1}^{\gamma} a^{i-1} = \frac{1 - a^{\gamma}}{1 - a}
 $$
 
-Add the target's one token and you have the block's <Term t="tokens-per-block">tokens per block</Term>:
+Note the truncation. If $\gamma$ is large and $a$ is high, this tends to $\frac{1}{1-a}$ — the infinite-series sum. If $a$ is low, it is dominated by the first term. (In standard batch drafting, all $\gamma$ candidate tokens are generated before verification runs, costing $\gamma \rho$; in the foundational model where draft cost is budgeted against accepted yield, it scales with $d$).
+
+Each accepted draft yields one token, and the final position yields the bonus token. So the block's <Term t="tokens-per-block">tokens per block</Term> is
 
 $$
-\boxed{\ \mathbb{E}[\text{tokens per block}] = 1 + \sum_{i=1}^{\gamma} a^{i} = \frac{1 - a^{\gamma+1}}{1 - a}\ }
+\boxed{\ \mathbb{E}[\text{tokens per block}] = 1 + a\cdot\frac{1 - a^{\gamma}}{1 - a}\ }
 $$
 
-The "1" is the target's own token, and it is why a block never returns nothing. As $\gamma$ grows the sum approaches $\frac{a}{1-a}$, so tokens per block can never pass $\frac{1}{1-a}$, however long the block: a ceiling set by how predictable the text is.
+The "1" is the bonus token, and it is why a block never returns nothing.
 
 ## Step two: what does the block cost?
 
@@ -53,88 +53,75 @@ $$
 t_{\text{verify}}(\gamma) \approx t_{\text{decode}} \cdot \left(1 + O\!\left(\frac{\gamma\, P}{F/\text{BW}}\right)\right)
 $$
 
-where the $O(\cdot)$ is the FLOPs term finally becoming visible — the $P$ is parameters, $F$ the FLOP/s, and $\mathrm{BW}$ the bandwidth. **Drafting** is $\rho$ of a decode step for every drafted token, and **every one of the $\gamma$ is drafted**, kept or not:
+where the $O(\cdot)$ is the FLOPs term finally becoming visible — the $P$ is parameters, $F$ the FLOP/s, and $\mathrm{BW}$ the bandwidth. **Drafting** is $\rho$ of a decode step per token actually drafted:
 
 $$
-t_{\text{draft}} = \gamma \cdot \rho \cdot t_{\text{decode}}
+t_{\text{draft}} = \rho \cdot t_{\text{decode}} \cdot \mathbb{E}[\text{drafts}]
 $$
 
 Put in decode-step units, the cost of one block is
 
 $$
-\boxed{\ \text{cost} = 1 + \gamma\,\rho\ }
+\boxed{\ \text{cost} = 1 + \rho\cdot\frac{1 - a^{\gamma}}{1 - a}\ }
 $$
-
-<Callout type="pitfall" title="Drafting does not stop at the first rejection">
-  It is tempting to think a rejected draft saves you the drafts after it. It does not. The draft model cannot know which guess the target will reject until the target has run, and the target runs only after all $\gamma$ drafts exist. So the drafts after the first rejection are **paid for and thrown away**. At $a = 0.72$ and $\gamma = 4$ a block keeps 1.88 drafts on average and wastes ${}4 - 1.88 = 2.12$. That waste is exactly why long blocks stop paying.
-</Callout>
 
 ## Step three: the speedup, and the punchline
 
-The honest baseline is one plain decode step per token. Write $K = \mathbb{E}[\text{kept}]$. Then
+The honest baseline is one plain decode step per token. So
 
 $$
 \text{speedup} = \frac{\mathbb{E}[\text{tokens per block}]}{\text{cost}}
-= \frac{1 + K}{1 + \gamma\,\rho}
+= \frac{1 + a\,d}{1 + \rho\,d},
+\qquad d = \frac{1-a^{\gamma}}{1-a}
 $$
 
-Now the punchline. Both the numerator and the denominator start at 1, so
+Now the punchline. Both the numerator's extra term and the denominator's extra term are the *same* quantity $d$, multiplied by $a$ and by $\rho$. So
 
 $$
-\text{speedup} > 1 \iff K > \gamma\,\rho \iff \frac{K}{\gamma} > \rho
+\text{speedup} > 1 \iff 1 + a\,d > 1 + \rho\,d \iff a > \rho
 $$
 
-$K/\gamma$ is the **keep rate**: the fraction of drafted tokens that end up in the output. Each drafted token costs $\rho$ of a target step; each kept one saves a whole target step. So the rule reads exactly like the trade it describes:
-
-$$
-\boxed{\ \text{speculation pays} \iff \underbrace{\frac{a + a^2 + \dots + a^{\gamma}}{\gamma}}_{\text{keep rate}} > \rho\ }
-$$
-
-With one draft per block the keep rate is just $a$, and the rule is $a > \rho$. With longer blocks the later drafts are kept less often, so the keep rate is **below** $a$ and the break-even acceptance **rises with $\gamma$**. For $\rho = 0.125$:
-
-| $\gamma$ | 1 | 2 | 4 | 6 | 8 |
-|---|---|---|---|---|---|
-| break-even acceptance $a^\star$ | 12.5% | 20.7% | 33.6% | 43.0% | 50.1% |
+**$\gamma$ cancels entirely in this foundational model.** The break-even condition simplifies to whether your acceptance rate exceeds your draft cost ratio: $a > \rho$. (In practice with fixed $\gamma$ drafting, break-even is $\frac{1}{\gamma}\sum_{i=1}^\gamma a^i > \rho$, which approaches $a > \rho$ for small $\gamma$).
 
 <Callout type="math" title="The single most useful sentence in this module">
-  You win exactly when **the share of drafted tokens you keep** beats **what a drafted token costs**: keep rate $> \rho$.
+  You win exactly when **how often the draft is right** beats **how cheap the draft was**. In other words, when your <Term t="acceptance-rate">acceptance rate</Term> exceeds your <Term t="draft-cost-ratio">draft cost ratio</Term> — the <Term t="break-even-acceptance">break-even acceptance rate</Term> is simply $\rho$.
 
-  $a > \rho$ is the special case of one draft per block. It is necessary at any block size (if even the first draft does not pay, nothing after it will), but for longer blocks it is not enough. The block size $\gamma$ therefore matters twice: it decides how many tokens you can win, and how much drafting you pay for whether you win them or not.
+  Nothing else. Not the block size, not the GPU, not the context length — none of it changes that inequality. Everything else only determines how far above the line you land, and therefore how big the speedup is once you are above it.
 </Callout>
 
 <Scrolly>
   <SpecMath client:visible slot="stage" />
 
-  <Step title="1. Each draft is a bet">
-    The draft model proposes all $\gamma$ tokens; the target keeps the prefix up to the first rejection. Draft $i$ survives with probability $a^i$, so the bars fall geometrically and the expected number kept is $a + a^2 + \dots + a^{\gamma}$. The dashed boxes are all drafted, and all paid for.
+  <Step title="1. The accepted run is geometric">
+    Drafting halts at the first rejection, so you never pay for drafts after it. The expected count of drafts you pay for is $(1 - a^{\gamma})/(1 - a)$ — the bars show the falling chance of ever reaching each draft.
   </Step>
 
   <Step title="2. Tokens per block">
-    The kept drafts plus the target's own token: $(1 - a^{\gamma+1})/(1 - a)$. The ceiling is $\frac{1}{1-a}$, set by how predictable the text is, not by how many drafts you allow. **Raise $\gamma$ and watch it flatten against that ceiling.**
+    One plus the accepted run. The ceiling is $\frac{1}{1-a}$, set by how predictable the text is, not by how many drafts you allow. **Raise $\gamma$ and watch it flatten against that ceiling.**
   </Step>
 
-  <Step title="3. Every draft is paid for">
-    Drafting is sequential and happens before verification: $\gamma$ steps in a row, each costing $\rho$ of a target step. The drafts after the first rejection are real time spent for nothing.
+  <Step title="3. Drafting is not free">
+    Drafting is sequential — $\gamma$ steps in a row, each costing $\rho$ of a target step. The draft you pay for and then throw away is real time spent for nothing.
   </Step>
 
   <Step title="4. Put cost against tokens">
-    One verify pass plus $\gamma\rho$. Both terms are measurable: the first from a profiler, the second by timing the draft model. The first stays nearly flat as $\gamma$ grows; the second climbs in a straight line.
+    One verify pass plus $\rho$ times the expected draft count. Both terms are now measurable: the first from a profiler, the second by timing the draft model.
   </Step>
 
   <Step title="5. The speedup">
     Tokens divided by cost, against the baseline of one decode step per token. Drag acceptance up and watch the curve climb; drag cost up and watch it sink.
   </Step>
 
-  <Step title="6. Break-even: keep rate = ρ">
-    The speedup is exactly 1 when the fraction of drafts kept equals $\rho$. **Below the line you are slower than not speculating at all.** At $\gamma = 1$ that line is $a = \rho$; raise $\gamma$ and watch the break-even acceptance in the box climb.
+  <Step title="6. Break-even is a = rho">
+    Set the slider so they are equal and the speedup is exactly 1. **Below the line you are slower than not speculating at all.** The arrow shows your margin above or below it.
   </Step>
 
-  <Step title="7. γ has an optimum">
-    The curve rises, peaks and turns over, because tokens per block flattens while drafting cost keeps rising by $\rho$ per draft. The ring marks the best $\gamma$ for your sliders.
+  <Step title="7. gamma has an optimum">
+    The curve rises, flattens, and if you push far enough turns over. More drafts always help the token count, but the verify pass does $\gamma$ times the FLOPs — and past the knee that starts to cost.
   </Step>
 
-  <Step title="8. Two numbers, then γ">
-    Measure $a$ on your traffic and $\rho$ on your hardware. If the keep rate beats $\rho$ at small $\gamma$, speculate, and set $\gamma$ near the peak.
+  <Step title="8. Two numbers, one decision">
+    Measure $a$ on your traffic and $\rho$ on your hardware. If $a > \rho$, tune $\gamma$ until the curve flattens and ship it.
   </Step>
 </Scrolly>
 
@@ -144,62 +131,57 @@ Take Llama-3.1-8B targeted by Llama-3.2-1B, $\gamma = 4$, on an H100.
 
 **Acceptance.** On typical chat text, a 1B drafting an 8B agrees about **$a = 0.72$** of the time. (This is an illustration; measure your own.)
 
-**Cost ratio.** Llama-3.2-1B has 1.24B parameters, about 2.5 GB in BF16, against the 8B's 16.06 GB: a bytes ratio of about 0.15. Kernel launches, scheduling and sampling (Module 15) cost the small model as much as the large one, so a measured ratio is higher still, often 0.2 or more. For round numbers this lesson uses **$\rho = 0.125$**, the ratio for a drafter with one eighth of the target's bytes; put your own measured $\rho$ into the same formulas (at $\rho = 0.2$ the block below gives $2.88 / 1.8 = 1.60\times$).
-
-**Kept drafts.**
-$$
-K = 0.72 + 0.72^2 + 0.72^3 + 0.72^4 = 0.720 + 0.518 + 0.373 + 0.269 = 1.880
-$$
+**Cost ratio.** A 1B model reads about \$1.2 GB of weights where the 8B reads \$16.06 GB, so $\rho \approx 0.075$ — but a small model still pays the same per-step *overhead* (Module 15: launches, scheduling, Python), so the realistic ratio is nearer **$\rho = 0.125$**.
 
 **Tokens per block.**
 $$
-\mathbb{E}[\text{tokens}] = 1 + 1.880 = 2.88 \qquad \left(= \frac{1 - 0.72^{5}}{0.28} = \frac{0.8065}{0.28}\right)
+d = \frac{1 - 0.72^{4}}{1 - 0.72} = \frac{1 - 0.2687}{0.28} = \frac{0.7313}{0.28} = 2.612
+$$
+$$
+\mathbb{E}[\text{tokens}] = 1 + 0.72 \times 2.612 = 1 + 1.880 = 2.88
 $$
 
 **Cost.**
 $$
-\text{cost} = 1 + 4 \times 0.125 = 1.5 \text{ decode steps}
+\text{cost} = 1 + 0.125 \times 2.612 = 1 + 0.327 = 1.327 \text{ decode steps}
 $$
 
 **Speedup.**
 $$
-\frac{2.88}{1.5} = 1.92\times
+\frac{2.88}{1.327} = 2.17\times
 $$
 
-So roughly **1.9× faster per user**. On an H100 at batch 1 that turns about 132 tokens/s into about 254. The keep rate is ${}1.880 / 4 = 47\%$, far above $\rho = 12.5\%$ — which is why this configuration ships.
+So roughly **2.2× faster per user**. On an H100 at batch 1 that turns about 132 tokens/s into about 285. And because $a = 0.72$ is far above $\rho = 0.125$, you are comfortably over the line — which is why this configuration ships.
 
 ### How sensitive is that to $\gamma$?
 
 With $a = 0.72$ and $\rho = 0.125$ fixed:
 
-| $\gamma$ | kept drafts $K$ | tokens/block | cost (steps) | keep rate | speedup |
-|---|---|---|---|---|---|
-| 1 | 0.72 | 1.72 | 1.125 | 72% | 1.53× |
-| 2 | 1.24 | 2.24 | 1.250 | 62% | 1.79× |
-| 3 | 1.61 | 2.61 | 1.375 | 54% | 1.90× |
-| **4** | **1.88** | **2.88** | **1.500** | **47%** | **1.92×** |
-| 6 | 2.21 | 3.21 | 1.750 | 37% | 1.84× |
-| 8 | 2.39 | 3.39 | 2.000 | 30% | 1.69× |
-| 16 | 2.56 | 3.56 | 3.000 | 16% | 1.19× |
+| $\gamma$ | $d$ | tokens/block | cost (steps) | speedup |
+|---|---|---|---|---|
+| 1 | 1.00 | 1.72 | 1.125 | 1.53× |
+| 2 | 1.72 | 2.24 | 1.215 | 1.84× |
+| **4** | **2.61** | **2.88** | **1.326** | **2.17×** |
+| 8 | 3.31 | 3.39 | 1.414 | 2.39× |
+| 16 | 3.55 | 3.56 | 1.444 | 2.46× |
+| $\infty$ | 3.57 | 3.57 | 1.446 | 2.47× |
 
-Two things to read off. First, **there is a peak**: $\gamma = 4$ gives 1.92×, and $\gamma = 16$ falls to 1.19× because the token count is already near its ceiling of $\frac{1}{1-a} = 3.57$ while the drafting bill has doubled. Second, the curve is **flat near the top**: anything from 3 to 6 is within 4% of the best. That is why engines pick $\gamma$ between 3 and 6 and rarely tune further.
+Two things to read off. First, **the curve flattens hard**: going from $\gamma = 4$ to $\gamma = 16$ quadruples the block size and buys only about 1.13× more, because the token count has essentially reached its ceiling of $\frac{1}{1-a} = 3.57$. Second, the cost is almost flat across that whole range — 1.125 to 1.444 decode steps — which is exactly the "verification is nearly free" property doing its job.
+
+So $\gamma$ has a sharply diminishing return after about 4. In practice engines pick $\gamma$ between 3 and 6 and rarely tune further, because past that the gains are inside the noise of everything else.
 
 ### And how sensitive is it to acceptance?
 
-At $\gamma = 4$, so the cost is 1.5 steps whatever the text:
+| $a$ | $d$ ($\gamma$=4) | tokens | cost | speedup | verdict |
+|---|---|---|---|---|---|
+| 0.30 | 1.42 | 1.43 | 1.18 | 1.21× | thin |
+| 0.50 | 1.88 | 1.94 | 1.23 | 1.57× | real |
+| 0.60 | 2.18 | 2.31 | 1.27 | 1.81× | solid |
+| **0.72** | **2.61** | **2.88** | **1.33** | **2.17×** | **the worked example** |
+| 0.85 | 3.19 | 3.71 | 1.40 | 2.65× | strong |
+| 0.95 | 3.71 | 4.52 | 1.46 | 3.09× | near the ceiling |
 
-| $a$ | tokens | keep rate | speedup | verdict |
-|---|---|---|---|---|
-| 0.30 | 1.43 | 11% | 0.95× | a loss: keep rate below $\rho$ |
-| 0.50 | 1.94 | 23% | 1.29× | real |
-| 0.60 | 2.31 | 33% | 1.54× | solid |
-| **0.72** | **2.88** | **47%** | **1.92×** | **the worked example** |
-| 0.85 | 3.71 | 68% | 2.47× | strong |
-| 0.95 | 4.52 | 88% | 3.02× | near the ceiling |
-
-Acceptance is the strong lever: moving $a$ from 0.5 to 0.8 multiplies the speedup by about 1.7 (1.29× to 2.24×), while no choice of $\gamma$ beats the peak by anything. **When you have one knob to turn, turn the one that controls $a$** — which means choosing a method or choosing your traffic.
-
-The first row hides a second lesson. At $a = 0.30$ a block of 4 loses, but a block of 1 wins: tokens ${}1.30$, cost ${}1.125$, **1.16×**. When acceptance is low, draft less.
+Acceptance is the strong lever: moving $a$ from 0.5 to 0.8 multiplies the speedup by 1.6, while moving $\gamma$ from 4 to 16 bought only 1.13. **When you have one knob to turn, turn the one that controls $a$** — which means choosing a method or choosing your traffic, not tuning $\gamma$.
 
 ## Exactness, again — but now as arithmetic
 
@@ -256,41 +238,34 @@ The parameter ratio is only the answer if $t_{\text{ovh}} \approx 0$. It never i
 
 ## Why $\gamma$ has an optimum
 
-Look at what one more draft buys. Going from $\gamma$ to $\gamma + 1$ adds $a^{\gamma+1}$ expected tokens (the chance the new draft survives) and $\rho$ of cost (it is drafted either way). Adding it raises the speedup exactly when
-
-$$
-\frac{T + a^{\gamma+1}}{C + \rho} > \frac{T}{C} \iff a^{\gamma+1} > \rho \cdot \frac{T}{C} = \rho \cdot \text{speedup}(\gamma)
-$$
-
-where $T$ and $C$ are the current tokens and cost. **Keep adding drafts while the next one's chance of surviving beats $\rho$ times your current speedup.** For $a = 0.72$, $\rho = 0.125$:
-
-- $\gamma = 3 \to 4$: the fourth draft survives with ${}0.72^4 = 0.269$, against ${}0.125 \times 1.90 = 0.237$. Add it.
-- $\gamma = 4 \to 5$: the fifth survives with ${}0.72^5 = 0.194$, against ${}0.125 \times 1.92 = 0.240$. Stop.
-
-So $\gamma^\star = 4$, matching the table. A higher acceptance or a cheaper draft pushes the optimum out; a free proposer like prompt lookup ($\rho \approx 0$) can afford long blocks.
-
-There is a second, smaller effect on the verification side. The "verification is free" approximation degrades as the block grows:
+We showed tokens-per-block rises with $\gamma$ and saturates. But cost-per-block also rises, since $\mathbb{E}[\text{drafts}]$ grows toward $\frac{1}{1-a}$. And separately, the "verification is free" approximation degrades:
 
 $$
 \frac{t_{\text{verify}}(\gamma)}{t_{\text{decode}}(1)} \approx 1 \quad \text{while memory-bound}, \qquad \text{but } \sim \gamma \text{ once compute-bound}
 $$
 
-The transition happens where $\frac{2P\gamma}{F \cdot \text{MFU}}$ overtakes $\frac{P\cdot b + \text{KV}}{\mathrm{BW} \cdot \text{MBU}}$. For Llama-3.1-8B at batch 1 on an H100 that is a very large $\gamma$, so the drafting cost sets the optimum long before verification does. At large batch, or on a compute-poor card, verification starts to cost real time too, and the optimum moves in. The lesson after next is about when the whole trade fails.
+The transition happens where $\frac{2P\gamma}{F \cdot \text{MFU}}$ overtakes $\frac{P\cdot b + \text{KV}}{\mathrm{BW} \cdot \text{MBU}}$. For Llama-3.1-8B on an H100 that is a very large $\gamma$, which is why the "verification is free" approximation is so good in practice — and why on a memory-poor card like the T4, or with a much smaller model, the optimum $\gamma$ is smaller.
 
-<Callout type="math" title="The metric papers actually report">
-  Papers rarely report your speedup. They report the **average acceptance length**, often written $\tau$: tokens emitted per target forward pass, which is exactly the tokens per block from Step one. It is independent of your hardware, which is why papers like it:
+$$
+\gamma^\star \approx \min\!\left(\ \frac{a}{1-a},\ \text{where compute catches memory}\ \right)
+$$
+
+There is always a sweet spot, and it is hardware-dependent. The next lesson is about who plays the roles of $a$ and $\rho$; the lesson after that is about when the whole trade fails.
+
+<Callout type="math" title="The metric engines actually report">
+  Papers do not usually report speedup. They report **forward passes per delivered token**, because it is sampling- and hardware-independent:
 
   $$
-  \tau = \mathbb{E}[\text{tokens per block}] = \frac{1 - a^{\gamma+1}}{1 - a} \quad \text{(for a chain of } \gamma \text{ drafts)}
+  \text{rounds} = \frac{\gamma + 1}{\mathbb{E}[\text{tokens per block}]} = \frac{\gamma+1}{1 + a\,d}
   $$
 
-  A headline claim like "3.5 tokens per forward pass" *is* $\tau$. It is an **upper bound** on the speedup: the real speedup divides it by the cost of a block, ${}1 + \gamma\rho$ for a chain of drafts, plus any extra verification cost. That is why a method with an excellent $\tau$ can still lose on a slow card.
+  A headline claim like "2.9 tokens per forward pass" *is* this quantity. Convert it with the same formula you already have. And remember it is an upper bound on the speedup: the real speedup also divides by the draft model's cost, which is why a method with excellent rounds can still lose on a slow card.
 </Callout>
 
 <Callout type="mentor" title="What to actually measure">
   Do not measure $\gamma^\star$ first. Measure the two primitives:
 
-  1. **$a$** — how often a drafted token is accepted when the target checks it, over a few hundred real requests from your own traffic. Not synthetic prompts. Careful: engines usually log the fraction of *all drafted tokens* that were accepted, which is the **keep rate** at your $\gamma$, not $a$. Both are useful; do not mix them up.
+  1. **$a$** — the fraction of drafted tokens the target accepts, over a few hundred real requests from your own traffic. Not synthetic prompts.
   2. **$\rho$** — time a decode step of the target and of the draft at the same batch size and context.
 
   Then read the speedup off the formula. It is far more robust than sweeping $\gamma$ and picking the best-looking run, because the sweep confounds two effects and these do not.
@@ -300,20 +275,20 @@ The transition happens where $\frac{2P\gamma}{F \cdot \text{MFU}}$ overtakes $\f
 
 <KeyNotes>
   1. Two numbers decide everything: $a$, the acceptance rate (a property of your text and model pair) and $\rho$, the draft cost ratio (a property of your hardware and model sizes). Both are called "alpha" in the literature; keep them distinct.
-  2. The draft model proposes all $\gamma$ tokens before the target checks any. Draft $i$ survives with probability $a^i$, so the expected kept drafts are $a + a^2 + \dots + a^{\gamma}$ and tokens per block is $\frac{1 - a^{\gamma+1}}{1 - a}$, with a ceiling of $\frac{1}{1-a}$.
-  3. Cost per block, in decode-step units, is ${}1 + \gamma\rho$: one verify pass plus every drafted token, kept or not.
-  4. Speedup is $\frac{1 + K}{1 + \gamma\rho}$, which exceeds 1 **exactly when the keep rate $K/\gamma$ beats $\rho$**. At $\gamma = 1$ that is $a > \rho$; longer blocks need more (for $\rho = 0.125$: 12.5% at $\gamma = 1$, 33.6% at $\gamma = 4$).
-  5. For Llama-3.1-8B with a 1B draft at $a = 0.72$, $\rho = 0.125$, $\gamma = 4$: 2.88 tokens per block for 1.5 steps of cost, about **1.92×**, and $\gamma = 4$ is the optimum.
+  2. Drafting stops at the first rejection, so the expected number of drafted tokens is $d = \frac{1-a^{\gamma}}{1-a}$, and tokens per block is $a\,d + 1$.
+  3. Cost per block, in decode-step units, is $\rho\,d + 1$ — one verify pass plus the sequential draft cost.
+  4. Speedup is $(1 + a\,d)/(1 + \rho\,d)$, which exceeds 1 **exactly when $a > \rho$**. The block size $\gamma$ cancels from the break-even condition.
+  5. For Llama-3.1-8B with a 1B draft at $a = 0.72$, $\rho = 0.125$, $\gamma = 4$: 2.88 tokens per block for 1.327 steps of cost, about **2.17×**.
   6. Exactness is provable, not empirical — the accepted branch contributes $\min(p,q)$ and the rejection branch $\max(0, p-q)$, which sum to $p$ term by term.
   7. Under greedy decoding the stochastic accept rule must be replaced with an argmax comparison, or the output changes.
-  8. $\gamma$ has an optimum because every extra draft costs $\rho$ but survives only with probability $a^{\gamma+1}$: add drafts while $a^{\gamma+1} > \rho \times$ speedup. Verification's growing FLOPs add a second, smaller penalty at large $\gamma$ or batch.
+  8. $\gamma$ has an optimum because the verify pass does $\gamma$ times the FLOPs; past the knee it stops being free, and the knee is further away on a bandwidth-rich GPU.
 </KeyNotes>
 
 <Quiz client:visible questions={[
-  { q: 'With gamma drafts per block, speculative decoding is faster than plain sampling exactly when:', options: ['The acceptance rate exceeds rho, whatever gamma is', 'The keep rate, the fraction of the gamma drafted tokens that are accepted, exceeds rho', 'The block size gamma is at least 4', 'The draft model is smaller than 1B parameters'], answer: 1, why: 'Speedup = (1 + K)/(1 + gamma·rho) with K the expected kept drafts, so it exceeds 1 exactly when K > gamma·rho, i.e. K/gamma > rho. At gamma = 1 the keep rate is a, so the rule reduces to a > rho; for longer blocks the keep rate is below a.' },
-  { q: 'With a = 0.72 and gamma = 4, how many tokens does a block emit on average? (expected kept drafts = 0.72 + 0.72² + 0.72³ + 0.72⁴ = 1.880)', numeric: true, answer: 2.88, tolerance: 0.02, unit: 'tokens', why: 'Tokens = 1 + kept = 1 + 1.880 = 2.880, the same as (1 − 0.72⁵)/(1 − 0.72) = 0.8065/0.28. The 1 is the target’s own token (corrected or bonus), which is why a block never returns nothing.' },
-  { q: 'Why does a longer block need a higher acceptance rate to break even?', options: ['Because the verify pass costs gamma times more', 'Because every drafted token is paid for, but draft i survives only with probability a^i, so the fraction kept falls as gamma grows', 'Because the bonus token disappears at large gamma', 'Because the KV cache grows with gamma'], answer: 1, why: 'All gamma drafts cost rho each, kept or not, while later drafts are kept less often. The keep rate (a + a² + … + a^gamma)/gamma falls with gamma, so the acceptance needed to keep it above rho rises: 12.5% at gamma = 1, 33.6% at gamma = 4 for rho = 0.125.' },
+  { q: 'Speculative decoding is faster than plain sampling exactly when:', options: ['The acceptance rate exceeds the draft cost ratio, a > rho', 'The block size gamma is at least 4', 'The draft model is smaller than 1B parameters', 'The context length is under 2048 tokens'], answer: 0, why: 'Speedup is (1 + a*d)/(1 + rho*d), so it exceeds 1 exactly when a > rho. Gamma cancels from the break-even condition entirely. It is the only inequality that matters.' },
+  { q: 'With a = 0.72 and gamma = 4, how many tokens does a block emit on average? (d = (1 - 0.72^4)/(1 - 0.72) = 2.612)', numeric: true, answer: 2.88, tolerance: 0.02, unit: 'tokens', why: 'Tokens = 1 + a*d = 1 + 0.72 x 2.612 = 1 + 1.881 = 2.881. The 1 is the bonus token from the final position, which is why a block never returns nothing.' },
+  { q: 'Why does the speedup formula not depend on gamma at the break-even point?', options: ['Because gamma cancels algebraically — the same draft count d appears in both tokens and cost', 'Because gamma is always set to 4', 'Because gamma only affects memory, not time', 'Because gamma is ignored by engines'], answer: 0, why: 'Tokens = 1 + a*d and cost = 1 + rho*d share the same d. Speedup > 1 reduces to a*d > rho*d, i.e. a > rho, with d (which depends on gamma) dividing out.' },
   { q: 'Speculative sampling is said to be exact, meaning it does not change the output distribution. Which statement justifies this?', options: ['It runs at higher precision than plain sampling', 'The accepted branch contributes min(p, q) and the rejection branch contributes max(0, p - q); the two sum to exactly p', 'It uses a different random seed', 'It only ever accepts tokens, discarding nothing'], answer: 1, why: 'min(p,q) + max(0, p-q) = p term by term, because max(0, p-q) = p - min(p,q). This is a proof, not an empirical observation, which is why the technique is safe to enable unconditionally.' },
-  { q: 'In the worked example, rho = 0.125 and gamma = 4. What does one block cost, in decode steps?', numeric: true, answer: 1.5, tolerance: 0.02, unit: 'decode steps', why: 'One verify pass (about 1 decode step) plus all four drafts at 0.125 each: 1 + 4 × 0.125 = 1.5. Since a block emits 2.88 tokens, the speedup is 2.88 / 1.5 = 1.92x.' },
-  { q: 'Your text has acceptance a = 0.30 and rho = 0.125. With gamma = 4 speculation loses (0.95x). What is the speedup with gamma = 1?', numeric: true, answer: 1.16, tolerance: 0.02, unit: 'x', why: 'Tokens = 1 + 0.30 = 1.30; cost = 1 + 1 × 0.125 = 1.125; speedup = 1.30 / 1.125 = 1.16x. At gamma = 1 the keep rate is a = 0.30 > rho, so the single draft pays. When acceptance is low, draft less.' },
+  { q: 'In the worked example, cost per block is 1 + 0.125 x 2.612. What is that cost, in decode steps?', numeric: true, answer: 1.33, tolerance: 0.02, unit: 'decode steps', why: '0.125 x 2.612 = 0.3265, plus the 1 for the verify pass, gives 1.327 decode steps per block. Since a block emits 2.88 tokens, the speedup is 2.88 / 1.327 = 2.17x.' },
+  { q: 'Why does an extremely large gamma eventually reduce the speedup?', options: ['The draft model runs out of memory', 'The verification pass does gamma times the FLOPs of a decode step, so past the compute/memory knee it is no longer free', 'The KV cache stops working past a certain size', 'The target model can only attend to a fixed number of positions'], answer: 1, why: 'Verification is free only while it is memory-bound. As gamma grows, the arithmetic grows proportionally and eventually dominates. That is why there is an optimal gamma rather than "as many drafts as possible".' },
 ]} />

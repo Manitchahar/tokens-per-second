@@ -3,7 +3,7 @@ import { Stage, Readout, Segmented, Slider } from '../lib/Stage';
 import { useStep } from '../lib/useStep';
 import { useTween } from '../lib/tween';
 import { Label, Span, Arrow, Chip, Fade, Dim, Bar } from '../lib/svg';
-import { block, decodeStep, breakEvenAcceptance, MACHINES, type Machine } from './specModel';
+import { block, decodeStep, verifyPass, LLAMA8B, MACHINES, type Machine } from './specModel';
 
 // When does speculation pay? Four dials decide it: how predictable the text is
 // (acceptance), how much a batch already amortises the weights (batching), how
@@ -28,7 +28,7 @@ const CAPTIONS = [
   'A decode step also carries fixed overhead: kernel launches, scheduling, Python. At small batch on a fast GPU that overhead can be a sizeable fraction of the step, and speculation replaces one step with gamma+1 steps, so it multiplies that overhead rather than hiding it.',
   'The trick relies on the verify pass being free relative to a decode step, and that is most true when the weights dominate. Small models have cheap matmuls relative to their weight read, so verification stays memory-bound and speculation keeps paying as gamma grows.',
   'Acceptance rate is entirely a property of the text. Code, extraction, templated output and agent loops repeat; open-ended prose does not. The same engine can be a big win on one request type and a loss on another.',
-  'Some cases are outright losses: a large batch where compute dominates, text with very low acceptance, a draft model large enough that rho approaches the fraction of drafts kept, and short outputs where the block never gets the chance to pay off.',
+  'Some cases are outright losses: a large batch where compute dominates, text with very low acceptance, a draft model large enough that rho approaches a, and short outputs where the block never gets the chance to pay off.',
   'Walk the four dials together. Speculation wins when acceptance is high, batch is small, per-step overhead is large, and the draft model is much cheaper than the target.',
   'Measure a and rho on your own traffic before enabling anything. Those two numbers, plus your batch size, determine the outcome; everything else is a detail of which method delivered them.',
 ];
@@ -65,7 +65,6 @@ export default function SpecCrossover() {
   const tStep = passTime(1);
   const tVer = passTime(gamma + 1);
   const r = block(a, 0.125, gamma, tVer, tStep);
-  const be = breakEvenAcceptance(0.125, gamma, tVer, tStep);
   const sp = useTween(r.speedup, 450);
 
   const overheadShare = overheadMs / 1000 / tStep;
@@ -90,7 +89,7 @@ export default function SpecCrossover() {
       {...s}
       readout={
         <Readout items={[
-          { label: 'Acceptance a', value: `${(a * 100).toFixed(0)}%`, kind: 'token', note: `break-even ${(be * 100).toFixed(0)}% at ρ = 0.125, γ = ${gamma}` },
+          { label: 'Acceptance a', value: `${(a * 100).toFixed(0)}%`, kind: 'token', note: `break-even is 12.5% at ρ=0.125` },
           { label: 'Batch', value: `${batch}`, kind: 'compute', note: bound > 1 ? 'step is compute-bound' : 'step is memory-bound' },
           { label: 'Overhead share', value: `${(overheadShare * 100).toFixed(0)}%`, kind: overheadShare > 0.2 ? 'error' : 'idle', note: `${overheadMs.toFixed(1)} ms of ${(tStep * 1e3).toFixed(2)} ms` },
           { label: 'Speedup', value: `${sp.toFixed(2)}x`, kind: sp >= 1 ? 'token' : 'error', note: sp >= 1.05 ? 'worth enabling' : sp >= 0.95 ? 'a wash' : 'turn it off' },
@@ -142,10 +141,10 @@ export default function SpecCrossover() {
           <rect x={CX} y={196} width={188} height={104} rx={4} fill="var(--ground-2)" stroke="var(--rule-2)" />
           <Label x={CX + 10} y={212} tone={2} size={10} mono={false} bold>1. Acceptance</Label>
           <Bar x={CX + 10} y={222} w={168} h={12} frac={Math.min(1, a / 0.95)} kind="token" value={`${(a * 100).toFixed(0)}%`} />
-          <Dim x1={CX + 10 + (Math.min(be, 0.95) / 0.95) * 168} x2={CX + 10 + (Math.min(be, 0.95) / 0.95) * 168} y={250} label="" kind="error" />
-          <line x1={CX + 10 + (Math.min(be, 0.95) / 0.95) * 168} y1={218} x2={CX + 10 + (Math.min(be, 0.95) / 0.95) * 168} y2={240} stroke="var(--error)" strokeWidth={1.5} strokeDasharray="3 3" />
-          <Label x={CX + 10 + (Math.min(be, 0.95) / 0.95) * 168} y={254} anchor="middle" size={8} kind="error">{`break-even ${(be * 100).toFixed(0)}%`}</Label>
-          <Label x={CX + 10} y={272} tone={3} size={8.5}>{a > be ? 'Above the line: drafts pay for themselves.' : 'Below the line: a net loss.'}</Label>
+          <Dim x1={CX + 10 + (0.125 / 0.95) * 168} x2={CX + 10 + (0.125 / 0.95) * 168} y={250} label="" kind="error" />
+          <line x1={CX + 10 + (0.125 / 0.95) * 168} y1={218} x2={CX + 10 + (0.125 / 0.95) * 168} y2={240} stroke="var(--error)" strokeWidth={1.5} strokeDasharray="3 3" />
+          <Label x={CX + 10 + (0.125 / 0.95) * 168} y={254} anchor="middle" size={8} kind="error">break-even 12.5%</Label>
+          <Label x={CX + 10} y={272} tone={3} size={8.5}>{a > 0.125 ? 'Above the line: profitable.' : 'Below the line: a net loss.'}</Label>
           <Label x={CX + 10} y={286} tone={3} size={8.5}>Repetitive text → high. Novel text → low.</Label>
         </Fade>
 
@@ -180,7 +179,7 @@ export default function SpecCrossover() {
           <rect x={CX} y={336} width={592} height={26} rx={3} fill="var(--ground-3)" stroke="var(--rule-2)" />
           <Label x={CX + 10} y={353} size={10} kind={sp >= 1 ? 'token' : 'error'} bold>
             {sp >= 1
-              ? `enable: a = ${(a * 100).toFixed(0)}% keeps ${(r.keepRate * 100).toFixed(0)}% of drafts, beating ρ = 0.125; batch ${batch} keeps the step memory-bound, and overhead is only ${(overheadShare * 100).toFixed(0)}%`
+              ? `enable: a = ${(a * 100).toFixed(0)}% clears ρ = 0.125, batch ${batch} keeps the step memory-bound, and overhead is only ${(overheadShare * 100).toFixed(0)}%`
               : `do not enable: at batch ${batch} the step is ${batch > 8 ? 'compute-bound' : 'nearly so'}, so the free-verification premise has failed`}
           </Label>
           <Label x={CX} y={378} tone={3} size={9}>Measure a on your traffic and ρ on your card. Those two decide it; batch size decides how much it is worth.</Label>
