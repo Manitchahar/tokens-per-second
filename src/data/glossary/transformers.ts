@@ -38,7 +38,7 @@ export const terms: Record<string, GlossaryEntry> = {
   },
   'byte-fallback': {
     term: 'Byte fallback',
-    def: 'Every tokenizer keeps one token for each of the 256 possible byte values, so any input can be spelled out one byte at a time. That is why real vocabulary sizes are multiples of 256 and why no tokenizer needs an "unknown" token.',
+    def: 'A byte-level tokenizer keeps one token for each of the 256 possible byte values, so any input can be spelled out one byte at a time and no "unknown" token is needed. GPT-2 introduced this in 2019; Llama-3 and Qwen2.5 inherit it. SentencePiece tokenizers such as Llama-2’s add 256 byte pieces as a fallback.',
     lesson: 'transformers/tokens',
   },
   'special-tokens': {
