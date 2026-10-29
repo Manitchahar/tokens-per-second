@@ -42,8 +42,8 @@ const labs = flatLessons.filter((l) => l.kind !== 'lesson').length;
   <section class="band">
     <div class="band-inner wide">
       <header class="sec-head">
-        <h2>The course, drawn as a map</h2>
-        <p>{modules.length} modules in {parts.length} parts, {flatLessons.length} lessons, about {Math.round(totalMinutes / 60)} hours. Everyone takes the trunk, then picks a branch (or both). Each row is a module; its cells fill in as you finish lessons.</p>
+        <h2>The course, drawn as a trace</h2>
+        <p>{modules.length} modules in {parts.length} parts, {flatLessons.length} lessons, about {Math.round(totalMinutes / 60)} hours. Each row is a module. Rows fill in as you finish lessons.</p>
       </header>
       <CourseWaterfall />
     </div>

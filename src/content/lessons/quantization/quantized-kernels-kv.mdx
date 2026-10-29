@@ -148,7 +148,7 @@ Most production KV quantization uses **per-token**, sometimes refined to **per-h
 
 | KV bits | Grouping | Verdict |
 |---|---|---|
-| FP8 (E4M3) | none needed (per-element exponent) | **Best default on GPUs with FP8 support (Ada, Hopper, Blackwell).** Halves KV memory at minimal quality cost. |
+| FP8 (E4M3) | none needed (per-element exponent) | **Best default on Hopper+.** Halves KV memory at minimal quality cost. |
 | INT8 | per-token | Safe, universally supported, and what to use off Hopper. |
 | INT4 | per-token, per-head scales | Real quality cost at long context. Only with an eval that shows it is acceptable. |
 | INT2 | — | Do not. |
@@ -174,7 +174,7 @@ Most production KV quantization uses **per-token**, sometimes refined to **per-h
   4. Compute the KV-to-weight byte ratio for your batch and context before choosing. Small batch and long context makes KV the dominant term.
   5. KV cache quantization groups per token (or per head), not per weight, because the scale has to be cheap to apply during attention.
   6. KV cache error accumulates over sequence length: 8,000 quantized keys all shift slightly. The symptom is repetition and lost long-range recall, not gibberish.
-  7. FP8 KV is the best default on Ada, Hopper and Blackwell because the per-element exponent removes the scale problem entirely; INT8 per-token is the safe portable choice.
+  7. FP8 KV is the best default on Hopper+ because the per-element exponent removes the scale problem entirely; INT8 per-token is the safe portable choice.
   8. Verify your engine's attention kernel is **native** in the KV dtype. A dequantize-to-BF16 workspace gives memory savings and no speed.
 </KeyNotes>
 

@@ -38,7 +38,7 @@ export const terms: Record<string, GlossaryEntry> = {
   },
   'byte-fallback': {
     term: 'Byte fallback',
-    def: 'A byte-level tokenizer keeps one token for each of the 256 possible byte values, so any input can be spelled out one byte at a time and no "unknown" token is needed. GPT-2 introduced this in 2019; Llama-3 and Qwen2.5 inherit it. SentencePiece tokenizers such as Llama-2’s add 256 byte pieces as a fallback.',
+    def: 'Every tokenizer keeps one token for each of the 256 possible byte values, so any input can be spelled out one byte at a time. That is why real vocabulary sizes are multiples of 256 and why no tokenizer needs an "unknown" token.',
     lesson: 'transformers/tokens',
   },
   'special-tokens': {
@@ -69,7 +69,7 @@ export const terms: Record<string, GlossaryEntry> = {
   },
   mqa: {
     term: 'Multi-query attention (MQA)',
-    def: 'All query heads share one key and value head. The KV cache shrinks by the query-head count — up to 32× — with a small quality cost. Used by PaLM, Falcon-7B, StarCoder and Gemma-2B.',
+    def: 'All query heads share one key and value head. The KV cache shrinks by the query-head count — up to 32× — with a small quality cost. Used by Grok-1 and some Llama-2-70B releases.',
     lesson: 'transformers/multi-head-gqa',
   },
   'mla': {
@@ -178,45 +178,5 @@ export const terms: Record<string, GlossaryEntry> = {
     term: 'Instruction tuning',
     def: 'Fine-tuning a base pre-trained language model on demonstrations of questions and answers so it follows instructions and converses rather than simply completing text.',
     lesson: 'transformers/neural-networks',
-  },
-  loss: {
-    term: 'Loss',
-    def: 'One number that says how wrong the model is on some data: zero is perfect, bigger is worse. Mean squared error for predicting numbers; cross-entropy, −ln(probability given to the right token), for language models. Training exists to make it smaller.',
-    lesson: 'transformers/how-models-learn',
-  },
-  gradient: {
-    term: 'Gradient',
-    def: 'The slope of the loss with respect to every weight at once: one number per weight saying how fast the loss rises if that weight is nudged up. It has as many entries as the model has parameters, and it points uphill.',
-    lesson: 'transformers/how-models-learn',
-  },
-  'gradient-descent': {
-    term: 'Gradient descent',
-    def: 'The training rule w ← w − η·gradient: step every weight a little in the direction that lowers the loss, recompute the slope, repeat. A ball rolling downhill on the loss surface.',
-    lesson: 'transformers/how-models-learn',
-  },
-  'learning-rate': {
-    term: 'Learning rate (η)',
-    def: 'How big a step gradient descent takes. Too large and every step overshoots the bottom until the loss blows up (divergence); too small and training crawls. LLaMA-7B peaked at 3 × 10⁻⁴ with warm-up and cosine decay.',
-    lesson: 'transformers/how-models-learn',
-  },
-  backpropagation: {
-    term: 'Backpropagation',
-    def: 'Computing the gradient of the loss for every weight in one backward sweep, by the chain rule: start at the loss and multiply local slopes layer by layer back to the input. Costs about twice a forward pass.',
-    lesson: 'transformers/how-models-learn',
-  },
-  'mini-batch': {
-    term: 'Mini-batch / SGD',
-    def: 'Estimating the gradient from a small random sample of the data instead of all of it. Stochastic gradient descent (SGD) takes one cheap, noisy step per mini-batch; the noise shrinks like 1/√(batch size). LLaMA used batches of 4M tokens.',
-    lesson: 'transformers/how-models-learn',
-  },
-  adam: {
-    term: 'Adam / AdamW',
-    def: 'The optimizer almost every LLM is trained with. It keeps a running average of each weight’s gradient (momentum) and of its square, and divides one by the square root of the other, giving every weight its own step size. AdamW adds decoupled weight decay. Two extra numbers per weight.',
-    lesson: 'transformers/how-models-learn',
-  },
-  'training-step': {
-    term: 'Training step',
-    def: 'One turn of the training loop: forward pass on a mini-batch, compute the loss, backward pass for the gradients, optimizer update. About 3× the compute of a forward pass, which is where the 6 in C ≈ 6ND comes from.',
-    lesson: 'transformers/how-models-learn',
   },
 };

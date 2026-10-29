@@ -11,7 +11,7 @@ objectives:
 import HeadsViz from '@/components/viz/transformers/HeadsViz.tsx';
 import Quiz from '@/components/learn/Quiz.tsx';
 
-03.5 ended with one attention head, 128 numbers wide. This lesson asks the obvious question: what if you did that several times at once? And then the question that separates people who understand transformers from people who have read about them: **why are the key and value heads allowed to be fewer than the query heads?**
+03.4 ended with one attention head, 128 numbers wide. This lesson asks the obvious question: what if you did that several times at once? And then the question that separates people who understand transformers from people who have read about them: **why are the key and value heads allowed to be fewer than the query heads?**
 
 That second question has a fourfold effect on how many users one GPU can serve. It is the highest-leverage piece of arithmetic in this module.
 
@@ -40,19 +40,19 @@ There is one non-obvious convention: **head_dim stays at 128 even as the model g
 | Qwen2.5-32B | 5,120 | 40 | **128** |
 | Llama-3.1-70B | 8,192 | 64 | **128** |
 
-So $\text{head\_dim} = d_{\text{model}} / n_{\text{heads}}$, and for most modern models that quotient is 128. Holding it constant means the RoPE frequency spectrum from 03.4 has the same shape in every model, and the softmax statistics inside each head stay comparable across widths.
+So $\text{head\_dim} = d_{\text{model}} / n_{\text{heads}}$, and for most modern models that quotient is 128. Holding it constant means the RoPE frequency spectrum from 03.3 has the same shape in every model, and the softmax statistics inside each head stay comparable across widths.
 
 ## Then K and V do not have to keep up
 
 Here is the design decision that matters for inference. Full multi-head attention gives **every** head its own key and value. But look at what a key actually does: it exists so that some other token's query can score against it. Queries are numerous and independent. Keys and values are a *shared resource* that every query reads.
 
-Nothing in the mathematics requires $n_{kv} = n_q$. Three choices, with head counts shown for a 32-query-head model such as Llama-2-7B or Llama-3.1-8B (the models in the last column have their own head counts):
+Nothing in the mathematics requires $n_{kv} = n_q$. Three choices:
 
 | Style | Query heads | KV heads | Group size | Used by |
 |---|---|---|---|---|
-| **MHA** — multi-head | 32 | 32 | 1 | Llama-2-7B (these counts); LLaMA-1 at every size; GPT-2 small (12 heads), GPT-3 175B (96 heads) |
-| **MQA** — multi-query | 32 | **1** | 32 | PaLM, Falcon-7B, StarCoder, Gemma-2B |
-| **GQA** — grouped-query | 32 | **8** | 4 | Llama-3.1-8B (these counts), Mistral-7B; Llama-2-70B, Llama-3.2 and Qwen2 with other ratios |
+| **MHA** — multi-head | 32 | 32 | 1 | GPT-2, GPT-3, Llama-2-7B |
+| **MQA** — multi-query | 32 | **1** | 32 | Grok-1, some Llama-2-70B releases |
+| **GQA** — grouped-query | 32 | **8** | 4 | Llama-3.1, Llama-3.2, Qwen2, Mistral |
 
 GQA is the compromise, and it is what nearly every current open model uses: 32 query heads, 8 key/value heads, four queries sharing each key and value. At the time of writing it is the default choice, and the reason is arithmetic.
 

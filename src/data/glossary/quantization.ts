@@ -44,7 +44,7 @@ export const terms: Record<string, GlossaryEntry> = {
   },
   'fp8-e4m3': {
     term: 'FP8 E4M3',
-    def: 'An 8-bit float with 1 sign, 4 exponent and 3 mantissa bits. The per-element exponent means it needs no group scales, handles outliers like BF16, and runs at 2× the BF16 tensor-core rate on GPUs with FP8 tensor cores (Ada Lovelace, Hopper, Blackwell).',
+    def: 'An 8-bit float with 1 sign, 4 exponent and 3 mantissa bits. The per-element exponent means it needs no group scales, handles outliers like BF16, and runs at 2× the BF16 tensor-core rate on Hopper and newer.',
     lesson: 'quantization/quant-schemes',
   },
   'arithmetic-intensity-quant': {
@@ -221,10 +221,5 @@ export const terms: Record<string, GlossaryEntry> = {
     term: 'Recovery fine-tuning',
     def: 'Continuing training after pruning so the surviving weights adapt to the ones that were deleted. Without it a pruned model is usually broken; with it most of the quality comes back, at the cost of a training run.',
     lesson: 'quantization/distillation-pruning',
-  },
-  fp8: {
-    term: 'FP8',
-    def: '8-bit floating point (E4M3 or E5M2). Halves memory versus BF16, and doubles tensor-core speed on GPUs with FP8 tensor cores: NVIDIA Ada Lovelace (L4, L40S, RTX 4090), Hopper (H100, H200) and Blackwell. On Ampere (A100) and older it saves memory only.',
-    lesson: 'quantization/quant-schemes',
   },
 };

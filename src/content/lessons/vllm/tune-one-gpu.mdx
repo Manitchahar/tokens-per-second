@@ -191,7 +191,7 @@ Not tuning knobs, but you will meet them in `--help` (names and defaults are ver
 
 | Flag | Why you would use it |
 |---|---|
-| `--dtype` | `bfloat16` on Ampere and newer, `float16` on older cards such as the T4. FP8 is not a `--dtype`: use `--quantization fp8` for the weights and `--kv-cache-dtype fp8` for the cache; both are fast on GPUs with FP8 tensor cores (Ada Lovelace, Hopper, Blackwell). |
+| `--dtype` | `bfloat16` on Ampere and newer, `float16` on older cards such as the T4, `float8_*` on Hopper and newer. |
 | `--quantization` | `awq`, `gptq`, `fp8` and friends. This is the flag that shrinks the weights, and therefore grows the pool. Module 11. |
 | `--tensor-parallel-size` | Shard the model across GPUs when it does not fit on one. Module 18 · Multi-GPU Parallelism. |
 | `--enable-prefix-caching` | Reuse a request's prefix across requests. Module 10. |

@@ -16,7 +16,7 @@ Five boxes. Everything you have learned in this module goes into them, and every
 ## The five stages
 
 $$
-\text{IDs} \;\rightarrow\; \mathrm{Embed} \;\rightarrow\; \underbrace{\big[\,\text{block} \times L\,\big]}_{\text{03.5–03.7}} \;\rightarrow\; \mathrm{RMSNorm} \;\rightarrow\; W_{\text{head}} \;\rightarrow\; \mathrm{sample} \;\rightarrow\; \text{ID}
+\text{IDs} \;\rightarrow\; \mathrm{Embed} \;\rightarrow\; \underbrace{\big[\,\text{block} \times L\,\big]}_{\text{03.4–03.6}} \;\rightarrow\; \mathrm{RMSNorm} \;\rightarrow\; W_{\text{head}} \;\rightarrow\; \mathrm{sample} \;\rightarrow\; \text{ID}
 $$
 
 For Llama-3.1-8B, with $L = 32$:
@@ -103,7 +103,7 @@ Three observations that matter for serving:
   </Step>
 
   <Step title="5. And then sampling">
-    Temperature, top-k, top-p, and a draw. No weights, no GEMMs, about 0.5 MFLOP of pure arithmetic. A couple of microseconds on a GPU, hidden behind the next layer. Module 03.9 does it properly.
+    Temperature, top-k, top-p, and a draw. No weights, no GEMMs, about 0.5 MFLOP of pure arithmetic. A couple of microseconds on a GPU, hidden behind the next layer. Module 03.8 does it properly.
   </Step>
 
   <Step title="6. Decode: read 15 GB, do 15 GFLOP">

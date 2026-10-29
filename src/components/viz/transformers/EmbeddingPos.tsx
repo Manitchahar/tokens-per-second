@@ -21,7 +21,7 @@ const freq = (base: number, i: number) => Math.pow(base, (-2 * i) / D_HEAD);
 /** Distance in tokens for one full turn of pair i. */
 const wavelength = (base: number, i: number) => (2 * Math.PI) / freq(base, i);
 
-// The sentence from 03.3, as IDs into a toy vocabulary.
+// The sentence from 03.2, as IDs into a toy vocabulary.
 const SENT = [
   { id: 15339, piece: 'the' },
   { id: 1917, piece: 'transform' },

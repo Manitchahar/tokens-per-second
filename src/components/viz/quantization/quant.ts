@@ -177,7 +177,7 @@ export interface Scheme {
 /** The schemes this module compares. wBits = weight precision, kvBits = KV cache precision. */
 export const SCHEMES: Scheme[] = [
   { id: 'bf16', label: 'BF16', wBits: 16, kvBits: 16, note: 'The default. Full precision, nothing saved.' },
-  { id: 'fp8', label: 'FP8', wBits: 8, kvBits: 16, note: 'E4M3 weights. 2× smaller, native on Ada, Hopper, Blackwell.' },
+  { id: 'fp8', label: 'FP8', wBits: 8, kvBits: 16, note: 'E4M3 weights. 2× smaller, native on Hopper+.' },
   { id: 'w8a8', label: 'W8A8', wBits: 8, kvBits: 8, note: 'INT8 weights and activations. The safest big win.' },
   { id: 'w4a16', label: 'W4A16', wBits: 4, kvBits: 16, note: '4-bit weights, 16-bit compute. The standard 4-bit recipe.' },
   { id: 'w4kv8', label: 'W4 + KV8', wBits: 4, kvBits: 8, note: '4-bit weights and a halved KV cache. Memory-bound serving wins here.' },

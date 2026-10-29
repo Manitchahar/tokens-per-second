@@ -37,7 +37,7 @@ const d = entry.data;
   <article class="lesson" data-lesson={key} data-href={url(meta.href)} data-code={meta.code} data-title={d.title}>
     <header class="lesson-head">
       <nav class="crumbs" aria-label="Breadcrumb">
-        <a href={url('learn/')}>Part {part.label ?? part.num} · {part.title}</a>
+        <a href={url('learn/')}>Part {part.num} · {part.title}</a>
         <span aria-hidden="true">/</span>
         <a href={url(`learn/${mod.slug}/`)}>{mod.num} {mod.title}</a>
       </nav>

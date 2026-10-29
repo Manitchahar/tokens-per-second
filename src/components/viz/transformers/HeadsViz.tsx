@@ -6,8 +6,8 @@ import { arch, type ModelId } from './modelShapes';
 
 type Mode = 'mha' | 'mqa' | 'gqa';
 const MODES: { id: Mode; name: string; qh: number; kvh: number; who: string }[] = [
-  { id: 'mha', name: 'MHA', qh: 8, kvh: 8, who: 'Llama-2-7B, every LLaMA-1, GPT-2, GPT-3' },
-  { id: 'mqa', name: 'MQA', qh: 8, kvh: 1, who: 'PaLM, Falcon-7B, StarCoder, Gemma-2B' },
+  { id: 'mha', name: 'MHA', qh: 8, kvh: 8, who: 'GPT-2, GPT-3, Llama-2-7B' },
+  { id: 'mqa', name: 'MQA', qh: 8, kvh: 1, who: 'Grok-1, some Llama-2-70B releases' },
   { id: 'gqa', name: 'GQA', qh: 8, kvh: 2, who: 'Llama-3.1, Qwen2, Mistral' },
 ];
 const D_HEAD = 128;

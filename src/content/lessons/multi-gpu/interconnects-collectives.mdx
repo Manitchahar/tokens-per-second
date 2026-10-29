@@ -13,7 +13,7 @@ import Quiz from '@/components/learn/Quiz.tsx';
 
 You have optimised one GPU as hard as one GPU can be optimised. PagedAttention, continuous batching, FlashAttention, quantized GEMMs, CUDA graphs, speculation — every one of those techniques makes better use of a fixed budget of FLOP/s and bytes per second.
 
-Some problems are not solvable that way. Llama-3.1-70B in BF16 is 141 GB of weights. The largest Hopper GPU, the H200, has 141 GB, so those weights alone would fill it completely and leave nothing for the KV cache, the activations or the CUDA context. On an 80 GB H100 they do not fit at all. Qwen2.5-32B with a batch of 32 requests at 8,192 tokens of context holds about 90 GB of KV cache *on top of* 66 GB of weights. You cannot fit that on one card, and no kernel in the world will make it fit.
+Some problems are not solvable that way. Llama-3.1-70B in BF16 is 141 GB of weights. There is no 141 GB GPU. Qwen2.5-32B with a batch of 32 requests at 8,192 tokens of context holds about 90 GB of KV cache *on top of* 66 GB of weights. You cannot fit that on one card, and no kernel in the world will make it fit.
 
 So you use more than one GPU. And the moment you do, a new, completely un-familiar cost appears: **the GPUs have to talk to each other**, and that conversation is not free.
 

@@ -22,7 +22,7 @@ const labs = flatLessons.filter((l) => l.kind !== 'lesson');
       const ls = labs.filter((l) => l.module.part === p.num);
       return (
         <section>
-          <h2><span class="pn">Part {p.label ?? p.num}</span> {p.title}</h2>
+          <h2><span class="pn">Part {p.num}</span> {p.title}</h2>
           <ol class="list">
             {ls.map((l) => {
               const e = byId.get(`${l.module.slug}/${l.slug}`);

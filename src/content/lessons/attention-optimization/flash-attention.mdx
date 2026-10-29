@@ -224,17 +224,6 @@ What it does **not** solve is decode. Decode is a completely different shape —
 
 That is the next lesson.
 
-<Callout type="real" title="Now read the paper">
-  **"FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"**, Dao, Fu, Ermon, Rudra and Ré, 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135).
-
-  - **Read:** the introduction and Section 2 (2.1 is the GPU memory hierarchy from Module 02 and 12, with A100 numbers; 2.2 is eager attention, Algorithm 0, which writes $S$ and $P$ to HBM). Then Section 3.1 and **Algorithm 1**, the forward pass, slowly.
-  - **Notice the loop order.** Algorithm 1 puts the loop over **key/value blocks outside** and the loop over query blocks inside, so each $O_i$, $\ell_i$ and $m_i$ is read from HBM, rescaled and written back on every outer step. This lesson teaches the order of **FlashAttention-2** (Dao, 2023, [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)): query tile outside, key/value tiles inside, the running state kept on chip, and one division at the end. Same mathematics, fewer HBM round-trips and better parallelism across query tiles.
-  - **Skim:** Section 3.2, Theorem 2 (HBM accesses $\Theta(N^2 d^2 M^{-1})$ against $\Theta(Nd + N^2)$ for eager attention, where $M$ is the SRAM size) and the lower bound after it; then the speedup and memory figures in Section 4.
-  - **Skip:** Section 3.3 (block-sparse FlashAttention) and the backward-pass derivation in the appendix, unless you are writing training kernels.
-
-  You will now recognise the online-softmax statistics $m$ and $\ell$, tiling sized to fit SRAM, recomputation in the backward pass instead of storing $P$, and the paper's central claim: attention got faster in wall-clock time by moving fewer bytes, not by doing fewer FLOPs.
-</Callout>
-
 <KeyNotes>
   1. A FlashAttention program owns one tile of query rows ($B_r \approx 64$) and keeps it in SRAM for its entire life. That residency is what makes fusion possible.
   2. The forward pass is a loop over key tiles: load $K_j$, compute $S_j = Q_j K_j^\top$ in SRAM, merge into $(m, \ell, O)$ with the online softmax, discard the tile.

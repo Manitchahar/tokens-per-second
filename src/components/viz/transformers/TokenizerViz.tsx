@@ -30,7 +30,7 @@ const CAPTIONS = [
   'A tokenizer merges neighbouring characters into pieces that appear often in real text: the, transformer, tokens. The sentence collapses from 28 items to 7.',
   'Each piece gets an integer ID, and that integer is the only thing the model ever sees. The ID is just a row number in a table — the embedding table that the next lesson opens.',
   'How aggressively a tokenizer merges is a design choice, and it trades memory against meaning. Drag the slider: at level 2 English runs about 4 characters per token.',
-  'A byte-level tokenizer keeps one token for each of the 256 possible byte values, so any input can be spelled out and nothing is ever rejected as unknown. Llama-3.1’s 128,256 entries are 256 byte tokens, 127,744 learned merges and 256 reserved special tokens.',
+  'Every tokenizer can fall back to single bytes, one token each for all 256 possible byte values. That is why a real vocabulary is a multiple of 256 and why no input is ever rejected as unknown.',
   'A token is a unit of work: one embedding row to read, one row in every attention score matrix, one entry in the KV cache at every layer. Prompt length is counted in these, not in characters.',
 ];
 
@@ -159,30 +159,27 @@ export default function TokenizerViz() {
             })}
             <Label x={30} y={296} tone={3} size={9.5}>{`Llama-3.1 has 128,256 entries; Qwen2.5 has 151,936. Same idea, 5,500× more of them.`}</Label>
             <Label x={30} y={314} tone={3} size={9.5}>{'An ID is not a meaning. It is an index — into the embedding table, and into the output head.'}</Label>
-            <Label x={30} y={332} tone={3} size={9.5}>{'That is the last thing the model knows about your text until 03.4 turns it into a vector.'}</Label>
+            <Label x={30} y={332} tone={3} size={9.5}>{'That is the last thing the model knows about your text until 03.3 turns it into a vector.'}</Label>
           </g>
         )}
 
         {st === 5 && (
           <g className="v-fade">
             <Label x={30} y={146} tone={1} size={10.5} bold>No text is ever unknown</Label>
-            <rect x={30} y={162} width={96} height={40} rx={3} fill="var(--memory)" stroke="var(--memory)" strokeWidth={1} />
-            <text x={78} y={180} textAnchor="middle" className="v-label" style={{ fontSize: 10, fontWeight: 700, fill: '#0e1116' }}>256</text>
-            <text x={78} y={193} textAnchor="middle" className="v-label" style={{ fontSize: 8.5, fill: '#0e1116' }}>byte tokens</text>
-            <Label x={134} y={188} tone={2} size={14} math>+</Label>
-            <rect x={150} y={162} width={110} height={40} rx={3} fill="var(--compute)" stroke="var(--compute)" strokeWidth={1} />
-            <text x={205} y={180} textAnchor="middle" className="v-label" style={{ fontSize: 10, fontWeight: 700, fill: '#0e1116' }}>127,744</text>
-            <text x={205} y={193} textAnchor="middle" className="v-label" style={{ fontSize: 8.5, fill: '#0e1116' }}>learned merges</text>
-            <Label x={268} y={188} tone={2} size={14} math>+</Label>
-            <rect x={284} y={162} width={96} height={40} rx={3} fill="var(--ground-3)" stroke="var(--rule-2)" strokeWidth={1} />
-            <text x={332} y={180} textAnchor="middle" className="v-label t1" style={{ fontSize: 10, fontWeight: 700 }}>256</text>
-            <text x={332} y={193} textAnchor="middle" className="v-label t2" style={{ fontSize: 8.5 }}>special</text>
-            <Label x={390} y={188} tone={1} size={11}>= 128,256 (Llama-3.1)</Label>
+            <rect x={30} y={162} width={104} height={40} rx={3} fill="var(--memory)" stroke="var(--memory)" strokeWidth={1} />
+            <text x={82} y={180} textAnchor="middle" className="v-label" style={{ fontSize: 10, fontWeight: 700, fill: '#0e1116' }}>256</text>
+            <text x={82} y={193} textAnchor="middle" className="v-label" style={{ fontSize: 8.5, fill: '#0e1116' }}>byte tokens</text>
+            <Label x={148} y={188} tone={2} size={14} math>×</Label>
+            <rect x={168} y={162} width={104} height={40} rx={3} fill="var(--compute)" stroke="var(--compute)" strokeWidth={1} />
+            <text x={220} y={180} textAnchor="middle" className="v-label" style={{ fontSize: 10, fontWeight: 700, fill: '#0e1116' }}>501</text>
+            <text x={220} y={193} textAnchor="middle" className="v-label" style={{ fontSize: 8.5, fill: '#0e1116' }}>merge levels</text>
+            <Label x={288} y={180} tone={1} size={11}>=</Label>
+            <Label x={288} y={196} tone={2} size={11}>128,256 vocabulary entries</Label>
             <Label x={30} y={228} tone={2} size={10}>Any byte sequence in the world can be spelled out one byte token at a time,</Label>
             <Label x={30} y={246} tone={2} size={10}>so a tokenizer never has to say “unknown”. It just becomes expensive.</Label>
             <Label x={30} y={276} tone={3} size={9.5}>{'Cost of the fallback: a rare name splits into 4–6 byte tokens instead of 2,'}</Label>
             <Label x={30} y={294} tone={3} size={9.5}>{'each one paying for an embedding row, an attention row and a KV cache entry.'}</Label>
-            <Label x={30} y={322} tone={3} size={9.5}>{'Byte-level BPE came from GPT-2 (2019). Qwen2.5: 151,643 learned tokens + special tokens, padded to 151,936.'}</Label>
+            <Label x={30} y={322} tone={3} size={9.5}>{'Qwen2.5 is 151,936 = 256 × 593 + 288 special tokens (chat markers).'}</Label>
           </g>
         )}
 

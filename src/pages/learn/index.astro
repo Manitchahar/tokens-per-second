@@ -9,14 +9,14 @@ import { url } from '../../site';
 const all = await getCollection('lessons');
 const available = new Set(all.map((e) => e.id));
 const first = flatLessons[0];
-const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtime depth', scale: 'Scale depth', research: 'Engine & research depth', build: 'Build with it' };
+const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtime depth', scale: 'Scale depth', research: 'Engine & research depth' };
 ---
 <Base title="Course map" description="Every module and lesson of Tokens per Second, drawn as one timeline.">
   <div class="page">
     <header class="head">
-      <h1>The course map</h1>
+      <h1>The course, as one trace</h1>
       <p class="lead">
-        {modules.length} modules, {flatLessons.length} lessons, about {Math.round(totalMinutes / 60)} hours. Everyone takes the trunk, then the course forks: build products with an LLM, or make serving fast. Each row is a module.
+        {modules.length} modules, {flatLessons.length} lessons, about {Math.round(totalMinutes / 60)} hours. Read it like a profiler trace: time runs left to right, and each row is a module.
         Your finished lessons fill in, and a flag marks where you stopped.
       </p>
       <a class="btn" href={url(first.href)} data-resume data-resume-alt>Start at {first.code}: {first.title}</a>
@@ -27,9 +27,9 @@ const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtim
     <section class="paths">
       <h2>Which path is yours?</h2>
       <div class="path-grid">
-        <p><strong>AI engineer.</strong> Part 1, then Part B: prompting, evaluation, RAG, agents, finetuning, data and production apps.</p>
-        <p><strong>Applied inference engineer.</strong> Part 1, then Parts 2 to 4 and 7. Serve models well on one GPU, then run them in production.</p>
-        <p><strong>Performance or distributed engineer.</strong> Add Part 5 (kernels, FlashAttention, compilation, speculative decoding) and Part 6 (parallelism, MoE, long context, disaggregation).</p>
+        <p><strong>Applied inference engineer.</strong> Parts 1 to 4, then 7. Serve models well on one GPU, then run them in production.</p>
+        <p><strong>Performance engineer.</strong> Add Part 5: kernels, FlashAttention, compilation and speculative decoding.</p>
+        <p><strong>Distributed engineer.</strong> Add Part 6: tensor and pipeline parallelism, MoE, long context and disaggregation.</p>
         <p><strong>Engine builder.</strong> Everything, finishing with Part 8, where you build your own mini vLLM and reproduce research.</p>
       </div>
     </section>
@@ -37,7 +37,7 @@ const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtim
     {parts.map((p) => (
       <section class="part" id={`part-${p.num}`}>
         <header class="part-head">
-          <h2><span class="pnum">Part {p.label ?? p.num}</span> {p.title}</h2>
+          <h2><span class="pnum">Part {p.num}</span> {p.title}</h2>
           <p>{p.question}</p>
         </header>
         {modules.filter((m) => m.part === p.num).map((m) => {

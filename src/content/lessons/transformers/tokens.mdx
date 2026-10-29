@@ -5,7 +5,7 @@ objectives:
   - Explain why a model cannot read characters and what a token really is
   - Describe byte-pair encoding as greedy merging of frequent pairs
   - Compute characters per token, and check a tokenizer against a real vocabulary size
-  - 'Explain where a real vocabulary size comes from: 256 byte tokens, learned merges, special tokens and padding'
+  - Explain why real vocabulary sizes are multiples of 256
   - Convert a prompt from characters to tokens and from tokens to KV cache bytes
 ---
 import TokenizerViz from '@/components/viz/transformers/TokenizerViz.tsx';
@@ -33,7 +33,7 @@ The answer most people landed on: **learn the most common pieces of text from a 
 
 **3. Merge the most frequent pair.** Replace every occurrence of that pair with a new single token. `t`+`h` becomes `th`, a new token with a new ID. Recount.
 
-**4. Repeat until you hit your budget.** Each merge shortens the text a little: one token disappears for every place the pair occurred. And each merge adds exactly one entry to the vocabulary, so the budget is simply a number of merges. GPT-2 (2019) stopped after 50,000: 256 byte tokens + 50,000 merges + 1 end-of-text marker = **50,257** entries. LLaMA-1 and Llama-2 use **32,000**; Llama-3.1 uses 128,000 learned tokens plus 256 reserved special tokens, **128,256**.
+**4. Repeat until you hit your budget.** Every merge halves the average length of the text. Stop at 32,000 merges and you have GPT-2's vocabulary; at 128,000 and you have Llama-3.1's.
 
 The result, in the visual, for our toy sentence:
 
@@ -44,7 +44,7 @@ The result, in the visual, for our toy sentence:
 | After all merges | `the` · ` ` · `transformer` · ` ` · `reads` · ` ` · `tokens` = 7 | **4.00** |
 
 <Callout type="math" title="Characters per token is the number to memorise">
-  English prose runs at roughly **4 characters per token**, or about **1.3 tokens per word**. Keep the reciprocal too: **1 token ≈ 0.75 English words**, so 1,000 tokens is about 750 words. Every "tokens per second" figure, every context-length claim and every price depends on this ratio.
+  English prose runs at roughly **4 characters per token**, or 0.75 tokens per word. Keep the reciprocal too: **1 token ≈ 0.75 English words**. Every "tokens per second" figure, every context-length claim and every price depends on this ratio.
 </Callout>
 
 ## Each piece is just an integer
@@ -77,7 +77,7 @@ That ID is the *only* representation of your text inside the model. `15339` does
   </Step>
 
   <Step title="5. Nothing is ever lost">
-    The base of a byte-level vocabulary is **all 256 byte values**, one token each. Anything on earth can therefore be spelled out, so the tokenizer never needs an "unknown" symbol. GPT-2 introduced this in 2019. Llama-3.1's 128,256 entries are **256 byte tokens + 127,744 learned merges + 256 reserved special tokens**.
+    The base of every vocabulary is **all 256 byte values**, one token each. Anything on earth can therefore be spelled out, so no tokenizer ever needs an "unknown" symbol. Llama-3.1's 128,256 is exactly **256 × 501**: 256 byte tokens plus 501 rounds of learned merges.
   </Step>
 
   <Step title="6. A token is not free">
@@ -87,15 +87,15 @@ That ID is the *only* representation of your text inside the model. `15339` does
 
 ## The real vocabularies
 
-| Model | Vocabulary | Made of | Character ratio | Special tokens |
+| Model | Vocabulary | ÷ 256 | Character ratio | Special tokens? |
 |---|---|---|---|---|
-| GPT-2 | 50,257 | 256 bytes + 50,000 merges + 1 special | ≈ 4.0 | `<\|endoftext\|>` |
-| Llama-2 | 32,000 | SentencePiece BPE, incl. 256 byte-fallback pieces | ≈ 3.2 | `<unk>`, `<s>`, `</s>` |
-| Llama-3.1 | 128,256 | 128,000 byte-level BPE + 256 reserved special | ≈ 4.0 | 256 reserved, e.g. `<\|begin_of_text\|>` |
-| Qwen2.5 | 151,936 | 151,643 byte-level BPE + special tokens, padded | ≈ 3.6 | `<\|im_start\|>`, `<\|im_end\|>`, … |
-| GPT-4 | ~100,000 | byte-level BPE | ≈ 4.0 | |
+| GPT-2 | 50,257 | — | ≈ 4.0 | |
+| Llama-2 | 32,000 | 125 | ≈ 3.6 | `<unk>`, `<s>`, `</s>` |
+| Llama-3.1 | 128,256 | **501** | ≈ 4.0 | none (byte-level) |
+| Qwen2.5 | 151,936 | 593 + 288 | ≈ 3.6 | 288 chat/system markers |
+| GPT-4 | ~100,000 | — | ≈ 4.0 | |
 
-Three things worth noticing. **Byte-level BPE with a 256-byte floor came from GPT-2** (2019): with every byte available as a token there is nothing left to be unknown, so there is no `<unk>`. LLaMA-1 and Llama-2 took a different route, a SentencePiece tokenizer that falls back to 256 byte pieces for rare characters but still keeps an `<unk>` entry; Llama-3 switched to GPT-2-style byte-level BPE and inherits the floor. Second, **special tokens** such as `<|im_start|>` are entries the chat template injects to mark conversation roles. They are real tokens that consume real context. Third, **the sizes are often padded**: Qwen2.5's tokenizer has 151,643 learned tokens plus a couple of dozen special ones, but its embedding table has 151,936 rows, rounded up so the matrix shapes suit GPU kernels. Karpathy's nanoGPT does the same to GPT-2, padding 50,257 to 50,304 (a multiple of 64) purely for speed. Unused rows are never produced by the tokenizer.
+Two things worth noticing. Llama-3 dropped the `<unk>` token entirely — with 256 byte tokens as a floor there is nothing to be unknown about. And Qwen2.5's extra 288 entries are **special tokens**: strings like `<|im_start|>` that the chat template injects to mark conversation roles. Those are real tokens that consume real context.
 
 <Callout type="pitfall" title="Non-English text and code are much denser">
   The 4-characters-per-token figure is *English prose*. Two cases that will bite you:
@@ -205,9 +205,9 @@ Real tokenizers add one thing: they never let a merge cross a category boundary.
 <KeyNotes>
   1. A model reads **integers, not text**. A token is a piece of text plus an integer ID, and the ID is a row number, not a meaning.
   2. **Byte-pair encoding** starts from bytes, repeatedly merges the most frequent adjacent pair, and stops at a fixed vocabulary size. Every merge is one learned rule.
-  3. English runs at about **4 characters per token**, about **1.3 tokens per word** (1 token ≈ 0.75 words). Code is denser (≈ 2.5–3 characters per token); CJK is much denser still (≈ 1 token per character).
-  4. A byte-level vocabulary starts with **all 256 byte values**, one token each, so no input is ever unknown and no `<unk>` token is needed. GPT-2 introduced this in 2019; Llama-3 and Qwen2.5 inherit it.
-  5. Vocabulary sizes: GPT-2 50,257 (256 bytes + 50,000 merges + 1 special) · Llama-2 32,000 · Llama-3.1 128,256 (128,000 learned + 256 reserved special) · Qwen2.5 151,936 (151,643 learned + special tokens, padded).
+  3. English runs at about **4 characters per token** (0.75 tokens per word). Code is denser (≈ 2.5–3); CJK is much denser still (≈ 1 token per character).
+  4. Every vocabulary starts with **all 256 byte values**, one token each. Llama-3.1's 128,256 = 256 × 501 exactly. This is why no tokenizer needs an "unknown" token.
+  5. Vocabulary sizes: GPT-2 50,257 · Llama-2 32,000 · Llama-3.1 128,256 · Qwen2.5 151,936 (256 × 593 + 288 special chat tokens).
   6. **Tokens are the billing unit.** Everything else — KV cache, context limit, prefill cost, tokens per second — is denominated in tokens.
   7. KV cache for Llama-3.1-8B = $T \times 131{,}072$ bytes. 8,192 tokens = **1.07 GB** for a single sequence.
   8. Word-start spaces are part of the token (`Ġthe`), and merges never cross a word/number/punctuation boundary.
@@ -216,7 +216,7 @@ Real tokenizers add one thing: they never let a merge cross a category boundary.
 <Quiz client:visible questions={[
   { q: 'How many characters are in the string "the transformer reads tokens"?', numeric: true, answer: 28, tolerance: 0, why: '"the" is 3, a space 1, "transformer" is 11, a space 1, "reads" is 5, a space 1, "tokens" is 6: 3+1+11+1+5+1+6 = 28.' },
   { q: 'If that sentence tokenizes to 7 tokens, what is the characters-per-token ratio?', numeric: true, answer: 4, tolerance: 0.05, why: '28 ÷ 7 = 4.00 characters per token, which is exactly the English average.' },
-  { q: 'GPT-2’s vocabulary holds 50,257 entries. Where does that number come from?', options: ['It is a prime number chosen for hashing', '256 byte tokens, plus 50,000 learned merges, plus 1 end-of-text token', '50,000 English words plus 257 punctuation marks', '2¹⁶ minus the IDs reserved for padding'], answer: 1, why: 'Byte-level BPE starts from the 256 possible byte values and adds one entry per learned merge. GPT-2 learned 50,000 merges and added <|endoftext|>: 256 + 50,000 + 1 = 50,257. The byte floor means any input can be spelled, so no unknown token is needed.' },
+  { q: 'Llama-3.1’s vocabulary holds 128,256 entries. Why is that number exactly divisible by 256?', options: ['It is a power of two, like every vocabulary', 'The base of every BPE vocabulary is one token per possible byte value, and the learned merges come in multiples of that', 'Because 256 is the largest vocabulary that fits in a 16-bit ID', 'Because 256 is the number of characters in the Latin alphabet'], answer: 1, why: 'BPE starts from the 256 possible byte values, then adds learned merges. 128,256 = 256 × 501. It guarantees that any input can be spelled, so no "unknown" token is needed — Llama-2 had one, Llama-3 does not.' },
   { q: 'A prompt is 4,000 tokens on Llama-3.1-8B. How much KV cache does it hold, in MiB?', numeric: true, answer: 500, tolerance: 10, unit: 'MiB', why: '4,000 × 131,072 bytes = 524,288,000 bytes = 500 MiB (4,000 × 128 KiB ÷ 1,024 KiB/MiB).' },
   { q: 'Why does code usually produce more tokens per character than English prose?', options: ['Code is always longer', 'Code is full of rare symbols and short pieces with no natural word structure, so the vocabulary covers it less efficiently', 'Tokenizers skip whitespace in code', 'Because code contains more uppercase letters'], answer: 1, why: 'The 4 characters-per-token figure is measured on English prose. Source code mixes rare identifiers, operators and digits, so the merge table covers it less well — typically 2.5–3 characters per token.' },
   { q: 'A Chinese prompt and an English prompt express the same information. The Chinese one uses 2,500 tokens, the English one 1,000. Why?', options: ['Chinese models are lower quality', 'Han characters usually cost about one token each, so the same meaning needs more tokens', 'The tokenizer was trained only on English', 'Chinese text has more punctuation'], answer: 1, why: 'One Han character carries roughly the meaning of an English *word*, so the same information needs ~2.5× the characters, and Han characters are not well covered by merge patterns. Budget per-language, not per-character.' },

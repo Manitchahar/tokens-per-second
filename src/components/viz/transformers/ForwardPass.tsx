@@ -42,7 +42,7 @@ const CAPTIONS = [
   'One block: two RMSNorms, attention, the MLP, two residual adds. 436.2 M parameters, 436.2 MB of weights, and 2 FLOPs per parameter.',
   'Thirty-two identical blocks, so 6.98 billion parameters and 13.96 GB of weights. This is the part that makes decode slow: the whole thing is re-read for every token.',
   'One final RMSNorm, then the output head: a 4,096 × 128,256 matrix multiply. That is 525 million more weights — 1.05 GB, another 6.8% of the step.',
-  'The logits are 128,256 numbers, one score per token in the vocabulary. Sampling turns them into one token. That is Module 03.9.',
+  'The logits are 128,256 numbers, one score per token in the vocabulary. Sampling turns them into one token. That is Module 03.8.',
   'One generated token costs about 15 GFLOP of math and 15.5 GB of bytes. On an H100 that is 16 microseconds of math against 5.8 milliseconds of memory — memory-bound by 360×.',
   'Prefill runs the identical graph with many rows at once. The weights are read once and reused m times, so bytes stay flat while FLOPs grow linearly with m.',
   'Prefilling 512 tokens costs about 14 ms. Generating those same 512 tokens one at a time costs 512 × 5.8 ms ≈ 3.0 seconds. Same model, same arithmetic, 208× the cost. That gap is Module 05.',
@@ -218,7 +218,7 @@ export default function ForwardPass() {
             {st === 1 && (
               <>
                 <Label x={24} y={130} tone={1} size={10.5} bold>one block, 218.1 M parameters</Label>
-                <Label x={24} y={156} tone={2} size={9.5}>{'RMSNorm → attention (03.5, 03.6) → add → RMSNorm → SwiGLU → add'}</Label>
+                <Label x={24} y={156} tone={2} size={9.5}>{'RMSNorm → attention (03.4, 03.5) → add → RMSNorm → SwiGLU → add'}</Label>
                 <Label x={24} y={182} tone={2} size={9.5}>{'attention matrices  41.94 M params   83.9 MB'}</Label>
                 <Label x={24} y={202} tone={2} size={9.5}>{'MLP matrices     176.16 M params  352.3 MB'}</Label>
                 <Label x={24} y={222} tone={2} size={9.5}>{'2 × RMSNorm gain     0.008 M params    0.03 MB'}</Label>
@@ -252,7 +252,7 @@ export default function ForwardPass() {
                 <Label x={24} y={182} tone={2} size={9.5}>{'It touches no weights and does no GEMMs — it is pure arithmetic'}</Label>
                 <Label x={24} y={202} tone={2} size={9.5}>{'over 128,256 numbers, about 0.5 MFLOP. On a GPU that is'}</Label>
                 <Label x={24} y={222} tone={2} size={9.5}>{'a couple of microseconds, entirely hidden behind the next layer.'}</Label>
-                <Label x={24} y={250} tone={1} size={9.5}>{'Module 03.9 does it properly. For now: the forward pass is done.'}</Label>
+                <Label x={24} y={250} tone={1} size={9.5}>{'Module 03.8 does it properly. For now: the forward pass is done.'}</Label>
               </>
             )}
           </g>

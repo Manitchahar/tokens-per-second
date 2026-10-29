@@ -3,24 +3,6 @@ title: 'Module 04 · Run Your First LLM'
 module: first-llm
 ---
 
-## Open weights: what LLaMA changed
-
-| | LLaMA-1 (Feb 2023) | Llama-2 (Jul 2023) | Llama-3 (Apr 2024) |
-|---|---|---|---|
-| sizes | 7B, 13B, 33B, 65B | 7B, 13B, 70B | 8B, 70B (3.1: 405B) |
-| tokens | 1.0T (7B, 13B) / 1.4T (33B, 65B) | 2T | 15T+ |
-| context | 2,048 | 4,096 | 8,192 (3.1: 128K) |
-| vocab | 32,000 | 32,000 | 128,256 |
-| attention | MHA | GQA on 34B/70B | GQA everywhere |
-
-- LLaMA-13B beat GPT-3 (175B) on most benchmarks, trained only on public data.
-- Four changes to the 2017 block: **pre-norm**, **RMSNorm**, **SwiGLU**, **RoPE** (plus no biases, untied head).
-- SwiGLU width $= \tfrac{2}{3} \cdot 4d$, rounded up to a multiple of 256: **11,008** for 7B, **13,824** for 13B. Keeps ~135M FFN weights per layer.
-- LLaMA-7B: 32 layers, d 4096, 32 heads, **6.7B** params, 13.5 GB BF16, **512 KiB** KV/token (Llama-3-8B with 8 KV heads: 128 KiB).
-- Over-training: 7B on 1.0T tokens ≈ **150 tokens/param** (Chinchilla-optimal ≈ 20). Serving cost ∝ size, so train small and long.
-- LLaMA-13B: ~¼ of GPT-3's training FLOPs ($6ND$: $7.8 \times 10^{22}$ vs $3.2 \times 10^{23}$), ~13× fewer FLOPs per generated token.
-- **Open weights ≠ open source**: weights (Llama: custom licence; Mistral-7B, most Qwen2.5: Apache 2.0) vs weights + code + data (OLMo, Pythia). Read: commercial use, scale/field-of-use terms, output/derivative terms.
-
 ## Choosing a model
 
 $$

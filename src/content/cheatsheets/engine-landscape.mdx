@@ -96,14 +96,13 @@ $$
 | **Prefix reuse** | block-level, CoW | **best** | block-level, CoW | limited |
 | **4-bit** | supported | supported | supported | **native** |
 | **Build step** | none | none | **per configuration** | none |
-| **Runs without NVIDIA** | yes (ROCm, TPU, CPU, Gaudi) | yes (ROCm, CPU, …) | no | **yes** (CPU, Metal, Vulkan) |
-| **Strongest at** | breadth, most models and hardware | prefix-heavy traffic | one fixed config on NVIDIA, lowest latency | small hardware: CPU, Apple silicon, consumer GPUs |
+| **Strongest at** | breadth, most models | prefix-heavy traffic | one fixed config, lowest latency | fitting a big model on small/non-NVIDIA HW |
 
 Decide in this order:
 
 1. **Does it fit?** weights + reserve vs GPU memory. Arithmetic; eliminates candidates.
 2. **Hard constraints**: model support, hardware owned, build runnable in the deploy pipeline.
-3. **Design vs traffic**: prefix-heavy → SGLang; fixed config, latency-critical → TensorRT-LLM; breadth → vLLM; laptop/CPU/Apple silicon or memory-starved → llama.cpp; AMD or TPU → vLLM or SGLang (TensorRT-LLM is NVIDIA-only). Hardware support lists change: check each engine's docs at the time you decide.
+3. **Design vs traffic**: prefix-heavy → SGLang; fixed config, latency-critical → TensorRT-LLM; breadth → vLLM; non-NVIDIA or memory-starved → llama.cpp.
 4. **Only then measure.**
 
 ## The selection matrix

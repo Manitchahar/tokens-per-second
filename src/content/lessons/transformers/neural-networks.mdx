@@ -13,7 +13,7 @@ import Quiz from '@/components/learn/Quiz.tsx';
 
 Module 02 ended with a fact that felt slightly abstract: a decode step on an 8B model reads about 16 GB of weights, and that is why it is **memory-bound**. This module explains where those 16 GB come from, one neuron at a time, and then builds the whole transformer on top of them.
 
-You already have every tool needed. A neuron is a dot product. A layer is a <Term t="matmul">matrix multiply</Term>. A deep network is a stack of matrix multiplies with a nonlinearity wedged between them. The only new idea is that those numbers were **learned**, and that learning is a completely separate activity from everything this course is about. The next lesson, [How a model learns](/learn/transformers/how-models-learn/), shows exactly how; this one is about what was learned.
+You already have every tool needed. A neuron is a dot product. A layer is a <Term t="matmul">matrix multiply</Term>. A deep network is a stack of matrix multiplies with a nonlinearity wedged between them. The only new idea is that those numbers were **learned**, and that learning is a completely separate activity from everything this course is about.
 
 ## One neuron, in full
 
@@ -105,7 +105,7 @@ That is a <Term t="matmul">matrix multiply</Term>, which the GPU does with tenso
   </Step>
 
   <Step title="8. Training moves them. Inference reads them.">
-    This is the single most important sentence in the module. **Training** adjusts every one of those 8.03 billion numbers by gradient descent to reduce a loss on data — weeks of compute on thousands of GPUs, done once. The next lesson (03.2) shows how. **Inference** never changes a weight. It reads 16.1 GB, multiplies, and moves on.
+    This is the single most important sentence in the module. **Training** adjusts every one of those 8.03 billion numbers by gradient descent to reduce a loss on data — days of compute, done once. **Inference** never changes a weight. It reads 16.1 GB, multiplies, and moves on.
   </Step>
 </Scrolly>
 
@@ -135,7 +135,7 @@ Two things fall out of this table that matter for the rest of your career.
 **Second, the embedding table is not small.** 128,256 rows of 4,096 is 525 million parameters, 6.5% of the model, and it exists twice: once as the lookup table at the front, once as the `lm_head` that produces logits at the end. Llama-3.1 does not tie them together; Qwen2.5-0.5B does, sharing one table for both jobs.
 
 <Callout type="pitfall" title="Why hidden 4096 and not 3000">
-  `$k\_proj$` is not 4096 × 4096. Llama-3.1-8B has **8 KV heads**, not 32, so `k_proj` and `v_proj` are 4096 × 1024. If you assume full multi-head attention you will over-count a Llama model's weights by about 1.2 billion and every memory calculation you make afterwards will be wrong. Read the config, not the family name. Module 03.6 shows why those KV heads are fewer.
+  `$k\_proj$` is not 4096 × 4096. Llama-3.1-8B has **8 KV heads**, not 32, so `k_proj` and `v_proj` are 4096 × 1024. If you assume full multi-head attention you will over-count a Llama model's weights by about 1.2 billion and every memory calculation you make afterwards will be wrong. Read the config, not the family name. Module 03.5 shows why those KV heads are fewer.
 </Callout>
 
 ## Bytes: the number that decides everything
@@ -188,7 +188,7 @@ $$
 \mathbf{y} = \mathbf{u} + \mathrm{MLP}(\mathrm{Norm}(\mathbf{u}))
 $$
 
-Every symbol in that expression is a lesson in this module. First, 03.2 shows how the weights inside it were learned. Then the following pages build it, in order: tokens (03.3), <Term t="embedding">embeddings</Term> and positions (03.4), attention (03.5), heads (03.6), the MLP and the residual stream (03.7), the whole thing running (03.8), and turning its output into a token (03.9).
+Every symbol in that expression is a lesson in this module. The next eight pages build it, in order: <Term t="embedding">embeddings</Term> and positions (03.3), attention (03.4), heads (03.5), the MLP and the residual stream (03.6), and then the whole thing running (03.7).
 
 <Callout type="try" title="Prove the parameter count yourself">
   In the Colab notebook for this module, load `Qwen/Qwen2.5-0.5B-Instruct` and read its config. Compute the parameter count from the shapes **on paper**, then compare with `sum(p.numel() for p in model.parameters())`. If they disagree by more than 0.1%, find the matrix you forgot. Doing this once with real weights is worth ten readings of the table above.
@@ -225,12 +225,12 @@ class Block(nn.Module):
 
     def forward(self, x):                      # x: [batch, tokens, d]
         h = self.n1(x)
-        # attention: project, score, softmax, mix  (03.5 and 03.6 do this properly)
+        # attention: project, score, softmax, mix  (03.4 and 03.5 do this properly)
         h2 = self.n2(x)
         a = self.o(F.scaled_dot_product_attention(self.q(h), self.k(h), self.v(h), is_causal=True))
-        x = x + a                              # residual add: 03.7
+        x = x + a                              # residual add: 03.6
         m = self.down(F.silu(self.gate(h2)) * self.up(h2))
-        return x + m                           # residual add: 03.7
+        return x + m                           # residual add: 03.6
 ```
 
 Two details already visible: `bias=False` on every projection (Llama and Qwen2 put the bias nowhere; RMSNorm and the residual stream do that job instead), and `k`/`v` are only 1,024 wide because there are 8 KV heads.
@@ -271,17 +271,17 @@ Early transformers explored two styles: bidirectional encoders like BERT (readin
 
 **What changed for inference:** Auto-regressive generation requires generating one token at a time in a loop, which gave birth to the <Term t="kv-cache">KV cache</Term> (Module 05 · Prefill, Decode & the KV Cache) and turned text generation into a memory-bound decode loop.
 
-### 5. Instruction tuning (early 2022) and chat models (late 2022 onward): following orders
+### 5. Instruction tuning and chat models (2022): following orders
 
-A raw base language model is an autocomplete engine: given a question, it might generate more questions instead of answering. <Term t="instruction-tuning">Instruction tuning</Term> fixed that. InstructGPT (OpenAI, early 2022) combined supervised finetuning with reinforcement learning from human feedback so that a model followed a single instruction and answered it, one prompt in, one answer out. Chat models, starting with ChatGPT in November 2022, extended the same training to multi-turn conversations.
+A raw base language model is an autocomplete engine: given a question, it might generate more questions instead of answering. <Term t="instruction-tuning">Instruction tuning</Term> and reinforcement learning aligned models to act as interactive assistants following user prompts.
 
-**What changed for inference:** Instruction-following models still served one prompt and one answer. Chat models added **chat templates** with special role tokens (such as `<|im_start|>` and `<|im_end|>`) that mark who is speaking, and turned inference into long multi-turn sessions that resend the shared conversation history on every turn, creating demand for prefix caching (Module 10).
+**What changed for inference:** Chat templates introduced special control tokens (such as `<|im_start|>` and `<|im_end|>`) and transformed batch inference into long multi-turn sessions with shared conversational history, creating demand for prefix caching (Module 10).
 
 ### 6. Mixture-of-experts and reasoning models: scaling smarter
 
 Scaling dense models indefinitely becomes unaffordable: an 800-billion parameter dense model requires reading hundreds of gigabytes per generated token. Modern architectures employ a <Term t="mixture-of-experts">mixture-of-experts (MoE)</Term> design, where only a fraction of total parameters (experts) activate for any single token. Alongside MoE, reasoning models trade extra output tokens (test-time computation) for higher accuracy on complex math and code.
 
-**What changed for inference:** MoE decouples total model memory footprint from active compute FLOPs (Module 19 · Mixture-of-Experts), while reasoning models dramatically lengthen output sequences, making serving throughput and KV cache occupancy the dominant operational challenges (Module 26 · Specialized Workloads).
+**What changed for inference:** MoE decouples total model memory footprint from active compute FLOPs (Module 19 · Mixture-of-Experts), while reasoning models dramatically lengthen output sequences, making serving throughput and KV cache occupancy the dominant operational challenges (Module 27 · Specialized Workloads).
 
 | Era | Architecture | Problem solved | What changed for inference |
 |---|---|---|---|
@@ -289,7 +289,7 @@ Scaling dense models indefinitely becomes unaffordable: an 800-billion parameter
 | 2014 | RNNs & LSTMs | Capturing word sequence and memory | Sequential bottleneck: GPU forced to compute prompt serially |
 | 2017 | Transformer | Removed sequential loop via attention | Enabled single-pass parallel prefill across the whole prompt |
 | 2018–2020 | GPT decoder-only | Bidirectional encoders could not generate freely | Autoregressive generation created the memory-bound decode loop and KV cache |
-| 2022 | Instruction tuning, then chat | Autocomplete models rambled instead of answering | Instruction models answered one prompt; chat models added role tokens, chat templates and multi-turn history |
+| 2022 | Chat & Instruction | Autocomplete models rambled instead of answering | Introduced special tokens, chat templates, and multi-turn state |
 | Recent | MoE & Reasoning | Dense parameters too heavy; hard logic needs thought | Sparse memory access per token and prolonged generation runs |
 
 <Callout type="intuition" title="The invariant across all six eras">
@@ -300,7 +300,7 @@ Scaling dense models indefinitely becomes unaffordable: an 800-billion parameter
   1. A neuron is a weighted sum, plus a bias, plus a nonlinearity: $y = f(Wx + b)$. Three steps, and you can do all of them by hand.
   2. Without the nonlinearity, stacked layers collapse into one linear map, so depth would buy nothing. SiLU is what current open models use.
   3. A layer is the same operation done 4,096 times at once, which is a matrix multiply on tensor cores. Nothing new happens between the neuron and the layer.
-  4. Parameters are learned once during training, by gradient descent on a loss (next lesson, 03.2). **At inference every weight is read-only.** That single fact governs the rest of this course.
+  4. Parameters are learned once during training. **At inference every weight is read-only.** That single fact governs the rest of this course.
   5. Llama-3.1-8B holds 8.03 B parameters across 32 layers: 70.2% in MLP matrices, 16.7% in attention, and 13.1% in the embedding table and output head.
   6. `k_proj` and `v_proj` are 4096 × 1024, not 4096 × 4096, because Llama-3.1-8B has 8 KV heads. Read the config, not the family name.
   7. 8.03 B weights × 2 bytes = **16.1 GB in BF16** — too big for a free Colab T4. At 8 bits it is 8.0 GB and fits; at 4 bits, 4.0 GB.
