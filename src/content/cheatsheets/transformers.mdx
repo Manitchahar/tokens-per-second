@@ -75,9 +75,9 @@ $$
 
 | Style | n_q | n_kv | group | Used by |
 |---|---|---|---|---|
-| MHA | 32 | 32 | 1 | GPT-2, GPT-3, Llama-2-7B |
-| MQA | 32 | 1 | 32 | Grok-1, some Llama-2-70B |
-| **GQA** | 32 | 8 | 4 | Llama-3.1, Qwen2, Mistral |
+| MHA | 32 | 32 | 1 | Llama-2-7B (these counts), all LLaMA-1; GPT-2 small has 12 heads, GPT-3 175B 96 |
+| MQA | 32 | 1 | 32 | PaLM, Falcon-7B, StarCoder, Gemma-2B |
+| **GQA** | 32 | 8 | 4 | Llama-3.1-8B (these counts), Mistral-7B, Llama-2-70B, Qwen2 |
 
 | Model | L | n_kv | d_h | per token | @4K | @32K |
 |---|---|---|---|---|---|---|

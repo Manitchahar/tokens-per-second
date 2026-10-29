@@ -69,7 +69,7 @@ export const terms: Record<string, GlossaryEntry> = {
   },
   mqa: {
     term: 'Multi-query attention (MQA)',
-    def: 'All query heads share one key and value head. The KV cache shrinks by the query-head count — up to 32× — with a small quality cost. Used by Grok-1 and some Llama-2-70B releases.',
+    def: 'All query heads share one key and value head. The KV cache shrinks by the query-head count — up to 32× — with a small quality cost. Used by PaLM, Falcon-7B, StarCoder and Gemma-2B.',
     lesson: 'transformers/multi-head-gqa',
   },
   'mla': {

@@ -137,7 +137,7 @@ Everything about positions is free at inference in a way that is worth being pre
 
 | | Cost |
 |---|---|
-| Learned absolute position table | extra memory (GPT-2: 1,024 × 768 = 786 K params, tiny) |
+| Learned absolute position table | extra memory (GPT-2 small, 124M: 1,024 × 768 = 786 K params; GPT-2 1.5B: 1,024 × 1,600 = 1.6 M; tiny either way) |
 | RoPE | **zero extra parameters.** It is a rotation applied to Q and K after they are computed |
 | Where it runs | one elementwise kernel over Q and K per layer, or fused into the QKV projection |
 

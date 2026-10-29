@@ -271,17 +271,17 @@ Early transformers explored two styles: bidirectional encoders like BERT (readin
 
 **What changed for inference:** Auto-regressive generation requires generating one token at a time in a loop, which gave birth to the <Term t="kv-cache">KV cache</Term> (Module 05 · Prefill, Decode & the KV Cache) and turned text generation into a memory-bound decode loop.
 
-### 5. Instruction tuning and chat models (2022): following orders
+### 5. Instruction tuning (early 2022) and chat models (late 2022 onward): following orders
 
-A raw base language model is an autocomplete engine: given a question, it might generate more questions instead of answering. <Term t="instruction-tuning">Instruction tuning</Term> and reinforcement learning aligned models to act as interactive assistants following user prompts.
+A raw base language model is an autocomplete engine: given a question, it might generate more questions instead of answering. <Term t="instruction-tuning">Instruction tuning</Term> fixed that. InstructGPT (OpenAI, early 2022) combined supervised finetuning with reinforcement learning from human feedback so that a model followed a single instruction and answered it, one prompt in, one answer out. Chat models, starting with ChatGPT in November 2022, extended the same training to multi-turn conversations.
 
-**What changed for inference:** Chat templates introduced special control tokens (such as `<|im_start|>` and `<|im_end|>`) and transformed batch inference into long multi-turn sessions with shared conversational history, creating demand for prefix caching (Module 10).
+**What changed for inference:** Instruction-following models still served one prompt and one answer. Chat models added **chat templates** with special role tokens (such as `<|im_start|>` and `<|im_end|>`) that mark who is speaking, and turned inference into long multi-turn sessions that resend the shared conversation history on every turn, creating demand for prefix caching (Module 10).
 
 ### 6. Mixture-of-experts and reasoning models: scaling smarter
 
 Scaling dense models indefinitely becomes unaffordable: an 800-billion parameter dense model requires reading hundreds of gigabytes per generated token. Modern architectures employ a <Term t="mixture-of-experts">mixture-of-experts (MoE)</Term> design, where only a fraction of total parameters (experts) activate for any single token. Alongside MoE, reasoning models trade extra output tokens (test-time computation) for higher accuracy on complex math and code.
 
-**What changed for inference:** MoE decouples total model memory footprint from active compute FLOPs (Module 19 · Mixture-of-Experts), while reasoning models dramatically lengthen output sequences, making serving throughput and KV cache occupancy the dominant operational challenges (Module 27 · Specialized Workloads).
+**What changed for inference:** MoE decouples total model memory footprint from active compute FLOPs (Module 19 · Mixture-of-Experts), while reasoning models dramatically lengthen output sequences, making serving throughput and KV cache occupancy the dominant operational challenges (Module 26 · Specialized Workloads).
 
 | Era | Architecture | Problem solved | What changed for inference |
 |---|---|---|---|
@@ -289,7 +289,7 @@ Scaling dense models indefinitely becomes unaffordable: an 800-billion parameter
 | 2014 | RNNs & LSTMs | Capturing word sequence and memory | Sequential bottleneck: GPU forced to compute prompt serially |
 | 2017 | Transformer | Removed sequential loop via attention | Enabled single-pass parallel prefill across the whole prompt |
 | 2018–2020 | GPT decoder-only | Bidirectional encoders could not generate freely | Autoregressive generation created the memory-bound decode loop and KV cache |
-| 2022 | Chat & Instruction | Autocomplete models rambled instead of answering | Introduced special tokens, chat templates, and multi-turn state |
+| 2022 | Instruction tuning, then chat | Autocomplete models rambled instead of answering | Instruction models answered one prompt; chat models added role tokens, chat templates and multi-turn history |
 | Recent | MoE & Reasoning | Dense parameters too heavy; hard logic needs thought | Sparse memory access per token and prolonged generation runs |
 
 <Callout type="intuition" title="The invariant across all six eras">
