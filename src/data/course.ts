@@ -17,18 +17,22 @@ export interface ModuleMeta {
   title: string;
   tagline: string;
   part: number;
-  track: 'core' | 'runtime' | 'scale' | 'research';
+  track: 'core' | 'runtime' | 'scale' | 'research' | 'build';
   lessons: LessonMeta[];
 }
 
 export interface PartMeta {
   num: number;
+  label?: string; // shown instead of num when set ("B")
   title: string;
   question: string; // the question this part answers
 }
 
+// Part 1 is the trunk everyone takes. After it the course forks: Part B builds products on top of
+// an LLM, Parts 2-8 make serving fast. The parts array order is the display order.
 export const parts: PartMeta[] = [
-  { num: 1, title: 'Foundations', question: 'What do I need to know before touching an LLM?' },
+  { num: 1, title: 'Foundations', question: 'How does an LLM work, how did we get here, and how do I run one?' },
+  { num: 9, label: 'B', title: 'Build with it', question: 'How do I build reliable products on top of an LLM?' },
   { num: 2, title: 'How inference works', question: 'What actually happens when a model produces a token?' },
   { num: 3, title: 'Serving engines', question: 'How do we serve many people at once from one GPU?' },
   { num: 4, title: 'Single-GPU optimization', question: 'How do we squeeze more out of the GPU we have?' },
@@ -82,6 +86,7 @@ export const modules: ModuleMeta[] = [
     tagline: 'Build the transformer in your head, one block at a time.',
     lessons: [
       L('neural-networks', 'Neurons, layers & weights', 18),
+      L('how-models-learn', 'How a model learns: loss & gradient descent', 22),
       L('tokens', 'Tokens & tokenizers', 15),
       L('embeddings-positions', 'Embeddings & positions', 16),
       L('attention', 'Attention from scratch: Q, K and V', 25),
@@ -93,14 +98,144 @@ export const modules: ModuleMeta[] = [
     ],
   },
   {
+    num: '3A', slug: 'pretraining', title: 'One Machine, Two Jobs', part: 1, track: 'core',
+    tagline: 'The same transformer, two training games: fill in the blank, or guess the next word.',
+    lessons: [
+      L('self-supervision', 'Free labels: learning from raw text', 18),
+      L('loss-perplexity', 'Cross-entropy, perplexity & bits per byte', 20),
+      L('bert', 'Reading: BERT and the masked-word game', 22),
+      L('gpt2', 'Writing: GPT-2 and the next-word game', 22),
+      L('encoder-vs-decoder', 'Why decoders won', 16),
+      LAB('lab-two-jobs', 'Lab: Fill the blank vs finish the sentence', 45),
+    ],
+  },
+  {
+    num: '3B', slug: 'scaling', title: 'What Scale Buys', part: 1, track: 'core',
+    tagline: 'Make the model bigger and new abilities appear. But how big, on how much data?',
+    lessons: [
+      L('training-compute', 'Counting training compute: C ≈ 6ND', 20),
+      L('gpt3-in-context', 'GPT-3: learning from the prompt', 22),
+      L('scaling-laws', 'Scaling laws: loss falls as a power law', 20),
+      L('chinchilla', 'Chinchilla: the compute-optimal model', 22),
+      L('beyond-chinchilla', 'Over-training for cheap inference & the limits of scale', 18),
+      LAB('lab-compute-budget', 'Lab: Spend a compute budget', 40),
+    ],
+  },
+  {
+    num: '3C', slug: 'alignment', title: 'From Autocomplete to Assistant', part: 1, track: 'core',
+    tagline: 'A base model only continues text. Here is how it learns to answer you.',
+    lessons: [
+      L('base-vs-assistant', 'Why a base model does not answer you', 16),
+      L('sft', 'Supervised finetuning: teaching by example', 18),
+      L('reward-models', 'Preference data & reward models', 20),
+      L('rlhf-instructgpt', 'RLHF: the InstructGPT recipe', 24),
+      L('dpo', 'DPO: preference tuning without RL', 18),
+      L('hallucination', 'Why models hallucinate', 18),
+      LAB('lab-preferences', 'Lab: Train a tiny reward model', 45),
+    ],
+  },
+  {
     num: '04', slug: 'first-llm', title: 'Run Your First LLM', part: 1, track: 'core',
     tagline: 'Download a real model, make it talk, watch the GPU, put it behind HTTP.',
     lessons: [
+      L('open-weights-llama', 'Open weights: what LLaMA changed', 18),
       L('choose-a-model', 'Choosing an open model', 15),
       L('load-and-generate', 'Load, tokenize, generate & stream', 22),
       L('watch-the-gpu', 'Watching the GPU work', 15),
       L('serve-over-http', 'Serving a model over HTTP', 20),
       LAB('lab-first-server', 'Lab: Your first GPU inference server', 60),
+    ],
+  },
+
+  // ───────────── Part B · Build with it
+  {
+    num: 'B1', slug: 'prompting', title: 'Prompt Engineering', part: 9, track: 'build',
+    tagline: 'Steer a model without touching its weights, and measure whether it worked.',
+    lessons: [
+      L('chat-templates', 'Chat templates & system prompts', 16),
+      L('in-context', 'Zero-shot, few-shot & in-context learning in practice', 18),
+      L('writing-prompts', 'Writing prompts that work: instructions, context & decomposition', 20),
+      L('chain-of-thought', 'Chain of thought & test-time compute', 20),
+      L('context-position', 'Long prompts: lost in the middle', 16),
+      L('prompt-ops', 'Versioning, testing & optimizing prompts', 16),
+      LAB('lab-prompting', 'Lab: Prompt, measure, iterate', 40),
+    ],
+  },
+  {
+    num: 'B2', slug: 'evaluation', title: 'Evaluating AI Systems', part: 9, track: 'build',
+    tagline: 'If you cannot measure it, you cannot ship it. How to score open-ended output.',
+    lessons: [
+      L('why-eval-is-hard', 'Why evaluating LLMs is hard', 16),
+      L('exact-evaluation', 'Exact evaluation: pass@k, exact match & similarity', 20),
+      L('ai-as-judge', 'AI as a judge, and its biases', 20),
+      L('comparative-eval', 'Comparative evaluation: Elo & arenas', 18),
+      L('benchmarks-contamination', 'Public benchmarks, saturation & contamination', 18),
+      L('eval-pipeline', 'Designing your evaluation pipeline', 22),
+      L('model-selection', 'Choosing a model: the selection funnel', 18),
+      LAB('lab-eval', 'Lab: Build an eval harness with an AI judge', 50),
+    ],
+  },
+  {
+    num: 'B3', slug: 'rag', title: 'Retrieval & RAG', part: 9, track: 'build',
+    tagline: 'Give the model the facts it was never trained on, at the moment it needs them.',
+    lessons: [
+      L('why-rag', 'Why retrieval: finetuning for form, RAG for facts', 16),
+      L('embeddings-search', 'Embeddings & vector search', 20),
+      L('bm25-hybrid', 'Keyword search, BM25 & hybrid retrieval', 18),
+      L('ann-indexes', 'Approximate nearest neighbours: HNSW & IVF', 20),
+      L('chunking-reranking', 'Chunking, query rewriting & reranking', 20),
+      L('evaluating-retrieval', 'Evaluating retrieval: precision, recall & NDCG', 18),
+      LAB('lab-rag', 'Lab: Build and measure a RAG pipeline', 60),
+    ],
+  },
+  {
+    num: 'B4', slug: 'agents', title: 'Agents', part: 9, track: 'build',
+    tagline: 'From a model that answers to a model that acts: tools, plans and memory.',
+    lessons: [
+      L('what-is-an-agent', 'What makes an agent', 16),
+      L('tools', 'Tools: read, compute & write actions', 18),
+      L('planning', 'Planning: ReAct, reflection & plan-then-execute', 22),
+      L('memory', 'Agent memory', 18),
+      L('agent-failures', 'Agent failure modes & evaluation', 18),
+      LAB('lab-agent', 'Lab: A tool-using agent from scratch', 60),
+    ],
+  },
+  {
+    num: 'B5', slug: 'finetuning', title: 'Finetuning', part: 9, track: 'build',
+    tagline: 'Change the weights, cheaply: when it is worth it, and how LoRA makes it fit.',
+    lessons: [
+      L('when-to-finetune', 'When to finetune (and when not to)', 16),
+      L('training-memory', 'Training memory: weights, gradients & optimizer states', 20),
+      L('lora', 'LoRA: low-rank adaptation', 24),
+      L('qlora', 'QLoRA & finetuning on one GPU', 18),
+      L('finetuning-tactics', 'Finetuning tactics: learning rate, loss masking & epochs', 18),
+      L('model-merging', 'Model merging & task arithmetic', 16),
+      LAB('lab-lora', 'Lab: Finetune a small model with LoRA', 60),
+    ],
+  },
+  {
+    num: 'B6', slug: 'datasets', title: 'Dataset Engineering', part: 9, track: 'build',
+    tagline: 'The model is only as good as its data: curate, synthesize, verify, clean.',
+    lessons: [
+      L('quality-coverage-quantity', 'Quality, coverage & quantity', 18),
+      L('instruction-data', 'Formatting instruction data', 16),
+      L('synthetic-data', 'Synthetic data & distillation', 20),
+      L('verifying-data', 'Verifying synthetic data & model collapse', 18),
+      L('dedup-cleaning', 'Deduplication & cleaning at scale', 18),
+      LAB('lab-data', 'Lab: Build and clean a finetuning set', 45),
+    ],
+  },
+  {
+    num: 'B7', slug: 'ai-apps', title: 'Production AI Applications', part: 9, track: 'build',
+    tagline: 'Wrap the model in a system: guardrails, routing, caching, observability and feedback.',
+    lessons: [
+      L('app-architecture', 'From one model call to a full AI system', 18),
+      L('guardrails', 'Guardrails: input & output', 18),
+      L('prompt-injection', 'Prompt injection & jailbreaks', 20),
+      L('gateway-routing', 'Model gateways, routers & caches', 18),
+      L('app-observability', 'Observability for AI apps', 18),
+      L('user-feedback', 'User feedback & the data flywheel', 18),
+      PROJECT('project-ai-app', 'Project: Ship an AI app end to end', 120),
     ],
   },
 

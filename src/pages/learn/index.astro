@@ -9,7 +9,7 @@ import { url } from '../../site';
 const all = await getCollection('lessons');
 const available = new Set(all.map((e) => e.id));
 const first = flatLessons[0];
-const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtime depth', scale: 'Scale depth', research: 'Engine & research depth' };
+const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtime depth', scale: 'Scale depth', research: 'Engine & research depth', build: 'Build with it' };
 ---
 <Base title="Course map" description="Every module and lesson of Tokens per Second, drawn as one timeline.">
   <div class="page">
@@ -37,7 +37,7 @@ const trackNames: Record<string, string> = { core: 'Core path', runtime: 'Runtim
     {parts.map((p) => (
       <section class="part" id={`part-${p.num}`}>
         <header class="part-head">
-          <h2><span class="pnum">Part {p.num}</span> {p.title}</h2>
+          <h2><span class="pnum">Part {p.label ?? p.num}</span> {p.title}</h2>
           <p>{p.question}</p>
         </header>
         {modules.filter((m) => m.part === p.num).map((m) => {

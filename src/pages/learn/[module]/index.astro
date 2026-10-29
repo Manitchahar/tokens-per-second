@@ -26,7 +26,7 @@ const mins = mod.lessons.reduce((s, l) => s + l.minutes, 0);
 ---
 <Base title={`${mod.num} ${mod.title}`} description={mod.tagline}>
   <div class="page">
-    <nav class="crumbs"><a href={url('learn/')}>Course map</a> <span>/</span> <a href={url(`learn/#part-${part.num}`)}>Part {part.num} · {part.title}</a></nav>
+    <nav class="crumbs"><a href={url('learn/')}>Course map</a> <span>/</span> <a href={url(`learn/#part-${part.num}`)}>Part {part.label ?? part.num} · {part.title}</a></nav>
     <header class="head">
       <p class="mnum">Module {mod.num}</p>
       <h1>{mod.title}</h1>
