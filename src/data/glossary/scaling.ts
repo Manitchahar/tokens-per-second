@@ -25,4 +25,8 @@ export const terms: Record<string, GlossaryEntry> = {
   'isoflop': { term: 'IsoFLOP curve', def: 'All the ways to spend one fixed compute budget: each model size N trained on D = C / 6N tokens. Loss along it forms a U-shaped valley whose bottom is the compute-optimal model.', lesson: 'scaling/chinchilla' },
   'compute-optimal': { term: 'Compute-optimal (Chinchilla-optimal)', def: 'The split of a training budget between parameters and tokens that gives the lowest loss. Hoffmann et al. 2022: about 20 tokens per parameter, so N ≈ √(C/120).', lesson: 'scaling/chinchilla' },
   'irreducible-loss': { term: 'Irreducible loss', def: 'The part of the loss no model can remove, because text itself is not fully predictable. The constant E (about 1.69 nats) in the Chinchilla formula L = E + A/N^α + B/D^β.', lesson: 'scaling/chinchilla' },
+
+  // ── 3B.5 · Over-training and the limits of scale
+  'over-training': { term: 'Over-training', def: 'Training a model on far more tokens than the compute-optimal ~20 per parameter, on purpose, so a smaller model reaches the target quality and is cheaper to serve for its whole life. LLaMA-1 7B: ~143 tokens/param; Llama 3 8B: ~1,875.', lesson: 'scaling/beyond-chinchilla' },
+  'lifetime-compute': { term: 'Lifetime compute', def: 'Training plus serving: 6ND + 2NT, where T is every token the model will process in production. Serving overtakes training once T = 3D.', lesson: 'scaling/beyond-chinchilla' },
 };

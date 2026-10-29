@@ -1,0 +1,252 @@
+---
+title: 'Over-training for cheap inference & the limits of scale'
+summary: 'Chinchilla finds the cheapest model to train. But a model is trained once and served for its whole life, and every served token costs 2N FLOPs. Add serving to the bill and the best model gets smaller and trains far longer, which is exactly what LLaMA and Llama 3 did. Then the limits: text, synthetic data and power.'
+objectives:
+  - Write lifetime compute as training plus serving, 6ND + 2NT, and find the serving volume at which they are equal
+  - Explain why heavy traffic favours a smaller model trained on many more tokens than Chinchilla’s 20 per parameter
+  - Compute tokens per parameter for LLaMA-1 7B and Llama 3 8B and place them against the Chinchilla rule
+  - Explain why a model below a minimum size cannot reach a target quality at any data budget
+  - Describe the data, synthetic-data and power limits on further scaling, with numbers
+---
+import LifetimeCost from '@/components/viz/scaling/LifetimeCost.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Here is a fact from lesson 1 that should have bothered you. Llama-3.1-8B was trained on 15 trillion tokens. By the Chinchilla rule, an 8B model is compute-optimal at 20 × 8B = **160 billion** tokens. Meta trained it on **94 times** that. Its training compute, 7.2 × 10²³ FLOPs, was more than Chinchilla 70B's. With that budget the rule says you should train a model of √(7.2 × 10²³ / 120) ≈ 77B parameters.
+
+So was Meta wasting most of its compute, the way Gopher did?
+
+No. Chinchilla answered a precise question: **what is the cheapest model to *train* to a given quality?** That is the right question for a research run. It is the wrong question for a product. A product model is trained once and then generates tokens, for millions of people, for a year or more. Every one of those tokens costs a forward pass, $2N$ FLOPs, and it is the model's size, not its training length, that sets that price.
+
+This lesson puts serving into the bill. The answer it gives is the reason the models you will spend this course serving are small.
+
+## Train once, serve forever
+
+<Scrolly>
+  <LifetimeCost client:visible slot="stage" />
+
+  <Step title="1. Chinchilla’s question: cheapest training for a target quality">
+    Fix the quality you need, say Chinchilla's own: the loss of a 70B model trained on 1.4T tokens. Many model sizes can reach it. A bigger one needs fewer tokens, a smaller one more, and below a certain size no amount of data will do.
+
+    Plot the training compute, $6N \times D(N)$, for each size that can reach the target (amber). It is lowest near **20 tokens per parameter**, at about 72B. That point is Chinchilla's answer, and it ignores everything after training.
+  </Step>
+
+  <Step title="2. Every served token costs 2N">
+    Now the model goes into service. Every token it processes (prompt or output) costs a forward pass, about **$2N$ FLOPs** (Module 01). Serve $T$ tokens over its life and that is $2NT$ FLOPs.
+
+    On these log axes the serving cost is a straight line (green): proportional to model size. A model twice as big costs twice as much **forever**.
+  </Step>
+
+  <Step title="3. Lifetime cost = training + serving">
+    Add the two (white). The minimum of the sum is **not** where the training minimum was. It has moved left, to a smaller model.
+
+    The smaller model costs more to train to the same quality, because it needs many more tokens to get there. But it pays that back on every token it will ever serve.
+  </Step>
+
+  <Step title="4. More traffic, smaller model">
+    Turn up the traffic. At 100 trillion served tokens the lifetime-optimal model is about **21B parameters trained on 12.7T tokens**: almost 600 tokens per parameter, 30 times the Chinchilla ratio. Its lifetime compute is 61% lower than the Chinchilla choice's.
+
+    Deliberately training a model far past its Chinchilla point is called <Term t="over-training">**over-training**</Term>. The word sounds like a mistake. Here it is the optimum.
+  </Step>
+
+  <Step title="5. The wall: too small never gets there">
+    It cannot go on forever. Every model has a capacity penalty $A/N^{\alpha}$ that no data can remove. If that alone is above the target, the model never reaches it: the hatched region.
+
+    Near the wall the data needed explodes, so training cost shoots up. The lifetime optimum always sits to the right of it.
+  </Step>
+
+  <Step title="6. What the labs did: LLaMA and Llama 3">
+    This is not a thought experiment. Meta's **LLaMA-1 7B** (2023) was trained on 1T tokens: about **143 tokens per parameter**. **Llama 3 8B** (2024) read 15T: about **1,875**.
+
+    Both are far to the right of Chinchilla's 20 on the ruler. Both were chosen to be the best model *you can afford to run*, not the cheapest one to train.
+  </Step>
+
+  <Step title="7. The next wall: running out of text">
+    Over-training eats data. A small model at thousands of tokens per parameter needs tens of trillions of tokens, and good text is finite.
+
+    One careful estimate puts all quality-adjusted public human text at roughly **300 trillion tokens**. Llama 3 already used 15T. The scaling recipe of the last five years is heading into a supply limit.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### The lifetime bill
+
+Two terms, both of which you already know. Together they are the <Term t="lifetime-compute">lifetime compute</Term> of a model:
+
+$$
+C_{\text{life}} = \underbrace{6\,N\,D}_{\text{training}} + \underbrace{2\,N\,T}_{\text{serving}}
+$$
+
+where $T$ is every token the model will ever process in production, prompt tokens and output tokens alike (prefill and decode both cost $2N$ FLOPs per token).
+
+The first useful thing to read off it is the **break-even point**: the serving volume at which serving has cost as much as training.
+
+$$
+2NT = 6ND \quad\Longrightarrow\quad T = 3D
+$$
+
+The model size cancels. **A model has cost as much to run as to make once it has processed three times its training tokens.**
+
+<Callout type="math" title="Worked: when does serving overtake training?">
+  Chinchilla 70B was trained on 1.4T tokens, so it breaks even at 3 × 1.4T = **4.2T served tokens**.
+
+  How long is that? Take a hypothetical service processing 10 billion tokens a day, prompts included. 4.2 × 10¹² ÷ 10¹⁰ = 420 days: a little over a year. At 100 billion tokens a day it is six weeks, and after that every day of serving costs more than the training did in total.
+
+  For Llama 3 8B, trained on 15T tokens, break-even is 45T served tokens. Over-training pushes the break-even point out, because the training bill is bigger, but the serving bill per token is 9× smaller than a 70B model's.
+</Callout>
+
+### Fixed quality, choose the size
+
+Now the design question. You need a model of a certain quality, which in the language of lesson 4 means a target loss $L^*$. From the Chinchilla formula, a model of size $N$ reaches it after
+
+$$
+L^* = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}} \quad\Longrightarrow\quad D(N) = \left(\frac{B}{L^* - E - A / N^{\alpha}}\right)^{1/\beta}
+$$
+
+tokens. Two things fall out of this formula immediately.
+
+1. **There is a minimum size.** If $A/N^{\alpha} \ge L^* - E$, the denominator is zero or negative: no data budget reaches the target. That is the hatched wall in the visual. For Chinchilla's quality, the minimum is about 11B parameters.
+2. **Near the wall, D explodes.** As $A/N^{\alpha}$ approaches $L^* - E$, the denominator goes to zero and $D(N)$ goes to infinity. Shrinking the model is cheap at first and then suddenly very expensive.
+
+Substitute $D(N)$ into the lifetime bill, $C_{\text{life}}(N) = 6N\,D(N) + 2NT$, and choose the $N$ that minimizes it. With $T = 0$ you get Chinchilla back. With $T > 0$ the serving term rewards a smaller $N$, and the minimum slides toward the wall.
+
+The visual and the code below use the 2024 refit of the Chinchilla data from the last lesson (Besiroglu et al.), because its optimum agrees with the 20-tokens rule; the printed constants would shift every number but not the conclusion.
+
+```python
+E, A, B, alpha, beta = 1.8172, 482.01, 2085.43, 0.3478, 0.3658   # Besiroglu et al. 2024 refit
+
+def loss(N, D):
+    return E + A / N**alpha + B / D**beta
+
+def tokens_needed(N, target):
+    """Tokens for an N-parameter model to reach `target` loss (None if it never can)."""
+    room = target - E - A / N**alpha
+    return (B / room) ** (1 / beta) if room > 0 else None
+
+target = loss(70e9, 1.4e12)                        # Chinchilla's quality
+sizes = [10**(9 + i / 100) for i in range(301)]    # 1B .. 1T
+
+def cheapest(served):
+    plans = []
+    for N in sizes:
+        D = tokens_needed(N, target)
+        if D:
+            plans.append((6 * N * D + 2 * N * served, N, D))
+    return min(plans)
+
+for served in [0, 1e12, 1e13, 1e14]:
+    total, N, D = cheapest(served)
+    print(f"serve {served:7.0e} tokens -> N={N/1e9:5.1f}B  D={D/1e12:5.2f}T  "
+          f"D/N={D/N:5.0f}  total={total:.2e} FLOPs")
+```
+
+```text
+serve   0e+00 tokens -> N= 72.4B  D= 1.35T  D/N=   19  total=5.88e+23 FLOPs
+serve   1e+12 tokens -> N= 57.5B  D= 1.74T  D/N=   30  total=7.16e+23 FLOPs
+serve   1e+13 tokens -> N= 34.7B  D= 3.71T  D/N=  107  total=1.47e+24 FLOPs
+serve   1e+14 tokens -> N= 21.4B  D=12.68T  D/N=  593  total=5.90e+24 FLOPs
+```
+
+Read it row by row. With no serving, the answer is Chinchilla (72B, 19 tokens per parameter). With a trillion served tokens, barely different. At 10 trillion, half the size and five times the ratio. At 100 trillion, a 21B model trained on 12.7T tokens, about 600 tokens per parameter. The more a model will be used, the smaller and longer-trained it should be.
+
+<Callout type="intuition" title="Training is a fixed cost, serving is a variable cost">
+  This is the same arithmetic as any manufacturing decision. Spending more up front (a more expensive factory, a longer training run) is worth it if it lowers the cost of every unit you will ever make, and the more units you will make, the more it is worth.
+
+  Chinchilla optimized the factory alone. A product team optimizes the factory plus every unit, and for a model millions of people use, the units dominate.
+</Callout>
+
+### FLOPs understate the case
+
+Everything above counts FLOPs. Real serving is worse for big models than FLOPs suggest, for reasons you will spend Parts 2 to 7 on:
+
+- **Decode is memory-bound** (Module 05). Each generated token reads every weight, so its time is set by the bytes of the model, which also grow with $N$. A 21B model in 16-bit numbers is 42 GB of weights per step; a 72B model is 144 GB.
+- **Fitting on fewer GPUs.** 42 GB fits on one 80 GB GPU with room for KV cache; 144 GB needs at least two, plus the communication between them (Module 18).
+- **More room for the batch.** Memory not spent on weights is spent on KV cache, which means more concurrent requests per GPU and a lower cost per token (Module 25).
+- **Latency.** A smaller model produces each token faster, which users notice.
+
+So the true lifetime optimum leans even further toward small, long-trained models than the FLOP count says.
+
+<Callout type="pitfall" title="The formula is least reliable exactly where it now points">
+  The Chinchilla constants were fitted on runs near 20 tokens per parameter. Lifetime-optimal models live at hundreds or thousands. Sardana et al. (2023), who studied this trade-off in detail, trained 47 models out to 10,000 tokens per parameter and found that quality keeps improving at those extremes, but more slowly than a fit to ordinary ratios predicts. A fitted law extrapolated far from its data, again (lesson 3). The direction of the conclusion holds; the exact sizes should be checked with real runs.
+</Callout>
+
+## What the labs actually did
+
+**LLaMA-1** (Touvron et al., February 2023) made the argument explicitly. Its introduction notes that the Chinchilla recommendation for a 10B model is about 200B tokens, but that a 7B model was still improving after 1T, and states the goal as the best performance at a given *inference* budget rather than training budget. LLaMA-1 7B and 13B were trained on 1T tokens, 33B and 65B on 1.4T. The 7B ratio: 1 × 10¹² ÷ 7 × 10⁹ ≈ **143 tokens per parameter** (149 with its exact 6.7B parameters). Module 04 opens with what that model did to the field when its weights became available.
+
+**Llama 3** (2024) went much further. The 8B and 70B models were trained on more than 15T tokens. For the 8B: 15 × 10¹² ÷ 8 × 10⁹ ≈ **1,875 tokens per parameter**, 94 times Chinchilla's ratio. Meta's announcement put the Chinchilla-optimal amount for an 8B model at about 200B tokens, and reported that both models were still improving, roughly log-linearly, at 15T.
+
+| Model | Parameters | Training tokens | Tokens per parameter | Training FLOPs (6ND) |
+|---|---|---|---|---|
+| GPT-3 | 175B | 300B | 1.7 | 3.2 × 10²³ |
+| Chinchilla | 70B | 1.4T | 20 | 5.9 × 10²³ |
+| LLaMA-1 7B | 7B (6.7B) | 1T | 143 | 4.0 × 10²² |
+| Llama 3 8B | 8B | 15T | 1,875 | 7.2 × 10²³ |
+| Llama 3.1 405B | 405B | 15.6T | 39 | 3.8 × 10²⁵ |
+
+The bottom row is worth a moment. Even Meta's biggest model, trained "only" at 39 tokens per parameter, is past the Chinchilla ratio. The whole field moved right.
+
+<Callout type="real" title="Now read the paper">
+  **Sardana, Portes, Doubov and Frankle, "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws", 2023** (ICML 2024). [arXiv:2401.00448](https://arxiv.org/abs/2401.00448).
+
+  It is the paper that turns this lesson's argument into a formal optimization. **Read** the introduction and the section that adds inference FLOPs to the Chinchilla objective: its first figures are this lesson's visual, model size and tokens per parameter as a function of inference demand. **Skim** the part that converts FLOPs into dollars with different hardware utilization for training and inference, which is a preview of Module 25. **Read** the experiments on very long training (up to 10,000 tokens per parameter), because they show where the fitted law stops being trustworthy. **Skip** the appendix details of model configurations.
+
+  You will now recognise the lifetime objective $6ND + 2NT$, the leftward shift of the optimum with demand, and the caveat about extreme ratios. The LLaMA paper (Touvron et al., [arXiv:2302.13971](https://arxiv.org/abs/2302.13971)) Section 1 is a two-paragraph version of the same argument, and Module 04 reads it with you.
+</Callout>
+
+## The limits of scale
+
+Every lesson in this module has been about spending more: more parameters, more tokens, more compute, more serving. Each runs into something finite.
+
+### Running out of text
+
+Over-training makes the data problem worse, because a small model at a thousand tokens per parameter needs as much text as a much larger Chinchilla-optimal one. How much text is there?
+
+Villalobos et al. (Epoch AI, 2024; [arXiv:2211.04325](https://arxiv.org/abs/2211.04325)) estimate the stock of quality- and repetition-adjusted public human text at about **300 trillion tokens**, with a 90% range of 100T to 1,000T. If training sets keep growing at their historical rate, they project that stock being fully used **between 2026 and 2032**, sooner for heavily over-trained models.
+
+<Callout type="math" title="Worked: how close is the wall?">
+  Llama 3 used 15T tokens: 15 ÷ 300 = **5%** of the central estimate, in one training run.
+
+  A compute-optimal model at 20 tokens per parameter that used all 300T tokens would have $N$ = 300T ÷ 20 = 15T parameters, and cost 6 × 1.5 × 10¹³ × 3 × 10¹⁴ = 2.7 × 10²⁸ FLOPs, about 700 times Llama 3.1 405B's training compute. Over-trained at 1,875 tokens per parameter, the same 300T tokens are only enough for a 160B model.
+</Callout>
+
+Two escape routes, each with a catch:
+
+- **Repeat the data.** Muennighoff et al. (2023) found that training on the same data for up to about 4 epochs is nearly as good as fresh data, and that returns fall quickly after that. Repetition stretches the stock a few times, not indefinitely.
+- **Synthetic data.** Have models write training text for other models. This works well when the output can be checked (code that must pass tests, maths with verifiable answers) and is how much of today's instruction data is made. Done carelessly, it fails: Shumailov et al. (2024) showed that models trained recursively on their own generations lose the rare tails of the original distribution, a degradation called **model collapse**. Module B6 covers making and verifying synthetic data properly.
+
+### Running out of power
+
+Compute is not just money. Llama 3.1 405B was trained on up to 16,384 H100s. At the H100's 700 W rating that is 16,384 × 700 W ≈ **11.5 MW** for the GPUs alone, before the CPUs, network switches and cooling, which add a large fraction on top. A 100,000-GPU cluster would be 70 MW of GPUs: a city district's worth of electricity, on one site, all the time. Power supply, grid connections and datacenter construction now set the pace of the biggest training runs as much as chip supply does.
+
+### Running out of returns
+
+And then there is the exponent. Lesson 3: every 10× of compute lowers loss by about 11%. The next 10× costs ten times more than the last one did, in money, in power and in data. Progress along the scaling laws is reliable, but each step costs an order of magnitude more than the last.
+
+This is one reason the field has started spending compute somewhere else: **at inference time**. Letting a model "think" longer, writing out intermediate steps before answering, can buy quality without a bigger model or more training data. Module B1 covers chain of thought and test-time compute. For an inference engineer the consequence is direct: more of the world's compute is moving from training clusters to serving fleets, which is the machine this course teaches you to run.
+
+## Why an inference engineer cares
+
+This lesson is the bridge between the two halves of the course. The scaling laws say how quality is bought with training compute; the serving term says that for any model people actually use, **inference is where most of the compute goes**. That is why labs over-train small models, why Llama-3.1-8B rather than a 77B model is the default open model, and why this course spends so much time on squeezing tokens per second out of exactly such models.
+
+When you reach Module 25, you will price the serving term properly: dollars per million tokens from GPU-hours, batch size and bandwidth, not just FLOPs ([Cost per million tokens, from scratch](/learn/economics/cost-per-token/)). And Module 04 starts by reading the LLaMA release that this lesson ended on ([Open weights: what LLaMA changed](/learn/first-llm/open-weights-llama/)).
+
+<KeyNotes>
+  1. Lifetime compute is training plus serving: $C_{\text{life}} = 6ND + 2NT$, where $T$ counts every token processed in production, prompts included.
+  2. Serving overtakes training once $T = 3D$: a model has cost as much to run as to make after processing three times its training tokens.
+  3. For a fixed target quality, a smaller model needs more tokens, $D(N) = \left(B / (L^* - E - A/N^{\alpha})\right)^{1/\beta}$, and below a minimum size it can never reach the target.
+  4. Adding serving moves the cheapest model left of the Chinchilla point: smaller, and trained far longer. At 100T served tokens for Chinchilla-level quality, about 21B on 12.7T tokens, roughly 600 tokens per parameter.
+  5. LLaMA-1 7B trained on 1T tokens (≈143 tokens per parameter) and Llama 3 8B on 15T (≈1,875): over-trained on purpose for cheap inference.
+  6. FLOPs understate the advantage: smaller models also need fewer bytes per decode step, fewer GPUs and leave more memory for batching.
+  7. Fitted laws are least reliable at extreme tokens-per-parameter ratios, where gains continue but more slowly than predicted.
+  8. Limits: roughly 300T tokens of quality public text (fully used around 2026–2032 at current trends), synthetic data that risks model collapse if unchecked, multi-megawatt power for each frontier run, and a loss exponent that makes every 10× cost ten times more.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why did Meta train Llama 3 8B on 15T tokens, about 94× the Chinchilla-optimal amount for its size?', options: ['To minimize training compute', 'Because a smaller model trained much longer reaches high quality while costing far less per served token, and the model will serve enormous volumes', 'Because Chinchilla’s rule only applies to models above 70B', 'Because larger models cannot be trained on 15T tokens'], answer: 1, why: 'Chinchilla minimizes training compute only. Serving costs 2N per token for the model’s whole life, so heavy use favours a smaller model trained past its Chinchilla point.' },
+  { q: 'A model was trained on 2T tokens. After how many served tokens (prompt + output) has serving cost as many FLOPs as training? Answer in trillions.', numeric: true, answer: 6, tolerance: 0.15, unit: 'T tokens', why: 'Break-even when 2NT = 6ND, so T = 3D = 3 × 2T = 6T tokens, whatever the model size.' },
+  { q: 'Llama 3 8B: 8 billion parameters, 15 trillion training tokens. How many tokens per parameter?', numeric: true, answer: 1875, tolerance: 40, unit: 'tokens/param', why: '15e12 ÷ 8e9 = 1,875 tokens per parameter, against Chinchilla’s ~20.' },
+  { q: 'An 8B model serves 10 trillion tokens over its life. How many serving FLOPs is that, in units of 10²³?', numeric: true, answer: 1.6, tolerance: 0.05, unit: '× 10²³ FLOPs', why: '2N × T = 2 × 8e9 × 1e13 = 1.6e23 FLOPs, about a fifth of its 7.2e23 training compute.' },
+  { q: 'For a fixed target loss, what happens as you shrink the model toward its minimum size?', options: ['Training tokens needed fall to zero', 'Training tokens needed stay about 20 per parameter', 'The tokens needed blow up, because the capacity term A/N^α alone approaches the gap between target and floor', 'The irreducible loss E falls'], answer: 2, why: 'D(N) = (B / (L* − E − A/N^α))^(1/β). As A/N^α approaches L* − E the denominator goes to zero, so D goes to infinity: below the minimum size the target is unreachable.' },
+  { q: 'A training cluster has 16,384 GPUs rated at 700 W each. How many megawatts do the GPUs alone draw at full power?', numeric: true, answer: 11.5, tolerance: 0.3, unit: 'MW', why: '16,384 × 700 W = 11,468,800 W ≈ 11.5 MW, before CPUs, networking and cooling.' },
+]} />
