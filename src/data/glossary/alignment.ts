@@ -98,4 +98,19 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'β · log(π(y|x) / π_ref(y|x)): the reward a policy implicitly assigns an answer, by how much more likely it makes it than the reference model does. DPO trains this quantity with the Bradley-Terry loss.',
     lesson: 'alignment/dpo',
   },
+  hallucination: {
+    term: 'Hallucination',
+    def: 'Fluent, confident model output that is not true: an invented date, citation or detail. Not the same as ignorance; it is ignorance without saying so, encouraged by objectives that reward plausible text and by grading that rewards guessing.',
+    lesson: 'alignment/hallucination',
+  },
+  'hallucination-snowballing': {
+    term: 'Hallucination snowballing',
+    def: 'An early wrong token (often the verdict, before any working) commits the rest of the answer, because every later token is predicted given it. The model then writes a fluent justification of the error, which it often recognises as false when asked separately.',
+    lesson: 'alignment/hallucination',
+  },
+  abstention: {
+    term: 'Abstention',
+    def: 'Answering “I don’t know” instead of guessing. Under 0/1 grading it always scores worse than a guess; with a confidence target t and a wrong-answer penalty t/(1−t), it is the best choice whenever the model’s chance of being right is below t.',
+    lesson: 'alignment/hallucination',
+  },
 };

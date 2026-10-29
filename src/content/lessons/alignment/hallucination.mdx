@@ -1,0 +1,181 @@
+---
+title: 'Why models hallucinate'
+summary: 'A model trained the way this module describes will sometimes state false things fluently and confidently. Trace the causes to the training objectives themselves (plausibility over truth, early tokens that commit a whole answer, finetuning that teaches guessing, and grading that rewards it) and see which mitigations work, and why.'
+objectives:
+  - Define a hallucination and separate it from simple ignorance
+  - Explain how the pretraining objective, snowballing, SFT on unknown facts and 0/1 grading each push toward confident guessing
+  - Compute a path probability in a token tree and the expected score of answering versus abstaining
+  - Choose between retrieval, abstention training, verification and sampling changes for a given failure
+---
+import HallucinationTree from '@/components/viz/alignment/HallucinationTree.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Ask a well-trained assistant for the birthday of a moderately famous researcher and you may get a specific date, stated without hesitation, that is simply wrong. Ask again and you may get a different, equally confident date. Ask it to summarise a document and it may add a detail that is not in the document. Ask it whether a number is prime and it may say "yes" and then produce a tidy, convincing argument for something false.
+
+This is called a <Term t="hallucination">hallucination</Term>: fluent, confident output that is not true. It is not the same as ignorance. A model that says "I don't know" is ignorant and honest; a model that invents a date is ignorant and *not saying so*. It is also not a rare glitch to be patched. Everything in this module so far, pretraining on documents, imitating demonstrations, optimising for what people prefer, contains a pressure toward producing *an answer that looks right*. This lesson traces those pressures one by one, using the training objectives you now know, and then sorts the fixes by what they can and cannot do.
+
+## One question, two branches
+
+Watch a hallucination being made. The question has a definite answer, and the model has the knowledge to get it right.
+
+<Scrolly>
+  <HallucinationTree client:visible slot="stage" />
+
+  <Step title="1. A question the model is unsure about">
+    Is 10,403 prime? No: it is 101 × 103. The format asks for the verdict *first*, so the very first token must be Yes or No, before any working. The model is close to a coin flip: **55% Yes, 45% No**.
+  </Step>
+
+  <Step title="2. The first token is a commitment">
+    Sampling picks "Yes". One token, drawn with 55% probability, and the answer is already wrong. Generation is autoregressive (Module 03): **no later token can take it back**.
+  </Step>
+
+  <Step title="3. Everything after conditions on it">
+    Each later token is predicted *given "Yes"*. The likeliest continuation is a justification of primality, each step 84–92% likely. The path's probability is 0.55 × 0.92 × 0.84 × 0.88 = **0.374**. The error has snowballed into a confident argument.
+  </Step>
+
+  <Step title="4. The branch it did not take">
+    Had it sampled "No", the same model would have written **10,403 = 101 × 103**. Both branches are fluent. The model held the knowledge for the true one; an early, nearly even draw decided which came out.
+  </Step>
+
+  <Step title="5. Fluent is not the same as true">
+    Pretraining rewards plausible continuations, and a confident justification after "Yes" is very plausible text. **Nothing in the loss checks a claim against the world**, only against what documents tend to say next.
+  </Step>
+
+  <Step title="6. Asked separately, it knows">
+    In a fresh context, ask whether 10,403 is divisible by 101 and it says yes. Models often **recognise their own snowballed claims as false** when they are not committed to them. That is the opening for verification.
+  </Step>
+
+  <Step title="7. Guessing beats abstaining, if you score 0/1">
+    Under right-or-wrong grading, a guess with any chance of being right scores more than "I don't know". Make wrong answers cost $t/(1-t)$ and answering pays only when the model's confidence exceeds $t$. Drag the sliders.
+  </Step>
+
+  <Step title="8. What actually helps">
+    **Retrieval** supplies the facts, **abstention training** makes "I don't know" a real answer, **verification** catches errors, and **sampling choices** (reason first, compare several samples) change which branch you get. None of them adds knowledge.
+  </Step>
+</Scrolly>
+
+The probabilities in the tree are illustrative; the products are exact. The phenomenon is not illustrative: Zhang et al. (2023) built question sets of exactly this kind (primality, graph connectivity, and questions about U.S. senators) where ChatGPT and GPT-4 committed to a wrong answer and then justified it, and named it <Term t="hallucination-snowballing">hallucination snowballing</Term>.
+
+## Then derive it properly
+
+### Cause 1: the objective rewards plausibility
+
+Go back to the identity from lesson 3C.1. For a given context, pretraining loss is minimised by reproducing the mix of continuations in the data. If the data contains a fact many times, the model can learn it. If the data mentions a fact once, the model has seen it once, among billions of other tokens, and what it mostly learns is the *shape* of such facts: a birthday is a month and a day, a citation has authors and a year, a prime number's justification lists small divisors.
+
+Kalai et al. (2025) turned this into a clean statistical argument. Even with error-free training data, a model that matches the data's distribution must make some errors on facts that have no pattern to learn from, such as arbitrary birthdays. They bound the error rate for such facts from below by the fraction of them that appear exactly once in the training data: if 20% of birthday facts appear only once, a base model should be expected to get at least about 20% of birthday questions wrong. And a model that is wrong does not write "unknown"; the training data contains confident dates, so it writes a confident date.
+
+<Callout type="intuition" title="Why the model cannot just ‘know it doesn’t know’">
+  Pretraining never shows the model a document that says "the birthday of this person is not something I have seen". Every birthday in the data is stated confidently. So the most plausible continuation of "X was born on" is always a confident date, whether or not the model has a good guess. Expressing uncertainty is a behaviour, and behaviours have to be in the training data.
+</Callout>
+
+### Cause 2: early tokens commit the answer
+
+The tree in the visual is the general shape of every generation. The probability of a whole answer is the product of conditional token probabilities:
+
+$$
+P(y \mid x) = \prod_{t=1}^{T} p(y_t \mid x, y_{<t}) .
+$$
+
+Once $y_1$ is chosen, every later factor is conditioned on it. A model trained to produce *consistent* text will keep the rest consistent with $y_1$, true or not.
+
+<Callout type="math" title="Worked: the wrong path is the likeliest single answer">
+  With the visual's numbers, the false path has probability
+
+  $$
+  0.55 \times 0.92 \times 0.84 \times 0.88 = 0.374,
+  $$
+
+  and the true path
+
+  $$
+  0.45 \times 0.71 \times 0.66 \times 0.97 = 0.205 .
+  $$
+
+  The false argument is nearly twice as likely as the true one, even though the model contains everything needed for the true one. Greedy decoding (Module 03) takes 0.55 over 0.45 at the first step and produces the false answer **every time**. Lowering the temperature makes this worse, not better: it sharpens a distribution whose top choice is wrong.
+</Callout>
+
+Snowballing is also why the *format* of a prompt matters. "Answer yes or no, then explain" forces the commitment before any working. "Work through it, then give your answer" lets the model compute 101 × 103 before it has to commit. The verdict comes last, conditioned on the working rather than the other way round. Module B1's lesson on chain of thought builds on exactly this.
+
+### Cause 3: finetuning on facts the model does not know teaches guessing
+
+Supervised finetuning (lesson 3C.2) shows the model a demonstration and says: produce this. Suppose a demonstration answers a question whose answer the base model never learned. The only way to lower the loss on that example is to learn to produce *some* confident, specific answer to questions of that kind. The model is being taught that when it does not know, it should answer anyway.
+
+Gekhman et al. (2024) tested this directly. They finetuned models on closed-book question answering while controlling what fraction of the examples contained knowledge the base model did not already have. Those examples were learned much more slowly than familiar ones, and once they were learned, the model's tendency to hallucinate on *other* questions rose roughly linearly with how many there had been. Their conclusion matches LIMA's from the other direction: models get their knowledge in pretraining, and finetuning mostly teaches them how to use it. Try to inject facts through SFT and you also teach confident guessing.
+
+### Cause 4: grading that rewards guessing
+
+Preference tuning and evaluation add a final push. If people (or a reward model) rate a specific, confident answer above "I'm not sure", the policy learns to be specific and confident. And most benchmarks grade answers right or wrong, with "I don't know" scoring the same as a wrong answer: zero.
+
+Kalai et al. (2025) point out what that does. If a model is right with probability $p$, then under 0/1 grading:
+
+$$
+\mathbb{E}[\text{score} \mid \text{answer}] = p, \qquad \mathbb{E}[\text{score} \mid \text{abstain}] = 0 .
+$$
+
+For any $p > 0$, guessing wins. A model that guesses will beat an otherwise identical model that honestly abstains, on every leaderboard. Their proposed fix is to state a confidence target $t$ in the instructions and score accordingly: $+1$ for a right answer, ${}0$ for "I don't know", and $-t/(1-t)$ for a wrong one. Then
+
+$$
+\mathbb{E}[\text{score} \mid \text{answer}] = p - (1 - p)\,\frac{t}{1 - t},
+$$
+
+which is positive exactly when $p > t$.
+
+<Callout type="math" title="Worked: when to answer">
+  A model is 30% sure ($p = 0.30$). Under 0/1 grading, answering scores 0.30 in expectation against 0 for abstaining: guess.
+
+  With $t = 0.75$ the penalty is 0.75 / 0.25 = 3:
+
+  $$
+  0.30 - 0.70 \times 3 = -1.80 ,
+  $$
+
+  so abstaining (score 0) is far better. At exactly $p = t$ the two tie: 0.75 − 0.25 × 3 = 0. The penalties for the common targets are $t = 0.5 \to 1$, $t = 0.75 \to 3$, $t = 0.9 \to 9$.
+</Callout>
+
+There is evidence that post-training reshapes how a model's stated confidence relates to its accuracy. The GPT-4 technical report shows a plot in which the pretrained model's probabilities on multiple-choice questions closely track how often it is right, and the post-trained model's track it noticeably less well. Base models are, in this narrow sense, more honest about their uncertainty than the assistants built from them.
+
+### What actually helps
+
+No mitigation adds knowledge to the weights. Each one makes the model guess less often, or catches it when it does. Pick by failure.
+
+| Failure | Mitigation | Why it works | Where in the course |
+|---|---|---|---|
+| The fact is not in the model, or is stale | **Retrieval**: put the source text in the prompt | the answer becomes a closed-domain task: copy from the context | Module B3 |
+| The model answers questions it cannot answer | <Term t="abstention">**Abstention training**</Term>: include "I don't know" responses in SFT and preference data for questions the model gets wrong; score abstention above errors | makes uncertainty a learned behaviour with a reward | Modules B5, B6 |
+| A plausible claim slips through | **Verification**: check claims in a separate pass, with tools (a calculator, code, search) or against sources | the model is better at checking an isolated claim than at not making it | Modules B2, B4 |
+| The answer is committed before the working | **Prompt and sampling**: reason first, verdict last; sample several answers and treat disagreement as uncertainty | changes which branch of the tree you get, and measures how unsure the model was | Module B1 |
+
+Two notes on the last row. Lowering temperature reduces random variation but does **not** fix a model whose *most likely* answer is wrong, as the worked example showed. And sampling several answers costs several times the decode work, the same trade as best-of-N in lesson 3C.3. When answers disagree across samples, that disagreement is one of the cheapest uncertainty signals available.
+
+Retrieval deserves its own warning. It changes an open-domain question into a closed-domain one, and InstructGPT already showed closed-domain hallucination is not zero: it made up information not in the input about 21% of the time, against GPT-3's 41% (lesson 3C.4). Grounding helps a great deal; it does not end the problem, which is why Module B3 also measures it.
+
+<Callout type="pitfall" title="Finetuning to ‘add knowledge’">
+  A common request: "finetune the model on our internal documents so it knows our product". If the facts are new to the model, Gekhman et al.'s result predicts the model will learn them slowly, and become more willing to answer confidently about things it does not know. For facts, use retrieval; finetune for format, tone and task behaviour. Module B3 opens with exactly this rule.
+</Callout>
+
+<Callout type="real" title="Hallucination, measured">
+  For an inference engineer, hallucination becomes a number you are responsible for. When you change a model, a quantization level (Module 11) or a sampling default, the hallucination rate can move even if every benchmark you track stays flat. Keep a small evaluation set of questions with known answers, including some the model should decline, and score it with an abstention-aware rule like the one above. The binary-grading trap applies to your own dashboards too.
+</Callout>
+
+<Callout type="mentor" title="Read further">
+  Three readable papers cover this lesson: **How Language Model Hallucinations Can Snowball** (Zhang et al., 2023, [arXiv 2305.13534](https://arxiv.org/abs/2305.13534)) for cause 2; **Does Fine-Tuning LLMs on New Knowledge Encourage Hallucinations?** (Gekhman et al., 2024, [arXiv 2405.05904](https://arxiv.org/abs/2405.05904)) for cause 3; and **Why Language Models Hallucinate** (Kalai et al., 2025, [arXiv 2509.04664](https://arxiv.org/abs/2509.04664)) for causes 1 and 4. In each, read the introduction and the main results figure first; the theory sections can wait.
+</Callout>
+
+<KeyNotes>
+  1. A **hallucination** is fluent, confident output that is false. Ignorance plus honesty says "I don't know"; ignorance plus the training objectives in this module produces a confident guess.
+  2. **Pretraining rewards plausibility.** For arbitrary facts seen once, a base model's error rate is bounded below by roughly the fraction seen once (Kalai et al., 2025), and its errors look like confident facts.
+  3. **Snowballing:** an answer's probability is a product of conditional token probabilities, so an early wrong token commits the rest. Worked: 0.55 × 0.92 × 0.84 × 0.88 = 0.374 for the false path vs 0.205 for the true one; greedy picks the false one every time.
+  4. Models often **recognise their own errors when asked separately** (Zhang et al. report 67% for ChatGPT and 87% for GPT-4), which is why reasoning first and verifying separately help.
+  5. **SFT on unknown facts teaches guessing:** such examples are learned slowly and raise hallucination roughly linearly with their share (Gekhman et al., 2024). Use retrieval for facts, finetuning for behaviour.
+  6. **0/1 grading rewards guessing:** answering scores $p$, abstaining 0. With a confidence target $t$ and a wrong-answer penalty $t/(1-t)$, answering pays only when $p > t$ (p = 0.3, t = 0.75 → −1.8).
+  7. **Mitigations** do not add knowledge: retrieval, abstention training, verification, and prompting or sampling changes. Lower temperature does not fix a wrong top choice.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A model’s first token is wrong with probability 0.6, and given that token the next three tokens of a fluent justification have conditional probabilities 0.9, 0.8 and 0.9. What is the probability of that whole wrong path?', numeric: true, answer: 0.389, tolerance: 0.01, why: '0.6 × 0.9 × 0.8 × 0.9 = 0.3888. Every factor after the first is conditioned on the wrong token, so the error carries through.' },
+  { q: 'Under 0/1 grading, a model that is 20% sure of its answer chooses between answering and saying “I don’t know”. What is the expected score of answering?', numeric: true, answer: 0.2, tolerance: 0.005, why: 'Right with probability 0.2 for 1 point, wrong with 0.8 for 0 points: 0.2 × 1 + 0.8 × 0 = 0.2, which beats 0 for abstaining. Guessing always wins under 0/1 grading.' },
+  { q: 'With confidence target t = 0.9, wrong answers cost t/(1 − t). A model is 80% sure. What is its expected score if it answers?', numeric: true, answer: -1, tolerance: 0.02, why: 'Penalty = 0.9 / 0.1 = 9. Expected score = 0.8 − 0.2 × 9 = 0.8 − 1.8 = −1.0. It should abstain, since p = 0.8 is below t = 0.9.' },
+  { q: 'The model’s top first token is wrong (0.55 vs 0.45 for the right one). What does lowering the temperature toward 0 do?', options: ['Fixes it, because low temperature is more accurate', 'Makes the wrong answer more likely, because it sharpens the distribution around its top choice', 'Has no effect on the first token', 'Makes the model abstain'], answer: 1, why: 'Temperature below 1 sharpens the distribution, and at 0 decoding is greedy: it picks the 0.55 token every time. Temperature cannot correct a wrong ranking; reasoning first or verifying can.' },
+  { q: 'Why does supervised finetuning on facts the base model never learned tend to increase hallucination?', options: ['It overwrites the model’s vocabulary', 'To lower the loss on those examples, the model learns to produce confident specific answers to questions it cannot actually answer, and generalises that habit', 'It makes the model forget the chat template', 'It only happens with LoRA'], answer: 1, why: 'Gekhman et al. (2024) found such examples are learned slowly and, once learned, raise hallucination roughly in proportion to their share. The model learns to guess, not the facts.' },
+  { q: 'A support bot must answer from a product manual that changes weekly. Which mitigation fits best?', options: ['Finetune on each new manual', 'Retrieval: put the relevant manual sections in the prompt and instruct the model to answer only from them', 'Lower the temperature to 0', 'Use a larger base model'], answer: 1, why: 'The facts are new and change often, so they belong in the context, not the weights. Retrieval turns the task into a closed-domain one, which still needs measuring for unsupported claims.' },
+]} />
