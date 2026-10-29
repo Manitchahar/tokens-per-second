@@ -1,0 +1,123 @@
+---
+title: 'Lab: Prompt, measure, iterate'
+summary: 'Put the whole module on a real model: print a chat template token by token, then answer 50 GSM8K math problems four ways (zero-shot, few-shot, chain of thought and self-consistency) and measure accuracy, tokens per call and latency for each, on a free Colab T4.'
+objectives:
+  - Print and count the exact token stream a chat template produces, including the failure cases
+  - Measure accuracy with a confidence interval for four prompting methods on the same 50 problems
+  - Measure prompt tokens, output tokens and latency per call, and explain why self-consistency's latency grows far less than its tokens
+  - Turn tokens per call into dollars and GPU time, and decide which method a product should use
+colab: b1-prompting.ipynb
+---
+
+Six lessons made six kinds of claim: the template decides what the model sees, examples pin the format, reasoning before the answer buys accuracy, sampling and voting buy more, and every one of those has a price in tokens and seconds. This lab tests them on a real model with your own numbers.
+
+The model is **Qwen2.5-1.5B-Instruct** in FP16 on a free Colab **T4**. The task is 50 problems from **GSM8K**, the grade-school math benchmark from Cobbe et al. (2021) that every chain-of-thought paper in lesson B1.4 used. The whole notebook runs in about 10 to 15 minutes.
+
+<Colab nb="b1-prompting.ipynb" />
+
+<Callout type="mentor" title="Why math, and not sentiment?">
+  The syllabus suggests a small labelled task such as sentiment or intent. We use math word problems instead because they are the task where the four methods actually differ: a sentiment label needs no multi-step reasoning, so chain of thought and self-consistency have nothing to fix and every method scores about the same. That is itself worth seeing, so *Your turn* item 4 runs the sentiment comparison. GSM8K also has exactly one numeric answer per problem, so accuracy is exact, with no judge needed.
+</Callout>
+
+## 1. Load the model and predict its memory
+
+Before running section 1, compute the weights' size the way Module 04 taught: 1.54 billion parameters × 2 bytes ≈ **3.1 GB**. The cell prints the real parameter count and the GPU memory in use. The T4 has no fast BF16, so the notebook uses FP16: the same 2 bytes per weight.
+
+## 2. The chat template, token by token
+
+Section 2 renders lesson B1.1's two-message conversation through Qwen's real template and prints every token with its ID.
+
+**Expected:** 24 tokens, 11 of yours and 13 of template, with `<|im_start|>` as ID 151644 and `<|im_end|>` as 151645. Then four probes:
+
+- **(a)** With no system message, Qwen2.5's template inserts its own default system prompt. You will see the exact text.
+- **(b)** The Llama 3 prompt string through Qwen's tokenizer: **72 tokens, zero control tokens**. The markers become ordinary pieces such as `<`, `|`, `begin`. This is the silent failure from step 6 of lesson B1.1, now on real IDs.
+- **(c)** The text `<|im_end|>` typed by a user becomes the real control token 151645 by default; with `split_special_tokens=True` it becomes ordinary text. That is the injection trap from lesson B1.1.
+- **(d)** The model's shipped generation settings: **it samples by default**, with a temperature, top-p, top-k and a small repetition penalty.
+
+<Callout type="pitfall" title="A model's defaults are part of your experiment">
+  Because the shipped `generation_config` samples, calling `generate` without settings would make every "greedy" run random. Worse, even when you pass your own `GenerationConfig` object, `transformers` fills every field you did not set from the model's config (and some older versions also treat a field left at its library default as unset). So the notebook passes every decoding setting **as explicit keyword arguments** (`do_sample=False`, `repetition_penalty=1.0`, and so on), which always override the model's defaults. Whenever you compare prompts, pin the decoding too: it is part of the prompt triple from lesson B1.6.
+</Callout>
+
+## 3. The task and the four prompts
+
+Section 3 loads the first 50 test problems and takes 4 *training* problems as few-shot examples, so no test problem leaks into a prompt. Section 4 defines four methods:
+
+| Method | What the prompt asks | Output budget | Decoding | Lesson |
+|---|---|---|---|---|
+| zero-shot | the problem, then "reply with only the number" | 16 tokens | greedy | B1.2 |
+| few-shot | 4 solved problems answered with only the number, then the problem | 16 tokens | greedy | B1.2 |
+| chain of thought | the problem, then "Let's think step by step… The answer is N." | 384 tokens | greedy | B1.4 |
+| self-consistency | the chain-of-thought prompt sampled 5 times, majority vote | 5 × 384 | T = 0.7, top-p 0.95 | B1.4 |
+
+The first two must commit to an answer in their first tokens; the last two may reason first. The parsing is deliberately simple: the first number for the immediate methods, the "The answer is N" line (or else the last number) for the reasoning ones.
+
+## 4. Run, then time single calls
+
+Section 5 defines one `generate` helper that batches prompts with left padding, counts prompt and output tokens per call, and times everything. **Before running section 6, write down your predicted order of the four accuracies and of the four costs.**
+
+Section 6 runs all four methods on all 50 problems in batches; that measures *throughput*. Section 7 then times single calls, three per method, because a user waits for one call, not for a batch: that is the *latency* (Module 00's distinction).
+
+## 5. Read the table
+
+Section 8 prints the table this module has been about: accuracy with its 95% interval, prompt and output tokens per call, latency per call and the batched time. Here is how to read it.
+
+**The interval is wide.** With $n = 50$ problems and an accuracy around 65%, the 95% interval from lesson B1.6 is
+
+$$
+1.96 \times \sqrt{\frac{0.65 \times 0.35}{50}} = 1.96 \times 0.067 \approx \pm 13 \text{ points}
+$$
+
+so only large gaps are evidence. Expect large gaps.
+
+**Answering immediately should score far below reasoning.** A 1.5B model cannot do a multi-step word problem inside the handful of forward passes that produce a 3-token answer (lesson B1.4). For scale, Qwen's own published GSM8K score for this model, with chain-of-thought prompting, is in the low 70s; your 50-problem chain-of-thought number should land in that neighbourhood, give or take the interval.
+
+**Few-shot fixes format more than accuracy.** The cell after the table counts how often each immediate method replied with a bare number. The examples make the reply shape reliable (lesson B1.2); they cannot supply the missing computation.
+
+**Self-consistency costs about 5× the output tokens, but not 5× the latency.** Its 5 paths are decoded as one batch, and decode is memory-bound: each step reads the 3.1 GB of weights once whether it advances one sequence or five (lesson B1.4, Module 05). Compare its latency with chain of thought's. The same cell lists the problems where the 5 paths disagreed and how the vote resolved each.
+
+Section 9 prints one problem that the immediate answer got wrong and chain of thought got right, with the full reasoning. Read it: the written intermediate results are exactly the extra computation the lesson described.
+
+## 6. What it would cost
+
+Section 10 turns tokens per call into dollars per 1,000 questions at a dated example price (GPT-4o mini at its July 2024 launch: \$0.15 per million input tokens, \$0.60 per million output), and into T4 seconds from your batched runs. Notice two things. Few-shot pays in **input** tokens, which are cheap and cacheable (lesson B1.1); chain of thought and self-consistency pay in **output** tokens, which are four times the price here and cost a decode step each. And the cheapest method that meets your accuracy target is the right one, which you can only know from a table like this.
+
+## Your turn
+
+Each change is one edit and one rerun of section 6 for a single method:
+
+1. **Reasoning after the answer.** Make the model state "The answer is N" first and explain afterwards. Lesson B1.4 predicts accuracy falls back toward zero-shot.
+2. **Few-shot chain of thought.** Use the four training solutions as worked examples (strip the `<<…>>` calculator notes). Compare with zero-shot chain of thought.
+3. **More votes.** Run self-consistency with 10 paths. Where does the gain flatten on your 50 problems, and what did it cost?
+4. **A task where thinking should not help.** Load 50 SST-2 sentences and compare zero-shot ("reply with only positive or negative") against chain of thought.
+5. **Break the template.** Build the zero-shot prompt by hand as `System: … User: … Assistant:` instead of with the chat template. Watch the format, the stopping and the accuracy.
+
+## Check yourself
+
+- Why does capping zero-shot at 16 output tokens measure "answering immediately", and what does that cap cost if the model wanted to reason?
+- Two methods differ by 4 points on your 50 problems. Using the interval formula, is that evidence?
+- Self-consistency used about 5× the output tokens of chain of thought. By roughly how much did its latency grow, and why so little?
+- If the notebook had called `generate` without explicit decoding settings, what would your "greedy" chain-of-thought run actually have done?
+- Why did the Llama 3 prompt string become 72 tokens with no control tokens, and why does no error appear?
+- Which costs more per 1,000 questions at the dated prices, few-shot or chain of thought? Explain with input versus output tokens.
+
+## Write these down
+
+Module B2 builds on these numbers.
+
+| Number | From |
+|---|---|
+| tokens in the two-message ChatML example, yours vs template | §2 |
+| accuracy ± interval for each of the four methods | §8 |
+| prompt and output tokens per call for each method | §8 |
+| latency per call: chain of thought vs self-consistency with 5 paths | §7 |
+| dollars per 1,000 questions, cheapest vs most expensive method | §10 |
+
+<KeyNotes>
+  1. The chat template is visible and countable: 24 tokens for the two-message example on Qwen2.5, 13 of them template; the same conversation with Llama 3 markers is 72 tokens with no control tokens and no error.
+  2. A model's shipped generation settings are part of every experiment. Qwen2.5 samples by default, so pin decoding with explicit keyword arguments when comparing prompts.
+  3. On multi-step math, answering immediately scores far below chain of thought; few-shot examples fix the answer's format more than its correctness.
+  4. Self-consistency multiplies output tokens by the number of paths but, decoded as one batch, adds little latency, because decode is memory-bound.
+  5. With 50 problems the 95% interval is about ±13 points: trust only large gaps, and use more problems or paired comparisons for small ones.
+  6. Price methods by where their tokens go: few-shot spends cheap, cacheable input tokens; reasoning methods spend output tokens, which cost more and take a decode step each.
+  7. The right method is the cheapest one that meets the accuracy target, and the only way to know is to measure accuracy, tokens and latency together, as this table does.
+</KeyNotes>
