@@ -1,0 +1,115 @@
+---
+title: 'Lab: Train a tiny reward model'
+summary: 'Build stage two of the InstructGPT recipe on a free Colab T4: train a small reward model on real human preference pairs with the Bradley-Terry loss, measure it against a length-only baseline, and use it to pick the best of four answers from Qwen2.5-0.5B-Instruct, timing what that costs.'
+objectives:
+  - Load a real preference dataset and confirm that each pair differs only in the final reply
+  - Train a reward model with the Bradley-Terry loss using FP16 mixed precision on a T4
+  - Measure pairwise accuracy and compare it with a “longer reply wins” baseline
+  - Run best-of-N reranking with a chat model and explain why the picked reward rises by construction
+  - Time best-of-4 against a single answer and explain the result with batched decoding
+colab: 3c-reward-model.ipynb
+---
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Lessons 3C.3 to 3C.5 were about a single idea: turn people's choices between two answers into a training signal. This lab makes it real. In about twenty minutes on the free Colab T4 you will train a reward model on human preference data, find out how good it is (and how good it *can* be), and then put it to work choosing between answers from a real chat model.
+
+None of it needs a big GPU. The reward model is `distilroberta-base`, 82 million parameters. The chat model is `Qwen2.5-0.5B-Instruct`, about 1 GB in FP16. What you will learn is not how to build a state-of-the-art reward model; it is what every number in lessons 3C.3 and 3C.4 looks like when you produce it yourself.
+
+<Colab nb="3c-reward-model.ipynb" />
+
+## Before you start
+
+You need nothing but a Google account. The notebook uses only `torch`, `transformers` and `datasets`, which Colab preinstalls, and downloads two models and one dataset from the Hugging Face Hub. Choose **Runtime → Change runtime type → T4 GPU**, then run the cells in order.
+
+A note on precision, because it bites everyone once. The T4 has FP16 tensor cores and no BF16 support, so the training loop runs the forward pass under `torch.autocast(dtype=torch.float16)` with a **gradient scaler**. FP16 has a narrow exponent range (Module 01), and small gradients can underflow to zero; the scaler multiplies the loss up before the backward pass and divides the gradients back down before the optimiser step. You will see `scaler.scale(loss).backward()` and `scaler.step(opt)` in the code: that is all it is.
+
+## Task 1 · Look at the data
+
+Load the `helpful-base` subset of Anthropic's HH-RLHF and print one pair.
+
+**Expected:** two transcripts that are identical, character for character, up to the final `Assistant:` turn, and then differ. The notebook checks this for you and prints `True`.
+
+**How to read it:** this is exactly the $(x, y_w, y_l)$ triple from lesson 3C.3. The conversation is the prompt $x$, and the two final replies are $y_w$ and $y_l$. Read five or six pairs yourself. You will agree with some choices, find others baffling, and see pairs where both replies are poor. That noise is not a flaw in this particular dataset; it is what human preference data looks like, and it sets a ceiling on everything that follows.
+
+## Task 2 · Check the loss by hand
+
+Before training anything, the notebook evaluates the Bradley-Terry loss on the worked example from lesson 3C.3.
+
+**Expected:** P(chosen) = σ(0.8) = 0.690, loss 0.371 nats, loss with the order reversed 1.171 nats, and the loss unchanged when both scores are shifted by 5.
+
+**How to read it:** the last line is shift invariance. It is why you will see raw reward scores of any size later, positive or negative, and why only their differences mean anything.
+
+## Task 3 · Measure before you train
+
+Compute pairwise accuracy with the untrained model, and the accuracy of a baseline with no model at all: *the longer reply wins*.
+
+**Expected:** the untrained model near **50%**, a coin flip, because its one-number head is random. The length baseline somewhat above 50%: on this data the chosen reply is longer more often than not.
+
+**How to read it:** the length baseline is the bar your reward model must clear to show it learned anything beyond length. Keep both numbers.
+
+## Task 4 · Train
+
+Two epochs over 4,000 pairs, 16 pairs per step, AdamW at a learning rate of 2e-5 with a short warm-up and linear decay. Each step scores the 16 chosen and 16 rejected replies in **one** forward pass of 32 sequences, then applies `-logsigmoid(r_w - r_l)`.
+
+**Expected:** a loss that starts at about **0.693** (ln 2, a coin flip) and falls, a batch accuracy that climbs into the 60s, and two to four minutes of training on a T4.
+
+**Watch out for:** the truncation side. The notebook sets `truncation_side = "left"` so that long conversations lose their *beginning*, not their end. With the default right-side truncation, a long conversation is cut before the final reply, the chosen and rejected texts become identical, and the model cannot learn from that pair at all. If your accuracy sits at 50–52%, check this first.
+
+## Task 5 · Measure after training
+
+Recompute pairwise accuracy on 1,000 held-out pairs and look at how confident the model is.
+
+**Expected:** held-out accuracy clearly above 50% and above the length baseline, roughly in the high 50s to mid 60s for this small model and data. A score gap distribution centred above zero, with only a minority of pairs where the model is more than 90% sure.
+
+**How to read it:** do not be disappointed by 60-something percent. Lesson 3C.3 explained the ceiling: InstructGPT's labelers agreed with each other only about three times in four, and HH-RLHF's labels are at least as noisy. A reward model cannot predict a coin-flip choice. The interesting question is *where* it is confident, and whether it is right there.
+
+Then the notebook correlates each reply's score with its length.
+
+**Expected:** a positive correlation. How large depends on your run.
+
+**How to read it:** whatever the model learned, part of it is "longer is better". That is harmless when you only measure accuracy, and it is exactly what an optimiser will exploit, as you will see in Task 6.
+
+## Task 6 · Best-of-4 with a real chat model
+
+For eight everyday prompts, generate four answers each from Qwen2.5-0.5B-Instruct (temperature 0.9, top-p 0.95) and score every answer with your reward model, written in the HH format it was trained on. Print the best and worst for a few prompts.
+
+**Expected:** the reward model's ranking agrees with yours on some prompts and not others. The mean reward of the picked answers is higher than the mean over all answers, and the picked answers tend to be longer.
+
+**How to read it:** the reward of the picked answer is higher **by construction**: you took a maximum over four noisy scores. That says nothing on its own about whether the answers are better. Only reading them, or an independent judge (Module B2), can tell you. If the picks are also much longer, your reward model's length bias is doing part of the choosing. This is reward hacking in miniature: the gentlest possible optimisation against a learned reward, already pulling toward what the reward model over-rates.
+
+## Task 7 · What best-of-N costs
+
+Time one 128-token answer, then four 128-token answers in a single batched call, then the reward-model scoring.
+
+**Expected:** four answers take well **under four times** as long as one, often only 1.1–1.5×, and scoring adds tens of milliseconds.
+
+**How to read it:** each decode step must read all of the model's weights from memory (Module 02's two speed limits), and four sequences in one batch share that read. At small N, best-of-N buys four candidates for a fraction more time. At large N the batch stops being free, the memory for the extra sequences adds up (Module 05), and the selection effect from Task 6 grows. Batching, the subject of Part 3, is why the first of those statements is true.
+
+## Check yourself
+
+1. Why must the reward model's tokenizer truncate from the left for this dataset?
+2. Your model reaches 62% held-out pairwise accuracy. Give two reasons the ceiling on HH-RLHF is far below 100%.
+3. The mean best-of-4 reward is higher than the mean reward of a random answer. Why is that not, by itself, evidence that best-of-4 answers are better?
+4. Four answers took about 1.3× the time of one. Which resource limits a decode step, and why do four sequences in one batch share it?
+5. You subtract 0.002 × (answer length in characters) from every score before picking. Which failure from lesson 3C.4 are you guarding against?
+
+<Callout type="mentor" title="Where this goes next">
+  You now have the second stage of the InstructGPT recipe in your hands. The third stage, RL against this reward model, is out of reach of a T4 for anything but toy models, and lesson 3C.4 explained why: four models in memory and a generation loop in every iteration. DPO, from lesson 3C.5, needs only the policy and a frozen reference, and the same pairs you used here. Module B5 finetunes with LoRA on one GPU, and a DPO run on a 0.5B model with LoRA is a natural follow-up once you have done it.
+</Callout>
+
+<KeyNotes>
+  1. A preference pair is one conversation with two final replies; HH-RLHF's `chosen` and `rejected` transcripts are identical up to the last `Assistant:` turn.
+  2. A reward model is a transformer with a one-number head trained with `-logsigmoid(r_w - r_l)`. Score both replies in one batched forward pass. An encoder reads its first token; a decoder reads its last.
+  3. Truncate conversations from the **left** so the replies being compared survive; otherwise many pairs become identical and teach nothing.
+  4. On a T4, train with FP16 autocast and a gradient scaler; FP16's narrow range makes small gradients underflow without one.
+  5. Always compare pairwise accuracy with a trivial baseline such as “longer reply wins”. Human disagreement caps accuracy well below 100%, so the high 50s to mid 60s is a sensible result for a small model.
+  6. Best-of-N raises the picked reward by construction and inherits the reward model's biases, length first among them. Judge the picks independently.
+  7. Batched decoding makes small-N best-of-N cheap: four answers cost far less than four times one, because each decode step reads the weights once for the whole batch.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Your training loop prints a loss of 0.693 for the first 50 steps and it never moves. What does that value mean?', options: ['The model is perfectly trained', 'It is ln 2: the model is a coin flip, giving chosen and rejected the same score, so it is learning nothing', 'The learning rate is too high', 'It is the length baseline'], answer: 1, why: '−log σ(0) = ln 2 = 0.693. Identical scores for both replies, for example because truncation removed the part that differs, leave the gap at 0 and the gradient carries no information.' },
+  { q: 'A reward model gets 610 of 1,000 held-out pairs right. What is its pairwise accuracy, in percent?', numeric: true, answer: 61, tolerance: 0.5, unit: '%', why: '610 ÷ 1,000 = 0.61 = 61%. Compare it with 50% (chance) and with the length baseline on the same pairs before calling it good.' },
+  { q: 'One 128-token answer takes 2.0 s and a batch of four takes 2.6 s. Scoring the four takes 0.06 s. How many times the cost of a single answer is best-of-4?', numeric: true, answer: 1.33, tolerance: 0.03, unit: '×', why: '(2.6 + 0.06) ÷ 2.0 = 1.33×. Four candidates for a third more time, because each decode step reads the weights once for the whole batch.' },
+  { q: 'Why is a higher mean reward for best-of-4 picks not, on its own, evidence that the picks are better answers?', options: ['Because rewards are shift-invariant', 'Because taking the maximum of four noisy scores raises the score by construction, including through whatever the reward model over-rates, such as length', 'Because the chat model was not finetuned', 'Because four is too small a sample'], answer: 1, why: 'Selection on a noisy, biased measure always raises the measure. Whether real quality rose has to be checked independently, by reading the answers or with a separate judge.' },
+]} />
