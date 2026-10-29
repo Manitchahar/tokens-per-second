@@ -39,4 +39,29 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Splitting one job across several model calls, each with a small focused prompt, such as a router that outputs a label and a specialised prompt per label. End-to-end accuracy is the product of the stages; it costs extra round trips but sends only the context each request needs.',
     lesson: 'prompting/writing-prompts',
   },
+  'test-time-compute': {
+    term: 'Test-time compute',
+    def: 'Computation spent at inference to get a better answer: writing reasoning tokens, sampling several answers and voting, or searching with a verifier. Paid in output tokens, so in decode time and money.',
+    lesson: 'prompting/chain-of-thought',
+  },
+  'chain-of-thought': {
+    term: 'Chain of thought (CoT)',
+    def: 'Having the model write its intermediate reasoning before the final answer, via worked examples (few-shot) or an instruction such as "Let\u2019s think step by step" (zero-shot). Each written step is another forward pass the answer can build on.',
+    lesson: 'prompting/chain-of-thought',
+  },
+  'self-consistency': {
+    term: 'Self-consistency',
+    def: 'Sample several chain-of-thought answers at a temperature above zero and return the most common final answer. Right paths tend to agree while wrong ones scatter; it costs N times the output tokens but, batched, little extra latency.',
+    lesson: 'prompting/chain-of-thought',
+  },
+  verifier: {
+    term: 'Verifier',
+    def: 'A model or program that judges whether a candidate answer is correct, used to pick the best of N samples. Programmatic checks (unit tests, recomputation) cannot be fooled; learned verifiers can, and large N finds their mistakes.',
+    lesson: 'prompting/chain-of-thought',
+  },
+  'reasoning-model': {
+    term: 'Reasoning model',
+    def: 'A model trained (typically with reinforcement learning on verifiable answers) to write a long chain of thought before answering, such as OpenAI o1 or DeepSeek-R1. Often thousands of output tokens per answer; prompt it zero-shot and set a thinking budget.',
+    lesson: 'prompting/chain-of-thought',
+  },
 };

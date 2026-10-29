@@ -1,0 +1,190 @@
+---
+title: 'Chain of thought & test-time compute'
+summary: 'A model that must answer in its first token gets one forward pass of thinking. Let it write its reasoning first and it gets one pass per token. Then spend more: sample many reasoning paths and vote, or let a verifier choose. Every extra token buys accuracy and costs decode time, and this lesson prices both.'
+objectives:
+  - Explain why writing intermediate steps gives a model more computation before it commits to an answer
+  - Use few-shot and zero-shot chain-of-thought prompts, with the reasoning placed before the answer
+  - Compute when majority voting helps and when it hurts, and how best-of-N with a verifier differs
+  - Price chain of thought, self-consistency and reasoning models in output tokens and latency
+---
+import SelfConsistency from '@/components/viz/prompting/SelfConsistency.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Ask a capable model: "A shop sells 3 pens for \$2. How much do 12 pens cost?" and demand just the number. Surprisingly often it says \$6. Twelve divided by two. It is not that the model cannot do the arithmetic; ask it to explain itself and it gets \$8 nearly every time.
+
+The difference is not knowledge. It is **computation**. Module 03 showed you that a transformer produces each token with one forward pass of fixed depth: 32 layers for Llama-3.1-8B, no more, no less. When you demand the answer immediately, the model has to work the whole problem out inside the forward pass that produces the answer's first token. When it writes "12 ÷ 3 = 4 groups" first, each of those tokens is another forward pass, and each later pass can read what the earlier ones wrote. The written steps are a scratchpad, and the scratchpad is extra computation.
+
+That idea, **spending more computation at inference time to get a better answer**, has a name: <Term t="test-time-compute">test-time compute</Term>. It starts with one sentence in a prompt and ends with models that think for thousands of tokens. Every step of the way it is paid for in output tokens, which are the slow, expensive kind. This lesson builds it up and prices it.
+
+<Scrolly>
+  <SelfConsistency client:visible slot="stage" />
+
+  <Step title="1. Answer immediately, and miss">
+    The direct prompt: question, then "A:". The model commits to its answer within its first tokens, and says **\$6**. Two output tokens, so two forward passes, are all the thinking it got. On a toy set of such problems this kind of answering scores 20% (the numbers in this visual are illustrative).
+  </Step>
+
+  <Step title="2. Show the work: few-shot chain of thought">
+    Give one worked example whose answer writes out its steps. The model copies the format: intermediate results first, then the answer, **\$8**. That is <Term t="chain-of-thought">chain-of-thought prompting</Term>. The answer now costs 250 tokens instead of 5.
+  </Step>
+
+  <Step title="3. Or just ask: let's think step by step">
+    No example at all: end the prompt with "Let's think step by step." A large enough model writes its own reasoning. **Zero-shot chain of thought.** A second short prompt then pulls the final answer out of the reasoning.
+  </Step>
+
+  <Step title="4. Why it works: tokens are computation">
+    Each column is one generated token, which is one full pass through the network. The direct answer gets 2 columns. A 40-token chain gets 40, and **each pass can attend to every step written before it**. The model can store an intermediate result in the text and build on it.
+  </Step>
+
+  <Step title="5. Sample many reasoning paths">
+    Sample at temperature 0.7 instead of greedily and every run reasons a little differently. Most paths reach \$8; some slip to \$6 or \$24. One sample is right 56% of the time on the toy set. Drag **N** to sample more.
+  </Step>
+
+  <Step title="6. Majority vote: self-consistency">
+    Keep only each path's final answer and take the most common one. Right paths agree with each other; wrong ones scatter. That is <Term t="self-consistency">self-consistency</Term>. On the toy set accuracy climbs from 56% to 65% at N = 5 and 72% at N = 32: **fast at first, then flat**.
+  </Step>
+
+  <Step title="7. A verifier instead of a vote">
+    Or score every path with a <Term t="verifier">verifier</Term>, a model or program that judges correctness, and keep the top score: <Term t="best-of-n">best-of-N</Term>. It beats the vote here, 76% at N = 5. But push **N to 13 or more**: path 13 is wrong and scores highest. Search hard enough and you find the verifier's mistakes.
+  </Step>
+
+  <Step title="8. The bill: tokens and time">
+    Every path is paid in output tokens: N × 250. Decoded **in parallel** as one batch, 32 paths take 2.0 s against 1.9 s for one, because decode is memory-bound. One after another they would take 60 s. A <Term t="reasoning-model">reasoning model</Term> writing 2,000 thinking tokens takes 15 s at the same speed.
+  </Step>
+</Scrolly>
+
+## Few-shot chain of thought
+
+Wei et al. (2022) made the idea concrete. They took the few-shot prompts of lesson B1.2 and changed only the examples' answers: instead of "The answer is 13", each example's answer walked through the steps and then gave the number. With eight such exemplars, a 540-billion-parameter model went from about 18% to about 57% on GSM8K, a benchmark of grade-school math word problems, beating the best previous result, which had needed a finetuned model plus a trained verifier.
+
+Two findings in the paper matter more for you than the headline number.
+
+**It was a property of scale.** In their experiments, chain of thought helped only the largest models, around 100 billion parameters; smaller models wrote fluent but illogical chains and did no better or even worse. Today's instruction-tuned models are trained on reasoning data, so much smaller ones benefit, but the lesson stands: check that reasoning helps *your* model on *your* task before paying for it.
+
+**The content of the steps is what helps.** The authors tried three controls. Asking for just the equation, without words, helped much less on multi-step problems. Asking the model to output a string of dots as long as a reasoning chain, giving it the extra tokens without the reasoning, did not help. And asking for the reasoning *after* the answer did not help either. That last one is a trap people still fall into:
+
+<Callout type="pitfall" title="Reasoning after the answer is decoration">
+  A JSON schema like `{"answer": ..., "reasoning": ...}` makes the model commit to the answer before it writes a single step; the reasoning that follows is a justification, not a computation. Put the reasoning field **first** and the answer **last**, or let the model reason in free text and end with a fixed line such as `The answer is 8`, which your code parses. The order of fields in a structured output is part of the prompt.
+</Callout>
+
+## Zero-shot: let's think step by step
+
+Kojima et al. (2022) removed the exemplars entirely. They appended one sentence, "Let's think step by step", after the question, and then ran a second prompt that fed the model's reasoning back with "Therefore, the answer (arabic numerals) is" to extract a clean final answer. For an InstructGPT model (text-davinci-002), accuracy on the MultiArith benchmark rose from 17.7% to 78.7%, and on GSM8K from 10.4% to 40.7%, with no examples at all. They also tried other trigger sentences; the wording mattered, and this one did best among those they tested.
+
+The two-stage design is worth copying even now: **one call to reason, one cheap way to extract**. In practice the second stage is usually a fixed answer line you ask for in the first prompt plus a regular expression, rather than a second model call.
+
+Modern instruction-tuned models often reason step by step on math problems without being asked, because they were finetuned on data that does. The prompt-level lesson becomes: **allow** the model to reason (do not demand a bare answer when the task is multi-step), and **constrain only where the final answer goes**.
+
+<Callout type="intuition" title="Why written steps add computation">
+  Inside one forward pass, information flows upward through 32 layers and then stops: the model must produce a token. Text is the only memory that survives from one pass to the next. Writing "4 groups" puts an intermediate result into the context, where every later pass can attend to it. A chain of 40 tokens is a computation 40 passes deep, with each pass able to read all the earlier work. A direct answer is a computation one pass deep.
+</Callout>
+
+## Sample many, then vote: self-consistency
+
+A single chain of thought is one sample from the model's distribution over reasoning paths. Sample again at a temperature above zero (Module 03) and you get a different path, sometimes a different answer. Wang et al. (2022) turned that variation into accuracy: sample $N$ chains, throw away the reasoning, and return the most common final answer. On GSM8K with the same 540B model, this lifted chain-of-thought accuracy by 17.9 points, with similar gains on other arithmetic and commonsense benchmarks. Their main experiments sampled 40 paths; most of the gain came well before that.
+
+Why does voting work? A problem usually has one right answer and many ways to reach it, but many different wrong answers, each reached by a different slip. Right paths **agree**; wrong paths **scatter**. So the right answer tends to be the most common one even when fewer than half of the paths are right.
+
+Voting is not magic, though, and the arithmetic shows exactly when it helps.
+
+<Callout type="math" title="When the vote helps, and when it hurts">
+  Take the worst case for voting: every wrong path gives the *same* wrong answer. With $N = 3$ paths each right with probability $p$, the majority is right when at least 2 of 3 are:
+
+  $$
+  P = p^3 + 3p^2(1-p)
+  $$
+
+  At $p = 0.6$: ${}0.216 + 3 \times 0.36 \times 0.4 = 0.216 + 0.432 = 0.648$. Voting raised 60% to 64.8%.
+
+  At $p = 0.4$: ${}0.064 + 3 \times 0.16 \times 0.6 = 0.064 + 0.288 = 0.352$. Voting **lowered** 40% to 35.2%.
+
+  The vote amplifies whatever the model's most common answer is. It helps on questions where the right answer is the mode, and hurts where a single wrong answer is the mode. When wrong answers scatter across many values, the right answer can win with well under half the votes, which is why real gains are larger than this worst case suggests. In the toy set of the visual, the accuracy approaches the share of questions where the right answer is the most likely single answer (74%), and no number of samples gets past that.
+</Callout>
+
+Self-consistency needs a **final answer you can compare**: a number, a letter for multiple choice, a label, a function's test result. For open-ended text there is no exact match to vote on; you then need a judge, which is Module B2's subject.
+
+### What N paths cost
+
+The token bill is linear: $N$ paths of 250 tokens is ${}250N$ output tokens per question. The latency is not, and this is where inference engineering pays off. Decode is memory-bound (Module 05): each step reads all 16 GB of Llama-3.1-8B's weights whether it advances one sequence or thirty-two. Decode the $N$ paths **as one batch** and each step costs barely more:
+
+| | One path | 32 paths, batched | 32 paths, one after another |
+|---|---|---|---|
+| time per decode step | 7.5 ms | 8.1 ms | 7.5 ms |
+| 250 tokens | 1.88 s | 2.03 s | 32 × 1.88 = 60 s |
+| output tokens | 250 | 8,000 | 8,000 |
+
+The prompt can be shared too: engines that support parallel sampling (the `n` parameter of an OpenAI-compatible API) prefill the question once and fork the KV cache for each path, so only the reasoning tokens are paid N times. The tokens still cost money, and the N copies of the reasoning still occupy KV cache, which limits how many other users fit on the GPU (Modules 05 and 08).
+
+## A verifier instead of a vote
+
+Voting uses only agreement. A <Term t="verifier">verifier</Term> judges each path on its own: a model trained to predict whether a solution is correct, or better, a program that checks it. Then you keep the best-scoring path. This is <Term t="best-of-n">best-of-N</Term>, which you met in Module 3C with a reward model as the judge.
+
+Cobbe et al. (2021), the paper that introduced GSM8K (8.5K problems: 7.5K for training, 1K for testing), trained exactly such verifiers. A generator sampled 100 solutions per problem, a verifier scored them, and the top one was submitted. Their finding, which is worth stating carefully: on the full training set, a **6B model with a verifier slightly outperformed a finetuned 175B model** without one, a gain the authors compared to roughly a 30× increase in model size. They also found verification kept improving with more training data, where plain finetuning flattened.
+
+The visual's toy model shows the three curves that frame this:
+
+- **Any path right** (the dotted ceiling): the fraction of questions where at least one of the $N$ paths is correct. A perfect checker would score this. It rises toward 100%.
+- **Majority vote**: needs no checker, flattens early.
+- **Verifier**: sits between them, as high as the verifier is good.
+
+And step 7 shows the catch. A learned verifier has blind spots, and searching through more candidates is precisely a search for a candidate it scores highly. With enough samples you find a wrong answer that looks right to the verifier. This is Goodhart's law in miniature, the same effect that makes best-of-N against a reward model drift as N grows. When you can, use a **programmatic** verifier: run the unit tests on generated code, recompute the arithmetic, validate the JSON against the schema. A check that cannot be fooled makes large N safe.
+
+## Reasoning models: thinking, trained in
+
+Chain of thought began as a prompting trick. Then it moved into training. Models such as OpenAI's o1 (announced September 2024) and DeepSeek-R1 (January 2025, open weights) were trained with reinforcement learning to produce long internal chains of thought before answering, rewarded when the final answer was verifiably correct. They routinely write hundreds to thousands of reasoning tokens per question, backtrack, and check their own work. The reasoning is learned behaviour, not a prompt.
+
+Prompting them is different:
+
+- **Do not ask them to think step by step**; they already do, and the instruction adds nothing.
+- **Prefer zero-shot.** As lesson B1.2 noted, the DeepSeek-R1 report found few-shot prompts consistently degraded its performance and recommended describing the problem and the output format directly.
+- **Set a budget.** At the time of writing, APIs and open models expose a reasoning-effort or thinking-budget setting, and some open models switch thinking on or off per request. Use the smallest budget that meets your accuracy target.
+
+And price them. Reasoning tokens are output tokens: they cost decode time, and at the time of writing hosted APIs bill them as output even when you never see them. At 7.5 ms per token for an 8B model at batch 1, 2,000 thinking tokens is ${}2{,}000 \times 7.5\ \text{ms} = 15$ s before the first word of the answer. A long trace also grows the KV cache as it goes, so it slows itself down; Module 26 works through that arithmetic for serving.
+
+## Choosing how much to think
+
+Here is a math tutoring app answering 10,000 questions a day, with the token counts from the visual:
+
+| Method | Output tokens per question | Per day | Latency (8B, H100, batch 1) |
+|---|---|---|---|
+| Direct | 5 | 50,000 | 38 ms |
+| Chain of thought | 250 | 2.5 million | 1.9 s |
+| Self-consistency, N = 5 (batched) | 1,250 | 12.5 million | 1.9 s |
+| Reasoning model | ~2,000 | ~20 million | ~15 s |
+
+At a dated example output price of \$0.60 per million tokens (GPT-4o mini at launch, July 2024), those are \$0.03, \$1.50, \$7.50 and about \$12 a day. The spread is 400× in tokens between the first and last rows. So, as a rule of thumb:
+
+- **Lookup, extraction, classification**: answer directly. There is nothing to reason about, and every reasoning token is latency.
+- **Multi-step problems with a checkable answer**: chain of thought, with the answer last. Add self-consistency where a wrong answer is expensive and the extra tokens are not.
+- **Code, or anything with a real checker**: sample several and keep one that passes the check.
+- **Hard problems where seconds are acceptable**: a reasoning model with the smallest budget that works.
+
+The only way to know which row your task belongs in is to measure accuracy, tokens and latency together on your own data, which is exactly what this module's lab does.
+
+<Callout type="real" title="Now read the papers">
+  Four short papers, in the order this lesson used them. You now know what each one is trying to show.
+
+  - **Wei et al., "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models" (2022), [arXiv 2201.11903](https://arxiv.org/abs/2201.11903).** Read the introduction, the method, and the arithmetic-reasoning results including the ablations (equation only, variable compute, reasoning after answer). Skim the commonsense and symbolic sections. You will recognise step 2 and the pitfall above.
+  - **Kojima et al., "Large Language Models are Zero-Shot Reasoners" (2022), [arXiv 2205.11916](https://arxiv.org/abs/2205.11916).** Read the figure that shows the two-stage prompt and the table comparing trigger sentences. Skip the per-dataset appendix.
+  - **Wang et al., "Self-Consistency Improves Chain of Thought Reasoning in Language Models" (2022), [arXiv 2203.11171](https://arxiv.org/abs/2203.11171).** Read the method section and the plot of accuracy against the number of sampled paths. That plot is step 6 with real data.
+  - **Cobbe et al., "Training Verifiers to Solve Math Word Problems" (2021), [arXiv 2110.14168](https://arxiv.org/abs/2110.14168).** Read the dataset description and the verification results, including the comparison with finetuning a larger model. Skip the training details on a first pass.
+</Callout>
+
+<KeyNotes>
+  1. Each output token is one forward pass of fixed depth. A direct answer gets one or two passes of computation; a written chain of reasoning gets one pass per token, each able to read the earlier steps. That is **test-time compute**.
+  2. **Few-shot chain of thought** (Wei et al. 2022): exemplars that show their steps, about 18% → 57% on GSM8K for a 540B model. Only the content helps: equation-only, filler dots and reasoning-after-answer controls did not match it.
+  3. **Zero-shot chain of thought** (Kojima et al. 2022): "Let's think step by step", then extract the answer. 17.7% → 78.7% on MultiArith for text-davinci-002.
+  4. Put the reasoning **before** the answer, including in JSON field order, and end with a fixed answer line your code can parse.
+  5. **Self-consistency** (Wang et al. 2022): sample N chains, vote on the final answer. Right paths agree, wrong ones scatter; gains come fast then flatten. With one dominant wrong answer, N = 3 turns 60% into 64.8% but 40% into 35.2%: the vote amplifies the model's most common answer.
+  6. **Best-of-N with a verifier** (Cobbe et al. 2021): a 6B model with a verifier slightly beat a finetuned 175B model on GSM8K. Large N also finds the verifier's mistakes; prefer programmatic checks.
+  7. Cost is output tokens: 5 (direct), 250 (CoT), 250N (self-consistency), thousands (reasoning models). Batched, N paths take about as long as one because decode is memory-bound (1.88 s vs 2.03 s for 32 paths on an 8B model); sequential, N times as long.
+  8. Reasoning models think by training, not prompting: no "step by step", prefer zero-shot, set the smallest thinking budget that works, and budget for seconds of decode.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Three sampled paths are each right with probability 0.6, and every wrong path gives the same wrong answer. What is the probability that the majority vote is right, in percent?', numeric: true, answer: 64.8, tolerance: 0.5, unit: '%', why: 'Majority needs at least 2 of 3 right: p³ + 3p²(1 − p) = 0.216 + 3 × 0.36 × 0.4 = 0.216 + 0.432 = 0.648.' },
+  { q: 'Same setup, but each path is right with probability 0.4. What is the majority-vote accuracy, in percent?', numeric: true, answer: 35.2, tolerance: 0.5, unit: '%', why: '0.4³ + 3 × 0.4² × 0.6 = 0.064 + 0.288 = 0.352. Lower than one sample’s 40%: when a single wrong answer is the most likely one, voting amplifies it.' },
+  { q: 'A tutoring app answers 10,000 questions a day with self-consistency at N = 5 and about 250 output tokens per path. How many million output tokens is that per day?', numeric: true, answer: 12.5, tolerance: 0.3, unit: 'M tokens', why: '5 × 250 = 1,250 tokens per question; × 10,000 = 12,500,000 = 12.5 million.' },
+  { q: 'A reasoning model writes 2,000 thinking tokens before answering, on hardware that decodes at 7.5 ms per token for one request. How many seconds pass before the answer starts?', numeric: true, answer: 15, tolerance: 0.5, unit: 's', why: '2,000 × 7.5 ms = 15,000 ms = 15 s, all of it before the first visible answer token.' },
+  { q: 'Your structured output is {"answer": number, "reasoning": string}, generated in that order. Why is this a problem?', options: ['JSON cannot hold long strings', 'The model commits to the answer before writing any reasoning, so the reasoning cannot inform it; put the reasoning field first', 'Reasoning must always be hidden from users', 'Numbers must come last in JSON'], answer: 1, why: 'Generation is left to right. With the answer first, its tokens are produced with no written steps to attend to, which is exactly the "reasoning after answer" control that did not help in Wei et al.' },
+  { q: 'Why do 32 reasoning paths decoded as one batch take only slightly longer than a single path on one GPU?', options: ['The GPU skips 31 of them', 'Decode is memory-bound: each step reads all the weights once whether it advances 1 sequence or 32, so the extra arithmetic is small', 'Temperature sampling is faster than greedy', 'The paths share their reasoning tokens'], answer: 1, why: 'Reading 16 GB of weights dominates each step (about 6 ms on an H100). Advancing 32 sequences adds little compute and a little KV-cache reading: about 8.1 ms instead of 7.5 ms per step. The tokens are still billed 32 times.' },
+]} />
