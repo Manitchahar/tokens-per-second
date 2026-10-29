@@ -14,4 +14,10 @@ export const terms: Record<string, GlossaryEntry> = {
   'in-context-learning': { term: 'In-context learning', def: 'A model picking up a task from instructions and examples in its prompt, with no change to its weights. The examples are read in one forward pass and forgotten afterwards. It gets much stronger as models get bigger.', lesson: 'scaling/gpt3-in-context' },
   'zero-shot': { term: 'Zero-shot', def: 'Prompting with only a description of the task and the input, no solved examples. One-shot adds one example.', lesson: 'scaling/gpt3-in-context' },
   'few-shot': { term: 'Few-shot', def: 'Prompting with K solved examples (typically 10–100 for GPT-3) before the real input. Every example costs prompt tokens, so prefill work, on every query.', lesson: 'scaling/gpt3-in-context' },
+
+  // ── 3B.3 · Scaling laws
+  'scaling-law': { term: 'Scaling law', def: 'A measured rule for how a model’s test loss falls as parameters, data or compute grow. For language models it is a power law: a straight line on log-log axes that can be fitted on small runs and extended to predict big ones.', lesson: 'scaling/scaling-laws' },
+  'power-law': { term: 'Power law', def: 'y = c · x^(−α). Multiplying x by k multiplies y by k^(−α), the same fraction at every scale, so it plots as a straight line on log-log axes with slope −α.', lesson: 'scaling/scaling-laws' },
+  'pf-day': { term: 'Petaflop/s-day (PF-day)', def: 'A unit of compute: 10¹⁵ FLOP/s sustained for one day, 8.64 × 10¹⁹ FLOPs. GPT-3’s training was about 3,640 PF-days.', lesson: 'scaling/scaling-laws' },
+  'non-embedding-params': { term: 'Non-embedding parameters', def: 'The weights inside the transformer blocks, leaving out the token and position embedding tables. Kaplan et al. measured their scaling laws against this count.', lesson: 'scaling/scaling-laws' },
 };
