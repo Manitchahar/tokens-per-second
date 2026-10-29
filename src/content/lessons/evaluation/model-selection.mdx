@@ -1,0 +1,248 @@
+---
+title: 'Choosing a model: the selection funnel'
+summary: 'How to navigate the four-stage model selection funnel, filter by hard constraints and public benchmarks, run custom domain evals, and calculate Build vs Buy economics.'
+objectives:
+  - 'Execute the four-stage model selection funnel from hard constraints to canary deployment'
+  - 'Filter candidate models against legal licenses, privacy regulations, latency SLOs, and context bounds'
+  - 'Construct and evaluate domain-specific scorecards for shortlisted models'
+  - 'Evaluate the multi-dimensional trade-offs between commercial APIs and self-hosted open weights'
+  - 'Calculate the economic break-even token volume between leased GPU infrastructure and managed API pricing'
+---
+import ModelSelectionFunnelViz from '@/components/viz/evaluation/ModelSelectionFunnelViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+With hundreds of open-weight checkpoints and commercial endpoints released each year, choosing the right model for an AI application is one of the most consequential decisions an engineering team makes. Pick a model that is too small, and domain accuracy collapses; pick a model that is too large, and your monthly infrastructure bill explodes while user latency breaches your interactive Service Level Objectives (SLOs).
+
+Engineering teams often approach model selection emotionally: someone reads a viral thread about a new reasoning model, conducts a few ad-hoc chat queries in a browser tab, and decides to rebuild the company backend around it. Two weeks later, the system crashes in staging because the model fails strict JSON schema compliance or lacks commercial licensing.
+
+To make model selection reproducible, robust, and economically sound, we use the **Four-Stage Selection Funnel**. This lesson walks through every gate of the funnel and provides the mathematical break-even models for the ultimate engineering decision: **Build versus Buy**.
+
+## The model selection funnel
+
+<Scrolly>
+  <ModelSelectionFunnelViz client:visible slot="stage" />
+
+  <Step title="1. The four-stage model selection funnel">
+    Model selection is a funnel, not a shoot-out. You begin with over 100 available models on Hugging Face and commercial API hubs, progressively narrowing the pool through four rigorous stages: **Hard Constraints**, **Public Benchmark Screening**, **Proprietary Golden Evaluation**, and **Canary Deployment**.
+  </Step>
+
+  <Step title="2. Stage 1: Hard constraints filter first">
+    Before evaluating a single prompt, apply non-negotiable operational filters: legal licensing (commercial Apache 2.0 vs restrictive terms), data residency (HIPAA/GDPR on-premise requirements), latency budget (TTFT &lt; 400 ms), and context window. This eliminates 80% of candidates in minutes.
+  </Step>
+
+  <Step title="3. Stage 2: Public benchmark shortlisting">
+    Use public benchmarks (MMLU, HumanEval, GSM8K) strictly as a coarse threshold. Models scoring below 75% on MMLU lack foundational instruction-following and general literacy. Filtering by coarse benchmarks narrows your shortlist to 3 or 4 top contenders.
+  </Step>
+
+  <Step title="4. Stage 3: Your proprietary golden evaluation">
+    Run the shortlisted models through your internal golden evaluation dataset (200 to 500 representative edge cases). Measure performance across the four criteria buckets: Domain Accuracy, Generation Quality, Instruction Following, and Operational Latency.
+  </Step>
+
+  <Step title="5. Build vs Buy: architectural trade-off matrix">
+    Compare managed proprietary APIs (OpenAI, Anthropic, Google) against self-hosted open weights (vLLM, TensorRT-LLM on dedicated GPUs). Weigh data sovereignty, custom LoRA support, P99 latency guarantees, and freedom from silent model deprecation.
+  </Step>
+
+  <Step title="6. The Build vs Buy break-even economics">
+    Self-hosting has high fixed costs (leased GPUs) but near-zero marginal cost per token. Commercial APIs have zero fixed costs but linear token billing. Calculate the exact monthly token volume where dedicated GPU leasing becomes dramatically cheaper than managed APIs.
+  </Step>
+</Scrolly>
+
+## Stage 1: Hard constraints filter first
+
+The single most common mistake in model selection is running evaluation prompts on models that can never legally or operationally ship to production.
+
+Stage 1 evaluates four boolean criteria:
+
+### 1. Legal license and IP indemnity
+- **Permissive Open Source**: Apache 2.0 and MIT licenses (such as Qwen 2.5, Mistral 7B) permit unrestricted commercial use, fine-tuning, and redistribution.
+- **Community Licenses with Restrictions**: Checkpoints such as Llama 3.1 carry specific acceptable use policies (e.g. monthly active user thresholds, restrictions against using outputs to train competing models).
+- **Non-Commercial / Research Only**: Models released under CC-BY-NC cannot be monetized.
+- **Enterprise Indemnity**: Many enterprise legal departments mandate vendor indemnification against copyright infringement lawsuits, restricting choices to commercial enterprise providers.
+
+### 2. Data privacy and regulatory sovereignty
+If your application processes protected health information (HIPAA), European personal data (GDPR), or confidential customer financial records, sending raw user prompts to a shared multi-tenant commercial API may violate legal covenants.
+- Does the vendor offer **Zero Data Retention (ZDR)** agreements with verified SOC2 Type II compliance?
+- Does your compliance charter require total air-gapped isolation inside a private VPC or on-premise datacenter?
+
+If VPC isolation is mandatory, all closed proprietary APIs are instantly disqualified; your funnel must focus exclusively on open-weight models.
+
+### 3. Latency budget (SLO feasibility)
+In *Latency metrics: TTFT, ITL & TPOT* (Module 06), you saw that human reading speed is roughly 5 words/second (~7 tokens/second), while interactive chat requires a Time to First Token (TTFT) under 400 ms.
+- If your product is an interactive IDE autocomplete plugin, your total end-to-end latency budget is **under 100 ms**. A 70B parameter model whose single-decode step takes 25 ms cannot physically generate a 10-line function within 100 ms.
+- Compute the theoretical speed floor before evaluating. If a model's parameter count requires multiple GPUs with tensor parallelism that breaches your latency budget, disqualify it immediately.
+
+### 4. Context length requirement
+Does your workload require ingesting entire 50-page legal filings (roughly 60,000 tokens)?
+- A model with an 8,192-token context limit cannot serve the application, regardless of how high its benchmark scores are.
+- Ensure the model's native RoPE base and attention kernel support your required context window without severe perplexity degradation.
+
+## Stage 2: Coarse benchmark screening
+
+Once the candidate field has been filtered by hard constraints, use public benchmarks (MMLU, HumanEval, GSM8K, Chatbot Arena) to perform **coarse screening**.
+
+As derived in *Public benchmarks, saturation & contamination*, public benchmarks correlate strongly with general pretraining compute ($C \approx 6ND$), but fail to predict fine-grained application success.
+- **Establish a threshold floor**: For example, reject any model with MMLU < 75% or HumanEval < 60%.
+- **Do not split hairs**: If Candidate A scores 86.4% on MMLU and Candidate B scores 85.1%, treat them as tied. Pass both to Stage 3.
+
+At the conclusion of Stage 2, your engineering team should have a shortlist of **3 to 4 models**.
+
+## Stage 3: Proprietary golden evaluation
+
+Stage 3 is where the real decision happens. You take your 3 shortlisted models and run them through your automated evaluation harness over your curated golden dataset.
+
+You construct an explicit decision matrix across the four criteria buckets:
+
+| Evaluation Dimension | Candidate A (70B Open Weight) | Candidate B (8B Open Weight) | Candidate C (Proprietary API) | Target SLO |
+|---|---|---|---|---|
+| **Domain Accuracy (Task Correctness)** | **92.5%** | 86.0% | 93.0% | $\ge 85.0\%$ |
+| **Generation Quality (Faithfulness)** | 94.0% | 89.0% | **96.0%** | $\ge 90.0\%$ |
+| **Instruction Following (Valid JSON)** | **99.5%** | 98.0% | 99.0% | $\ge 98.0\%$ |
+| **P95 TTFT Latency** | 620 ms | **110 ms** | 480 ms | $\le 400\ \text{ms}$ |
+| **P95 TPOT Latency** | 22 ms / tok | **8 ms / tok** | 18 ms / tok | $\le 20\ \text{ms}$ |
+| **Cost per 1M Blended Tokens** | \$0.90 | **\$0.15** | \$2.50 | $\le 1.00$ USD |
+
+Inspect this trade-off landscape:
+- **Candidate C (Proprietary API)** has the highest generation quality (96.0%), but fails your cost target (\$2.50 vs \$1.00) and violates the 400 ms TTFT latency budget due to API network queueing.
+- **Candidate A (70B Open Weight)** provides frontier-grade accuracy (92.5%) and near-perfect JSON schema compliance (99.5%), but requires multi-GPU serving and marginally misses the 400 ms TTFT SLO.
+- **Candidate B (8B Open Weight)** easily passes the domain accuracy bar (86.0% vs 85.0% threshold), achieves blazing speed (110 ms TTFT, 8 ms TPOT), costs only \$0.15 per million tokens, and can run on a single cost-effective GPU.
+
+For an interactive, high-volume production microservice, **Candidate B is the clear winner**, despite being ranked 20 spots lower on public leaderboards than Candidate C!
+
+## Stage 4: Canary deployment and shadow monitoring
+
+Before routing 100% of user traffic to your selected model, execute a **canary deployment**:
+
+1. **Shadow Traffic (Dark Launch)**: Duplicate 5% to 10% of live production requests in the background. Send the duplicate request to the new candidate model, discard its output, and log its latency, memory usage, and parsed schema errors.
+2. **Canary Split**: Once shadow testing proves stability, route 5% of real user traffic to the candidate model.
+3. **Telemetry Monitoring**: Monitor user implicit feedback (retry rate, thumbs down, copy-to-clipboard rate) and operational metrics (P99 TTFT, token generation rate).
+4. **Gradual Ramp**: Scale traffic from 5% $\to$ 25% $\to$ 50% $\to$ 100% over several days with an automated rollback trigger if error rates spike.
+
+## Build versus Buy: architectural trade-offs
+
+The ultimate decision in AI systems architecture is whether to use a commercial managed API (Buy) or self-host open weights on dedicated GPU infrastructure (Build).
+
+Neither choice is universally correct; each represents distinct engineering trade-offs.
+
+| Dimension | Commercial Managed API (Buy) | Self-Hosted Open Weights (Build) |
+|---|---|---|
+| **Time to Market** | Hours (call HTTP API with an API key) | Days to weeks (configure vLLM, Kubernetes, CUDA) |
+| **DevOps Overhead** | Zero infrastructure management | Requires GPU cluster maintenance, driver updates, auto-scaling |
+| **Latency Consistency** | Variable (subject to multi-tenant cloud traffic spikes) | Deterministic (dedicated H100/L4 hardware guarantees SLO) |
+| **Low-Level Control** | Restricted to vendor-exposed JSON parameters | Complete access to logits processors, speculative decoding, custom CUDA |
+| **Model Customization** | Prompt engineering; vendor-managed fine-tuning APIs | Full fine-tuning, LoRA adapters, model merging, weight quantization |
+| **Data Sovereignty** | Prompts leave your security perimeter | 100% on-premise / isolated VPC data custody |
+| **Deprecation & Drift** | High risk (vendors retire models or silently adjust RLHF) | Zero risk (weights are immutable, pinned safetensor files) |
+
+<Callout type="pitfall" title="The silent model drift hazard">
+  Commercial API providers continuously update their models to reduce serving costs, patch safety vulnerabilities, or improve specific benchmarks. A prompt that worked flawlessly in March may break in June because the vendor updated the backend weights without altering the model name. With self-hosted open weights, your model file is an immutable cryptographic hash that never changes.
+</Callout>
+
+## The break-even economics: fixed GPU lease vs variable token pricing
+
+The financial choice between Build and Buy comes down to a classical cost-accounting calculation: **Fixed Capital / Lease Cost versus Marginal Variable Cost.**
+
+### 1. The Cost Equations
+Let:
+- $C_{\text{gpu}}$ be the fixed monthly cost of leasing and operating dedicated GPU servers (e.g. cloud instances from AWS, GCP, Lambda, or RunPod).
+- $P_{\text{api}}$ be the blended commercial API price per token (typically quoted per 1,000,000 tokens).
+- $V$ be the monthly generation volume in tokens.
+
+The monthly cost of the managed API is strictly linear:
+
+$$
+\text{Cost}_{\text{API}}(V) = V \times P_{\text{api}}
+$$
+
+The monthly cost of self-hosting is a step function (fixed per GPU instance up to its maximum throughput capacity):
+
+$$
+\text{Cost}_{\text{Self-Host}} = C_{\text{gpu}} \quad (\text{for } V \le V_{\text{max\_gpu}})
+$$
+
+Setting the two costs equal gives the **Break-Even Token Volume** ($V_{\text{break-even}}$):
+
+$$
+V_{\text{break-even}} = \frac{C_{\text{gpu}}}{P_{\text{api}}}
+$$
+
+- For volumes **below** $V_{\text{break-even}}$, the managed API is cheaper because you avoid paying for an idle GPU.
+- For volumes **above** $V_{\text{break-even}}$, self-hosting is dramatically cheaper because every additional token generated costs \$0.00 in marginal API fees.
+
+<Callout type="math" title="Worked numeric example: 8B parameter model break-even">
+  Suppose you are deploying an 8B parameter model (such as Llama-3.1-8B-Instruct or Qwen2.5-7B-Instruct).
+
+  **Option A: Self-Host on Leased GPU**
+  - An enterprise GPU instance suitable for 8B inference (e.g. 1x NVIDIA L4 or RTX 4090 or A10G) leases for approximately \$0.80 per hour.
+  - Monthly lease cost:
+    $$
+    C_{\text{gpu}} = 0.80 \times 24 \times 30 = \mathbf{576.00\ \text{USD/month}}
+    $$
+
+  **Option B: Managed Commercial API**
+  - A commercial provider charges a blended rate of \$0.30 per 1,000,000 tokens (\$0.15 input / \$0.60 output).
+  - Price per token:
+    $$
+    P_{\text{api}} = \frac{0.30}{1{,}000{,}000} = 0.30 \times 10^{-6}\ \text{USD/token}
+    $$
+
+  **Compute the Break-Even Volume:**
+  $$
+  V_{\text{break-even}} = \frac{576.00}{0.30 \times 10^{-6}} = 1{,}920{,}000{,}000\ \text{tokens} = \mathbf{1.92\ \text{billion tokens per month}}
+  $$
+
+  **Case 1: Low Volume (300 Million Tokens / Month)**
+  - Managed API Cost: 300 × \$0.30 = **\$90.00 per month**.
+  - Self-Hosted GPU Cost: **\$576.00 per month**.
+  - **Verdict**: The Managed API saves **\$486.00 per month** (84.4% cheaper). Buying avoids paying for idle compute.
+
+  **Case 2: High Volume (6 Billion Tokens / Month)**
+  - Managed API Cost: 6,000 × \$0.30 = **\$1,800.00 per month**.
+  - Self-Hosted GPU Cost: 1 GPU can easily serve 6B tokens/month at ~2,300 tokens/sec capacity: **\$576.00 per month**.
+  - **Verdict**: Self-hosting saves **\$1,224.00 per month** (68.0% savings).
+</Callout>
+
+<Callout type="math" title="Worked numeric example: 70B parameter frontier model">
+  Now consider a frontier 70B model:
+
+  **Self-Hosting Infrastructure:**
+  - Serving a 70B model in FP16 or FP8 requires 2x NVIDIA H100 (80GB) or 4x A100 (80GB) instances, leasing at roughly \$6.00 per hour.
+  - Monthly GPU lease cost:
+    $$
+    C_{\text{gpu}} = 6.00 \times 24 \times 30 = \mathbf{4{,}320.00\ \text{USD/month}}
+    $$
+
+  **Managed 70B API:**
+  - A commercial 70B endpoint charges \$1.80 per 1,000,000 blended tokens.
+  - Break-Even Volume:
+    $$
+    V_{\text{break-even}} = \frac{4{,}320.00}{1.80 \times 10^{-6}} = 2{,}400{,}000{,}000\ \text{tokens} = \mathbf{2.4\ \text{billion tokens per month}}
+    $$
+
+  If your application processes 10,000,000 requests per month averaging 500 tokens each ($V = 5{,}000\ \text{million tokens}$):
+  - API Cost: 5,000 × \$1.80 = **\$9,000.00 per month**.
+  - Self-Hosted Cost: **\$4,320.00 per month**.
+  - **Net savings from self-hosting**: **\$4,680.00 per month** (\$56,160 annually).
+</Callout>
+
+### Summary rule of thumb
+- **During prototyping and MVP validation**: Always Buy (Managed API). Focus 100% of engineering bandwidth on prompt design, evaluation datasets, and product-market fit.
+- **When scaling past break-even volume or facing strict privacy compliance**: Build (Self-Hosted). Migrate to high-performance engines (vLLM, TensorRT-LLM) to lock in massive cost savings, deterministic latencies, and total IP ownership.
+
+<KeyNotes>
+  1. The four-stage selection funnel systematically eliminates unqualified models through Hard Constraints, Benchmark Screening, Custom Evaluation, and Canary Deployments.
+  2. Stage 1 filters non-negotiable operational requirements (commercial license, data privacy, latency SLO, context window) before running any prompt evaluations.
+  3. Public benchmarks should only be used as a coarse filter to discard underpowered models, never to make the final deployment selection.
+  4. Your proprietary golden evaluation dataset (200 to 500 representative edge cases) makes the definitive model choice based on custom task rubrics.
+  5. Commercial APIs offer rapid time-to-market and zero DevOps overhead, but introduce multi-tenant latency spikes, privacy exposure, and silent model drift.
+  6. Self-hosted open weights provide data sovereignty, deterministic P99 latency, custom LoRA/logits control, and immutable weight files.
+  7. Break-even volume is $V_{\text{break-even}} = C_{\text{gpu}} / P_{\text{api}}$. Above this threshold, dedicated GPU leasing yields dramatic cost savings over commercial APIs.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'In the four-stage model selection funnel, which criterion should be evaluated first before running any prompt benchmarks?', options: ['The model’s Elo rating on Chatbot Arena', 'Hard constraints such as commercial license, data privacy regulations, latency SLOs, and context window limits', 'Few-shot prompt tuning', 'Training LoRA adapters'], answer: 1, why: 'Hard constraints eliminate legally or operationally disqualified models immediately, preventing wasted engineering effort.' },
+  { q: 'A dedicated GPU instance for serving an 8B model costs \$0.80 per hour to lease. What is the total fixed cost of operating this instance for a 30-day month?', numeric: true, answer: 576, tolerance: 5, unit: 'USD', why: 'Monthly cost = \$0.80 per hour * 24 hours/day * 30 days = \$576.00.' },
+  { q: 'A commercial API charges \$0.40 per 1,000,000 tokens. A self-hosted GPU instance costs \$600 per month. What is the break-even volume in millions of tokens?', numeric: true, answer: 1500, tolerance: 30, unit: 'M tokens', why: 'Break-even volume = \$600 / (\$0.40 / 1,000,000) = \$600 / (0.40 * 10^-6) = 1,500,000,000 tokens = 1,500 million tokens.' },
+  { q: 'If your application generates 400 million tokens per month and the commercial API rate is \$0.50 per 1M tokens, what is the monthly API cost?', numeric: true, answer: 200, tolerance: 2, unit: 'USD', why: 'Monthly API cost = 400 * \$0.50 = \$200.00.' },
+  { q: 'What is a primary operational advantage of self-hosting open-weight models compared to commercial managed APIs?', options: ['Self-hosting requires zero DevOps engineers', 'Open-weight model weights are immutable safetensor files that eliminate vendor-induced model drift or unexpected endpoint deprecation', 'Open weights use zero GPU memory', 'Self-hosting is always free'], answer: 1, why: 'Self-hosted open weights guarantee that the model checkpoint will never change or be deprecated without your explicit decision, eliminating silent drift.' },
+  { q: 'What is the purpose of a "shadow deployment" in Stage 4 of the selection funnel?', options: ['To run models in dark mode for better battery life', 'To send duplicate live production traffic to a candidate model in the background without exposing outputs to users, validating latency and stability', 'To train the model on private user passwords', 'To hide the model from cloud billing'], answer: 1, why: 'Shadow traffic duplicates a fraction of live requests to test candidate stability, latency, and parser compatibility safely before real users interact with it.' },
+]} />

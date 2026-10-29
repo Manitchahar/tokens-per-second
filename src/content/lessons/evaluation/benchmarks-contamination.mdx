@@ -1,0 +1,247 @@
+---
+title: 'Public benchmarks, saturation & contamination'
+summary: 'MMLU, GSM8K, and HumanEval: why benchmarks saturate, how pretraining corpora leak test questions, and how to detect contamination using n-grams and perplexity.'
+objectives:
+  - 'Differentiate the focus and methodology of MMLU, GSM8K, and HumanEval'
+  - 'Explain benchmark saturation and why leaderboards compress at the frontier'
+  - 'Detect data contamination using continuous n-gram overlap scanning'
+  - 'Diagnose memorization via perplexity spikes under entity perturbations'
+  - 'Structure public benchmarks as a coarse screening filter rather than a production selection gate'
+---
+import BenchmarkContaminationVisual from '@/components/viz/evaluation/BenchmarkContaminationVisual.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every major model launch is accompanied by a barrage of radar charts and marketing tables. Frontier labs proclaim new state-of-the-art records on standardized public benchmarks: MMLU, GSM8K, HumanEval, MATH, and ARC. For an engineer selecting a model for a production AI application, these leaderboards look like authoritative, peer-reviewed scorecards.
+
+In reality, public benchmarks are subject to two compounding failure modes:
+1. **Saturation**: As pretraining scales and instruction-tuning converges, top models achieve scores between 90% and 98% across popular benchmarks. When nearly every test question is answered correctly, the benchmark loses its dynamic range and ceases to distinguish subtle architectural differences.
+2. **Data Contamination**: Web-scraped pretraining corpora (containing tens of trillions of tokens from Common Crawl, GitHub, Wikipedia, and Stack Overflow) routinely ingest the exact questions and solutions of public test sets. A model scoring 95% on a coding test may not be reasoning—it may simply be reciting an answer it memorized during pretraining.
+
+This lesson explores how public benchmarks are built, why they saturate, how to audit a model for contamination, and how to use public scores appropriately as a **coarse screening filter** rather than a final deployment gate.
+
+## The public benchmark landscape
+
+<Scrolly>
+  <BenchmarkContaminationVisual client:visible slot="stage" />
+
+  <Step title="1. The canonical public benchmarks: MMLU, GSM8K, HumanEval">
+    Three benchmarks formed the historical backbone of LLM evaluation: **MMLU** (Massive Multitask Language Understanding: 57 academic subjects, 4-choice multiple choice), **GSM8K** (Grade School Math 8K: multi-step word problems), and **HumanEval** (164 Python challenges scored by functional unit tests).
+  </Step>
+
+  <Step title="2. Benchmark saturation: the ceiling effect">
+    Between 2021 and 2025, frontier scores climbed from 40% to over 95%. When scores compress into the 92% to 96% band, the benchmark reaches saturation: performance differences between rival models collapse into statistical noise, where a single ambiguous question flips leaderboard rank.
+  </Step>
+
+  <Step title="3. Correlation between benchmarks: redundant signals">
+    General academic benchmarks exhibit extreme Pearson correlation ($r > 0.85$). A model that scores high on MMLU almost always scores high on GSM8K and ARC-Challenge. Evaluating an engine against twenty generic benchmarks wastes compute without providing actionable signal for custom software apps.
+  </Step>
+
+  <Step title="4. Contamination mechanism 1: 8-gram and 13-gram overlap">
+    Because web crawlers vacuum up GitHub repositories and forum threads containing homework solutions, benchmark questions inevitably leak into pretraining data. We detect contamination by scanning the training corpus for exact matches of 8 continuous words (8-grams) or 13 continuous words (13-grams).
+  </Step>
+
+  <Step title="5. Contamination mechanism 2: perplexity drop on canonical questions">
+    When a model has memorized a test set verbatim, its cross-entropy loss on canonical benchmark text drops precipitously, producing an unnaturally low perplexity ($\text{PPL} \approx 1.3$). If renaming the variables or characters causes perplexity to spike to 7.8, the model has memorized the test rather than learning the logic.
+  </Step>
+
+  <Step title="6. The coarse screening rule: filter, never select">
+    Public benchmarks serve exactly one valid engineering purpose: **coarse screening**. You use public scores to eliminate underpowered models that fail basic reasoning thresholds. You never select your final production model from a public leaderboard.
+  </Step>
+</Scrolly>
+
+## The big three: MMLU, GSM8K, and HumanEval
+
+To interpret benchmark numbers intelligently, you must understand the exact formulation and modality of each standard test.
+
+### 1. MMLU (Massive Multitask Language Understanding)
+Introduced by Hendrycks et al. in 2020, MMLU consists of 15,908 multiple-choice questions spanning 57 subjects across STEM, humanities, social sciences, and professional fields (medicine, law, business).
+- **Format**: 4 choices (A, B, C, D).
+- **Evaluation**: 5-shot prompt. The model's predicted next-token logits over tokens `['A', 'B', 'C', 'D']` are normalized via softmax, and the choice with the highest logit is selected.
+- **Random Chance Floor**: 25.0%.
+- **Human Expert Baseline**: Approximately 89.8%.
+
+MMLU measures broad factual recall and encyclopedic breadth. However, because it is purely multiple-choice, models can exploit shallow heuristic cues without generating reasoning chains.
+
+### 2. GSM8K (Grade School Math 8K)
+Released by Cobbe et al. in 2021, GSM8K contains 8,500 multi-step arithmetic word problems designed for elementary and middle school students.
+- **Format**: Freeform English word problems requiring 2 to 8 calculation steps.
+- **Evaluation**: The model generates a Chain-of-Thought (CoT) explanation ending in a designated token format (e.g. `#### 42`). The final numerical value is parsed and evaluated with strict numerical exact match.
+- **Strengths**: Tests logical sequential deduction and basic arithmetic without allowing multiple-choice guessing.
+
+### 3. HumanEval
+Released by OpenAI in 2021 alongside Codex, HumanEval contains 164 hand-crafted programming problems.
+- **Format**: A Python function signature, docstring description, and 3 to 10 hidden unit test assertions.
+- **Evaluation**: Functional correctness via the unbiased pass@k estimator (derived in *Exact evaluation: pass@k, exact match & similarity*).
+- **Strengths**: Hand-crafted by humans to ensure zero overlap with pre-2021 GitHub repositories at the time of publication.
+
+## Benchmark saturation and the ceiling effect
+
+When a benchmark is first released, models struggle. As pretraining dataset size ($D$) and parameter count ($N$) scale according to the Chinchilla laws (Module 3B), performance rises rapidly. Eventually, however, every benchmark encounters the **ceiling effect**:
+
+```
+ Accuracy
+  100% +-----------------------------------------------------=== Ceiling (95%+)
+       |                                                 ====
+       |                                            ====
+   75% |                                       ====
+       |                                 =====
+   50% |                           =====
+       |                    ======
+   25% | ----- Random Guess (MMLU: 25%)
+       +-------------------------------------------------------------
+        2020                 2022                 2024          2026
+```
+
+Once top models reach 92% to 96% accuracy, three pathological phenomena occur:
+
+1. **Compression of dynamic range**: The performance gap between the world's best model (95.2%) and the fifth-best model (93.8%) is just 1.4 percentage points. On a 1,000-question test split, that is a difference of only 14 questions.
+2. **Annotation error domination**: Human-curated datasets inevitably contain label errors, ambiguous phrasing, or typos (typically 2% to 4% of questions). When a model hits 95%, further improvements are constrained by human annotation noise rather than model capability.
+3. **Goodhart gaming**: Labs specifically format system prompts, few-shot exemplars, and tokenization prefixes to match the benchmark grader's exact parsing regexes, gaining 2 to 3 artificial percentage points without improving underlying reasoning.
+
+<Callout type="mentor" title="The shift to frontier evaluations">
+  Because MMLU and GSM8K saturated, the industry shifted toward harder, multi-modal, and software-engineering benchmarks: **MMLU-Pro** (10 choices per question to reduce guessing, harder reasoning), **SWE-bench** (resolving real GitHub issues in full code repositories), and **GPQA** (graduate-level physics, chemistry, and biology written by domain PhDs).
+</Callout>
+
+## The mechanics of data contamination
+
+<Term t="data-contamination">Data contamination</Term> occurs when the questions, inputs, or ground-truth solutions of an evaluation benchmark are inadvertently or intentionally included in the model's pretraining or fine-tuning corpus.
+
+Contamination falls into three distinct categories:
+
+| Contamination Type | Mechanism | Detection Difficulty | Practical Impact |
+|---|---|---|---|
+| **Verbatim Leakage** | Complete questions and answers copied word-for-word into pretraining web dumps | Easy (N-gram scan) | Severe: Model recites answers from rote memory |
+| **Paraphrased Leakage** | Benchmark questions rephrased by synthetic data generation pipelines | Moderate (Embedding / Perplexity) | High: Model overfits to reasoning templates |
+| **Format Contamination** | System prompts or SFT datasets overfit to benchmark-specific answer tokens (e.g. `####`) | Subtle (Zero-shot probe) | Moderate: Model looks smarter only on that benchmark format |
+
+### Detecting contamination with n-gram overlap
+The standard industry method for auditing training corpora is **n-gram overlap analysis**.
+
+An $N$-gram is a contiguous sequence of $N$ tokens or words. For example, in the sentence:
+> *"The quick brown fox jumps over the lazy dog"*
+The 8-grams include:
+1. `["The", "quick", "brown", "fox", "jumps", "over", "the", "lazy"]`
+2. `["quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog"]`
+
+In natural language, the probability of an arbitrary 8-word sequence matching an unrelated document by pure coincidence is small. For a 13-word sequence (a 13-gram), the probability of random collision across English prose is virtually zero.
+
+Rule of thumb established by LLaMA and GPT-4 technical reports: **Any continuous 13-gram match between a pretraining document and an evaluation test set indicates verbatim contamination.**
+
+```python
+def extract_ngrams(tokens: list[str], n: int) -> set[tuple[str, ...]]:
+    """Extracts all contiguous n-grams from a list of tokens."""
+    return {tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)}
+
+def check_contamination(
+    pretraining_doc: str, test_question: str, n: int = 13
+) -> bool:
+    """Returns True if test question shares at least one n-gram with pretraining text."""
+    doc_tokens = pretraining_doc.lower().split()
+    test_tokens = test_question.lower().split()
+
+    doc_ngrams = extract_ngrams(doc_tokens, n)
+    test_ngrams = extract_ngrams(test_tokens, n)
+
+    shared = doc_ngrams.intersection(test_ngrams)
+    return len(shared) > 0
+```
+
+### The perplexity perturbation test
+If you do not have access to the model's multi-terabyte pretraining training data (as is the case with closed-source commercial APIs or pre-compiled weights), how do you prove a model is contaminated?
+
+You use the **Perplexity Perturbation Test** (Jacovi et al., 2023).
+
+Remember from *Tokens & vocabulary* (Module 02) that <Term t="perplexity">perplexity</Term> measures how surprised a language model is by a sequence of tokens $W = (w_1, w_2, \dots, w_N)$:
+
+$$
+\text{PPL}(W) = \exp\left( -\frac{1}{N} \sum_{i=1}^N \ln P(w_i \mid w_{<i}) \right) = \exp(\text{CrossEntropyLoss})
+$$
+
+If a model genuinely understands mathematical problem solving:
+- It should have roughly the same perplexity whether the character in the word problem is named "Alice" or "Bob", and whether the price of the apples is \$5 or \$7.
+
+If a model has memorized the exact test set verbatim from Common Crawl:
+- When given the **canonical benchmark text**, it predicts the next tokens with near-certainty. Its cross-entropy loss drops close to 0, producing an unnaturally low perplexity ($\text{PPL} \le 1.5$).
+- When you create a **perturbed variant**—swapping character names, changing locations, and adjusting numbers while keeping the syntactic structure identical—the memorization advantage evaporates, and perplexity spikes by $5\times$ to $10\times$.
+
+<Callout type="math" title="Worked numeric example: perplexity perturbation">
+  Suppose you evaluate an open-weight model on a canonical GSM8K test item:
+  > *"Janet has 16 eggs. She bakes 3 cakes using 4 eggs each. How many eggs are left?"*
+
+  The model achieves a cross-entropy loss of $L_{\text{canonical}} = 0.30$ nats/token.
+  $$
+  \text{PPL}_{\text{canonical}} = e^{0.30} \approx \mathbf{1.35}
+  $$
+
+  Now, you evaluate a perturbed variant with identical syllable length and syntax:
+  > *"Sarah has 16 pens. She packs 3 boxes using 4 pens each. How many pens are left?"*
+
+  The model's cross-entropy loss rises to $L_{\text{perturbed}} = 2.05$ nats/token.
+  $$
+  \text{PPL}_{\text{perturbed}} = e^{2.05} \approx \mathbf{7.77}
+  $$
+
+  Compute the Perplexity Ratio:
+  $$
+  \text{Ratio} = \frac{\text{PPL}_{\text{perturbed}}}{\text{PPL}_{\text{canonical}}} = \frac{7.77}{1.35} \approx \mathbf{5.76}
+  $$
+
+  A perplexity ratio of $5.76\times$ on an identical structural template is empirical proof of pretraining test leakage. A genuinely generalizing model exhibits a ratio close to $1.0\times$ (typically between $0.95$ and $1.15$).
+</Callout>
+
+## The coarse screening rule: filter, never select
+
+Given that public benchmarks saturate, correlate heavily with one another, and suffer from contamination, how should an inference engineer use them?
+
+The answer is the **Two-Stage Selection Funnel**:
+
+```
+  [ All 50+ Available Open/Closed Models ]
+                     |
+                     |  STAGE 1: Public Benchmark Screen (Coarse Filter)
+                     |  Rule: Discard models with MMLU < 75% or HumanEval < 60%
+                     v
+  [ Shortlist of 3-5 Candidate Models ]
+                     |
+                     |  STAGE 2: Proprietary Application-Specific Eval
+                     |  Golden dataset (100-300 internal prompts + rubrics)
+                     |  JSON schema validity + Latency SLOs + Token costs
+                     v
+  [ Selected Production Model ]
+```
+
+### Stage 1: Coarse screening
+Use public benchmarks as a negative filter, never a positive selector.
+- If a model scores below 70% on MMLU or below 50% on HumanEval, it lacks fundamental baseline reasoning and instruction-following capability. Discard it immediately without wasting time on custom evaluations.
+- However, if Model A scores 89.2% on MMLU and Model B scores 90.4%, **ignore the difference completely.** That 1.2% delta is statistically meaningless for your production application.
+
+### Stage 2: Custom evaluation
+Once you have shortlisted 3 to 5 candidate models that clear the coarse screening bar, test them exclusively against your proprietary golden evaluation suite. Measure the four buckets established in lesson 1: Domain Capability, Generation Quality, Instruction Following, and Cost & Latency.
+
+<Callout type="real" title="Now read the paper">
+  **Stop Uploading Test Data in Plain Text: Practical Strategies for Mitigating Data Contamination by Evaluating with Perturbations** (Alon Jacovi et al., 2023)
+  arXiv link: [https://arxiv.org/abs/2310.10628](https://arxiv.org/abs/2310.10628)
+
+  - **Read:** Section 1 (Introduction), Section 2 (The Data Contamination Landscape), and Section 3 (Evaluating with Perturbations).
+  - **Skip:** Section 4 (mathematical bounds on synthetic counterfactual text generation).
+  - **What you will recognize:** Why static public test sets are doomed to contaminate web-scale pretraining datasets, how entity-swapping unmasks memorization, and why future benchmarks must use dynamic or private test suites.
+</Callout>
+
+<KeyNotes>
+  1. Standard public benchmarks (MMLU, GSM8K, HumanEval) evaluate knowledge breadth, math reasoning, and code synthesis.
+  2. Public benchmarks suffer from saturation when frontier models achieve 90%+ scores, causing dynamic range to collapse into statistical noise.
+  3. Academic benchmarks exhibit high cross-correlation ($r > 0.85$); evaluating dozens of generic benchmarks yields redundant signals.
+  4. Data contamination occurs when web crawlers scrape public test questions and solutions into pretraining datasets.
+  5. Contamination can be detected via continuous 13-gram exact match scanning between pretraining corpora and test sets.
+  6. The Perplexity Perturbation Test unmasks memorization: contaminated models exhibit unnaturally low loss on canonical questions that spikes when entities are renamed.
+  7. Use public benchmarks strictly as a coarse screening filter to discard incapable models, never as the final criterion for production deployment.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'What is benchmark saturation in the context of large language models?', options: ['The GPU running out of VRAM while running benchmark inference', 'The phenomenon where top models score near 100%, causing the benchmark to lose dynamic range and fail to discriminate between models', 'A benchmark taking more than 24 hours to run', 'The tokenizer vocabulary becoming too large'], answer: 1, why: 'When models approach 95%+ accuracy, score differences compress into statistical noise and annotation error, destroying the benchmark’s discriminative power.' },
+  { q: 'A model achieves a cross-entropy loss of 0.40 nats/token on a canonical benchmark question. On an entity-perturbed variant of identical length and syntax, its loss rises to 1.80 nats/token. What is the ratio of perturbed perplexity to canonical perplexity?', numeric: true, answer: 4.06, tolerance: 0.15, unit: 'ratio', why: 'PPL_canonical = exp(0.40) ≈ 1.4918. PPL_perturbed = exp(1.80) ≈ 6.0496. Ratio = 6.0496 / 1.4918 = exp(1.80 - 0.40) = exp(1.40) ≈ 4.055 ≈ 4.06.' },
+  { q: 'According to industry standard deduplication practices (e.g. LLaMA/GPT-4 reports), what continuous n-gram threshold is commonly used to flag definitive pretraining contamination?', options: ['2-gram', '4-gram', '13-gram', '100-gram'], answer: 2, why: 'The chance of an accidental 13-word exact match occurring naturally between independent documents is virtually zero; a 13-gram collision indicates verbatim data leakage.' },
+  { q: 'Why is MMLU evaluated primarily using multiple-choice logit normalization rather than freeform generation?', options: ['Because multiple choice questions are easier to grade deterministically without subjective bias or complex regex parsing', 'Because LLMs cannot generate text longer than 5 tokens', 'Because multiple choice questions prevent hallucination', 'Because GPUs do not support string output'], answer: 0, why: 'Evaluating normalized logits over choices A, B, C, and D allows fast, deterministic scoring without parsing freeform answers.' },
+  { q: 'Two benchmarks, Benchmark A and Benchmark B, have a Pearson correlation of r = 0.92 across 40 tested models. What does this imply for an engineering evaluation pipeline?', options: ['Both benchmarks must be run on every commit', 'Evaluating on both benchmarks provides largely redundant information about model scale rather than orthogonal capabilities', 'Benchmark B is contaminated by Benchmark A', 'The benchmarks cannot be used on GPU hardware'], answer: 1, why: 'A correlation of 0.92 means that 85% of the variance in Benchmark B is explained by Benchmark A; running both yields diminishing diagnostic returns.' },
+  { q: 'In the Two-Stage Selection Funnel, what is the proper role of public benchmarks like MMLU and HumanEval?', options: ['To choose the exact model deployed in production', 'To serve as a coarse screening filter that eliminates models lacking baseline capability before running custom evaluations', 'To train the model weights via reinforcement learning', 'To replace human quality assurance teams entirely'], answer: 1, why: 'Public benchmarks cheaply eliminate underpowered models from consideration, allowing engineering teams to focus custom evaluations on a qualified shortlist.' },
+]} />

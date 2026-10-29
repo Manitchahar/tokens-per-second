@@ -1,0 +1,293 @@
+---
+title: 'Comparative evaluation: Elo & arenas'
+summary: 'How pairwise matchmaking, the Elo rating system, and the Bradley-Terry model rank models without fixed test sets—and why public arenas do not reflect production needs.'
+objectives:
+  - 'Derive the Elo expected win probability and post-match rating updates'
+  - 'Connect the Elo rating system to the Bradley-Terry preference model used in alignment'
+  - 'Describe the crowdsourced blind evaluation methodology of Chatbot Arena'
+  - 'Compute numerical Elo rating shifts from head-to-head match results'
+  - 'Analyze the divergence between public chat leaderboards and enterprise production requirements'
+---
+import EloArenaVisual from '@/components/viz/evaluation/EloArenaVisual.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In classical machine learning benchmarks, models are evaluated against a fixed, static test set with predetermined questions and reference answers. But as you saw in *Why evaluating LLMs is hard*, static benchmarks suffer from rapid saturation and pretraining contamination. The moment a test set is public, models overfit to its distribution, and within two years it fails to separate frontier models.
+
+In 2023, the Large Model Systems Organization (LMSYS) introduced a radical alternative borrowed from competitive chess: **Chatbot Arena**. Rather than grading models against static questions, the Arena pairs two anonymous models head-to-head on arbitrary, live prompts submitted by real human users. Users vote on whichever response they prefer, and the platform aggregates hundreds of thousands of crowdsourced battles into a unified leaderboard using the **Elo rating system** and the **Bradley-Terry preference model**.
+
+Comparative pairwise evaluation has become the industry's default standard for tracking frontier capabilities. Yet for an inference engineer building production systems, comparative arenas present subtle hazards: **the model that wins crowdsourced popularity contests is rarely the model you should deploy in your backend.**
+
+## The mechanics of comparative matchmaking
+
+<Scrolly>
+  <EloArenaVisual client:visible slot="stage" />
+
+  <Step title="1. Blind pairwise battles in Chatbot Arena">
+    A user enters an arbitrary prompt into the arena interface. Two anonymous models (e.g. Model A and Model B) generate responses in real time. The user reads both completions without knowing which lab built which model, and selects the winner, declares a tie, or marks both as bad. Only after voting are the model identities revealed.
+  </Step>
+
+  <Step title="2. The Elo expected outcome curve">
+    The Elo rating system converts the difference between two models’ numerical ratings into an expected win probability: $E_A = 1 / (1 + 10^{(R_B - R_A)/400})$. If two models share the exact same rating ($R_A = R_B$), each has an expected win rate of 50%. A 400-point rating advantage implies an expected win probability of 91%.
+  </Step>
+
+  <Step title="3. Worked arithmetic: 1200 vs 1100 rating">
+    Suppose Model A has a rating of 1200 and faces Model B with a rating of 1100. The 100-point difference translates to an expected score of $E_A \approx 0.6401$ (a 64.0% expected win rate). Model B has a complementary expected score of $1 - 0.6401 = 0.3599$ (36.0%).
+  </Step>
+
+  <Step title="4. Rating updates: R’ = R + K(S - E)">
+    After the match, ratings update according to $R' = R + K(S - E)$, where $S \in \{1, 0.5, 0\}$. If Model A wins ($S_A = 1$) with $K = 32$, it gains $+32 \times (1 - 0.6401) = +11.5$ points. Model B loses exactly $-11.5$ points. The rating shift is strictly zero-sum.
+  </Step>
+
+  <Step title="5. Bradley-Terry: the statistical foundation">
+    Underlying the Elo system is the Bradley-Terry probabilistic model: $P(A > B) = e^{r_A} / (e^{r_A} + e^{r_B})$. In Module 3C (*Alignment & Reward Modeling*), you saw this exact equation used to train RLHF and DPO reward models. LMSYS fits Bradley-Terry coefficients across millions of matches using logistic regression and bootstrap resampling.
+  </Step>
+
+  <Step title="6. The Arena dilemma: public chats vs enterprise apps">
+    Crowdsourced votes over-index on conversational charm, sycophancy, formatted bullet points, and humor. Production applications, however, demand deterministic JSON schemas, sub-second latency, zero factual hallucination, and rock-solid token economics.
+  </Step>
+</Scrolly>
+
+## Deriving the Elo rating system
+
+Invented by physicist and chess master Arpad Elo in 1960, the Elo system models performance as a random variable centered around a latent skill parameter $R$.
+
+### 1. The expected score formula
+If player $A$ has rating $R_A$ and player $B$ has rating $R_B$, the expected score $E_A$ (where $1.0$ is a certain win, $0.5$ is a tie, and $0.0$ is a certain loss) is given by the logistic sigmoid:
+
+$$
+E_A = \frac{1}{1 + 10^{(R_B - R_A)/400}}
+$$
+
+$$
+E_B = \frac{1}{1 + 10^{(R_A - R_B)/400}} = 1 - E_A
+$$
+
+Why the constant 400? In chess convention, a 400-point rating differential was chosen such that a player 400 points higher is expected to win ten times as often as they lose:
+
+$$
+\frac{E_A}{E_B} = 10^{(R_A - R_B)/400} = 10^{400/400} = 10^1 = 10
+$$
+
+Solving $E_A / (1 - E_A) = 10$ yields $E_A = 10/11 \approx 0.9091$ (a 90.9% win expectation).
+
+### 2. The post-match rating update
+Once the match concludes, the actual outcome $S_A$ is recorded:
+- $S_A = 1.0$ if Model A wins.
+- $S_A = 0.5$ if the match is a tie.
+- $S_A = 0.0$ if Model B wins.
+
+Each model's rating is adjusted proportionally to the gap between reality and expectation:
+
+$$
+R'_A = R_A + K \times (S_A - E_A)
+$$
+$$
+R'_B = R_B + K \times (S_B - E_B)
+$$
+
+The factor $K$ (typically set between 16 and 32) controls rating volatility:
+- If a heavy favorite wins, $S_A \approx E_A$, so $S_A - E_A \approx 0$, and ratings barely change.
+- If a massive underdog upsets the favorite, $S_A - E_A \approx 1.0$, resulting in a large transfer of rating points.
+
+Notice that because $E_A + E_B = 1$ and $S_A + S_B = 1$:
+
+$$
+(S_A - E_A) + (S_B - E_B) = (S_A + S_B) - (E_A + E_B) = 1 - 1 = 0
+$$
+
+The total points gained by the winner equal the total points lost by the loser. The Elo system is strictly **zero-sum**.
+
+<Callout type="math" title="Worked numeric example: 1200 vs 1100 rating">
+  Let Model A have rating $R_A = 1200$ and Model B have rating $R_B = 1100$, with volatility parameter $K = 32$.
+
+  **Step 1: Compute rating delta:**
+  $$
+  R_B - R_A = 1100 - 1200 = -100
+  $$
+
+  **Step 2: Compute expected probability:**
+  $$
+  10^{(-100 / 400)} = 10^{-0.25} \approx 0.56234
+  $$
+  $$
+  E_A = \frac{1}{1 + 0.56234} = \frac{1}{1.56234} \approx \mathbf{0.6401}\quad (64.01\%)
+  $$
+  $$
+  E_B = 1 - E_A = 1 - 0.6401 = \mathbf{0.3599}\quad (35.99\%)
+  $$
+
+  **Step 3: Outcome scenario 1 — Model A wins ($S_A = 1, S_B = 0$):**
+  $$
+  \Delta R_A = 32 \times (1.0 - 0.6401) = 32 \times 0.3599 = \mathbf{+11.52\ \text{points}}
+  $$
+  $$
+  R'_A = 1200 + 11.52 = \mathbf{1211.52}
+  $$
+  $$
+  R'_B = 1100 - 11.52 = \mathbf{1088.48}
+  $$
+
+  **Step 4: Outcome scenario 2 — Underdog Model B wins ($S_A = 0, S_B = 1$):**
+  $$
+  \Delta R_B = 32 \times (1.0 - 0.3599) = 32 \times 0.6401 = \mathbf{+20.48\ \text{points}}
+  $$
+  $$
+  R'_B = 1100 + 20.48 = \mathbf{1120.48}
+  $$
+  $$
+  R'_A = 1200 - 20.48 = \mathbf{1179.52}
+  $$
+
+  Notice the asymmetry: when the underdog pulls off an upset, it gains $+20.48$ points, nearly double the $+11.52$ points the favorite would have earned for an expected victory.
+</Callout>
+
+## The Bradley-Terry model and connection to alignment
+
+Online Elo updates process matches sequentially. However, in an offline evaluation dataset of 500,000 battles across 80 models, sequential updates suffer from **order sensitivity**: the final ratings depend on the order in which matches are processed.
+
+To resolve this, modern platforms use the **Bradley-Terry (BT) model**, which fits a global maximum likelihood estimator across the entire historical matrix of battles simultaneously.
+
+In the Bradley-Terry formulation, every model $i$ has an unconstrained latent quality parameter $r_i \in \mathbb{R}$. The probability that model $A$ beats model $B$ is:
+
+$$
+P(A > B) = \frac{e^{r_A}}{e^{r_A} + e^{r_B}} = \frac{1}{1 + e^{-(r_A - r_B)}} = \sigma(r_A - r_B)
+$$
+
+where $\sigma(z) = \frac{1}{1 + e^{-z}}$ is the standard logistic function.
+
+Notice that the Elo formula is simply the Bradley-Terry formulation with a change of base:
+
+$$
+e^{r_A - r_B} = 10^{(R_A - R_B)/400} \implies R_A = \frac{400}{\ln 10} \times r_A \approx 173.72 \times r_A
+$$
+
+<Callout type="intuition" title="The direct link to Module 3C (Alignment)">
+  In Module 3C, when you trained a Reward Model on human preferences, the loss function was:
+
+  $$
+  \mathcal{L}_{\text{RM}} = -\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma\left(r_\theta(x, y_w) - r_\theta(x, y_l)\right) \right]
+  $$
+
+  This is the exact negative log-likelihood of the Bradley-Terry model! Direct Preference Optimization (DPO) similarly derives its closed-form objective directly from the Bradley-Terry preference probability. When you look at the Chatbot Arena leaderboard, you are inspecting the global macroeconomic version of an RLHF reward model.
+</Callout>
+
+### Fitting the Bradley-Terry parameters
+Given an entire matrix of pairwise battle results, the log-likelihood of all observations is:
+
+$$
+\ln \mathcal{L}(r) = \sum_{A < B} \left[ W_{A,B} \ln \sigma(r_A - r_B) + W_{B,A} \ln \sigma(r_B - r_A) \right]
+$$
+
+where $W_{A,B}$ is the total number of times model $A$ defeated model $B$. LMSYS maximizes this convex log-likelihood using standard L-BFGS or logistic regression, and computes 95% confidence intervals using **bootstrap resampling** (resampling battles with replacement 1,000 times).
+
+## Why public arenas do not reflect production needs
+
+Chatbot Arena is an extraordinary tool for gauging consumer satisfaction with open-ended conversation. But if you rely on Arena Elo to choose a model for an enterprise software stack, you are making a category error.
+
+Here is why:
+
+### 1. The sycophancy and charm bias
+Crowdsourced voters on public websites are human beings chatting casually. They rate models higher when the model is polite, enthusiastic, flatters the user, uses emojis, and employs markdown headers.
+
+In production engineering, sycophancy is an anti-pattern. If a user asks an automated coding assistant to review a buggy SQL query, a sycophantic model will say: *"Great query! Here is a minor tweak..."* instead of bluntly flagging the SQL injection vulnerability.
+
+### 2. The formatting and verbosity penalty
+In Chatbot Arena, a 500-word response formatted with bold titles, introductory greetings, and concluding remarks routinely defeats a terse 30-word response.
+
+In a production microservice, extra tokens are pure waste:
+- Each unnecessary 100 output tokens adds $100 \times 15\ \text{ms} = 1.5\ \text{seconds}$ of user latency.
+- It inflates your API billing by \$0.001 per request, which scales to \$10,000/month at 10M requests.
+- It increases the surface area for parsing errors.
+
+### 3. Nontransitivity (rock-paper-scissors dynamics)
+The Elo and Bradley-Terry models assume **transitivity**: if Model A beats Model B, and Model B beats Model C, then Model A must beat Model C.
+
+In language models, capability is multidimensional. It is entirely possible that:
+- Model A excels at complex multi-step Python logic, beating Model B.
+- Model B excels at creative poetic roleplay, beating Model C.
+- Model C excels at strict structured JSON extraction, beating Model A.
+
+Collapsing multidimensional engineering capabilities into a single scalar Elo rating flattens domain-specific strengths into an aggregate consumer popularity contest.
+
+| Dimension | Chatbot Arena Priority | Production Serving Priority |
+|---|---|---|
+| **Tone** | Warm, conversational, agreeable | Neutral, objective, factual |
+| **Output Length** | Verbose, comprehensive, elaborate | Concise, minimal tokens, fast |
+| **Formatting** | Visual Markdown, bold text, emojis | Valid JSON, typed Pydantic objects |
+| **Latency (TTFT/TPOT)** | Ignored (users wait patiently) | P99 latency strictly enforced by SLO |
+| **Domain Specifics** | General trivia, creative writing, riddles | Proprietary internal schemas, domain terminology |
+
+<Callout type="real" title="Now read the paper">
+  **Chatbot Arena: An Open Platform for Evaluating LLMs by Human Preference** (Wei-Lin Chiang et al., 2024)
+  arXiv link: [https://arxiv.org/abs/2403.04132](https://arxiv.org/abs/2403.04132)
+
+  - **Read:** Section 1 (Introduction), Section 2 (Platform Architecture and Crowdsourcing System), Section 3 (Rating System: Elo, Bradley-Terry, and Bootstrap CI), and Section 5 (Discussion on benchmark saturation).
+  - **Skip:** Section 4 (details on specific LLM battle logs and toxicity filtering heuristics).
+  - **What you will recognize:** The mathematical equivalence between Elo and Bradley-Terry, how active matchmaking pairs models with similar ratings to maximize information gain, and why crowdsourced human preference provides a moving target that resists static contamination.
+</Callout>
+
+## In code: an Elo matchmaking simulator
+
+Here is how you can simulate a round-robin tournament and track Elo ratings in clean Python:
+
+```python
+import math
+
+class EloTournament:
+    def __init__(self, initial_rating: float = 1200.0, k_factor: float = 32.0):
+        self.ratings: dict[str, float] = {}
+        self.default_rating = initial_rating
+        self.k = k_factor
+
+    def get_rating(self, model: str) -> float:
+        return self.ratings.get(model, self.default_rating)
+
+    def expected_score(self, model_a: str, model_b: str) -> float:
+        ra = self.get_rating(model_a)
+        rb = self.get_rating(model_b)
+        return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+
+    def record_match(self, model_a: str, model_b: str, score_a: float):
+        """
+        score_a: 1.0 for A win, 0.5 for Tie, 0.0 for B win
+        """
+        ra = self.get_rating(model_a)
+        rb = self.get_rating(model_b)
+        ea = self.expected_score(model_a, model_b)
+        eb = 1.0 - ea
+
+        # Zero-sum rating update
+        self.ratings[model_a] = ra + self.k * (score_a - ea)
+        self.ratings[model_b] = rb + self.k * ((1.0 - score_a) - eb)
+
+    def leaderboard(self) -> list[tuple[str, float]]:
+        return sorted(self.ratings.items(), key=lambda x: x[1], reverse=True)
+
+# Simulate worked example:
+tourney = EloTournament(initial_rating=1200.0, k_factor=32.0)
+tourney.ratings["ModelA"] = 1200.0
+tourney.ratings["ModelB"] = 1100.0
+
+print(f"Initial expected win for ModelA: {tourney.expected_score('ModelA', 'ModelB'):.4f}")
+tourney.record_match("ModelA", "ModelB", score_a=1.0)
+print(f"After ModelA win -> ModelA: {tourney.get_rating('ModelA'):.2f}, ModelB: {tourney.get_rating('ModelB'):.2f}")
+```
+
+<KeyNotes>
+  1. The Elo rating system computes dynamic relative skill ratings from head-to-head pairwise matches without requiring a static golden answer set.
+  2. The expected win probability is given by the logistic curve $E_A = 1 / (1 + 10^{(R_B - R_A)/400})$; a 400-point gap indicates a 91% expected win rate.
+  3. Rating updates follow $R' = R + K(S - E)$, transferring points directly between winner and loser in a strictly zero-sum exchange.
+  4. The Bradley-Terry model provides the statistical foundation for Elo and connects comparative evaluation directly to RLHF/DPO reward modeling.
+  5. Chatbot Arena uses crowdsourced blind battles to combat static benchmark saturation and pretraining contamination.
+  6. Elo ratings assume transitivity, but real-world language model capabilities exhibit multi-dimensional, nontransitive strengths.
+  7. Public arena rankings favor conversational charm, formatting, and verbosity; enterprise production deployments require domain precision, low latency, and schema adherence.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'In the Elo rating formula, if Model A has a rating of 1400 and Model B has a rating of 1000, what is the expected win probability E_A for Model A?', numeric: true, answer: 0.909, tolerance: 0.02, unit: 'share', why: 'Delta = R_B - R_A = 1000 - 1400 = -400. 10^(-400/400) = 10^(-1) = 0.10. E_A = 1 / (1 + 0.10) = 1 / 1.10 ≈ 0.9091 (90.9%).' },
+  { q: 'Model A (rating 1200) faces Model B (rating 1100). Model A wins. With K = 32 and E_A = 0.64, what is the new rating of Model A?', numeric: true, answer: 1211.5, tolerance: 0.5, unit: 'Elo', why: 'Rating shift = K * (S - E) = 32 * (1.0 - 0.64) = 32 * 0.36 = +11.52 points. New rating = 1200 + 11.52 = 1211.52 ≈ 1211.5.' },
+  { q: 'Why is the Elo rating update system described as strictly "zero-sum"?', options: ['Ratings always sum to zero across all models', 'The number of rating points gained by the winner equals the exact number of rating points lost by the loser', 'Neither model gains points if the match is a tie', 'All matches end in a draw'], answer: 1, why: 'Because (S_A - E_A) + (S_B - E_B) = 0, the sum of adjustments is zero; points are simply transferred from loser to winner.' },
+  { q: 'Under the Bradley-Terry model, if latent score r_A = 2.0 and r_B = 1.0, what is the probability P(A > B) that Model A wins?', numeric: true, answer: 0.731, tolerance: 0.02, unit: 'share', why: 'P(A > B) = exp(2.0) / (exp(2.0) + exp(1.0)) = 7.389 / (7.389 + 2.718) = 7.389 / 10.107 ≈ 0.7311 (73.1%).' },
+  { q: 'Which of the following is a major risk of choosing a production model based purely on LMSYS Chatbot Arena rankings?', options: ['Chatbot Arena only tests models on chess games', 'Arena votes are heavily influenced by verbosity, polite tone, and formatting, which may hurt production latency, cost, and strict JSON parsing', 'Arena uses too few matches to compute ratings', 'The Bradley-Terry model cannot be solved on modern computers'], answer: 1, why: 'Crowdsourced public chat voters reward pleasantries and lengthy prose, whereas enterprise production systems require concise execution, low latency, and schema adherence.' },
+  { q: 'What is nontransitivity in comparative language model evaluation?', options: ['A model forgetting earlier conversation turns', 'A dynamic where Model A beats B, Model B beats C, but Model C beats A, violating the scalar ranking assumption of Elo', 'Ratings decaying over time due to inactivity', 'Evaluating models on two different GPUs'], answer: 1, why: 'Nontransitivity refers to rock-paper-scissors cycles where distinct specialized capabilities prevent models from being mapped onto a simple one-dimensional linear ladder.' },
+]} />

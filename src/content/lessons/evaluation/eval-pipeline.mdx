@@ -1,0 +1,308 @@
+---
+title: 'Designing your evaluation pipeline'
+summary: 'How to structure component-level evaluations, write anchor rubrics, detect Simpson’s paradox with slices, and calculate sample sizes with standard error and bootstrap intervals.'
+objectives:
+  - 'Decompose compound AI applications into component-level evaluation targets'
+  - 'Construct calibration rubrics with explicit positive and negative anchor examples'
+  - 'Identify and diagnose Simpson’s paradox across demographic and query slices'
+  - 'Calculate sample size requirements using binomial standard error'
+  - 'Implement bootstrap resampling to compute empirical confidence intervals'
+---
+import EvalPipelineVisual from '@/components/viz/evaluation/EvalPipelineVisual.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+So far in this module, you have studied individual evaluation tools: functional code verification with pass@k, rubric-guided AI judges with position swapping, and Elo rating tournaments. But in real-world software engineering, an AI application is never a single prompt in isolation. It is a compound pipeline comprising query rewriting, semantic retrieval, reranking, multi-turn state management, structured JSON generation, and safety guardrails.
+
+If you treat this compound pipeline as a monolithic black box and only measure whether the final answer pleases a user, you cannot engineer the system. When an answer is incorrect, did the vector database retrieve irrelevant chunks? Did the prompt fail to extract the right facts? Did the JSON parser throw a formatting error? Or did the safety guardrail produce a false rejection?
+
+This lesson brings all the threads together to design a production-grade **evaluation pipeline**: how to isolate components, author unambiguous rubrics with anchor examples, detect distributional illusions like **Simpson’s paradox**, and compute the sample sizes required to guarantee statistical significance.
+
+## Architectural blueprint of an evaluation pipeline
+
+<Scrolly>
+  <EvalPipelineVisual client:visible slot="stage" />
+
+  <Step title="1. Component-level decomposition: isolate every failure">
+    An end-to-end score hides root causes. Production pipelines decouple measurement into isolated stages: query rewriting (retrieval recall boost), vector retrieval (NDCG@k and chunk hit rate), LLM synthesis (factual grounding and faithfulness), and guardrails (false rejection rate).
+  </Step>
+
+  <Step title="2. Rubrics with anchor examples">
+    Vague grading criteria (*"Rate the quality 1 to 5"*) lead to massive scoring variance. Rigorous evaluation requires **anchor rubrics**: explicit, hand-written positive and negative boundary examples for each discrete numerical grade on the scale.
+  </Step>
+
+  <Step title="3. Slicing and Simpson’s paradox: the aggregation trap">
+    Never look only at an aggregate percentage. In Simpson’s paradox, Model 2 beats Model 1 overall (77% vs 58%), yet Model 1 is strictly superior on every individual query category (Easy: 90% vs 85%, Hard: 50% vs 45%). Shifting test distributions create dangerous illusions.
+  </Step>
+
+  <Step title="4. Sample size and standard error: SE = sqrt(p(1-p)/n)">
+    Your test suite’s statistical resolution is governed by the binomial standard error: $\text{SE} = \sqrt{p(1-p)/n}$. If your golden dataset contains only 100 samples, a measured 3% accuracy improvement is within random noise and cannot justify a production rollout.
+  </Step>
+
+  <Step title="5. Worked arithmetic: n=100 vs n=1000 sample bounds">
+    At baseline accuracy $p = 0.80$, $n = 100$ yields $\text{SE} = 4.00\%$ (a 95% confidence interval width of ~15.7%). Increasing to $n = 1000$ cuts the standard error to $1.26\%$ (CI width ~4.9%). Because $\text{SE} \propto 1/\sqrt{n}$, detecting a 3× smaller difference requires roughly **9× to 10× more samples**.
+  </Step>
+
+  <Step title="6. The evaluation loop: offline golden sets to online telemetry">
+    Evaluation is a continuous dual-loop system. Offline golden test suites (200 to 500 edge cases) gate CI/CD pull requests, while online shadow evaluation and implicit telemetry (copy-to-clipboard, retry rates, latency percentiles) monitor live production drift.
+  </Step>
+</Scrolly>
+
+## Component-level versus end-to-end evaluation
+
+When building compound AI systems—such as Retrieval-Augmented Generation (RAG) or multi-step autonomous agents—evaluating only the final output string is an engineering anti-pattern.
+
+Consider a customer querying a financial assistant:
+> *"What were our cloud infrastructure expenditures in Q3 2025?"*
+
+The system outputs: *"Your cloud infrastructure expenditure was \$420,000."*
+The user reports: *"Incorrect. The true filing was \$680,000."*
+
+Where did the failure originate?
+1. **Query Rewriter**: Did it strip the date and search for generic cloud expenditure?
+2. **Retriever**: Did the embedding model fail to retrieve the Q3 10-Q filing in its top-5 chunks?
+3. **Chunking**: Did the text splitter divide the balance sheet table across chunk boundaries, severing the label from the dollar figure?
+4. **Generator**: Did the prompt hallucinate the number despite the table being present in context?
+5. **Guardrail**: Did a post-processing filter truncate the response?
+
+Without component-level isolation, your team will spend days tweaking the generation prompt when the real bug was a chunking boundary error.
+
+| Pipeline Component | Isolated Input & Output | Core Evaluation Metric | Grader Modality |
+|---|---|---|---|
+| **Query Rewriter** | Raw query $\to$ Rewritten query | Context Recall Boost | Deterministic keyword hit |
+| **Retriever / Reranker** | Query $\to$ Top-k text chunks | Hit Rate@k, NDCG@k, MRR | Golden passage IDs |
+| **LLM Generator** | Context chunks + Query $\to$ Answer | Faithfulness (Groundedness) | Rubric-based AI Judge |
+| **Output Formatter** | Answer $\to$ JSON / Tool arguments | Schema compliance (Pydantic) | Deterministic parser |
+| **Safety Guardrail** | Final output $\to$ Approved / Blocked | False positive / negative rate | Golden toxicity split |
+
+By maintaining independent golden test sets for each stage, you can refactor your vector database or swap your embedding model without re-evaluating the entire generative layer.
+
+## Authoring anchor rubrics
+
+In *AI as a judge, and its biases*, you learned that LLM judges suffer from scale drift unless prompted with an explicit rubric. The gold standard for rubric design is the **Anchor Rubric**: providing real, hand-crafted concrete examples for every score tier.
+
+Consider a factual summarization task for customer support tickets:
+
+```markdown
+### 5-Point Groundedness Rubric with Concrete Anchors
+
+- **Score 5 (Exemplary Grounding)**:
+  Every claim in the summary is directly substantiated by the provided ticket. No speculative assertions. No conversational filler.
+  *Anchor Example*: "The customer reported error code ERR-402 at 14:15 UTC. The engineer restarted the gateway, which resolved the issue."
+
+- **Score 4 (Accurate but Verbose / Minor Extrapolation)**:
+  All core facts are accurate, but includes harmless conversational filler or minor plausible extrapolations not explicitly in the text.
+  *Anchor Example*: "The customer encountered a gateway error ERR-402, likely caused by network congestion. The issue was quickly resolved by restarting the service." (Note: "likely caused by network congestion" was not stated).
+
+- **Score 3 (Partially Grounded / Key Omission)**:
+  Contains factual statements from the ticket, but omits a critical resolution step or misstates an error code.
+  *Anchor Example*: "The customer had a network error. An engineer attended to it." (Omits the error code and resolution action).
+
+- **Score 2 (Major Factual Error)**:
+  Directly contradicts the ticket on key operational facts.
+  *Anchor Example*: "The engineer replaced the physical server hardware to resolve the error." (Contradicts ticket: only restarted service).
+
+- **Score 1 (Complete Hallucination or Toxic Output)**:
+  Fabricates an entirely unrelated narrative, leaks system prompt instructions, or outputs harmful text.
+  *Anchor Example*: "The customer requested a full account refund because their credit card was compromised." (Entirely fabricated).
+```
+
+When an automated judge prompt includes these concrete anchors, inter-rater reliability increases significantly: Cohen’s kappa between judge and human experts jumps from ~0.45 to over ~0.75.
+
+## Slicing and Simpson’s paradox
+
+An aggregate evaluation score (e.g. *"Our system achieved 82% accuracy"*) is an average over your entire test set. But production users do not experience averages; they experience individual interactions.
+
+To prevent catastrophic blind spots, you must partition your test dataset into **slices**:
+- **Query Length Slices**: Short (< 15 tokens), Medium (15–50 tokens), Long (> 50 tokens).
+- **User Demographics / Enterprise Tiers**: Free users, Enterprise users, Regulated healthcare clients.
+- **Task Intent Slices**: Creative generation, strict data extraction, mathematical reasoning, multi-turn follow-ups.
+- **Language / Locale Slices**: English, Spanish, multilingual code-switching.
+
+### The danger of Simpson’s paradox
+The most dangerous failure in aggregate metrics is <Term t="simpsons-paradox">Simpson's Paradox</Term>: a phenomenon where a trend appears in several different groups of data but disappears or reverses when the groups are combined.
+
+Consider a real-world scenario where you are comparing a Baseline Model (Model 1) against a proposed Candidate Model (Model 2) over two slices: **Slice A (Easy short queries)** and **Slice B (Hard multi-step queries)**.
+
+Here are the measured results:
+
+| Slice Category | Model 1 (Baseline) | Model 2 (Candidate Prompt) | True Winner |
+|---|---|---|---|
+| **Slice A: Easy Queries** | 18 / 20 = **90.0%** | 68 / 80 = **85.0%** | **Model 1 (+5.0%)** |
+| **Slice B: Hard Queries** | 40 / 80 = **50.0%** | 9 / 20 = **45.0%** | **Model 1 (+5.0%)** |
+| **Overall Aggregate** | 58 / 100 = **58.0%** | 77 / 100 = **77.0%** | **Model 2 (+19.0%?!)** |
+
+Inspect this table carefully:
+- On Slice A, Model 1 wins: 90.0% vs 85.0%.
+- On Slice B, Model 1 wins: 50.0% vs 45.0%.
+- **Model 1 is strictly superior on every single category of inquiry.**
+
+Yet if you only looked at the aggregate total, you would conclude that Model 2 achieved an astonishing **77.0%** versus Model 1's **58.0%**—an apparent 19-percentage-point leap in capability!
+
+Why did this occur?
+Because the test set distribution was unbalanced. In Model 2's test run, 80% of the queries happened to be easy (Slice A), whereas in Model 1's test run, 80% of the queries were hard (Slice B). The aggregate metric rewarded Model 2 simply because it was tested on an easier workload.
+
+<Callout type="pitfall" title="The aggregate trap in production">
+  If you deploy Model 2 to production based on the 77% aggregate score, your actual customer satisfaction will drop across every single user segment. Never evaluate models without standardizing slice weights or reporting sliced scorecards.
+</Callout>
+
+## Sample size, standard error, and statistical power
+
+How many samples do you actually need in an evaluation suite?
+
+If your golden dataset contains $n = 50$ samples, and a new prompt scores 42/50 (84%) while the old prompt scored 40/50 (80%), did your prompt change actually improve the system? Or did you get lucky with random generation noise?
+
+To answer this rigorously, we model each test case as a Bernoulli trial with success probability $p$. The **Standard Error (SE)** of the sample proportion $\hat{p}$ over $n$ independent samples is:
+
+$$
+\text{SE} = \sqrt{\frac{p(1 - p)}{n}}
+$$
+
+The 95% confidence interval for your measured accuracy is:
+
+$$
+\text{CI}_{95\%} = \hat{p} \pm 1.96 \times \text{SE}
+$$
+
+The total width of the 95% confidence interval is $W = 2 \times 1.96 \times \text{SE} \approx 3.92 \times \text{SE}$.
+
+<Callout type="math" title="Worked numeric example: n = 100 versus n = 1,000">
+  Assume a baseline accuracy of $p = 0.80$ (80.0%). The variance numerator is:
+  $$
+  p(1 - p) = 0.80 \times (1 - 0.80) = 0.80 \times 0.20 = 0.160
+  $$
+
+  **Case 1: Small golden set of n = 100 samples**
+  $$
+  \text{SE}_{100} = \sqrt{\frac{0.160}{100}} = \sqrt{0.0016} = \mathbf{0.0400}\quad (4.00\%)
+  $$
+  The 95% margin of error is:
+  $$
+  \pm 1.96 \times 0.0400 = \pm 0.0784\quad (\pm 7.84\%)
+  $$
+  The 95% confidence interval spans:
+  $$
+  [0.80 - 0.0784,\ 0.80 + 0.0784] = \mathbf{[72.16\%,\ 87.84\%]}
+  $$
+  The uncertainty window is a massive **15.68 percentage points wide**. If a prompt change yields 83%, that result is completely indistinguishable from baseline noise!
+
+  **Case 2: Scaled golden set of n = 1,000 samples**
+  $$
+  \text{SE}_{1000} = \sqrt{\frac{0.160}{1000}} = \sqrt{0.00016} \approx \mathbf{0.01265}\quad (1.265\%)
+  $$
+  The 95% margin of error is:
+  $$
+  \pm 1.96 \times 0.01265 = \pm 0.0248\quad (\pm 2.48\%)
+  $$
+  The 95% confidence interval spans:
+  $$
+  [0.80 - 0.0248,\ 0.80 + 0.0248] = \mathbf{[77.52\%,\ 82.48\%]}
+  $$
+  The uncertainty window narrows to just **4.96 percentage points**. An improvement from 80% to 83% is now statistically significant ($p < 0.05$).
+</Callout>
+
+### The inverse square law of sample size
+Notice the fundamental scaling relationship:
+
+$$
+\text{SE} \propto \frac{1}{\sqrt{n}} \implies n \propto \frac{1}{\text{SE}^2}
+$$
+
+To cut your measurement uncertainty in half ($2\times$ smaller margin of error), you need $2^2 = \mathbf{4\times}$ as many samples.
+
+To detect a **3× smaller delta** (for instance, detecting a subtle 1.5% improvement instead of a coarse 4.5% improvement), you need:
+
+$$
+3^2 = \mathbf{9\times\ \text{to}\ 10\times\ \text{more samples}}
+$$
+
+Rule of thumb for AI engineering teams:
+- **Smoke test / rapid prototyping**: $n = 50$ to $100$ samples (catches catastrophic regressions $> 10\%$).
+- **PR merge gate in CI/CD**: $n = 200$ to $400$ samples (resolves differences $\approx 4\%$).
+- **Major model migration / architecture decision**: $n = 1{,}000+$ samples (resolves subtle trade-offs $\le 1.5\%$).
+
+## Bootstrap confidence intervals
+
+The standard error formula assumes a simple binomial distribution (success or failure). But real-world evaluations often track non-normal continuous metrics: BERTScore F1, rubric averages on a 1-to-5 scale, or per-request latency.
+
+For non-normal metrics, we compute confidence intervals using **bootstrap resampling**:
+1. Take your observed list of $n$ evaluation scores.
+2. Draw a resampled list of size $n$ **with replacement** from the observed scores.
+3. Compute the mean score on this synthetic resample.
+4. Repeat this procedure $B = 1{,}000$ to $10{,}000$ times to generate an empirical sampling distribution.
+5. Sort the resampled means. The 2.5th percentile and 97.5th percentile define the exact empirical **95% Bootstrap Confidence Interval**.
+
+```python
+import numpy as np
+
+def bootstrap_confidence_interval(
+    scores: list[float], num_resamples: int = 1000, alpha: float = 0.05
+) -> tuple[float, float, float]:
+    """
+    Computes empirical bootstrap confidence interval for arbitrary metrics.
+    Returns: (mean, lower_bound, upper_bound)
+    """
+    arr = np.array(scores)
+    n = len(arr)
+    mean_val = float(np.mean(arr))
+
+    # Resample with replacement
+    resampled_means = np.zeros(num_resamples)
+    for i in range(num_resamples):
+        sample = np.random.choice(arr, size=n, replace=True)
+        resampled_means[i] = np.mean(sample)
+
+    lower = float(np.percentile(resampled_means, (alpha / 2) * 100))
+    upper = float(np.percentile(resampled_means, (1 - alpha / 2) * 100))
+
+    return mean_val, lower, upper
+```
+
+## The dual-loop evaluation architecture
+
+A mature AI engineering organization operates two interconnected evaluation loops:
+
+```
+  ================== OFFLINE PRE-DEPLOYMENT LOOP ==================
+   [ Pull Request ] 
+          |
+          v
+   [ Run Golden CI Suite (n=300) ]
+   ├── Slice: Edge cases & negatives
+   ├── Isolated components: Retriever NDCG + Generator Rubric
+   └── Pass Threshold: Accuracy >= 85% AND Zero PII leaks
+          |
+     (Pass CI)
+          v
+  ================== ONLINE PRODUCTION LOOP =======================
+   [ Canary Deployment (10% Traffic) ]
+          |
+          v
+   [ Telemetry & Observability Aggregation ]
+   ├── Implicit User Feedback: Thumbs up/down, Copy-to-clipboard
+   ├── Operational SLOs: P95 TTFT < 400ms, Error rate < 0.1%
+   └── Distribution Drift: PPL shifts on customer query logs
+          |
+          v
+   [ Failure Ingestion ] ──> [ Curate & Add to Offline Golden Set ]
+```
+
+Every production failure—every customer complaint, hallucinated ticket, or unexpected formatting break—is cleaned, anonymized, and committed as a permanent test case in your offline golden dataset. Over time, your evaluation suite becomes the institutional memory of your company's domain expertise.
+
+<KeyNotes>
+  1. Always decompose compound AI applications into component-level evaluations (query rewrite, vector retrieval, generation, guardrails) to isolate the exact source of failure.
+  2. Anchor rubrics provide concrete positive and negative boundary examples for every score tier, eliminating judge calibration drift.
+  3. Simpson’s paradox occurs when an inferior model appears to win in aggregate because its evaluation set was skewed toward easy queries.
+  4. Always partition evaluation scorecards into slices: query lengths, user tiers, languages, and task domains.
+  5. The standard error of accuracy is $\text{SE} = \sqrt{p(1-p)/n}$. At $p=0.8$, $n=100$ gives $\text{SE}=4.0\%$, while $n=1000$ gives $\text{SE}=1.26\%$.
+  6. The Inverse Square Law dictates that detecting a 3× smaller performance difference requires roughly 9× to 10× more evaluation samples.
+  7. Production systems unite offline golden CI gating (pre-merge regression prevention) with online telemetry (implicit user signals and live distribution drift detection).
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'In an evaluation test set, Model A scores 90% on Easy queries (n=20) and 50% on Hard queries (n=80). Model B scores 85% on Easy queries (n=80) and 45% on Hard queries (n=20). What are their overall aggregate accuracies?', options: ['Model A: 70%, Model B: 65%', 'Model A: 58%, Model B: 77%', 'Model A: 75%, Model B: 75%', 'Model A: 85%, Model B: 90%'], answer: 1, why: 'Model A total correct: (0.90 * 20) + (0.50 * 80) = 18 + 40 = 58 out of 100 (58.0%). Model B total correct: (0.85 * 80) + (0.45 * 20) = 68 + 9 = 77 out of 100 (77.0%). This is Simpson’s paradox: Model B has a much higher aggregate score despite performing worse on both slices.' },
+  { q: 'For a baseline pass rate of p = 0.80, what is the standard error (SE) of the accuracy estimate when evaluating a golden test set of n = 400 samples?', numeric: true, answer: 0.02, tolerance: 0.002, unit: 'SE', why: 'SE = sqrt[ p(1 - p) / n ] = sqrt[ 0.80 * 0.20 / 400 ] = sqrt[ 0.160 / 400 ] = sqrt[ 0.0004 ] = 0.0200 (2.0%).' },
+  { q: 'If you want to cut your evaluation measurement uncertainty (margin of error) in half by reducing standard error from 4% to 2%, by what factor must you increase your sample size?', numeric: true, answer: 4.0, tolerance: 0.2, unit: 'factor', why: 'Because standard error scales inversely with the square root of n (SE ∝ 1/√n), cutting SE in half requires (2)^2 = 4x more samples.' },
+  { q: 'What is the primary function of "anchor examples" in a 5-point evaluation rubric?', options: ['To speed up GPU inference time', 'To provide concrete, unambiguous reference text for each score tier so human and AI judges do not drift in their calibration', 'To replace the need for unit testing', 'To automatically fix bugs in model weights'], answer: 1, why: 'Anchor examples establish concrete real-world criteria for each score, preventing scoring drift and ensuring consistent calibration.' },
+  { q: 'An engineering team tests a prompt tweak on n = 64 samples at baseline p = 0.80. The measured score increases by 2.5 percentage points. Is this difference statistically significant at 95% confidence?', options: ['Yes, any positive increase is statistically significant', 'No, the standard error for n = 64 is 5.0%, making a 2.5% delta well within random sampling noise', 'Yes, because 64 is greater than 30', 'It depends on the GPU temperature'], answer: 1, why: 'SE = sqrt(0.80 * 0.20 / 64) = sqrt(0.16 / 64) = sqrt(0.0025) = 0.050 (5.0%). A 95% margin of error is ±1.96 * 5% = ±9.8%. A 2.5% delta is completely indistinguishable from chance.' },
+  { q: 'In component-level evaluation of a RAG pipeline, which metric is best suited to evaluate the retriever independently of the generation model?', options: ['ROUGE-1 word recall on final generation', 'NDCG@k or Hit Rate@k against known relevant document IDs', 'Perplexity of the user prompt', 'Token generation speed (TPOT)'], answer: 1, why: 'NDCG@k and Hit Rate@k directly measure whether the retrieval system placed relevant documents in top ranks, isolated from LLM synthesis.' },
+]} />
