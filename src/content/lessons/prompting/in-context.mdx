@@ -1,0 +1,199 @@
+---
+title: 'Zero-shot, few-shot & in-context learning in practice'
+summary: 'Examples in the prompt can teach a model a format, a label set and your edge cases, with no training at all. Learn when they help an instruction-tuned model, why their format and order matter more than their labels, and what each one costs on every single call.'
+objectives:
+  - Define zero-shot, one-shot and few-shot prompting and connect them to GPT-3's in-context learning
+  - Decide when examples help an instruction-tuned model and when they hurt
+  - Build an example set with a consistent format, balanced labels and a safe order
+  - Compute the token, latency and dollar cost of k examples at a given call volume
+---
+import FewShot from '@/components/viz/prompting/FewShot.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You are building a support inbox. Every incoming ticket must be tagged as `BILLING`, `BUG`, `ACCOUNT` or `OTHER` so it reaches the right team. You write a clear instruction, send a ticket that says "I was charged twice for my plan this month", and the model replies: "This ticket appears to concern a billing problem, since the customer reports a duplicate charge." It understood perfectly. Your parser, which expected one word, throws.
+
+Then the edge cases arrive. "I can't log in since the update": is that a `BUG` or an `ACCOUNT` problem? Your team has a rule (it is `ACCOUNT` unless the app crashes), but the model does not know your rule, and it picks differently on different days.
+
+The fix everyone reaches for is to paste in a few labelled tickets. It works, and it raises three questions this lesson answers with numbers: **how many examples, which ones, in what order**, and what they cost when every one of them is resent with every ticket, forever.
+
+## Learning from the prompt
+
+Module 3B told the story of GPT-3. Its authors gave a 175-billion-parameter model a task in three ways, all without changing a single weight:
+
+- **<Term t="zero-shot">Zero-shot</Term>**: a description of the task, then the input.
+- **One-shot**: the description, one solved example, then the input.
+- **<Term t="few-shot">Few-shot</Term>**: the description, $K$ solved examples (typically 10 to 100, as many as fit in GPT-3's 2,048-token window), then the input.
+
+Few-shot often worked dramatically better than zero-shot, and the gap grew with model size. The model was not trained on the examples; it read them and continued the pattern. That ability is called <Term t="in-context-learning">in-context learning</Term>, and it follows directly from next-token prediction: a document made of five "Ticket: … Label: …" pairs and one unfinished pair makes "a label, in that exact style" by far the most likely continuation.
+
+That was 2020, with a base model. You will mostly prompt instruction-tuned models, and they change what examples are for. Watch it happen.
+
+<Scrolly>
+  <FewShot client:visible slot="stage" />
+
+  <Step title="1. The task, and the zero-shot answer">
+    An instruction, a ticket, no examples. The instruction-tuned model got the category right and the **shape** wrong: a sentence where your code wanted one word. For a program, that answer counts as a failure. The bar at the top is this prompt drawn to scale: 250 input tokens.
+  </Step>
+
+  <Step title="2. One example pins the format">
+    Add a single solved ticket. The answer snaps to `BILLING`: one word, from the list. The example did not teach the model what billing is. It taught **what an answer looks like here**. The prompt grew by 200 tokens.
+  </Step>
+
+  <Step title="3. GPT-3: a base model learns from the prompt">
+    Now the chart (the curves are illustrative, shaped after the published results). A base model with zero examples sits near **chance, 25%** with four labels. Drag k and watch each example lift it. Same frozen weights: this is in-context learning.
+  </Step>
+
+  <Step title="4. An instruction-tuned model starts high">
+    Instruction tuning (Module 3C) moved the whole curve up: zero-shot already works. Examples now buy a few points, **mostly in the first two or three**, and then the curve is flat. Meanwhile the dashed blue line, tokens per call, keeps climbing in a straight line.
+  </Step>
+
+  <Step title="5. Format matters more than correct labels">
+    Switch the examples to **mixed formats** and the red curve drops. Switch to **random labels** (each example given a wrong label at random) and it barely moves. The examples mostly teach the label space, the style of the inputs and the format of the answer.
+  </Step>
+
+  <Step title="6. Order matters: the recency trap">
+    Choose **one label last**: end the examples with a run of one label, and the model leans toward that label. The shaded band is the spread you get by **reordering the same examples**. Balance the labels, interleave them, and the band narrows.
+  </Step>
+
+  <Step title="7. Every example is paid on every call">
+    Five examples of 200 tokens add **1,000 input tokens to every call**. At 100,000 tickets a day that is 100 million tokens a day, about 30 ms of extra prefill per call on an 8B model, and a line on your bill. Switch the dated price to see the range.
+  </Step>
+</Scrolly>
+
+## What instruction tuning changed
+
+With a base model, examples were the *only* way to say what you wanted. After supervised finetuning and preference tuning (Module 3C), the instruction does that job, so examples move from "teach the task" to three narrower jobs:
+
+1. **Pin the output format.** One word, from a fixed list, in capitals, with nothing around it. Format is the most common thing a zero-shot answer gets wrong, and one example fixes it more reliably than a paragraph of instructions.
+2. **Draw the boundaries of your labels.** "Can't log in since the update" → `ACCOUNT` encodes your team's rule in one line. Edge cases are where your definitions differ from the model's defaults, and examples are the cheapest way to state them.
+3. **Show the style.** Length, tone and vocabulary of a reply are easier to show than to describe.
+
+That gives a working rule: **start zero-shot**, with a precise instruction and an explicit output format. Run it on real inputs. Add an example only when it fixes a failure you actually observed, and choose the example that fixes it. An example that fixes nothing is pure cost.
+
+<Callout type="intuition" title="Why an example beats a paragraph of instructions">
+  The model was trained to continue documents. An instruction describes the answer; an example *is* an answer, sitting exactly where the next answer will go. Continuing a visible pattern is the oldest skill the model has, older than following instructions. So when you can show it, show it.
+</Callout>
+
+## What the examples actually teach
+
+Here is a surprise worth knowing. Min et al. (2022) took few-shot prompts for classification and multiple-choice tasks and **replaced the correct labels in the examples with random ones**. Performance barely dropped. What did matter was whether the examples showed:
+
+- the **label space**: the set of possible answers;
+- the **input distribution**: what real inputs look like;
+- the **format**: how an input and its answer are laid out.
+
+So for many tasks the model is not learning the mapping from your examples; it is learning *what kind of task this is and what an answer looks like*, and then using what it already knows. (The effect depends on the model: later work found that larger models do follow flipped labels more, so never use wrong labels on purpose. The point is what to be careful about.)
+
+The practical consequence: **format consistency is not cosmetic**. Every example must use the identical layout you want back, down to the delimiter:
+
+```text
+Bad: three formats for one task                 Good: one format, exactly what you will parse
+Ticket: The app crashes on upload.  -> Bug      Ticket: The app crashes when I upload a photo.
+Q: Charged twice? A: billing                    Label: BUG
+Ticket - "Locked out" (ACCOUNT)
+                                                Ticket: I was charged twice this month.
+                                                Label: BILLING
+```
+
+The left block teaches the model that any of three formats is acceptable, so it picks one, sometimes a fourth. The right block leaves exactly one plausible continuation.
+
+<Callout type="pitfall" title="Small inconsistencies are still inconsistencies">
+  `Label: BUG` in four examples and `label: Bug` in the fifth; a trailing space after one colon; one example on a single line. Each is a second "format" the model may copy. Generate your example block from data with one function, never by hand, so every example is formatted by the same code as the live input.
+</Callout>
+
+## Order and balance
+
+Examples are read in order, and order leaves fingerprints. Zhao et al. (2021) showed that GPT-3's few-shot accuracy could swing **from near chance to near state of the art** just by changing which examples were used and the order they came in, and traced the swings to three biases:
+
+- **Majority label bias**: the model favours whichever label appears most often in the examples.
+- **<Term t="recency-bias">Recency bias</Term>**: it favours the labels of the examples closest to the end.
+- **Common token bias**: it favours answers that are frequent words in general.
+
+Lu et al. (2022) found the same for order alone: one permutation of a fixed example set could be excellent and another near random. Instruction-tuned models are far less fragile than 2020's base models, which is why the band in step 6 is narrow for them, but the biases have not vanished. Five rules follow:
+
+1. **Balance the labels.** Two `BILLING`, two `BUG`, two `ACCOUNT`, two `OTHER`, not five `BILLING` and one of each other.
+2. **Interleave them.** Never end on a run of one label.
+3. **Cover the boundaries.** Spend examples on the confusable pairs (`BUG` versus `ACCOUNT`), not on easy cases the model already gets.
+4. **Fix the order once chosen.** A stable order gives reproducible results and, from lesson B1.1, a stable cacheable prefix.
+5. **Test more than one order** before you commit. Module B2 shows how to measure the spread properly.
+
+## Which examples: static or retrieved
+
+A fixed example set is simple and cacheable. The alternative is to **retrieve examples per request**, often called <Term t="dynamic-few-shot">dynamic few-shot</Term>: embed the incoming ticket, find the $k$ most similar labelled tickets in your history, and use those. Liu et al. (2021) found that examples chosen this way tend to beat randomly chosen ones, because a near neighbour shows the model exactly the distinction it needs. Module B3 builds the embedding search this requires.
+
+Retrieved examples have a cost that lesson B1.1 makes visible: they differ on every request, so they **cannot be part of the cached prefix**. Put the static instruction first and the retrieved examples after it, so at least the instruction is reused.
+
+At the other extreme, long-context models opened up <Term t="many-shot">many-shot</Term> prompting: Agarwal et al. (2024) reported that some tasks keep improving with hundreds or thousands of examples in the prompt. Run the cost arithmetic below on 500 examples of 200 tokens before you get excited: 100,000 input tokens on every call. At that size it is usually cheaper to move the examples out of the prompt and into the weights, which is what finetuning does (Module B5): you pay for the examples once, at training time, instead of on every call.
+
+## What k examples cost
+
+Every example is resent with every request. For $k$ examples of $t_{\text{ex}}$ tokens each and $R$ requests a day:
+
+$$
+\text{extra input tokens per day} = k \times t_{\text{ex}} \times R
+$$
+
+The worked example from the visual: $k = 5$, $t_{\text{ex}} = 200$, $R = 100{,}000$.
+
+$$
+5 \times 200 = 1{,}000\ \text{tokens per call}, \qquad 1{,}000 \times 100{,}000 = 10^{8} = 100\ \text{million tokens per day}
+$$
+
+Now put a price on it. Hosted APIs bill per million input tokens, and prices change often, so here are two **dated** list prices as examples, not as current quotes: \$0.15 per million (GPT-4o mini at its launch in July 2024) and \$2.50 per million (GPT-4o's input price from August 2024).
+
+| Price per million input tokens | Per day | Per year |
+|---|---|---|
+| \$0.15 | 100 × \$0.15 = **\$15** | \$15 × 365 = **\$5,475** |
+| \$2.50 | 100 × \$2.50 = **\$250** | \$250 × 365 = **\$91,250** |
+
+The same five examples cost seventeen times more on the bigger model. That ratio, not the absolute number, is the lesson: **an example's price is set by the model you send it to**.
+
+There is also a latency cost. Prefill costs about ${}2N$ FLOPs per token (Module 04), so on Llama-3.1-8B on an H100 at 55% of its 989 TFLOP/s:
+
+$$
+t = \frac{2 \times 8.03 \times 10^{9} \times 1{,}000}{0.55 \times 989 \times 10^{12}} \approx 0.030\ \text{s} = 30\ \text{ms}
+$$
+
+added to the time to first token of every call.
+
+<Callout type="math" title="Self-hosted, the same examples are almost free">
+  If you serve the model yourself, the 100 million extra tokens a day are pure prefill compute: ${}10^{8} \times 2 \times 8.03 \times 10^{9} = 1.6 \times 10^{18}$ FLOP. At ${}5.44 \times 10^{14}$ FLOP/s (55% of an H100) that is about 2,950 seconds, **0.82 H100-hours a day**, roughly \$2 at \$2.50 an hour, assuming the GPU is otherwise kept busy. Prefill is the cheap, compute-bound phase (Module 05). That gap between what prefill costs to run and what input tokens cost to buy is one reason hosted providers can discount cached input tokens, and why static examples belong in the cached prefix.
+</Callout>
+
+So examples are cheap per call and expensive at scale, and the curve in the visual says the marginal example is worth less each time. The right k is where the next example's accuracy gain stops paying for its tokens, and you can only find it by **measuring** on your own data, which is exactly what the lab does.
+
+## When examples hurt
+
+Examples are not free of side effects even when their cost is fine:
+
+- **Copying.** Models copy surface features. If every example summary is 20 words, your summaries become 20 words; if an example mentions "Acme Corp", Acme Corp starts appearing in answers about other companies. Vary the incidental details across examples.
+- **Narrowing.** Examples drawn from one corner of the input space teach the model that corner. If all your `BUG` examples are about uploads, a crash on login may not look like a `BUG`.
+- **Reasoning models.** Models trained to think at length before answering (lesson B1.4) can do worse with few-shot prompts. The DeepSeek-R1 report says exactly this: few-shot prompting consistently degraded its performance, and it recommends describing the problem and the output format zero-shot. For these models, spend your effort on the instruction and the format.
+
+<Callout type="real" title="Now read the paper">
+  **Min et al., "Rethinking the Role of Demonstrations: What Makes In-Context Learning Work?" (2022), [arXiv 2202.12837](https://arxiv.org/abs/2202.12837).**
+
+  Read the introduction, the experiment showing that gold labels matter little, and the analysis that separates the input distribution, the label space and the format. Skim the list of models and datasets. Skip the meta-training details unless you are curious. You will recognise step 5 of the visual, the format-consistency rule, and why "one example per label, identical format" is such a strong default.
+
+  If you want the order story too, read the abstract and first figure of Zhao et al., "Calibrate Before Use" (2021, [arXiv 2102.09690](https://arxiv.org/abs/2102.09690)), where the three biases are named.
+</Callout>
+
+<KeyNotes>
+  1. **Zero-shot** is instruction only, **one-shot** adds one solved example, **few-shot** adds several. A model using them without weight changes is doing **in-context learning**, GPT-3's headline result (Module 3B).
+  2. For a base model, examples specify the task. For an instruction-tuned model they mostly pin the **output format**, define your **label boundaries** and show **style**; the gain is concentrated in the first two or three examples.
+  3. Start zero-shot with a precise format, and add an example only to fix a failure you observed.
+  4. Examples teach the label space, the input distribution and the format more than the input-label mapping: random labels barely hurt, **inconsistent formats do**. Generate the example block with code.
+  5. Order leaves fingerprints (majority, recency and common-token biases). Balance labels, interleave them, never end on a run, and keep the order fixed so the prefix stays cacheable.
+  6. Cost: $k \times t_{\text{ex}} \times R$ extra input tokens a day. 5 × 200 × 100,000 = 100 million a day: \$15 a day at a dated \$0.15 per million, \$250 at \$2.50, plus about 30 ms of 8B prefill per call.
+  7. Retrieved (per-request) examples are more relevant but cannot be cached; hundreds of examples (many-shot) usually mean it is time to finetune instead.
+  8. Examples can hurt: models copy their surface details, narrow examples narrow behaviour, and reasoning models such as DeepSeek-R1 do better zero-shot.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Your prompt carries 5 examples of 200 tokens each. You make 100,000 calls a day at a dated price of $0.15 per million input tokens. What do the examples alone cost per day, in dollars?', numeric: true, answer: 15, tolerance: 0.3, unit: '$/day', why: '5 × 200 = 1,000 tokens per call; × 100,000 calls = 100,000,000 tokens = 100 million; 100 × $0.15 = $15 a day.' },
+  { q: 'Same 5 × 200-token examples and 100,000 calls a day, at a dated $2.50 per million input tokens. What do they cost per year?', numeric: true, answer: 91250, tolerance: 1500, unit: '$/year', why: '100 million tokens a day × $2.50 per million = $250 a day; × 365 = $91,250 a year.' },
+  { q: 'How many milliseconds of prefill do 1,000 extra prompt tokens add on Llama-3.1-8B (8.03B parameters) on an H100 at 55% of 989 TFLOP/s, using 2N FLOPs per token?', numeric: true, answer: 29.5, tolerance: 1.2, unit: 'ms', why: '2 × 8.03e9 × 1,000 = 1.61e13 FLOP; 0.55 × 989e12 = 5.44e14 FLOP/s; 1.61e13 / 5.44e14 = 0.0295 s ≈ 29.5 ms.' },
+  { q: 'Min et al. (2022) replaced the correct labels in few-shot examples with random labels. What did they find?', options: ['Accuracy fell to chance', 'Accuracy barely dropped: the label space, input distribution and format mattered much more than label correctness', 'Accuracy improved, so wrong labels should be used', 'The models refused to answer'], answer: 1, why: 'Ground-truth labels mattered little for many tasks. What mattered was showing the possible labels, realistic inputs and a consistent format. That is why format consistency is the first rule of building examples.' },
+  { q: 'Your 8 examples are 5 BILLING followed by one each of BUG, ACCOUNT and OTHER, ending with OTHER. Which change best addresses the biases Zhao et al. described?', options: ['Add more BILLING examples so the model is sure', 'Use two examples per label and interleave them so no label dominates or sits in a run at the end', 'Move the instruction to the end', 'Raise the temperature'], answer: 1, why: 'Majority label bias favours the most frequent label; recency bias favours the labels near the end. Balanced counts and interleaving remove both levers.' },
+  { q: 'You switch from a fixed example set to retrieving the 5 most similar past tickets for each request. What happens to prefix caching of the examples?', options: ['Nothing changes', 'The examples now differ per request, so they cannot be cached; keep the static instruction first so that part still is', 'Caching gets better because the examples are more relevant', 'The provider caches them automatically by meaning'], answer: 1, why: 'A prefix cache matches exact tokens from the start. Per-request examples break the match wherever they begin, so put them after the static instruction.' },
+]} />

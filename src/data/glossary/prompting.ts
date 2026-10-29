@@ -19,4 +19,19 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'A chat layout used by Qwen and others: each turn is <|im_start|>role, a newline, the content, then <|im_end|>. Five template tokens per message, three for the generation prompt.',
     lesson: 'prompting/chat-templates',
   },
+  'recency-bias': {
+    term: 'Recency bias (in few-shot prompts)',
+    def: 'The tendency of a model to favour the labels of the examples nearest the end of the prompt. With majority-label bias (favouring the most frequent label) it is why few-shot examples should be balanced and interleaved.',
+    lesson: 'prompting/in-context',
+  },
+  'dynamic-few-shot': {
+    term: 'Dynamic few-shot',
+    def: 'Choosing the examples per request, usually by retrieving the labelled inputs most similar to the new one. More relevant than a fixed set, but the examples change every call, so they cannot sit in a cached prefix.',
+    lesson: 'prompting/in-context',
+  },
+  'many-shot': {
+    term: 'Many-shot prompting',
+    def: 'Putting hundreds or thousands of examples in a long context window. Some tasks keep improving, but 500 examples of 200 tokens is 100,000 input tokens on every call, which is usually the point where finetuning is cheaper.',
+    lesson: 'prompting/in-context',
+  },
 };
