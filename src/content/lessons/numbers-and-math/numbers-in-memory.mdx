@@ -54,7 +54,7 @@ A computer stores everything as **bits**: tiny switches that are either 0 or 1. 
   </Step>
 
   <Step title="6. FP8 and 4-bit">
-    **FP8** squeezes a number into **1 byte**. The E4M3 variant has 4 exponent bits and 3 mantissa bits. Recent GPUs (NVIDIA Hopper and Blackwell) multiply FP8 at twice BF16's speed.
+    **FP8** squeezes a number into **1 byte**. The E4M3 variant has 4 exponent bits and 3 mantissa bits. Recent GPUs with FP8 tensor cores (NVIDIA Ada Lovelace such as the L4, L40S and RTX 4090, Hopper and Blackwell) multiply FP8 at twice BF16's speed.
 
     **4-bit** formats use half a byte and need a stored **scale** to mean anything (Module 11). Watch the rounding error grow as the bits shrink. That error is the price of **quantization**.
   </Step>

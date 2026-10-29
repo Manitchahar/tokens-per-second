@@ -106,7 +106,7 @@ Consequences:
 
 FP8 E4M3 keeps **3 mantissa bits**. INT8 with a per-group scale keeps *at least* 7 bits of information within a group (as computed in the previous lesson). So FP8 is genuinely the **less precise** of the two in mantissa terms — it wins because it spends bits on range instead of on a shared scale, and because range is what real activations need.
 
-Where it runs: **NVIDIA Hopper (H100, H200) and Blackwell have dedicated FP8 tensor cores** at 2× the BF16 rate. That is where FP8 is the default for training and increasingly for inference. On an A100 or a T4 there is no FP8 tensor-core path at all, so FP8 buys you the memory saving and nothing else — which is a fine reason to use it, but not a speed one.
+Where it runs: **NVIDIA Ada Lovelace (L4, L40S, RTX 4090), Hopper (H100, H200) and Blackwell have dedicated FP8 tensor cores** at 2× the BF16 rate. That is where FP8 is the default for training (on Hopper and Blackwell) and increasingly for inference. On an A100 (Ampere) or a T4 (Turing) there is no FP8 tensor-core path at all, so FP8 buys you the memory saving and nothing else — which is a fine reason to use it, but not a speed one.
 
 ## The KV cache gets its own decision
 
@@ -115,7 +115,7 @@ Weights are half the story in a memory-bound service. The other half, as Lesson 
 | KV scheme | Bytes/token (8B) | Notes |
 |---|---|---|
 | BF16 | 131,072 | default |
-| FP8 | 65,536 | per-tensor scale, works well; native on Hopper+ |
+| FP8 | 65,536 | per-tensor scale, works well; native on Ada, Hopper and Blackwell |
 | INT8 | 65,536 | per-token scale; slightly better than FP8 at 8 bits in practice |
 | INT4 (per-head or per-token) | 32,768 | bigger quality cost; group-wise scales are essential |
 
@@ -143,7 +143,7 @@ Crucially, KV quantization and weight quantization are **orthogonal**. W4 + KV8 
   </Step>
 
   <Step title="4. FP8: a float, not an integer">
-    A float, with its own exponent per element. No group scales, no metadata, and it handles outliers the way BF16 does. On Hopper and newer it also runs at 2× the BF16 tensor-core rate.
+    A float, with its own exponent per element. No group scales, no metadata, and it handles outliers the way BF16 does. On GPUs with FP8 tensor cores (Ada Lovelace, Hopper, Blackwell) it also runs at 2× the BF16 tensor-core rate.
   </Step>
 
   <Step title="5. The KV cache has its own budget">
@@ -160,7 +160,7 @@ Crucially, KV quantization and weight quantization are **orthogonal**. W4 + KV8 
 Ignore which scheme is fashionable. Work through these four questions in order:
 
 1. **What is my bottleneck?** Decode latency at low batch → weight memory → W4A16. Prefill throughput → activations → W8A8 or FP8. Both, and long context → W4 + KV8.
-2. **What hardware do I have?** FP8 needs Hopper or newer for the speed; on an A100 or T4 it is a memory-only win. INT8 needs a good integer GEMM path, which Ampere and later have.
+2. **What hardware do I have?** FP8 needs FP8 tensor cores for the speed: Ada Lovelace (L4, L40S), Hopper or Blackwell. On an A100 or T4 it is a memory-only win. INT8 needs a good integer GEMM path, which Ampere and later have.
 3. **How much quality budget do I have?** If the product is a coding assistant where a wrong token costs a debug session, buy FP8 W8. If it is summarising thousands of documents where occasional awkwardness is invisible, W4 is free money.
 4. **Do I have the kernel?** An unsupported scheme is a 1.3× win at best, because you will be dequantizing outside the fused GEMM. Check what your engine actually implements before choosing.
 
@@ -178,7 +178,7 @@ Ignore which scheme is fashionable. Work through these four questions in order:
   3. W4A16 gives ~4× less weight memory and ~4× shorter decode steps, but leaves prefill unchanged, since prefill is compute-bound in BF16.
   4. If you dequantize outside the GEMM, W4A16 is a memory win and a speed *loss*. Fused kernels are mandatory.
   5. W8A8 is the scheme that reaches the INT8 tensor cores, so it is the prefill/throughput lever — 2× on the compute term where W4A16 gives nothing.
-  6. FP8 is a float with a per-element exponent: no group scales, no metadata, outlier-tolerant, and 2× tensor-core rate on Hopper and newer. On older GPUs it is a memory-only win.
+  6. FP8 is a float with a per-element exponent: no group scales, no metadata, outlier-tolerant, and 2× tensor-core rate on GPUs with FP8 tensor cores (Ada Lovelace, Hopper, Blackwell). On Ampere (A100) and older it is a memory-only win.
   7. KV quantization is orthogonal and independently worth it. W4 + KV8 halves both terms and is the standard long-context configuration.
   8. Pick by bottleneck, then hardware, then quality budget, then kernel support — in that order. Never by fashion.
 </KeyNotes>
@@ -188,5 +188,5 @@ Ignore which scheme is fashionable. Work through these four questions in order:
   { q: 'Your workload is dominated by 12,000-token RAG prompts. Which scheme choice helps most, and why?', options: ['W4A16, because it cuts weight memory 4×', 'W8A8 or FP8, because prefill is compute-bound and only narrowing the activations reaches the fast tensor cores', 'Neither, because prefill cost is independent of precision', 'INT4 KV, because prefill is limited by cache writes'], answer: 1, why: 'Prefill at 12,000 tokens is firmly compute-bound (roughly 400 FLOP/byte), so reading fewer weight bytes changes nothing. You need the activations narrow too, which is what routes the matmul to INT8 or FP8 tensor cores for a 2× on the compute term.' },
   { q: 'What is the structural difference between INT8 and FP8 E4M3 that makes FP8 need no group scales?', options: ['FP8 uses more bytes internally', 'INT8 stores a fixed exponent per group; FP8 stores an exponent per element, so its range travels with the value', 'FP8 is signed and INT8 is unsigned', 'FP8 rounds instead of truncating'], answer: 1, why: 'INT8 covers its range with one shared scale, so an outlier forces a coarse grid. FP8 has 4 exponent bits per element, so each number carries its own range — outliers cost nothing and no scale metadata is needed at all.' },
   { q: 'A "4-bit" model with group size 128 and FP16 scales is storing how many bits per weight, really?', numeric: true, answer: 4.25, tolerance: 0.2, unit: 'bits', why: 'Data is 4 bits per weight. Each group of 128 weights adds 4 bytes (an FP16 scale plus an FP16 zero-point), which is 4/(128 × 0.5) = 6.25% overhead. 4 × 1.0625 = 4.25 bits per weight.' },
-  { q: 'You run FP8 on an A100 instead of an H100. What happens?', options: ['Everything is 2× faster; A100 supports FP8 tensor cores', 'You keep the memory saving but get no tensor-core speedup, because FP8 acceleration starts with Hopper', 'FP8 becomes INT8 automatically', 'It runs at half the speed of BF16'], answer: 1, why: 'Dedicated FP8 tensor cores arrived with Hopper (H100/H200) and Blackwell. On Ampere, FP8 is stored and unpacked but the matmul falls back to a slower path. It is still worth using for the memory saving — just do not expect the 2×.' },
+  { q: 'You run FP8 on an A100 instead of an H100. What happens?', options: ['Everything is 2× faster; A100 supports FP8 tensor cores', 'You keep the memory saving but get no tensor-core speedup, because the A100 (Ampere) has no FP8 tensor cores', 'FP8 becomes INT8 automatically', 'It runs at half the speed of BF16'], answer: 1, why: 'Dedicated FP8 tensor cores exist on Ada Lovelace (L4, L40S, RTX 4090), Hopper (H100/H200) and Blackwell, but not on Ampere. On an A100, FP8 weights are stored and unpacked but the matmul runs in a wider format. It is still worth using for the memory saving — just do not expect the 2×.' },
 ]} />

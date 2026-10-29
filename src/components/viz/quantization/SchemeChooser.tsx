@@ -24,7 +24,7 @@ const CAPTIONS = [
   'A scheme is two numbers. W is the bit width of the weights, A the bit width of the activations. A8 only pays off when there is a real integer tensor-core GEMM to run it on.',
   'W4A16 shrinks only the weights and leaves activations in BF16. It is the standard 4-bit recipe: a quarter of the weight memory, and a proportionally shorter decode step because that step is dominated by reading weights.',
   'W8A8 quantizes the activations too, and that is what actually reaches the INT8 tensor cores. It is the fastest safe win on hardware with good INT8 support, but activations have outliers and need per-token dynamic scales.',
-  'FP8 is a floating-point format with its own exponent, so it needs no group scale and copes with outliers the way BF16 does. On Hopper and newer it runs at full tensor-core rate, which makes it the high-quality option rather than the cheap one.',
+  'FP8 is a floating-point format with its own exponent, so it needs no group scale and copes with outliers the way BF16 does. On GPUs with FP8 tensor cores (Ada Lovelace, Hopper, Blackwell) it runs at full tensor-core rate, which makes it the high-quality option rather than the cheap one.',
   'The KV cache is a separate decision with a separate budget. Halving it to 8 bits halves the per-step read and often doubles concurrency, and it costs less quality than shrinking the weights further.',
   'There is no best scheme — only the one matching your bottleneck. Watch the recommendation move as you change batch, context, and what you say you are optimizing for.',
 ];

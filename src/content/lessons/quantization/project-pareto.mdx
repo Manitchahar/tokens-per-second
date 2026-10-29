@@ -77,7 +77,7 @@ Eight candidates, chosen because they span the space rather than because they ar
 | # | Weights | KV cache | Why it is in the matrix |
 |---|---|---|---|
 | 1 | BF16 | BF16 | The baseline everything is measured against |
-| 2 | FP8 | BF16 | Best quality per bit on Hopper+ |
+| 2 | FP8 | BF16 | Best quality per bit on Ada, Hopper and Blackwell |
 | 3 | INT8 | FP8 | The safe production default |
 | 4 | BF16 | FP8 | Isolates the KV effect — pure memory win |
 | 5 | INT4 g128 | BF16 | Isolates the weight effect — pure memory win |

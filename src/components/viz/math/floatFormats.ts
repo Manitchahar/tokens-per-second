@@ -6,7 +6,7 @@ export const FORMATS: FloatFormat[] = [
   { id: 'fp32', name: 'FP32', e: 8, m: 23, bytes: 4, note: 'Full precision. Training default in the past; rarely used for serving.' },
   { id: 'fp16', name: 'FP16', e: 5, m: 10, bytes: 2, note: 'Half precision. Good precision, small range (max 65,504).' },
   { id: 'bf16', name: 'BF16', e: 8, m: 7, bytes: 2, note: 'Brain float. FP32’s range with less precision. The LLM default.' },
-  { id: 'fp8e4m3', name: 'FP8 (E4M3)', e: 4, m: 3, bytes: 1, maxFinite: 448, note: 'Hopper/Blackwell tensor cores. Used for weights and activations.' },
+  { id: 'fp8e4m3', name: 'FP8 (E4M3)', e: 4, m: 3, bytes: 1, maxFinite: 448, note: 'Ada, Hopper and Blackwell tensor cores. Used for weights and activations.' },
   { id: 'fp8e5m2', name: 'FP8 (E5M2)', e: 5, m: 2, bytes: 1, note: 'More range, less precision. Used for gradients, sometimes KV cache.' },
 ];
 

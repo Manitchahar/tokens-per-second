@@ -411,7 +411,7 @@ for r in rows:
 # We cannot install these here, but this is the shape of the command you would run:
 #
 # ```bash
-# # FP8 weights on an H100 (Hopper+), KV cache in FP8
+# # FP8 weights on an H100 (FP8 tensor cores: Ada, Hopper, Blackwell), KV cache in FP8
 # vllm serve Qwen/Qwen2.5-7B-Instruct \
 #   --quantization fp8 \
 #   --kv-cache-dtype fp8 \
