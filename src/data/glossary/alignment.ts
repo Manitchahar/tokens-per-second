@@ -33,4 +33,29 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The LIMA paper’s claim that a model’s knowledge and abilities come almost entirely from pretraining, and that alignment mostly teaches which format and style to use with users. Hence 1,000 excellent examples can go a long way.',
     lesson: 'alignment/sft',
   },
+  'preference-data': {
+    term: 'Preference data',
+    def: 'Records of which of two (or K) model answers a person, or a judge model, prefers for the same prompt: (prompt, chosen, rejected). Cheaper and more consistent to collect than written ideal answers.',
+    lesson: 'alignment/reward-models',
+  },
+  'reward-model': {
+    term: 'Reward model',
+    def: 'A transformer whose vocabulary head is replaced by a single output, trained on preference data to score how much people would like an answer to a prompt. Only differences between its scores for the same prompt carry meaning.',
+    lesson: 'alignment/reward-models',
+  },
+  'bradley-terry': {
+    term: 'Bradley-Terry model',
+    def: 'P(A preferred to B) = σ(r_A − r_B): scores are log-odds, and their difference sets the odds of winning. Its negative log-likelihood, −log σ(r_w − r_l), is the standard reward-model loss.',
+    lesson: 'alignment/reward-models',
+  },
+  'pairwise-accuracy': {
+    term: 'Pairwise accuracy',
+    def: 'The fraction of held-out comparisons where a reward model scores the chosen answer above the rejected one. 50% is chance; the practical ceiling is human agreement, roughly 73–77% in InstructGPT’s data.',
+    lesson: 'alignment/reward-models',
+  },
+  'best-of-n': {
+    term: 'Best-of-N',
+    def: 'Generate N answers, score each with a reward model, return the highest. Costs N generations plus N scoring passes; the larger N, the more it also selects for the reward model’s mistakes.',
+    lesson: 'alignment/reward-models',
+  },
 };
