@@ -219,6 +219,18 @@ PyTorch's fused `scaled_dot_product_attention` does the same thing, and at the t
   Not on the equation. The equation is fixed by the model file. They spend it on three things: **which kernel** runs it (FlashAttention avoids materialising the $T \times T$ matrix at all — Module 14), **where the KV cache lives** (paged, so long sequences do not fragment — Module 08), and **how the mask is applied** (by subtracting a large number, or with $-\infty$, and whether the masked half is skipped). All three are memory problems. The maths is never the problem.
 </Callout>
 
+<Callout type="real" title="Now read the paper">
+  **"Attention Is All You Need"**, Vaswani et al., 2017. [arXiv:1706.03762](https://arxiv.org/abs/1706.03762).
+
+  It is a machine-translation paper, so its model is an **encoder-decoder**: an encoder reads the source sentence and a decoder writes the translation. The LLMs in this course keep only the decoder's masked self-attention and drop the cross-attention that connects it to the encoder. Read with that in mind.
+
+  - **Read:** Section 3.2 in full (3.2.1 is exactly this lesson's equation; 3.2.2 is the next lesson), Figure 2, and Section 3.5 on positional encodings. Then Section 4 and its Table 1, which compares the cost of self-attention, recurrence and convolution per layer.
+  - **Skim:** Sections 3.1, 3.3 and 3.4 (the layer stack, the feed-forward network and the embeddings), noting the post-norm "LayerNorm(x + Sublayer(x))" and the ReLU feed-forward 4× wider than the model, two choices later models changed (Module 04.1).
+  - **Skip:** Section 5's training details and Section 6's translation scores, unless you want the history.
+
+  You will now recognise the $\sqrt{d_k}$ scaling and the paper's footnote explaining why dot products of random vectors grow with $d_k$, the causal mask written as "setting to $-\infty$", the base model's $d_k = 64$ with 8 heads of a 512-wide model, and in Table 1 the $O(n^2 \cdot d)$ cost per layer that this lesson's FLOP count derived and that Module 14 attacks.
+</Callout>
+
 <KeyNotes>
   1. Attention is $\mathrm{softmax}(QK^\top/\sqrt{d} + M)V$: **project, score, scale, mask, softmax, mix**. Six steps, no mystery.
   2. $Q$, $K$, $V$ are three learned projections of the same hidden vector. RoPE rotates $Q$ and $K$ but never $V$.
