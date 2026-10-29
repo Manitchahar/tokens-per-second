@@ -20,4 +20,9 @@ export const terms: Record<string, GlossaryEntry> = {
   'power-law': { term: 'Power law', def: 'y = c · x^(−α). Multiplying x by k multiplies y by k^(−α), the same fraction at every scale, so it plots as a straight line on log-log axes with slope −α.', lesson: 'scaling/scaling-laws' },
   'pf-day': { term: 'Petaflop/s-day (PF-day)', def: 'A unit of compute: 10¹⁵ FLOP/s sustained for one day, 8.64 × 10¹⁹ FLOPs. GPT-3’s training was about 3,640 PF-days.', lesson: 'scaling/scaling-laws' },
   'non-embedding-params': { term: 'Non-embedding parameters', def: 'The weights inside the transformer blocks, leaving out the token and position embedding tables. Kaplan et al. measured their scaling laws against this count.', lesson: 'scaling/scaling-laws' },
+
+  // ── 3B.4 · Chinchilla
+  'isoflop': { term: 'IsoFLOP curve', def: 'All the ways to spend one fixed compute budget: each model size N trained on D = C / 6N tokens. Loss along it forms a U-shaped valley whose bottom is the compute-optimal model.', lesson: 'scaling/chinchilla' },
+  'compute-optimal': { term: 'Compute-optimal (Chinchilla-optimal)', def: 'The split of a training budget between parameters and tokens that gives the lowest loss. Hoffmann et al. 2022: about 20 tokens per parameter, so N ≈ √(C/120).', lesson: 'scaling/chinchilla' },
+  'irreducible-loss': { term: 'Irreducible loss', def: 'The part of the loss no model can remove, because text itself is not fully predictable. The constant E (about 1.69 nats) in the Chinchilla formula L = E + A/N^α + B/D^β.', lesson: 'scaling/chinchilla' },
 };

@@ -1,0 +1,295 @@
+---
+title: 'Chinchilla: the compute-optimal model'
+summary: 'Gopher had 280 billion parameters and read 300 billion tokens. DeepMind then trained a model four times smaller on four times more data, for the same compute, and it won. This lesson shows why with IsoFLOP valleys, derives the 20-tokens-per-parameter rule from C = 6ND, and reads the Chinchilla loss formula term by term.'
+objectives:
+  - Explain what an IsoFLOP curve is and why it is U-shaped
+  - Read the Chinchilla loss formula L = E + A/N^α + B/D^β and say what each term means
+  - Derive N_opt = √(C/120) from C = 6ND and D ≈ 20N, and apply it to a budget
+  - Compare Gopher and Chinchilla at equal compute, in predicted loss and measured accuracy
+  - Explain why the exact optimum is uncertain while the conclusion is not
+---
+import IsoFlop from '@/components/viz/scaling/IsoFlop.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+At the end of 2021 DeepMind published **Gopher**: 280 billion parameters, 1.6 times the size of GPT-3, trained on 300 billion tokens. It was very good. It was also, as the same lab showed four months later, a waste of most of its budget.
+
+Here is the puzzle Gopher's team faced, and it is the same one you will face with any fixed budget. Lesson 1 gave you $C \approx 6ND$. If the compute is fixed, then $N$ and $D$ are tied together: a bigger model means fewer tokens, more tokens means a smaller model. Kaplan's advice from the last lesson said to lean hard toward the bigger model. Gopher did.
+
+But nobody had actually tested that trade at fixed compute, directly, at scale. What happens if you take Gopher's exact budget and spend it differently? That is the experiment Hoffmann et al. ran, and the model it produced, **Chinchilla**, changed how every lab trains.
+
+## The valley
+
+<Scrolly>
+  <IsoFlop client:visible slot="stage" />
+
+  <Step title="1. Gopher: 280B parameters, 300B tokens">
+    Start with a single point: Gopher's choice. 280B parameters, 300B tokens, a budget the Chinchilla paper counts as **5.76 × 10²³ FLOPs**. (Plain 6ND gives 5.0 × 10²³; the paper's own count includes attention and the embeddings.)
+
+    One point tells you nothing about whether the choice was good. You need to see the alternatives.
+  </Step>
+
+  <Step title="2. Fix the compute, slide the model size">
+    Hold the budget fixed and let the model size vary. A model of $N$ parameters can be trained on $D = C / 6N$ tokens. Halve the model, double its data.
+
+    Every point on this line costs **exactly the same compute**. A curve of equal compute like this is an <Term t="isoflop">**IsoFLOP**</Term> curve ("iso" means equal). The question is which point on it has the lowest loss.
+  </Step>
+
+  <Step title="3. Two walls: capacity and data">
+    The Chinchilla paper fitted loss as the sum of three parts: $L = E + A/N^{\alpha} + B/D^{\beta}$. Watch the bar on the right as you slide.
+
+    The **capacity term** $A/N^{\alpha}$ (blue) is what a too-small model costs you: it shrinks as $N$ grows. The **data term** $B/D^{\beta}$ (green) is what too little training costs you: on an IsoFLOP curve it *grows* with $N$, because a bigger model gets fewer tokens. $E$ is the floor no model can beat.
+  </Step>
+
+  <Step title="4. The bottom of the valley">
+    One term falls, the other rises, so their sum is a **valley**. Somewhere in the middle the two balance and the loss is lowest: the <Term t="compute-optimal">**compute-optimal**</Term> model for this budget.
+
+    Gopher is far up the right wall: so many parameters that it could afford only 1.2 tokens per parameter. The fit says its budget could have bought a loss about 0.05 nats lower.
+  </Step>
+
+  <Step title="5. Chinchilla: same compute, 4× smaller">
+    So DeepMind trained the model the valley pointed to: **Chinchilla, 70B parameters on 1.4T tokens**. Four times fewer parameters, almost five times more data, and about the same compute as Gopher.
+
+    It beat Gopher across the board. On MMLU, a broad exam-style benchmark, it scored **67.5% against Gopher's 60.0%**. And at a quarter of the size, every token it serves costs a quarter of the FLOPs.
+  </Step>
+
+  <Step title="6. Change the budget: the valley moves">
+    Now draw one valley for each budget, from 10¹⁹ to 10²⁵ FLOPs. Every budget has its own valley and its own bottom.
+
+    As the budget grows the valleys sink (more compute, lower loss) and their **bottoms march to the right**: bigger budgets deserve bigger models. The question is how fast.
+  </Step>
+
+  <Step title="7. The bottoms lie on N ∝ √C: 20 tokens per parameter">
+    Join the bottoms. Hoffmann et al. measured the slope three independent ways and all three agree: the optimal $N$ and optimal $D$ both grow as roughly $C^{0.5}$. **Parameters and data should grow in step.**
+
+    In numbers: about **20 training tokens per parameter**. Combine with $C = 6ND$: $C = 6N \times 20N = 120N^2$, so $N_{\text{opt}} = \sqrt{C/120}$. Kaplan's 0.73 said the opposite.
+  </Step>
+
+  <Step title="8. A flat valley, and a fragile fit">
+    Look closely at the bottom. With the printed constants, every model from about 16B to 70B lands within 0.007 nats of the minimum (the green band). The floor is **flat**, so the exact optimum is hard to pin down.
+
+    Switch the loss fit to the 2024 refit by Besiroglu et al.: the bottom jumps from about 32B to 72B. The exact number moved a lot. **Gopher's verdict did not.**
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### The loss formula
+
+Kaplan wrote separate laws for $N$ and for $D$. Hoffmann et al. wrote one formula for both, built to have the shape the last lesson said real loss must have:
+
+$$
+L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}
+$$
+
+Read it term by term, because each one is a story.
+
+- $E$ is the <Term t="irreducible-loss">**irreducible loss**</Term>: the entropy of natural text itself, what even a perfect model would still pay. This is the floor from 3A, finally written into the law.
+- $A / N^{\alpha}$ is the **capacity penalty**: how much worse a model with only $N$ parameters is than a perfect one, even with infinite data. It is a power law in $N$, just like Kaplan's.
+- $B / D^{\beta}$ is the **data penalty**: how much worse training on only $D$ tokens is than training on infinite data. Also a power law.
+
+The paper fitted this to over 400 training runs (models from 70 million to over 16 billion parameters, 5 to 500 billion tokens) and printed:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| $E$ | 1.69 | irreducible loss, nats per token |
+| $A$ | 406.4 | size of the capacity penalty |
+| $\alpha$ | 0.34 | how fast more parameters shrink it |
+| $B$ | 410.7 | size of the data penalty |
+| $\beta$ | 0.28 | how fast more tokens shrink it |
+
+*(Loss in nats per token on DeepMind's MassiveText data and tokenizer. As with Kaplan's constants, the shape transfers, the exact digits do not.)*
+
+<Callout type="math" title="Worked: Gopher and Chinchilla through the formula">
+  **Gopher**, $N$ = 280 × 10⁹, $D$ = 300 × 10⁹:
+
+  $$
+  \frac{406.4}{(2.8\times 10^{11})^{0.34}} = \frac{406.4}{7{,}795} = 0.052, \qquad
+  \frac{410.7}{(3\times 10^{11})^{0.28}} = \frac{410.7}{1{,}636} = 0.251
+  $$
+
+  $L = 1.69 + 0.052 + 0.251 = 1.993$ nats.
+
+  **Chinchilla**, $N$ = 70 × 10⁹, $D$ = 1.4 × 10¹²:
+
+  $$
+  \frac{406.4}{(7\times 10^{10})^{0.34}} = \frac{406.4}{4{,}862} = 0.084, \qquad
+  \frac{410.7}{(1.4\times 10^{12})^{0.28}} = \frac{410.7}{2{,}520} = 0.163
+  $$
+
+  $L = 1.69 + 0.084 + 0.163 = 1.937$ nats.
+
+  Look at where Gopher's loss comes from. Its capacity penalty is tiny (0.052) and its data penalty is huge (0.251): it had capacity to spare and nothing to fill it with. Chinchilla gives up 0.032 of capacity penalty and saves 0.088 of data penalty. Net: **0.056 nats lower** for the same compute.
+</Callout>
+
+To get a feel for 0.056 nats, ask the formula a different question: how much compute would a well-balanced model need to *match* Gopher? Placed on its own budget's curve, Gopher's loss is 1.984. The bottom of the valley at 1.5 × 10²³ FLOPs is already 1.986, and at 2 × 10²³ it is 1.973. So, by the fit, a compute-optimal model would have matched Gopher with **about a quarter of Gopher's budget**. Three quarters of the money bought nothing.
+
+### Where the bottom is
+
+On an IsoFLOP curve $D = C/6N$, so the loss is a function of $N$ alone:
+
+$$
+L(N) = E + A N^{-\alpha} + B \left(\frac{C}{6N}\right)^{-\beta}
+$$
+
+At the bottom of the valley the slope is zero. Differentiate and set it to zero:
+
+$$
+\frac{dL}{dN} = -\alpha A N^{-\alpha - 1} + \beta B \left(\frac{C}{6}\right)^{-\beta} N^{\beta - 1} = 0
+\quad\Longrightarrow\quad
+\alpha \frac{A}{N^{\alpha}} = \beta \frac{B}{D^{\beta}}
+$$
+
+That last equation is worth stopping on. At the optimum, **the capacity penalty and the data penalty are in a fixed ratio**, $\beta/\alpha$ = 0.28 / 0.34 = 0.82. You are spending the budget so that neither wall is much higher than the other. Solving it for $N$ gives
+
+$$
+N_{\text{opt}} = G \left(\frac{C}{6}\right)^{\frac{\beta}{\alpha+\beta}}, \qquad G = \left(\frac{\alpha A}{\beta B}\right)^{\frac{1}{\alpha+\beta}}
+$$
+
+With the printed constants the exponent is 0.28 / 0.62 = 0.45, and $D_{\text{opt}}$ grows as the remaining 0.55. (With the unrounded constants in the paper's source, 0.46 and 0.54.) Close to one half each.
+
+### Three methods, one answer
+
+A single fitted formula is exactly the kind of thing the last lesson warned you about. So the paper estimated the optimal scaling three different ways, each with its own assumptions:
+
+| Approach | What they did | $N_{\text{opt}} \propto C^{a}$ | $D_{\text{opt}} \propto C^{b}$ |
+|---|---|---|---|
+| 1. Fixed sizes, varied training length | for each FLOP count, find which model size reached the lowest loss | 0.50 | 0.50 |
+| 2. IsoFLOP profiles | for nine fixed budgets, train many sizes, fit each valley and take its bottom | 0.49 | 0.51 |
+| 3. Parametric fit | fit $L(N, D) = E + A/N^{\alpha} + B/D^{\beta}$ to every run | 0.46 | 0.54 |
+| Kaplan et al. 2020 | | 0.73 | 0.27 |
+
+Three methods, three sets of assumptions, one conclusion: **grow parameters and data roughly equally**. Approach 2 is literally the visual you just scrolled through, done with real training runs instead of a formula.
+
+Why did Kaplan get 0.73? The Chinchilla paper points at the learning-rate schedule. Kaplan's runs all used a schedule sized for a long training run, so the models trained on fewer tokens were stopped while their learning rate was still high, before they had settled. That made short runs look worse than they are, and pushed the fit toward big models trained briefly. Hoffmann et al. matched each run's schedule to its own length. Later analyses added that counting only non-embedding parameters, at small scale, also bends the fit toward large models.
+
+### The rule of 20
+
+The paper's Approach 1 table turns the exponents into concrete prescriptions. A few rows:
+
+| Parameters | Training FLOPs | Training tokens | Tokens per parameter |
+|---|---|---|---|
+| 400M | 1.92 × 10¹⁹ | 8.0B | 20 |
+| 1B | 1.21 × 10²⁰ | 20.2B | 20 |
+| 10B | 1.23 × 10²² | 205.1B | 21 |
+| 67B | 5.76 × 10²³ | 1.5T | 22 |
+| 175B | 3.85 × 10²⁴ | 3.7T | 21 |
+| 280B | 9.90 × 10²⁴ | 5.9T | 21 |
+| 1T | 1.27 × 10²⁶ | 21.2T | 21 |
+
+The last column is the punchline: **about 20 tokens per parameter**, at every scale. Combine it with lesson 1's rule and you can do the whole calculation in your head.
+
+<Callout type="math" title="Worked: the compute-optimal model for a budget">
+  If $D = 20N$, then
+
+  $$
+  C = 6ND = 6N \times 20N = 120N^2 \quad\Longrightarrow\quad N_{\text{opt}} = \sqrt{\frac{C}{120}}, \qquad D_{\text{opt}} = 20\, N_{\text{opt}}
+  $$
+
+  For Gopher's budget, $C = 5.76 \times 10^{23}$:
+
+  $$
+  N_{\text{opt}} = \sqrt{\frac{5.76\times 10^{23}}{120}} = \sqrt{4.8\times 10^{21}} = 6.93\times 10^{10} \approx 69\text{B}, \qquad D_{\text{opt}} = 20 \times 69.3\text{B} \approx 1.4\text{T}
+  $$
+
+  That is Chinchilla, almost exactly: 70B parameters, 1.4T tokens.
+
+  Read the table the other way, too. For **Gopher's 280B parameters** to be compute-optimal, it would have needed 5.9T tokens and 9.9 × 10²⁴ FLOPs, 9.9 × 10²⁴ ÷ 5.76 × 10²³ ≈ **17 times** the budget it had.
+</Callout>
+
+Here is the same calculation as code, scanning the IsoFLOP curve rather than using the shortcut:
+
+```python
+import math
+
+E, A, B, alpha, beta = 1.69, 406.4, 410.7, 0.34, 0.28    # Hoffmann et al. 2022, as printed
+
+def loss(N, D):
+    return E + A / N**alpha + B / D**beta
+
+def isoflop(C, sizes):
+    """Fix the budget, train every model size on what is left: D = C / 6N."""
+    return [(N, C / (6 * N), loss(N, C / (6 * N))) for N in sizes]
+
+C = 5.76e23                                       # Gopher's budget
+sizes = [10**(9 + i / 20) for i in range(61)]     # 1B .. 1T, 20 steps per decade
+best = min(isoflop(C, sizes), key=lambda r: r[2])
+
+for name, N in [("Gopher", 280e9), ("Chinchilla", 70e9)]:
+    D = C / (6 * N)
+    print(f"{name:10s} N={N/1e9:5.0f}B  D={D/1e12:4.2f}T  loss={loss(N, D):.3f}")
+print(f"{'bottom':10s} N={best[0]/1e9:5.1f}B  D={best[1]/1e12:4.2f}T  loss={best[2]:.3f}")
+
+rule = math.sqrt(C / 120)                         # D = 20N  ->  C = 120 N^2
+print(f"rule of 20: N={rule/1e9:.1f}B  D={20*rule/1e12:.2f}T")
+```
+
+```text
+Gopher     N=  280B  D=0.34T  loss=1.984
+Chinchilla N=   70B  D=1.37T  loss=1.938
+bottom     N= 31.6B  D=3.04T  loss=1.931
+rule of 20: N=69.3B  D=1.39T
+```
+
+(Here every model sits on the 5.76 × 10²³ curve, so Gopher's point gets $D$ = 0.34T and a loss of 1.984 rather than the 1.993 of its real 300B tokens.)
+
+And here is something the output shows that the headline does not.
+
+<Callout type="pitfall" title="The printed fit and the 20-token rule disagree, and it matters less than you think">
+  The scan finds the bottom of the printed formula's valley at about **32B parameters and 3T tokens**, nearly 100 tokens per parameter, not 20. The parametric fit (Approach 3) is the one that disagrees with the other two methods, and that is where the paper's slightly different exponents (0.46 / 0.54) come from.
+
+  In 2024 Besiroglu et al. reconstructed the data behind the fit from the paper's figures and refitted it. Their constants ($E$ = 1.82, $A$ = 482, $B$ = 2,085, $\alpha$ = 0.35, $\beta$ = 0.37) put the bottom at about **72B parameters and 18 tokens per parameter**, in agreement with Approaches 1 and 2. Toggle between the two fits in the visual.
+
+  Why it matters less than you think: the valley floor is flat. With the printed constants, 70B (the rule) costs only 0.007 nats more than 32B (the formula's minimum). Gopher, on the steep right wall, costs 0.053. Uncertainty about *where exactly* the floor is never touches the conclusion that Gopher was **far** from it.
+</Callout>
+
+## What Chinchilla was, and what it showed
+
+Chinchilla used the same architecture family and the same MassiveText data as Gopher, with a few changes (it trained with the AdamW optimizer, for instance). Its shape: 80 layers and $d_{\text{model}}$ = 8,192, against Gopher's 80 layers and 16,384. Half the width means a quarter of the parameters, since parameters per layer grow as $d^2$.
+
+The results, at equal compute:
+
+- **Language modelling**: lower loss than Gopher on every evaluation set the paper reports.
+- **MMLU** (57 subjects of exam questions, 5-shot): **67.5%**, against Gopher's 60.0%, more than 7 points better. (The abstract says 67.5%; the results table gives 67.6%.)
+- **BIG-bench**, reading comprehension, common sense, closed-book QA: better on the large majority of tasks.
+
+And a fact that matters more to you than to the paper's authors: Chinchilla is **4× smaller**, so every token it generates costs 4× fewer FLOPs, its weights take 4× less memory (140 GB in 16-bit numbers instead of 560 GB), and it needs 4× fewer GPUs to hold. Same training compute, better model, a quarter of the serving cost.
+
+<Callout type="intuition" title="Why did the whole field get this wrong?">
+  Because the costs were asymmetric in a way that hid the mistake. A big model trained on too little data is still a good model, just not as good as it could have been for the money. Nothing breaks. You only see the loss when someone spends the same budget differently and compares, which is expensive enough that nobody did it at full scale until Chinchilla.
+
+  The general lesson: **"it works" is not the same as "it is optimal"**, and the only way to find out is a controlled comparison at equal cost. You will use exactly this argument to compare serving configurations in Module 25.
+</Callout>
+
+<Callout type="real" title="Now read the paper">
+  **Hoffmann et al., "Training Compute-Optimal Large Language Models", 2022.** [arXiv:2203.15556](https://arxiv.org/abs/2203.15556).
+
+  **Read** Section 1 and its Figure 1 (the three approaches' projections, with GPT-3, Gopher and Megatron-Turing NLG sitting far above them). **Read** Section 3 in full: 3.1, 3.2 and 3.3 are the three approaches (3.2's IsoFLOP figure is this lesson's visual, done with real runs), and 3.4 has the exponents table and the table of optimal sizes. **Read** Section 4.1 for Chinchilla's architecture and the MMLU part of 4.2. **Skim** the rest of 4.2: tables of benchmarks where Chinchilla beats Gopher. **Skip** the appendices on a first pass, except the one on how they count FLOPs if lesson 1 made you curious.
+
+  You will now recognise the IsoFLOP valleys, the exponents near 0.5 from three methods, the 5.76 × 10²³ budget, and the constants 1.69, 406.4, 410.7, 0.34 and 0.28. And when you reach the loss-fit section, you will know to check its optimum against the other two approaches.
+</Callout>
+
+## Why an inference engineer cares
+
+Chinchilla is the first time scaling research argued for **smaller models**, and the argument was purely about training compute. A 4× smaller model at equal quality is a 4× cheaper model to serve: fewer FLOPs per token, fewer bytes per decode step (Module 05), fewer GPUs to hold the weights (Module 18).
+
+But notice what the Chinchilla optimum ignores completely: everything that happens after training. It finds the cheapest model to *train* for a given quality. If the model will then serve trillions of tokens, a model that is cheaper to *run* might be worth more training compute. That is the next lesson, and it is why the models you will actually serve are smaller still.
+
+<KeyNotes>
+  1. At fixed compute, $D = C / 6N$: every model size on an IsoFLOP curve costs the same, and loss traces a valley.
+  2. Chinchilla's loss formula is $L = E + A/N^{\alpha} + B/D^{\beta}$: an irreducible floor, a capacity penalty and a data penalty. Printed constants: $E$ = 1.69, $A$ = 406.4, $B$ = 410.7, $\alpha$ = 0.34, $\beta$ = 0.28.
+  3. At the bottom of the valley the two penalties are in a fixed ratio, $\alpha A / N^{\alpha} = \beta B / D^{\beta}$.
+  4. Three independent methods agree that $N_{\text{opt}}$ and $D_{\text{opt}}$ both grow as about $C^{0.5}$, not Kaplan's 0.73 and 0.27.
+  5. The rule of thumb is about **20 tokens per parameter**, so $C = 120N^2$ and $N_{\text{opt}} = \sqrt{C/120}$. For 5.76 × 10²³ FLOPs: about 69B parameters on 1.4T tokens.
+  6. Chinchilla (70B, 1.4T tokens) used the same compute as Gopher (280B, 300B tokens), had lower loss, and scored 67.5% on MMLU against 60.0%.
+  7. The valley floor is flat and the parametric fit is fragile (its printed optimum is ~32B; a 2024 refit gives ~72B), but Gopher was far up the wall under every fit.
+  8. The Chinchilla optimum minimizes training compute only; it says nothing about the cost of serving the model afterwards.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'On an IsoFLOP curve, why does the data term B/D^β grow as the model gets bigger?', options: ['Because bigger models memorize the data', 'Because at fixed compute D = C/6N, so a bigger model can only be trained on fewer tokens', 'Because β is negative', 'Because the irreducible loss E grows with N'], answer: 1, why: 'The budget is fixed, so N and D trade off through C = 6ND. More parameters means fewer tokens, and fewer tokens means a larger data penalty.' },
+  { q: 'Using the 20-tokens-per-parameter rule, what is the compute-optimal model size for a budget of 1.2 × 10²⁴ FLOPs, in billions of parameters?', numeric: true, answer: 100, tolerance: 3, unit: 'B params', why: 'N = √(C/120) = √(1.2e24 / 120) = √(1e22) = 1e11 = 100B parameters, trained on 20 × 100B = 2T tokens.' },
+  { q: 'How many training tokens does that compute-optimal 100B model get, in trillions?', numeric: true, answer: 2, tolerance: 0.06, unit: 'T tokens', why: 'D = 20N = 20 × 100B = 2T tokens. Check: 6 × 1e11 × 2e12 = 1.2e24 FLOPs.' },
+  { q: 'Using L = 1.69 + 406.4/N^0.34 + 410.7/D^0.28, what is the data penalty B/D^β for D = 300B tokens (Gopher)?', numeric: true, answer: 0.251, tolerance: 0.008, unit: 'nats', why: '(3e11)^0.28 = e^(0.28 × ln 3e11) = e^(0.28 × 26.43) = e^7.40 = 1,636. 410.7 ÷ 1,636 = 0.251 nats, far larger than its capacity penalty of 0.052.' },
+  { q: 'Chinchilla and Gopher used about the same training compute. Why did Chinchilla win?', options: ['It had a better tokenizer', 'It moved compute from parameters to data: 4× smaller but trained on ~4.7× more tokens, much closer to the bottom of the IsoFLOP valley', 'It was trained for more epochs on the same 300B tokens', 'It used sparse attention'], answer: 1, why: 'Gopher had a tiny capacity penalty and a huge data penalty. Chinchilla balanced the two, which lowers the sum at the same 6ND.' },
+  { q: 'For Gopher’s 280B parameters to be compute-optimal at 20 tokens per parameter, how many FLOPs would its training have needed, in units of 10²⁴?', numeric: true, answer: 9.4, tolerance: 0.6, unit: '× 10²⁴ FLOPs', why: 'D = 20 × 280B = 5.6T tokens. C = 6 × 2.8e11 × 5.6e12 = 9.4e24 FLOPs (the paper’s own table, at ~21 tokens per parameter, says 9.9e24): about 17× the budget Gopher had.' },
+]} />
