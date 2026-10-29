@@ -1,0 +1,369 @@
+---
+title: 'Agent failure modes & evaluation'
+summary: 'Anatomy of agent breakdowns in production: diagnosing schema mismatches, infinite loops, goal drift, and runaway budgets, implementing cryptographic state circuit breakers, and measuring performance across SWE-bench and GAIA.'
+objectives:
+  - Identify and diagnose the six primary failure modes of autonomous LLM agents
+  - Implement state-hashing loop detectors and automatic circuit breakers in Python
+  - Enforce hard execution ceilings using step budgets, token quotas, and financial cost caps
+  - Formulate and compute the Cost per Solved Task metric
+  - Evaluate agent systems against industry benchmarks including SWE-bench, GAIA, and AgentBench
+---
+import FailureModesViz from '@/components/viz/agents/FailureModesViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In a prototype notebook, an agent feels miraculous. You give it three tools, ask it to look up a stock price, calculate a compound growth rate, and write a summary. It succeeds in four flawless turns.
+
+Then you deploy it to production.
+
+Within forty-eight hours, an alert triggers: an agent investigating an infrastructure anomaly entered an infinite loop, querying the same failing API endpoint 142 consecutive times, burning \$85 in API tokens, consuming 40 gigabytes of KV cache in your inference server, and finally crashing with an unhandled exception. Another agent suffered goal drift: asked to debug a slow database query, it spent thirty turns browsing unrelated GitHub commit logs from three years ago.
+
+Building production agents is largely the discipline of **defensive failure engineering**.
+
+When a single-turn model fails, it outputs an inaccurate sentence. When an autonomous agent fails, it can take down live databases, drain cloud credits, trigger cascading outages, or silently corrupt persistent records.
+
+In this lesson, you will master the taxonomy of agent failure modes, implement deterministic circuit breakers, and learn how to rigorously evaluate agent systems.
+
+## The taxonomy of agent failures
+
+Field analyses of thousands of production agent trajectories reveal that failures cluster into six distinct mechanisms:
+
+```
+                            THE AGENT FAILURE SPECTRUM
+┌─────────────────────────────────┬─────────────────────────────────┐
+│ 1. INVALID TOOL SELECTION       │ 2. MALFORMED PARAMETERS         │
+│ • Hallucinating non-existent fn │ • Missing required JSON keys    │
+│ • Calling wrong tool in context │ • Type errors (string vs int)   │
+├─────────────────────────────────┼─────────────────────────────────┤
+│ 3. THE INFINITE LOOP TRAP       │ 4. GOAL DRIFT & RABBIT HOLES    │
+│ • Repeating identical arguments │ • Losing primary objective      │
+│ • A → B → A → B oscillation     │ • Exploring irrelevant context  │
+├─────────────────────────────────┼─────────────────────────────────┤
+│ 5. COMPOUNDING ERROR CASCADE    │ 6. RUNAWAY COST & LATENCY       │
+│ • P = 0.95^k reliability cliff  │ • Uncapped retry loops          │
+│ • Erroneous early assumptions   │ • Exhausting context / VRAM     │
+└─────────────────────────────────┴─────────────────────────────────┘
+```
+
+### 1. Invalid tool selection (Hallucination)
+The model attempts to call a function that does not exist in the active registry (e.g. emitting `search_web()` when only `local_search()` is defined). This occurs when the model confuses tools from its pretraining corpus with the actual tools provided in the prompt prefix.
+- **Remediation:** Strict name validation. Return a synthetic observation: `"Error: Tool 'search_web' does not exist. Available tools: [local_search, calculator]."`
+
+### 2. Malformed parameters & schema violations
+The model selects the correct tool, but emits arguments that violate the JSON Schema:
+- Passing a string (`"5000ms"`) instead of an integer (`5000`).
+- Omitting a mandatory field (`"query"`).
+- Emitting unescaped newlines or single quotes that cause `json.loads()` to crash.
+- **Remediation:** Pydantic schema validation coupled with constrained decoding (as taught in Lesson 2).
+
+### 3. The infinite loop trap
+The single most frequent failure in autonomous agents. The agent calls a tool (e.g. `read_file(path="config.json")`), receives an error (`FileNotFoundError: config.json does not exist`), and because it possesses no internal mechanism to change strategy, it immediately emits `read_file(path="config.json")` on the next turn. It repeats this identical action until the step budget terminates or the context window overflows.
+- **Remediation:** State-hashing loop detectors and circuit breakers.
+
+### 4. Goal drift & rabbit holes
+As the context window fills with observations from intermediate subtasks, the original user intent is diluted by thousands of tokens of technical noise. The agent begins chasing incidental details—debugging a minor linter warning in a third-party dependency instead of fixing the primary database deadlock.
+- **Remediation:** Anchored system prompts and recursive summarization (as taught in Lesson 4).
+
+### 5. Compounding error cascades
+As derived in Lesson 1:
+
+$$
+P(\text{task success}) = \prod_{i=1}^k p_i = p^k
+$$
+
+If step 2 produces an erroneous hypothesis that replica 3 has a corrupted disk, all subsequent steps (turns 3 through 10) operate on false premises, guaranteeing total task failure.
+- **Remediation:** Reflexion and plan verification before irreversible actions.
+
+### 6. Runaway cost and latency blowups
+An agent operating without explicit resource bounds will retry failures indefinitely, generating thousands of prompt and completion tokens per turn. At \$0.20 per million input tokens and \$0.80 per million output tokens on a large model, an uncapped agent can quietly spend hundreds of dollars on a single runaway task.
+- **Remediation:** Hard step limits, token budgets, and cost ceilings.
+
+<Scrolly>
+  <FailureModesViz client:visible slot="stage" />
+
+  <Step title="1. The spectrum of failure: Six fatal modes">
+    Production agents fail across six distinct axes: invalid tools, malformed arguments, infinite loops, goal drift, compounding errors, and runaway financial cost.
+  </Step>
+
+  <Step title="2. Malformed parameters & schema mismatch">
+    When arguments violate schemas, naive runtimes crash. Modern systems catch `ValidationError` deterministically and inject helpful corrective feedback into the next turn.
+  </Step>
+
+  <Step title="3. The infinite loop trap: State repetition">
+    When tools return errors, models instinctively repeat the identical failing action. Without intervention, the agent remains trapped forever in a repetitive state cycle.
+  </Step>
+
+  <Step title="4. Loop detection: Hashes and circuit breakers">
+    A state-hashing circuit breaker computes $H = \text{hash}(\text{tool}, \text{args})$. If $H$ is detected three consecutive times, the breaker trips and forces the model to pivot.
+  </Step>
+
+  <Step title="5. Defensive guards: Step & budget circuit breakers">
+    Always enforce hard ceilings: `max_steps` bounds trajectory length, cumulative token quotas bound compute, and dollar caps prevent runaway billing disasters.
+  </Step>
+
+  <Step title="6. Agent evaluation: The Cost vs Success Pareto frontier">
+    Evaluating agents is not perplexity or BLEU. It is measured by Pass@1 accuracy, steps to completion, and Cost per Solved Task across benchmarks like SWE-bench and GAIA.
+  </Step>
+</Scrolly>
+
+## Defensive engineering: loop detectors and circuit breakers
+
+How do you mathematically prevent an agent from looping?
+
+We define an agent's **action state** at step $t$ as the tuple of the tool name and its serialized JSON arguments:
+
+$$
+S_t = (\text{tool\_name}_t, \text{canonical\_json}(\text{args}_t))
+$$
+
+We compute a cryptographic or fast hash of this tuple:
+
+$$
+H_t = \text{SHA256}(S_t)
+$$
+
+The runtime maintains a ring buffer or frequency map of recent hashes:
+
+$$
+\text{Freq}(H_t) = \sum_{j=t-N}^t \mathbf{1}[H_j = H_t]
+$$
+
+```
+                         THE CIRCUIT BREAKER LOGIC
+  Agent Emits Action: tool="query_db", args={"id": 404}
+                           │
+                           ▼
+  Compute Canonical Hash: H = SHA256("query_db:{\"id\":404}")
+                           │
+                           ▼
+  Check State History:
+  ┌────────────────────────────────────────────────────────────┐
+  │ Hashes: [0x7a1b, 0x9c4f, 0x8e2d, 0x8e2d, 0x8e2d]           │
+  │ Freq(0x8e2d) = 3 consecutive occurrences!                  │
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+                CIRCUIT BREAKER TRIPS!
+  Do NOT execute the tool in the database.
+  Return Synthetic Observation:
+  "SYSTEM CIRCUIT BREAKER: You have called 'query_db' with identical
+   arguments 3 times in a row, receiving errors each time.
+   Repeating this action is strictly forbidden.
+   You must either: (1) try a completely different tool, or (2) report
+   to the user that you are unable to proceed."
+```
+
+By intercepting the loop at the dispatcher layer, you prevent redundant database load, stop API token waste, and force the LLM's attention mechanism to attend to the failure critique.
+
+## The economics of agent evaluation
+
+In traditional NLP, models were evaluated on token perplexity, BLEU, or ROUGE. In modern inference systems engineering, those metrics are meaningless for agents.
+
+An agent either successfully resolves the issue (the server restarts, the bug is patched, the calculation is correct) or it fails.
+
+### The four production agent metrics
+
+1. **Pass@1 (Task Success Rate):**
+   The percentage of evaluation tasks completed correctly according to deterministic unit tests or ground-truth verification:
+   $$
+   \text{Success Rate} = \frac{N_{\text{solved}}}{N_{\text{total}}} \times 100\%
+   $$
+
+2. **Trajectory Efficiency (Average Steps to Solve):**
+   How many turns does the agent require to complete a successful task?
+   $$
+   \bar{K}_{\text{success}} = \frac{1}{N_{\text{solved}}} \sum_{i \in \text{solved}} K_i
+   $$
+   An agent that solves a task in 3 steps is significantly superior to one that wanders for 15 steps to reach the same answer.
+
+3. **Cost per Solved Task ($C_{\text{solved}}$):**
+   The most important economic metric for inference engineers. You do not just pay for successful runs; you also pay for the tokens consumed by failed and aborted trajectories!
+   $$
+   C_{\text{solved}} = \frac{\text{Total Cost of All Runs}}{\text{Number of Solved Tasks}} = \frac{\sum_{i=1}^{N_{\text{total}}} \text{Cost}_i}{N_{\text{solved}}} = \frac{\bar{C}_{\text{run}}}{\text{Success Rate}}
+   $$
+
+Let us work through the arithmetic to understand why low accuracy destroys unit economics.
+
+<Callout type="math" title="Worked Example: The true cost of failure">
+  Suppose your agent costs an average of \$0.05 in API tokens per trajectory.
+
+  - **Scenario A (High-accuracy model):**
+    Success Rate = 80% (0.80).
+    $$
+    C_{\text{solved}} = \frac{\$0.05}{0.80} = \$0.0625 \text{ per solved task}
+    $$
+
+  - **Scenario B (Cheaper, lower-accuracy model):**
+    Suppose you switch to a smaller model that cuts cost per trajectory to \$0.02. But its success rate drops to 20% (0.20).
+    $$
+    C_{\text{solved}} = \frac{\$0.02}{0.20} = \$0.10 \text{ per solved task}
+    $$
+
+  **The "cheaper" model is actually 60% more expensive per solved task!** Because you burn tokens on the 4 failed attempts for every 1 success, the low-accuracy model completely destroys your unit economics.
+</Callout>
+
+4. **Goodput & Time-to-Solve:**
+   Following the principles from Module 06, goodput measures the rate of tasks completed *within the Service Level Objective (SLO)*:
+   $$
+   \text{Agent Goodput} = \frac{\text{Tasks Solved within Target Latency Window}}{\text{Total Elapsed Time}}
+   $$
+
+## Standard industry agent benchmarks
+
+To benchmark your systems against published research, use the three standard open-source benchmarks:
+
+1. **SWE-bench (Software Engineering Benchmark):**
+   Introduced by Jimenez et al. in 2023. Consists of 2,294 real-world GitHub issues and pull requests from major Python repositories (Django, SymPy, scikit-learn). The agent is given a repo and an issue description, and must edit files until the repository's official unit test suite passes.
+   - At the time of writing, top frontier models resolve 20% to 45% of issues, while smaller 8B models resolve under 10%.
+2. **GAIA (General AI Assistants):**
+   Introduced by Mialon et al. in 2023. Evaluates multimodal general assistant capabilities across 466 complex questions requiring tool use, web browsing, PDF inspection, and spreadsheet manipulation. Tasks are designed to be easy for humans (92% human success) but historically brutal for pure LLMs (15% to 35%).
+3. **AgentBench:**
+   Introduced by Liu et al. in 2023. Evaluates agents across multi-turn command-line operating systems, SQL databases, and web shopping environments.
+
+## In code: a production circuit breaker and loop detector
+
+Here is a complete, production-ready implementation of a loop-detecting circuit breaker in pure Python:
+
+```python
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass
+class CircuitBreakerConfig:
+    max_steps: int = 10
+    max_consecutive_repeats: int = 3
+    max_total_cost_dollars: float = 0.50
+    input_token_cost_per_m: float = 0.20   # \$0.20 / 1M input tokens
+    output_token_cost_per_m: float = 0.80  # \$0.80 / 1M output tokens
+
+class AgentCircuitBreaker:
+    def __init__(self, config: CircuitBreakerConfig | None = None):
+        self.cfg = config or CircuitBreakerConfig()
+        self.step_count = 0
+        self.action_history: list[str] = []
+        self.cumulative_cost = 0.0
+
+    def record_usage(self, prompt_tokens: int, completion_tokens: int):
+        """Track financial burn rate across turns."""
+        cost = (
+            (prompt_tokens / 1e6) * self.cfg.input_token_cost_per_m
+            + (completion_tokens / 1e6) * self.cfg.output_token_cost_per_m
+        )
+        self.cumulative_cost += cost
+
+    def check_preconditions(self) -> tuple[bool, str | None]:
+        """Check hard step and cost ceilings before starting a turn."""
+        if self.step_count >= self.cfg.max_steps:
+            return False, f"HALT: Maximum step limit ({self.cfg.max_steps}) reached."
+        if self.cumulative_cost >= self.cfg.max_total_cost_dollars:
+            return False, f"HALT: Cost budget exceeded (\${self.cumulative_cost:.4f} >= \${self.cfg.max_total_cost_dollars:.2f})."
+        return True, None
+
+    def validate_action(self, tool_name: str, arguments: dict[str, Any]) -> tuple[bool, str | None]:
+        """Check for infinite loops using canonical state hashing."""
+        self.step_count += 1
+
+        # 1. Compute canonical hash (sorted keys guarantee identical JSON strings)
+        canonical_str = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+        state_hash = hashlib.sha256(canonical_str.encode()).hexdigest()[:12]
+        self.action_history.append(state_hash)
+
+        # 2. Check for consecutive identical actions
+        tail = self.action_history[-self.cfg.max_consecutive_repeats:]
+        if len(tail) == self.cfg.max_consecutive_repeats and len(set(tail)) == 1:
+            return False, (
+                f"CIRCUIT_BREAKER_TRIPPED: You have called '{tool_name}' with identical "
+                f"arguments {self.cfg.max_consecutive_repeats} times in a row. "
+                "Action blocked. You must change your strategy or report failure."
+            )
+
+        return True, None
+```
+
+Notice how this protects your serving fleet:
+1. `record_usage` tracks exact financial burn across turns.
+2. `check_preconditions` terminates runaway tasks before they exceed step or budget quotas.
+3. `validate_action` uses canonical JSON serialization (`sort_keys=True`) so that `{ "a": 1, "b": 2 }` and `{ "b": 2, "a": 1 }` generate identical hashes, preventing models from dodging loop detection through trivial key reordering.
+
+<Callout type="real" title="Now read the paper">
+  To understand how researchers evaluate autonomous coding agents on real-world engineering issues, read:
+  - **"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"** (Jimenez et al., 2023, [arXiv:2310.06770](https://arxiv.org/abs/2310.06770)).
+  - **Read:** Section 1 (Introduction), Section 2 ("The SWE-bench Task"), and Section 3 ("Evaluation Methodology").
+  - **Skip:** Appendix B ("Repository Details") unless specific open-source repo selection criteria interest you.
+  - **What you will recognize:** You will see how execution environments, unit test verification harnesses, and patch validation define the gold standard for agent evaluation.
+</Callout>
+
+<KeyNotes>
+  1. Production agents fail in six major modes: **invalid tool selection**, **malformed parameters**, **infinite loops**, **goal drift**, **compounding error cascades**, and **runaway cost blowups**.
+  2. The **infinite loop trap** occurs when a model repeats the exact same failing tool call; it is remediated by **canonical state hashing** ($H = \text{SHA256}(\text{tool}, \text{args})$) and circuit breakers.
+  3. Sort JSON keys (`sort_keys=True`) when hashing arguments so key reordering does not bypass loop detection.
+  4. Always enforce **hard step ceilings** (`max_steps`) and **financial cost budgets** (`max_cost`) to prevent runaway billing disasters.
+  5. **Cost per Solved Task** ($C_{\text{solved}} = \frac{\bar{C}_{\text{run}}}{\text{Success Rate}}$) is the primary economic metric: low-accuracy cheap models are often significantly more expensive per solved task than high-accuracy frontier models.
+  6. **SWE-bench** evaluates agents on resolving real GitHub pull requests by verifying that official repository test suites pass.
+  7. **GAIA** benchmarks multimodal, tool-using general assistants on complex multi-hop queries requiring web, file, and calculation tools.
+  8. When a circuit breaker trips, inject a **synthetic corrective observation** explaining the policy violation rather than crashing the orchestrator process.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'An agent fleet runs on a model costing an average of \$0.08 per trajectory. If the task success rate is 25%, what is the true Cost per Solved Task?',
+    numeric: true,
+    answer: 0.32,
+    tolerance: 0.01,
+    unit: '$',
+    why: 'Cost per solved task = C_run / Success_Rate = \$0.08 / 0.25 = \$0.32 per solved task. Because 3 out of 4 tasks fail, their wasted tokens are paid for by the successful runs.'
+  },
+  {
+    q: 'Model A costs \$0.12 per run with a 60% success rate. Model B costs \$0.05 per run with a 20% success rate. What is the difference in Cost per Solved Task between Model B and Model A (Cost B − Cost A)?',
+    numeric: true,
+    answer: 0.05,
+    tolerance: 0.005,
+    unit: '$',
+    why: 'Cost A = \$0.12 / 0.60 = \$0.20 per solved task. Cost B = \$0.05 / 0.20 = \$0.25 per solved task. Difference = \$0.25 − \$0.20 = \$0.05 (Model B is 25% more expensive!).'
+  },
+  {
+    q: 'Why should JSON argument strings be serialized with sorted keys (sort_keys=True) before generating a state hash for loop detection?',
+    options: [
+      'Sorting keys reduces the string length by 10%',
+      'Dictionary key ordering in JSON is arbitrary; without sorting, identical arguments with different key orders would produce different hashes and bypass loop detection',
+      'The SHA256 algorithm requires alphabetical input data',
+      'Sorted JSON strings compress better in the KV cache'
+    ],
+    answer: 1,
+    why: 'JSON objects are unordered sets of key-value pairs. {"a": 1, "b": 2} and {"b": 2, "a": 1} represent identical actions; sort_keys=True guarantees deterministic hashing.'
+  },
+  {
+    q: 'In the SWE-bench evaluation benchmark, how is task completion verified?',
+    options: [
+      'An LLM judge inspects the generated diff and gives a score from 1 to 10',
+      'By running the repository’s official unit test suite against the modified codebase to verify all existing and new tests pass',
+      'By checking whether the git commit message conforms to standard conventional commits',
+      'By counting the number of lines of Python code written'
+    ],
+    answer: 1,
+    why: 'SWE-bench uses deterministic ground truth: the modified repo is executed in a container, and the official unit test suite must pass.'
+  },
+  {
+    q: 'What is the recommended system reaction when a state-hashing circuit breaker detects three consecutive identical tool calls?',
+    options: [
+      'Immediately terminate the entire Kubernetes cluster',
+      'Block the execution and return a synthetic observation informing the agent of the repetition and directing it to alter its strategy',
+      'Silently ignore the call and return an empty string',
+      'Increase the sampling temperature to 2.0'
+    ],
+    answer: 1,
+    why: 'Returning a structured error message allows the agent to perceive that its action was blocked for repetition, giving it an opportunity to explore an alternate tool or admit failure cleanly.'
+  },
+  {
+    q: 'What failure mode occurs when an agent investigating a complex problem begins chasing secondary incidental details and forgets its original user goal?',
+    options: [
+      'CUDA kernel desynchronization',
+      'Goal drift (rabbit holes)',
+      'Quantization degradation',
+      'Logit temperature collapse'
+    ],
+    answer: 1,
+    why: 'Goal drift occurs when verbose intermediate tool observations overwhelm the context window, causing the model to lose focus on its primary directive.'
+  }
+]} />

@@ -1,0 +1,287 @@
+---
+title: 'Lab: A tool-using agent from scratch'
+summary: 'Construct and benchmark a complete ReAct agent from first principles in pure Python: load Qwen2.5-3B-Instruct in FP16 on a free Google Colab T4 GPU, implement a safe AST calculator, local search, and Python sandbox, add state-hashing circuit breakers, and measure Pass@1 across 20 evaluation tasks.'
+objectives:
+  - Implement a transparent ReAct agent loop from scratch in pure Python without third-party agent frameworks
+  - Construct three deterministic tools (safe AST calculator, local document search, and Python sandbox)
+  - Integrate a canonical state-hashing loop detector and step budget circuit breaker
+  - Run inference with Qwen2.5-3B-Instruct in FP16 on a free Google Colab T4 GPU
+  - Measure Pass@1 success rate and trajectory efficiency across a 20-task systems engineering benchmark
+colab: b4-agent.ipynb
+---
+import LabAgentSim from '@/components/viz/agents/LabAgentSim.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In the preceding lessons, you developed the theoretical foundations of autonomous LLM agents: the perceive-plan-act-observe cycle, compounding error arithmetic, tool blast radiuses, constrained grammar decoding, ReAct vs DAG planning, hybrid memory compaction buffers, and circuit breakers.
+
+Now it is time to build and benchmark the entire system on real GPU hardware.
+
+In this hands-on lab, you will construct a complete, autonomous **ReAct agent loop from first principles in pure Python**. You will use no third-party agent frameworks (no LangChain, no CrewAI, no AutoGen). Every line of the control loop, tool dispatcher, state-hashing circuit breaker, and memory history will be transparent code that you control.
+
+You will load an open-weights model (`Qwen2.5-3B-Instruct`) in FP16 on a free Google Colab NVIDIA T4 GPU, provide it with three deterministic tools, and evaluate its performance across a rigorous benchmark suite of **20 multi-step systems engineering tasks**.
+
+Open the Colab notebook below to run the lab on a live T4 GPU.
+
+<Colab nb="b4-agent.ipynb" />
+
+## Interactive Simulator: Step through the ReAct Loop
+
+Before running the GPU notebook, explore the interactive simulator below. Select different tasks — an H100 roofline knee calculation, a Llama-3.1-8B KV cache sizing problem, or a bandwidth comparison — and click **Step Forward** to watch the agent generate intermediate thoughts, dispatch tools, parse environment observations, and produce verified final answers.
+
+<Wide>
+  <LabAgentSim client:visible />
+</Wide>
+
+---
+
+## Lab Architecture & Workflow
+
+The lab is structured into five engineering phases:
+
+1. **Hardware & Environment Setup:** Verify the NVIDIA T4 GPU (16 GB VRAM, ~320 GB/s bandwidth) and load `transformers` and `accelerate`.
+2. **Deterministic Tool Implementation:**
+   - `calculator(expression: str)`: An Abstract Syntax Tree (`ast`) evaluator that executes math safely without dangerous `eval()`.
+   - `local_search(query: str)`: Token-overlap keyword retrieval over an internal knowledge base of 20 GPU and LLM architecture specifications.
+   - `python_sandbox(code: str)`: A sandboxed Python execution namespace with stdout redirection and error trapping.
+3. **Model Loading:** Load `Qwen2.5-3B-Instruct` in FP16 (`torch.float16`). The model occupies $\sim 6.2\text{ GB}$ of VRAM, leaving $\sim 9.8\text{ GB}$ of free headroom for KV caches and activations.
+4. **The ReAct Engine with Circuit Breakers:** A control loop that parses `Thought: ...` and `Action: tool(arg)`, records state hashes $H = \text{SHA256}(\text{tool} + \text{arg})$, trips a circuit breaker on 3 identical repeats, and enforces a hard ceiling of `max_steps = 6`.
+5. **20-Task Benchmark Execution:** Run 20 realistic systems engineering tasks, trace every trajectory, and report **Pass@1 Success Rate** and **Average Steps to Completion**.
+
+---
+
+## Task 1 · Construct the Three Deterministic Tools
+
+In the notebook, implement the three tools without using external web APIs:
+
+```python
+import ast, operator, re, sys
+from io import StringIO
+
+# Tool 1: Safe AST Calculator
+SAFE_OPERATORS = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.Pow: operator.pow, ast.USub: operator.neg,
+}
+
+def safe_eval(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    elif isinstance(node, ast.BinOp):
+        return SAFE_OPERATORS[type(node.op)](safe_eval(node.left), safe_eval(node.right))
+    elif isinstance(node, ast.UnaryOp):
+        return SAFE_OPERATORS[type(node.op)](safe_eval(node.operand))
+    raise ValueError(f"Unsupported node: {type(node)}")
+
+def tool_calculator(expression: str) -> str:
+    clean_expr = expression.replace(",", "").strip()
+    try:
+        tree = ast.parse(clean_expr, mode='eval')
+        return str(safe_eval(tree.body))
+    except Exception as e:
+        return f"Calculator Error: {e}"
+```
+
+**Expected output:**
+```
+Calculator test: 295.2238805970149
+Search test: [doc_01] NVIDIA H100 SXM features 80 GB of HBM3 memory with a peak bandwidth of 3.35 TB/s and 989 TFLOP/s...
+```
+
+**How to read it:** Notice that `tool_calculator` does not use Python's built-in `eval()`. Using `eval()` in an agent environment is a critical security vulnerability because an agent (or a prompt injection attack) could execute arbitrary shell commands. `ast.parse` validates that only mathematical operators are evaluated.
+
+---
+
+## Task 2 · Load Qwen2.5-3B-Instruct in FP16 on T4 GPU
+
+Load the 3-billion parameter model into GPU memory using Hugging Face `transformers`:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16,
+    device_map="cuda",
+)
+```
+
+**Expected output:**
+```
+Loading Qwen/Qwen2.5-3B-Instruct in FP16 on GPU...
+Model loaded. VRAM allocated: 6.18 GB
+```
+
+**How to read it:** ${}3\text{ billion parameters} \times 2\text{ bytes (FP16)} \approx 6.0\text{ GB}$. The weights fit easily on a 16 GB T4 GPU, leaving over 9.5 GB of free HBM. Because Turing T4 lacks BF16 tensor cores (it computes BF16 via slow software emulation), we strictly specify `torch_dtype=torch.float16`.
+
+---
+
+## Task 3 · The ReAct Control Loop & State Hashing Circuit Breaker
+
+Implement the execution engine. Notice how the circuit breaker intercepts loops using canonical SHA256 hashes:
+
+```python
+import hashlib
+
+def run_agent_react(goal: str, max_steps: int = 6, verbose: bool = False):
+    prompt = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{goal}<|im_end|>\n<|im_start|>assistant\n"
+    action_hashes = []
+    
+    for step in range(1, max_steps + 1):
+        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                temperature=0.1,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        
+        new_tokens = outputs[0][inputs.input_ids.shape[1]:]
+        response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        
+        if "Final Answer:" in response:
+            final_ans = response.split("Final Answer:")[-1].strip()
+            return {"status": "success", "steps": step, "final_answer": final_ans}
+        
+        tool_name, tool_arg = parse_action(response)
+        if not tool_name:
+            return {"status": "failed", "reason": "No valid action parsed", "steps": step}
+        
+        # State Hashing Circuit Breaker
+        state_str = f"{tool_name}:{tool_arg}"
+        h = hashlib.sha256(state_str.encode()).hexdigest()[:8]
+        action_hashes.append(h)
+        
+        if len(action_hashes) >= 3 and action_hashes[-1] == action_hashes[-2] == action_hashes[-3]:
+            obs = f"CIRCUIT_BREAKER: You have repeated {tool_name}({tool_arg}) 3 times. Action blocked."
+        else:
+            obs = TOOLS[tool_name](tool_arg) if tool_name in TOOLS else "Invalid tool."
+        
+        prompt += f"{response}\nObservation: {obs}\n"
+    
+    return {"status": "failed", "reason": "Max step budget exceeded", "steps": max_steps}
+```
+
+**How to read it:**
+1. The assistant generates autoregressively until it outputs an `Action:` string.
+2. The orchestrator halts generation, parses the function call, and checks the SHA256 state ring buffer.
+3. If the model attempts the exact same action three times consecutively, the execution is blocked, and a synthetic observation forces the model to pivot.
+4. If `max_steps = 6` is reached without a `Final Answer:`, the trajectory terminates cleanly, preventing infinite loops.
+
+---
+
+## Task 4 · Execute the 20-Task Benchmark
+
+Run the automated evaluation benchmark across the 20 systems engineering tasks:
+
+```python
+# Task snippet
+for task in BENCHMARK_TASKS:
+    res = run_agent_react(task["goal"], max_steps=6)
+    # Evaluates numerical correctness against ground truth
+```
+
+**Expected output:**
+```
+==================================================
+FINAL AGENT EVALUATION REPORT
+==================================================
+Total Benchmark Tasks:       20
+Tasks Solved Correctly:      17 / 20
+Pass@1 Success Rate:         85.0%
+Average Steps (Solved):      2.41 turns
+Step Limit Enforcement:      100% (max 6 steps)
+==================================================
+```
+
+**How to read it:**
+- **Pass@1 Success Rate (85.0%):** 17 out of 20 tasks solved completely without human assistance.
+- **Average Steps to Completion (2.41 turns):** Successful tasks required an average of roughly 2 to 3 turns (typically: search knowledge base $\to$ calculate arithmetic $\to$ final answer).
+- **Step Ceilings:** Zero tasks exceeded the 6-step limit, demonstrating total stability.
+
+---
+
+## Check Yourself: Systems Engineering Questions
+
+### 1. Why is AST parsing safer than `eval()` in tool calling?
+`eval()` executes any arbitrary Python string with full interpreter privileges, including `__import__('os').system('rm -rf /')`. AST parsing validates the syntax tree before evaluation and allows only whitelisted mathematical operations (addition, multiplication, division).
+
+### 2. What caused the 3 failed tasks in the benchmark?
+Inspect the traces of the 3 failed tasks in your notebook output. In typical runs on Qwen2.5-3B:
+- One failure stems from **parsing extraction**: the model passed an unescaped string with extra parentheses that failed AST parsing.
+- One failure stems from **search query formulation**: the model searched for general terms rather than specific hardware identifiers, retrieving an irrelevant document chunk.
+- One failure stems from **rounding discrepancy**: the model rounded intermediate floating-point numbers prematurely.
+
+### 3. How does prefix caching alter the speed of this 20-task benchmark?
+In this lab, we evaluated each task sequentially. If served via a production engine with prefix caching (like vLLM or SGLang), the static system prompt (350 tokens) would be cached permanently. Turn 2 and Turn 3 would hit the KV cache, cutting total benchmark runtime by over 50%.
+
+<KeyNotes>
+  1. A production agent requires no complex third-party frameworks: a **transparent while loop** around model inference and tool dispatch provides complete architectural visibility.
+  2. Compute tools must be strictly sandboxed: **never use `eval()`** for mathematical evaluation; use Abstract Syntax Tree (`ast.parse`) validation with whitelisted operators.
+  3. **Qwen2.5-3B-Instruct** in FP16 occupies only **6.2 GB of VRAM**, running comfortably on a free Google Colab NVIDIA T4 GPU.
+  4. Always use **`torch.float16`** instead of BF16 on NVIDIA Turing T4 GPUs, because T4 hardware tensor cores lack native BF16 support.
+  5. State-hashing loop detectors ($H = \text{SHA256}(\text{tool} + \text{args})$) prevent repetitive infinite loops by tripping an automatic circuit breaker at 3 repeats.
+  6. Enforcing a hard ceiling of **`max_steps = 6`** guarantees that runaway tasks terminate deterministically before blowing latency or budget limits.
+  7. On the 20-task systems benchmark, the pure Python ReAct agent achieves an **85.0% Pass@1 success rate** with an average trajectory length of **2.41 steps**.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why should Python’s built-in eval() function never be used as a calculator tool in an autonomous agent system?',
+    options: [
+      'eval() can only calculate integer addition',
+      'eval() executes arbitrary code strings and can be exploited by prompt injection to execute malicious operating system commands',
+      'eval() causes GPU tensor cores to desynchronize',
+      'eval() is not supported in Python 3.10+'
+    ],
+    answer: 1,
+    why: 'eval() executes arbitrary Python code. If an agent receives an adversarial prompt, eval() could be tricked into running system commands, deleting files, or leaking credentials.'
+  },
+  {
+    q: 'On an NVIDIA T4 GPU (16 GB VRAM), what precision should be used when loading Qwen2.5-3B-Instruct to achieve maximum tensor-core speed?',
+    options: [
+      'BF16 (bfloat16)',
+      'FP16 (float16)',
+      'FP32 (float32)',
+      'FP64 (double)'
+    ],
+    answer: 1,
+    why: 'The Turing architecture (T4) has native FP16 tensor cores but lacks native BF16 tensor cores. Running BF16 on a T4 falls back to slow software emulation.'
+  },
+  {
+    q: 'In the benchmark evaluation, an agent solved 17 out of 20 tasks in an average of 2.41 steps. If 3 failed tasks hit the maximum step limit of 6 steps, how many total LLM generation steps were executed across all 20 tasks?',
+    numeric: true,
+    answer: 59,
+    tolerance: 1,
+    unit: 'steps',
+    why: '17 solved tasks took 17 × 2.41 ≈ 40.97 steps (approx 41 steps). 3 failed tasks took 3 × 6 = 18 steps. Total steps = 41 + 18 = 59 steps.'
+  },
+  {
+    q: 'What is the purpose of hashing the tool name and arguments with SHA256 in the agent loop?',
+    options: [
+      'To encrypt the tool call for HIPAA compliance',
+      'To detect when the agent enters an infinite loop by repeating identical actions, allowing the system to trip a circuit breaker',
+      'To speed up the Python dictionary lookup by 10x',
+      'To quantize the tool arguments into 8-bit integers'
+    ],
+    answer: 1,
+    why: 'State hashing converts the tool call tuple into a compact identifier. Tracking identical consecutive hashes allows the runtime to detect and break repetitive loops deterministically.'
+  },
+  {
+    q: 'In the lab agent, why is temperature set to a low value (temperature=0.1) during generation?',
+    options: [
+      'To prevent the GPU from overheating',
+      'To encourage maximum creative hallucinations',
+      'To produce deterministic, reproducible reasoning and avoid random syntactic formatting errors in tool calls',
+      'To reduce the model’s parameter count'
+    ],
+    answer: 2,
+    why: 'Low temperature (or greedy decoding) produces predictable, highly focused token choices, which is essential for consistent tool syntax and logical reasoning.'
+  }
+]} />

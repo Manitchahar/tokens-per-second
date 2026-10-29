@@ -1,0 +1,409 @@
+---
+title: 'Agent memory'
+summary: 'Managing state across long horizons: coordinating working context, external vector stores, and model weights, eliminating quadratic context explosion, and implementing recursive summarization buffers.'
+objectives:
+  - Differentiate the three tiers of agent memory (working context, external stores, and parametric weights)
+  - Calculate the quadratic token and compute accumulation of unmanaged multi-turn context
+  - Diagnose the failure modes of naive FIFO sliding window truncation (goal amnesia)
+  - Design a production hybrid memory architecture combining anchored prompts, recursive summaries, and raw recent turns
+  - Implement a token-budgeted compaction buffer in Python
+---
+import AgentMemoryViz from '@/components/viz/agents/AgentMemoryViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In human cognition, memory is not a monolithic file dumped into working awareness. You possess **short-term working memory** (holding about 4 to 7 items in active focus), **long-term episodic memory** (recollecting what happened yesterday), and **semantic procedural memory** (knowing how to ride a bicycle or parse grammatical syntax without conscious retrieval).
+
+Large language models natively have none of this structure.
+
+When an LLM runs a forward pass, it is purely stateless. Its only "memory" consists of two extremes:
+1. **The weights $\theta$:** Billions of frozen floating-point numbers learned during pretraining. This is parametric memory: vast, static, impossible to update at runtime without retraining, and incapable of remembering what the user said two minutes ago.
+2. **The context window:** The sequence of tokens currently occupying the KV cache in GPU High Bandwidth Memory (HBM). This is working memory: immediate, fully accessible through self-attention, but strictly bounded in length and expensive in both compute and memory.
+
+If you build an autonomous agent that runs for 20, 50, or 100 turns, you immediately collide with the memory wall. Unmanaged agent loops either crash with Out-Of-Memory (OOM) errors, trigger massive TTFT latency spikes, or suffer catastrophic amnesia where the model forgets its original objective.
+
+In this lesson, you will master the engineering principles of **agent memory**: how to organize multi-tiered storage and how to implement token-budgeted compaction.
+
+## The three tiers of agent memory
+
+To design robust systems, an inference engineer must map cognitive abstractions to physical hardware reality.
+
+```
+                           THE THREE MEMORY TIERS
+┌─────────────────────────────────┬──────────────────────┬──────────────────────┐
+│  TIER 1: WORKING CONTEXT        │ TIER 2: EXTERNAL     │ TIER 3: PARAMETRIC   │
+│  (Short-Term Scratchpad)        │ (Long-Term Episodic) │ (Embedded Knowledge) │
+├─────────────────────────────────┼──────────────────────┼──────────────────────┤
+│ Physical: GPU HBM / KV Cache    │ Physical: Vector DB  │ Physical: Weights    │
+│ Bandwidth: 2.0 – 3.35 TB/s      │ Bandwidth: 100 MB/s  │ Bandwidth: Read once │
+│ Capacity: 4k – 128k tokens      │ Capacity: Infinite   │ Capacity: 8B – 70B   │
+│ Latency: Microseconds (O(1))    │ Latency: 5 – 50 ms   │ Latency: Zero fetch  │
+│ Mutability: Per-step append     │ Mutability: CRUD API │ Mutability: FROZEN   │
+│ Analogy: CPU L1/L2 Cache & RAM  │ Analogy: NVMe Disk   │ Analogy: Burned ROM  │
+└─────────────────────────────────┴──────────────────────┴──────────────────────┘
+```
+
+### Tier 1: Working Context (Short-Term Memory / RAM)
+This is the text currently inside the active prompt: the system instructions, active tool definitions, the user goal, and the immediate conversational turns.
+- **Hardware:** It lives in the GPU's High Bandwidth Memory as active key-value tensors (the KV cache).
+- **Properties:** It has ultra-fast access speed (read by attention at up to 3.35 TB/s on an H100). But capacity is strictly constrained by GPU VRAM and attention compute limits.
+
+### Tier 2: External Memory Stores (Long-Term Memory / Disk)
+When an agent session spans hours, days, or millions of tokens, data cannot remain inside Tier 1. It must be paged out to an external storage engine:
+- **Vector Databases (Dense retrieval):** Storing embeddings of past documentation, runbooks, and conversation archives (as taught in Module B3).
+- **Relational Databases (SQL / Key-Value):** Structured state tables tracking user profiles, ticket IDs, and transaction histories.
+- **File Scratchpads:** Markdown files or workspace scratchpads where the agent writes notes, intermediate code snippets, and research drafts.
+
+### Tier 3: Parametric Memory (Embedded Knowledge / ROM)
+The knowledge embedded directly into the transformer weight matrices during pretraining and alignment.
+- **Hardware:** Stored in GPU VRAM (e.g. 16 GB for an 8B model in BF16).
+- **Properties:** Read once per decode step. It cannot be updated during inference; modifying it requires fine-tuning (Module B5).
+
+<Scrolly>
+  <AgentMemoryViz client:visible slot="stage" />
+
+  <Step title="1. The three tiers: Working context, external store, weights">
+    Agent memory is a hierarchy. Tier 1 is fast working context in GPU HBM; Tier 2 is durable external storage in databases; Tier 3 is frozen parametric knowledge in model weights.
+  </Step>
+
+  <Step title="2. The unmanaged context overflow trap">
+    In an unmanaged agent loop, every turn appends actions and observations. By turn 20, context size explodes past budget thresholds, inflating TTFT latency and threatening OOM crashes.
+  </Step>
+
+  <Step title="3. Naive sliding window: The amnesia problem">
+    Discarding oldest tokens via a naive FIFO sliding window is disastrous. Evicting Turn 1 deletes the system prompt and original user goal, leaving the agent amnesiac and purposeless.
+  </Step>
+
+  <Step title="4. Recursive summarization: Compaction buffers">
+    Instead of dropping tokens, recursive summarization compacts past turns into a dense state representation, shrinking thousands of observation tokens down to a 250-token summary.
+  </Step>
+
+  <Step title="5. The hybrid context architecture">
+    Production hybrid memory: Anchor the static system prompt and initial goal at the start, inject the compacted summary in the middle, and keep the last 3-5 raw turns at the end.
+  </Step>
+
+  <Step title="6. Token budget arithmetic: Capping quadratic growth">
+    Token budget management caps total context at a fixed threshold (e.g., 4,000 tokens), transforming quadratic $O(K^2)$ accumulation into steady, predictable $O(K)$ linear serving costs.
+  </Step>
+</Scrolly>
+
+## The unmanaged context explosion: quadratic disaster
+
+Let us examine what happens to your inference server if you do not actively manage agent context.
+
+Suppose an agent runs a complex troubleshooting task that takes $K = 20$ turns.
+- Static system prompt and tool definitions: $L_0 = 1{,}500$ tokens.
+- Each turn generates a Thought + Action (100 tokens) and receives an Observation (400 tokens). Average tokens added per turn: $\Delta = 500$ tokens.
+
+In Turn 1, the prompt is:
+$$
+|\text{Prompt}_1| = L_0 = 1{,}500 \text{ tokens}
+$$
+
+In Turn 10, the prompt has grown to:
+$$
+|\text{Prompt}_{10}| = L_0 + 9 \times \Delta = 1{,}500 + 4{,}500 = 6{,}000 \text{ tokens}
+$$
+
+In Turn 20, the prompt reaches:
+$$
+|\text{Prompt}_{20}| = L_0 + 19 \times \Delta = 1{,}500 + 9{,}500 = 11{,}000 \text{ tokens}
+$$
+
+### The cumulative token disaster
+Without prefix caching, the total number of prompt tokens prefilled across the 20 turns is:
+
+$$
+\text{Total Tokens} = \sum_{i=1}^{20} [1{,}500 + (i - 1) \times 500] = 20 \times 1{,}500 + 500 \times \frac{20 \times 19}{2}
+$$
+
+$$
+\text{Total Tokens} = 30{,}000 + 500 \times 190 = 30{,}000 + 95{,}000 = 125{,}000 \text{ tokens!}
+$$
+
+Consider what this means for your infrastructure:
+1. **Compute Cost:** On an 8B model (2 FLOPs/param/token), prefilling 125,000 tokens costs:
+   $$
+   2 \times (8 \times 10^9) \times 125{,}000 = 2.0 \times 10^{15} \text{ FLOPs} = 2.0 \text{ PFLOPs}
+   $$
+2. **TTFT Degradation:** Turn 20 takes over **7× longer** to produce its first token than Turn 1.
+3. **KV Cache Memory:** In Llama-3.1-8B, 1 token of KV cache occupies 128 KiB (from Module 05). At 11,000 tokens, a single user's KV cache occupies:
+   $$
+   11{,}000 \times 131{,}072 \text{ bytes} \approx 1.44 \text{ GB of GPU VRAM}
+   $$
+   Ten concurrent agent sessions consume **14.4 GB of VRAM** in KV cache alone, leaving no memory for model weights and triggering server OOM crashes!
+
+## Truncation anti-patterns: the catastrophic amnesia trap
+
+When engineers first notice context explosion, their immediate reaction is often: *"Just use a sliding window! Keep only the last 4,000 tokens."*
+
+In software engineering, a FIFO (first-in, first-out) circular buffer is a classic data structure. In LLM agents, a naive FIFO sliding window is fatal.
+
+Look at what a FIFO queue drops first:
+```
+[Token 0 ... Token 1500]: System Prompt & User Goal ("Diagnose replica-3 crash")
+[Token 1501 ... Token 3000]: Turn 1 & Turn 2 (Inspected logs, discovered OOM)
+...
+[Token 3500 ... Token 5000]: Turn 6 & Turn 7 (Detailed memory metrics)
+```
+
+When Turn 8 arrives and total tokens exceed 4,000, a naive FIFO sliding window truncates from the left: **it deletes Tokens 0 through 1,000.**
+
+The system prompt and the original user goal vanish from context!
+
+The model receives a prompt that begins mid-sentence in the middle of a log trace:
+```
+...[tail output] connection reset by peer on socket 42...
+Thought: What am I supposed to be doing? Who am I?
+```
+
+The agent suffers **catastrophic amnesia**. It forgets its primary objective, forgets the tools it is permitted to call, and either crashes or hallucinates a brand new goal based on the most recent observation tokens.
+
+<Callout type="pitfall" title="The middle-turn context compression rule">
+  **Rule of Thumb:** Never truncate the head (system instructions and initial user prompt), and never truncate the tail (the immediate preceding action and observation).
+  If you must compact or discard tokens, **always compact the middle**.
+</Callout>
+
+## The production pattern: the hybrid compaction buffer
+
+The industry standard architecture for long-horizon agent memory is the **Hybrid Compaction Buffer** (also known as the Anchor-Summary-Recent pattern).
+
+```
+                      HYBRID COMPACTION BUFFER
+┌─────────────────────────┬───────────────────────┬────────────────────────┐
+│    1. ANCHOR HEAD       │  2. COMPACTION BUFFER │    3. RAW RECENT TAIL  │
+│  (Permanently Preserved)│  (Recursive Summary)  │  (Exact Working State) │
+├─────────────────────────┼───────────────────────┼────────────────────────┤
+│ • System instructions   │ • Condensed summary   │ • Turn k-2 (Act + Obs) │
+│ • Tool JSON schemas     │   of Turns 1 to k-3   │ • Turn k-1 (Act + Obs) │
+│ • Original user goal    │ • Structured state:   │ • Turn k (Current)     │
+│                         │   - Verified facts    │                        │
+│                         │   - Failed hypotheses │                        │
+├─────────────────────────┼───────────────────────┼────────────────────────┤
+│ Budget: ~1,500 tokens   │ Budget: ~400 tokens   │ Budget: ~1,500 tokens  │
+└─────────────────────────┴───────────────────────┴────────────────────────┘
+                  TOTAL MANAGED BUDGET: ~3,400 TOKENS (FIXED)
+```
+
+### 1. Anchor Head (Never truncated)
+The first block of the prompt contains:
+- The system prompt defining the agent's role, safety constraints, and formatting rules.
+- The JSON Schemas of all active tools.
+- The exact, verbatim user prompt specifying the primary objective.
+Because this block never changes, it achieves a **100% prefix cache hit rate** across the entire lifecycle of the agent!
+
+### 2. Compaction Buffer (The middle summary)
+When intermediate turns accumulate beyond a threshold (e.g. more than 4 turns), a lightweight background worker calls a fast, inexpensive model (such as Qwen2.5-1.5B or a specialized summarizer) to condense the older turns into a **structured state summary**:
+
+```json
+{
+  "investigation_status": "in_progress",
+  "established_facts": [
+    "Replica 3 exited with code 137 (SIGKILL) at 07:14 UTC",
+    "GPU HBM utilization was 98.4% immediately prior to termination"
+  ],
+  "disproven_hypotheses": [
+    "Thermal throttling was NOT the cause (temperatures remained stable at 62°C)",
+    "Network partition was NOT the cause (ping latency was 0.4ms)"
+  ],
+  "active_hypothesis": "Unbounded KV cache allocation in continuous batching scheduler",
+  "next_recommended_step": "Inspect vLLM max_num_seqs and gpu_memory_utilization flags"
+}
+```
+
+Notice the power of this representation:
+- 10 historical turns (consuming 5,000 raw observation tokens) are compressed into **under 250 tokens**.
+- All critical state (what was tried, what failed, what was proven) is preserved.
+- Noise (verbose stack traces, 500-line log dumps, raw JSON responses) is discarded.
+
+### 3. Raw Recent Tail (Short-term working scratchpad)
+The agent preserves the last $M$ turns (typically $M = 3$ to 5) in their raw, uncompressed form. This allows the model to see exact error codes, specific line numbers, and immediate tool arguments without loss of precision.
+
+When Turn $k+1$ finishes, Turn $k-M$ rolls into the Compaction Buffer, keeping total context strictly bounded at all times.
+
+## Token budget arithmetic: capping the wall
+
+Let us formalize the token budget for a production agent system.
+
+Suppose your serving cluster allocates a maximum context budget of $B_{\text{max}} = 4{,}096$ tokens per agent request (reserving remaining GPU memory for high concurrency and batch throughput).
+
+We define explicit token quotas:
+
+$$
+B_{\text{max}} = B_{\text{anchor}} + B_{\text{summary}} + B_{\text{tail}} + B_{\text{gen}}
+$$
+
+| Buffer Component | Token Allocation | Enforcement Policy |
+|:---|:---|:---|
+| $B_{\text{anchor}}$ (System + Schemas + Goal) | 1,500 tokens | Hard cap; reject goals $> 500$ tokens |
+| $B_{\text{summary}}$ (Compacted state JSON) | 400 tokens | Re-compact if summary exceeds 400 tokens |
+| $B_{\text{tail}}$ (Recent 3 raw turns) | 1,500 tokens | Truncate raw observations $> 500$ tokens |
+| $B_{\text{gen}}$ (Max completion tokens) | 696 tokens | Max tokens parameter in generation call |
+| **Total Context** | **4,096 tokens** | **Strictly bounded (zero OOM risk)** |
+
+### Comparing compute across 20 turns: unmanaged vs compacted
+
+Let us re-evaluate the 20-turn agent using the hybrid compaction architecture:
+- Turn 1: 1,500 tokens prefilled.
+- Turns 2 to 4: Context grows normally from 1,500 to 3,000 tokens.
+- Turns 5 to 20: Compaction activates. Context is held constant at $\sim 3{,}400$ tokens.
+
+With prefix caching active:
+- Turn 1 prefills 1,500 tokens.
+- Each subsequent turn prefills **only the newly appended turn** ($\sim 500$ tokens).
+- When compaction triggers, a small update is prefilled ($\sim 300$ tokens).
+
+$$
+\text{Total Prefill Tokens (Compacted)} \approx 1{,}500 + 19 \times 500 = 11{,}000 \text{ tokens}
+$$
+
+Compare this to the unmanaged system:
+- **Unmanaged without caching:** 125,000 tokens prefilled.
+- **Compacted with caching:** 11,000 tokens prefilled.
+- **Compute Reduction:** **91.2% savings in prefill FLOPs!**
+- **VRAM Footprint:** Maximum KV cache per user is capped at ${}4{,}096 \times 128\text{ KiB} \approx 536\text{ MB}$ instead of exploding to 1.44 GB.
+
+## In code: implementing a hybrid memory buffer
+
+Here is a clean, robust Python implementation of a token-budgeted hybrid memory manager:
+
+```python
+import json
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass
+class Turn:
+    role: str
+    content: str
+    tool_calls: list[dict] | None = None
+
+class HybridAgentMemory:
+    def __init__(
+        self,
+        system_prompt: str,
+        user_goal: str,
+        max_tail_turns: int = 4,
+        max_obs_chars: int = 1500,
+    ):
+        self.system_prompt = system_prompt
+        self.user_goal = user_goal
+        self.max_tail_turns = max_tail_turns
+        self.max_obs_chars = max_obs_chars
+        self.summary: str = "No past turns summarized yet."
+        self.tail_history: list[dict] = []
+
+    def add_turn(self, role: str, content: str, tool_calls: list[dict] | None = None):
+        """Add a turn, truncating massive observations to avoid context blowout."""
+        if role == "tool" and len(content) > self.max_obs_chars:
+            content = content[:self.max_obs_chars] + "\n...[Observation truncated for length]..."
+
+        msg = {"role": role, "content": content}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        self.tail_history.append(msg)
+
+    def compact_if_needed(self, summarizer_fn: Callable[[str, list[dict]], str]):
+        """Compact older turns into the summary buffer when tail exceeds threshold."""
+        if len(self.tail_history) > self.max_tail_turns * 2:
+            # Split off older turns to compact
+            turns_to_compact = self.tail_history[:-self.max_tail_turns]
+            self.tail_history = self.tail_history[-self.max_tail_turns:]
+
+            # Call background summarizer
+            self.summary = summarizer_fn(self.summary, turns_to_compact)
+
+    def compile_messages(self) -> list[dict]:
+        """Compile the complete prompt adhering to the Anchor-Summary-Recent pattern."""
+        messages = [
+            {"role": "system", "content": f"{self.system_prompt}\n\n[PAST PROGRESS SUMMARY]:\n{self.summary}"},
+            {"role": "user", "content": self.user_goal},
+        ]
+        # Append only recent uncompacted turns
+        messages.extend(self.tail_history)
+        return messages
+```
+
+Notice the design:
+1. `max_obs_chars` prevents a rogue tool call (like a 20,000-line core dump) from blowing the context window in a single turn.
+2. `system_prompt` and `user_goal` are permanently anchored at the head.
+3. `tail_history` is strictly bounded to the most recent turns.
+4. Older turns are safely rolled into `self.summary`.
+
+<Callout type="real" title="Now read the paper">
+  To see how researchers formalized multi-tiered memory architectures modeled directly after operating system virtual memory, read:
+  - **"MemGPT: Towards LLMs as Operating Systems"** (Packer et al., 2023, [arXiv:2310.08560](https://arxiv.org/abs/2310.08560)).
+  - **Read:** Section 1 (Introduction), Section 2 ("MemGPT Architecture: OS-Style Memory Management"), and Figure 2 ("MemGPT Memory Hierarchy").
+  - **Skip:** Section 4.2 ("Conversational Agent Evaluation") unless chatbot persona retention benchmarks interest you.
+  - **What you will recognize:** You will see the exact mapping between CPU/RAM/Disk and LLM Context/Vector/SQL memory tiers that we developed today, including function calls designed specifically for paging memory between tiers (`core_memory_append`, `archival_memory_insert`).
+</Callout>
+
+<KeyNotes>
+  1. Agent memory is divided into three physical tiers: **working context** (GPU HBM, fast, capacity-limited), **external stores** (vector DBs/disk, durable, infinite), and **parametric weights** (frozen knowledge).
+  2. In an unmanaged agent loop, context grows linearly each turn, creating **quadratic O(K^2) cumulative prefill token overhead** across a $K$-turn session.
+  3. Across 20 unmanaged turns, an agent can easily prefill over **125,000 cumulative tokens**, inflating TTFT latency by 7× and threatening GPU VRAM exhaustion.
+  4. Never use a naive **FIFO sliding window** on agent conversations: dropping the oldest tokens deletes the system instructions and original user goal, causing **catastrophic amnesia**.
+  5. The **Anchor-Summary-Recent pattern** permanently anchors the system prompt and goal at the head, compresses intermediate history into a summary in the middle, and preserves raw recent turns at the tail.
+  6. Compacting 10 historical turns into a structured JSON state representation shrinks context by **over 90%** while preserving verified facts and eliminated hypotheses.
+  7. Enforcing an explicit **token budget cap** (e.g. 4,000 tokens) protects serving concurrency, prevents OOM crashes, and stabilizes TTFT.
+  8. Always enforce a **maximum character limit on raw tool observations** to prevent individual verbose tools from blowing the context window in a single turn.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'An unmanaged agent session begins with an initial prefix of L0 = 1,000 tokens and adds Δ = 600 tokens per turn. Across K = 15 turns without prefix caching, how many total tokens are prefilled?',
+    numeric: true,
+    answer: 78000,
+    tolerance: 500,
+    unit: 'tokens',
+    why: 'Total prefill = K·L0 + Δ·K(K−1)/2 = 15 × 1,000 + 600 × (15 × 14 / 2) = 15,000 + 600 × 105 = 15,000 + 63,000 = 78,000 tokens.'
+  },
+  {
+    q: 'In the same scenario (L0 = 1,000, Δ = 600, K = 15 turns), a hybrid compaction buffer activates at turn 5, capping the active context size at 3,500 tokens. With ideal prefix caching, how many total prefill tokens are processed across all 15 turns?',
+    numeric: true,
+    answer: 9400,
+    tolerance: 200,
+    unit: 'tokens',
+    why: 'Turn 1 prefills L0 = 1,000 tokens. Each subsequent turn (14 turns) prefills only the newly appended tokens (14 × 600 = 8,400 tokens). Total prefill = 1,000 + 8,400 = 9,400 tokens (an 87.9% reduction vs unmanaged).'
+  },
+  {
+    q: 'Why is naive FIFO (first-in, first-out) circular buffer truncation dangerous for agent loops?',
+    options: [
+      'It causes CUDA kernels to encounter unaligned memory addresses',
+      'It discards the oldest tokens first, which evicts the system instructions and the original user goal, inducing catastrophic amnesia',
+      'It forces the model to decode at temperature 0.0 permanently',
+      'It corrupts the tokenizer vocabulary embeddings'
+    ],
+    answer: 1,
+    why: 'The oldest tokens in an agent context are the system prompt, tool definitions, and user goal. Dropping them leaves the model without its instructions or purpose.'
+  },
+  {
+    q: 'In the Anchor-Summary-Recent memory pattern, what is stored in the "Compaction Buffer"?',
+    options: [
+      'The raw FP16 weights of the transformer feed-forward layers',
+      'A dense, structured summary of verified facts, eliminated hypotheses, and progress from earlier intermediate turns',
+      'The entire training dataset used during pretraining',
+      'The raw HTTP request headers from the client'
+    ],
+    answer: 1,
+    why: 'The Compaction Buffer stores a concise synthesis of past history (what was tried, what succeeded, what failed), shrinking thousands of tokens of logs into a compact representation.'
+  },
+  {
+    q: 'On Llama-3.1-8B (128 KiB of KV cache per token), if an unmanaged agent context reaches 16,000 tokens, about how much GPU HBM does the KV cache occupy for that single sequence in GiB?',
+    numeric: true,
+    answer: 1.95,
+    tolerance: 0.1,
+    unit: 'GiB',
+    why: 'KV memory = 16,000 × 131,072 bytes = 2,097,152,000 bytes = 2,097,152,000 / (1024^3) ≈ 1.953 GiB (approx 2.1 GB).'
+  },
+  {
+    q: 'What is the primary operational advantage of permanently anchoring the system prompt and tool definitions at the very beginning of the context window?',
+    options: [
+      'It increases the model’s top-p sampling speed',
+      'It guarantees a 100% prefix cache hit rate for that prefix block across all subsequent turns',
+      'It automatically compiles the Python code into a Triton kernel',
+      'It prevents the model from hallucinating tool arguments'
+    ],
+    answer: 1,
+    why: 'Prefix caching reuses stored KV blocks when the prefix text is byte-identical. Keeping the system prompt and tool schemas untouched at the head ensures all turns hit the prefix cache.'
+  }
+]} />

@@ -1,0 +1,436 @@
+---
+title: 'Tools: read, compute & write actions'
+summary: 'How language models interact with the physical world: categorizing tools into knowledge, capability, and write actions, managing JSON schema token overhead, enforcing constrained decoding, and gating high-blast-radius mutations with human-in-the-loop approvals.'
+objectives:
+  - Categorize tools into read, compute, and write actions by their blast radius and idempotency
+  - Quantify the prompt token and prefill FLOP overhead of injecting JSON schemas
+  - Explain how constrained grammar decoding prevents JSON syntax errors during generation
+  - Diagram the Model Context Protocol (MCP) host-client-server architecture
+  - Implement a human-in-the-loop (HITL) authorization gate with dry-run diff verification
+---
+import ToolBlastRadiusViz from '@/components/viz/agents/ToolBlastRadiusViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+An LLM on its own is an isolated mathematical engine: a massive tensor of frozen floating-point parameters residing in GPU memory. It cannot check today's weather, query a live relational database, verify mathematical arithmetic without hallucinating, or reboot a stalled server.
+
+To perform useful work in the real world, the model must be granted **tools**.
+
+When developers first encounter tool calling, they often assume the model executes the function itself. It does not. The model never runs Python code, executes SQL queries, or sends network packets. The model only generates text.
+
+The entire mechanism of tool use is an agreed-upon protocol:
+1. You provide the model with a structured description of available tools in its system prompt.
+2. The model outputs a specially formatted string (typically a JSON payload containing a function name and arguments).
+3. Your application runtime parses the string, runs the actual function in Python or Go, and sends the raw output back into the model's context window.
+
+This sounds deceptively simple. But in production systems engineering, giving an LLM access to external tools introduces severe security, latency, and financial risks. A tool that reads documentation has an entirely different risk profile than a tool that deletes database tables or transfers funds.
+
+## The tool taxonomy: read, compute, and write
+
+Every tool an agent can invoke falls into one of three distinct categories, differentiated by their **blast radius**, **idempotency**, and **reversibility**.
+
+```
+                           THE TOOL SPECTRUM
+┌────────────────────┬────────────────────────┬────────────────────────┐
+│  1. READ TOOLS     │   2. COMPUTE TOOLS     │    3. WRITE TOOLS      │
+│  (Knowledge)       │   (Capability)         │    (Action)            │
+├────────────────────┼────────────────────────┼────────────────────────┤
+│ • Vector search    │ • Python AST sandbox   │ • SQL UPDATE / DELETE  │
+│ • SQL SELECT       │ • Calculator / solver  │ • Shell command exec   │
+│ • Document lookup  │ • Data parser / regex  │ • Cloud API terminate  │
+│ • Web GET request  │ • Code compiler        │ • Send email / webhook │
+├────────────────────┼────────────────────────┼────────────────────────┤
+│ Side-effects: NONE │ Side-effects: CPU/RAM  │ Side-effects: PERMANENT│
+│ Blast radius: LOW  │ Blast radius: MEDIUM   │ Blast radius: CRITICAL │
+│ Autonomy: FULL     │ Autonomy: SANDBOXED    │ Autonomy: HITL GATE    │
+└────────────────────┴────────────────────────┴────────────────────────┘
+```
+
+### 1. Read tools (Knowledge)
+Read tools fetch information from the environment without altering state. Examples include vector retrieval (Module B3), `SELECT` queries on read replicas, REST `GET` requests, and reading local configuration files.
+- **Idempotency:** Purely idempotent. Calling `get_pod_status("replica-1")` ten times leaves the universe unchanged.
+- **Blast radius:** Low. The primary risks are data leakage (the model retrieves confidential records it should not see) and context flooding (returning a 50,000-token log dump that blows the context window).
+
+### 2. Compute tools (Capability)
+Compute tools expand the model's computational powers. LLMs are notoriously poor at exact multi-digit arithmetic, string reversing, graph traversal, and complex floating-point calculations because transformer attention is not a Turing-complete calculator in a single forward pass.
+- A compute tool provides an isolated execution runtime: a Python `ast.literal_eval` calculator, a sandboxed WASM runtime, or a code interpreter.
+- **Side effects:** Transient. It consumes CPU cycles and RAM on the host machine but does not mutate persistent external state.
+- **Blast radius:** Medium. The primary failure modes are infinite loops (e.g. `while True: pass`), CPU denial of service, memory exhaustion, and sandbox escapes.
+
+### 3. Write tools (Action & Mutation)
+Write tools change the state of the external world. Examples include executing `DROP TABLE`, writing files to disk, modifying firewall rules, restarting production pods, creating GitHub pull requests, or transferring cryptocurrency.
+- **Idempotency:** Non-idempotent. Calling `charge_customer(amount=50)` twice charges the user twice.
+- **Blast radius:** Critical. A mistake here cannot be resolved by generating more tokens. Once a database table is dropped or an erroneous email is dispatched to 10,000 customers, the damage is permanent.
+
+<Scrolly>
+  <ToolBlastRadiusViz client:visible slot="stage" />
+
+  <Step title="1. The tool spectrum: Read, Compute, Write">
+    Tools span three distinct categories. Knowledge tools safely read external facts; compute tools run sandboxed calculations; write tools permanently mutate databases, cloud infrastructure, or financial ledgers.
+  </Step>
+
+  <Step title="2. Blast radius: Mutation vs Idempotency">
+    Blast radius measures the maximum irreversible damage an errant step can cause. Read tools have zero persistent side effects. Write actions cannot be undone by hitting backspace.
+  </Step>
+
+  <Step title="3. JSON Schema: Token weight in the prefix">
+    Tool calling is not free. Every tool description and JSON Schema must be serialized into the system prompt prefix. Ten tools easily consume 1,500 to 2,500 prompt tokens on every turn.
+  </Step>
+
+  <Step title="4. Constrained decoding: Grammar enforcement">
+    Standard token sampling risks generating malformed JSON syntax (unescaped quotes, missing braces). Constrained decoding masks invalid logits to force 100% syntactically valid JSON.
+  </Step>
+
+  <Step title="5. The Model Context Protocol (MCP) abstraction">
+    The open MCP standard decouples models from tools. A central Host coordinates with an MCP Client (orchestrator), which connects to standardized MCP Servers over JSON-RPC.
+  </Step>
+
+  <Step title="6. Human-in-the-loop: The approval checkpoint">
+    High-risk write actions require an explicit human-in-the-loop gate. The agent pauses execution, presents a dry-run diff of the proposed mutation, and waits for cryptographic human approval.
+  </Step>
+
+  <Step title="7. Security & Blast Radius Matrix">
+    Hardening an agent requires enforcing the principle of least privilege: give the agent read-only tools by default, isolate compute tools in sandboxes, and mandate human sign-off for mutations.
+  </Step>
+</Scrolly>
+
+## Function calling: under the hood
+
+How does an LLM actually emit a tool call? Modern models (such as Qwen2.5, Llama-3.1, and GPT-4o) are trained via supervised finetuning (SFT) and direct preference optimization (DPO) on structured tool dialogues.
+
+You declare your tools using **JSON Schema**, a standard specification for annotating JSON data structures:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "query_database",
+    "description": "Execute a read-only SQL SELECT query against the analytics database",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "A valid PostgreSQL SELECT query string"
+        },
+        "max_rows": {
+          "type": "integer",
+          "description": "Maximum number of rows to return (1-100)",
+          "default": 10
+        }
+      },
+      "required": ["query"]
+    }
+  }
+}
+```
+
+When you dispatch an API request with `tools=[...]`, the inference engine converts these schemas into plain text and injects them directly into the model's system prompt using the model's specific chat template (as taught in Module B1).
+
+For example, in Qwen2.5's chat template:
+
+```
+<|im_start|>system
+You are a helpful assistant with access to the following functions:
+
+# Tool: query_database
+{"name": "query_database", "description": "Execute a read-only SQL SELECT...", "parameters": {...}}
+
+To call a tool, respond with:
+<tool_call>
+{"name": "query_database", "arguments": {"query": "SELECT count(*) FROM users;"}}
+</tool_call>
+<|im_end|>
+```
+
+During decode, when the model decides to invoke `query_database`, it generates the special token `<tool_call>`, decodes the JSON argument string, and closes with `</tool_call>`.
+
+### The hidden tax: schema token arithmetic
+
+Inference engineers must account for the token overhead of tool schemas. A typical well-specified tool schema (with parameter types, property descriptions, constraints, and defaults) consumes **150 to 250 tokens**.
+
+If your agent has access to 10 enterprise tools:
+
+$$
+T_{\text{schema}} = 10 \times 200 = 2{,}000 \text{ tokens}
+$$
+
+Every single request to the model carries this 2,000-token payload in its prefix!
+
+Let us calculate the compute overhead across a 10-turn agent session on an 8B model:
+
+1. **Without prefix caching:**
+   In every turn, those 2,000 tool schema tokens are re-prefilled from scratch.
+   $$
+   \text{Wasted Prefill Tokens} = 10 \text{ turns} \times 2{,}000 \text{ tokens} = 20{,}000 \text{ tokens}
+   $$
+   At 2 FLOPs per parameter per token:
+   $$
+   \text{Compute Waste} = 2 \times (8 \times 10^9) \times 20{,}000 = 3.2 \times 10^{14} \text{ FLOPs} = 320 \text{ TFLOPs}
+   $$
+   At an API cost of \$0.20 per million input tokens, passing 20,000 unnecessary tokens costs \$0.004 per task. Across 1,000,000 agent sessions per month, that unmanaged schema boilerplate costs **\$4,000/month** in pure waste.
+
+2. **With prefix caching:**
+   The 2,000 schema tokens are computed **once** in Turn 1 and remain resident in the KV cache across all subsequent turns. Total schema prefill tokens = 2,000, saving 90% of the compute and cost.
+
+<Callout type="pitfall" title="Tool definition bloat and retrieval-augmented tools">
+  If you have 100 tools in an enterprise environment, injecting all 100 schemas into the prompt would consume ${}100 \times 200 = 20{,}000$ tokens of context before the user even types a character!
+  The solution is **Tool Retrieval**: index your tool schemas in a vector store, use BM25 or embedding search to find the 3 to 5 most relevant tools for the current user goal, and inject only those dynamic tools into the prompt.
+</Callout>
+
+## Constrained decoding: guaranteeing valid JSON
+
+When an LLM generates a tool call, what prevents it from producing syntax errors? In standard autoregressive generation, the model samples from its full vocabulary of 32,000 to 128,000 tokens at every step.
+
+If temperature is non-zero, or if the model's probability distribution is slightly diffuse, the model might emit:
+```json
+{"query": "SELECT * FROM users WHERE name = "Alice""}
+```
+Notice the unescaped quotation mark around `Alice`. When your Python runtime calls `json.loads()`, it immediately throws `json.decoder.JSONDecodeError: Expecting ',' delimiter`. The entire agent trajectory crashes.
+
+To eliminate this class of failure, production inference engines employ **constrained decoding** (such as `Outlines`, `Guidance`, or vLLM's `guided_decoding`).
+
+```
+                              LOGIT MASKING
+  Vocabulary: [ "cat", "dog", "{", "\"", "SELECT", "123", ":" ]
+                     │
+                     ▼
+  Grammar FSM: Expecting JSON object opening brace '{'
+                     │
+                     ▼
+  Logit Mask:  [ -inf, -inf, 0.0, -inf,  -inf,   -inf, -inf ]
+                     │
+                     ▼
+  Softmax:     [   0,    0,  1.0,    0,     0,      0,    0  ]
+                     │
+                     ▼
+             Sampled Token: '{' (100% Guaranteed)
+```
+
+The engine constructs a **Deterministic Finite Automaton (DFA)** or pushdown automaton from the tool's JSON Schema. At each decode step:
+1. The engine checks which tokens in the vocabulary are valid transitions in the DFA.
+2. All invalid tokens are masked by setting their logits to $-\infty$.
+3. Softmax evaluates only over syntactically valid tokens.
+
+Under constrained decoding, the probability of a JSON syntax error drops to **exactly zero percent**. The model literally cannot emit an invalid bracket, an unclosed string, or a missing comma.
+
+## The Model Context Protocol (MCP)
+
+Until recently, every AI developer wrote custom glue code to connect LLMs to databases, GitHub repositories, and shell terminals. Each tool integration had its own proprietary wrapper.
+
+In late 2024, Anthropic open-sourced the **Model Context Protocol (MCP)**, which has rapidly become the industry standard protocol for connecting AI agents to external data and tools.
+
+MCP adopts a client-server architecture inspired by the Language Server Protocol (LSP) used in software development:
+
+```
+  ┌────────────────────────────────────────────────────────┐
+  │                        MCP HOST                        │
+  │  (The User Application: Claude Desktop, IDE, Terminal) │
+  └───────────────────────────┬────────────────────────────┘
+                              │
+                              ▼
+  ┌────────────────────────────────────────────────────────┐
+  │                       MCP CLIENT                       │
+  │     (The Agent Core: Maintains 1:1 Server Sessions)    │
+  └─────────────┬────────────────────────────┬─────────────┘
+                │ JSON-RPC 2.0               │ JSON-RPC 2.0
+                ▼                            ▼
+  ┌───────────────────────────┐ ┌───────────────────────────┐
+  │      MCP SERVER A         │ │      MCP SERVER B         │
+  │  (Postgres DB Connector)  │ │  (GitHub API Connector)   │
+  │  • Tools: db_query        │ │  • Tools: create_pr       │
+  │  • Resources: schema.sql  │ │  • Resources: git_diff    │
+  └───────────────────────────┘ └───────────────────────────┘
+```
+
+MCP defines three core primitives:
+1. **Tools:** Functions callable by the model (with side effects or computation). Clients discover tools via `tools/list` and invoke them via `tools/call`.
+2. **Resources:** Read-only data sources (file contents, database schemas, log streams) that can be read into context like files via `resources/read`.
+3. **Prompts:** Pre-defined prompt templates and workflows provided by the server.
+
+Communication happens over standard **JSON-RPC 2.0**, using either `stdio` (local subprocess pipes) or `SSE` (Server-Sent Events over HTTP). Because MCP is vendor-agnostic, an agent built with MCP can switch between models and tool providers without modifying a single line of business logic.
+
+## Human-in-the-loop (HITL): gating high-risk actions
+
+How do you safely grant an agent write permissions in production? The answer is never: *"Give the agent root access and hope the model doesn't hallucinate."*
+
+The industry standard pattern is **Human-In-The-Loop (HITL) Checkpoints**.
+
+```
+[Agent] Emits Write Action: terminate_instance(id="i-084f9b2")
+   │
+   ▼
+[Policy Engine] Checks Blast Radius:
+   Is tool in Tier 3 (Write)? → YES
+   │
+   ▼
+[HITL Gate] PAUSE AGENT EXECUTION
+   1. Generate Dry-Run Diff:
+      "Action: Terminate EC2 Instance"
+      "Instance: i-084f9b2 (Production Inference Worker 4)"
+      "Blast Radius: High (Will drop live serving capacity by 25%)"
+   2. Present to Operator (Slack / Web UI / CLI)
+   3. Wait for human cryptographic signature / token
+   │
+   ├─► Operator DENIES → Return Observation: "Action cancelled by operator: risky."
+   │
+   └─► Operator APPROVES → Runtime issues scoped mutation credential → Action runs.
+```
+
+### Implementing a secure tool dispatcher in Python
+
+Here is a complete, production-ready tool dispatcher in pure Python. It categorizes tools, checks permissions, calculates blast radius, and enforces human approval for state mutations:
+
+```python
+import json
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable, Any
+
+class ToolTier(Enum):
+    READ = "read"         # Zero side-effects, auto-approved
+    COMPUTE = "compute"   # Sandboxed computation, auto-approved
+    WRITE = "write"       # State mutation, requires human approval
+
+@dataclass
+class ToolDefinition:
+    name: str
+    description: str
+    tier: ToolTier
+    schema: dict
+    handler: Callable[..., Any]
+
+class SecureToolDispatcher:
+    def __init__(self):
+        self.registry: dict[str, ToolDefinition] = {}
+
+    def register(self, tool: ToolDefinition):
+        self.registry[tool.name] = tool
+
+    def get_schemas(self) -> list[dict]:
+        """Return JSON Schemas for injection into LLM system prompt."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": f"[{t.tier.value.upper()}] {t.description}",
+                    "parameters": t.schema,
+                }
+            }
+            for t in self.registry.values()
+        ]
+
+    def execute(self, tool_name: str, arguments_json: str, user_approved: bool = False) -> str:
+        """Execute a tool call with blast-radius gating."""
+        if tool_name not in self.registry:
+            return f"Error: Tool '{tool_name}' not recognized."
+
+        tool = self.registry[tool_name]
+
+        # Parse JSON arguments safely
+        try:
+            args = json.loads(arguments_json)
+        except json.JSONDecodeError as e:
+            return f"Error: Malformed JSON arguments: {e}"
+
+        # Human-In-The-Loop gate for Write actions
+        if tool.tier == ToolTier.WRITE and not user_approved:
+            return (
+                f"ACTION_REQUIRED: Tool '{tool_name}' has WRITE blast radius. "
+                f"Proposed arguments: {args}. Awaiting explicit user confirmation."
+            )
+
+        # Execute the underlying function
+        try:
+            result = tool.handler(**args)
+            return json.dumps({"status": "success", "result": result})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+```
+
+Notice the design:
+1. Every tool is explicitly tagged with its `ToolTier`.
+2. The model cannot bypass the approval check by simply insisting or using clever phrasing; the gate is enforced in deterministic Python code outside the LLM.
+3. If an unapproved write action is emitted, the dispatcher does not crash. It returns an `ACTION_REQUIRED` observation string, allowing the agent to explain its intent and present the proposal cleanly to the user.
+
+<Callout type="real" title="Now read the paper">
+  To see how language models first learned to discover and invoke tools autonomously without human-annotated trajectories, read:
+  - **"Toolformer: Language Models Can Teach Themselves to Use Tools"** (Schick et al., 2023, [arXiv:2302.04761](https://arxiv.org/abs/2302.04761)).
+  - **Read:** Section 1 (Introduction) and Section 2 ("Approach: Self-Supervised Tool Use").
+  - **Skip:** Section 4 ("Downstream Tasks") unless benchmark details on QA datasets interest you.
+  - **What you will recognize:** You will see how the authors used simple API call syntax tokens (`[Calculator(...)]` and `[QA(...)]`) to interleave tool calls directly into next-token prediction, laying the foundation for modern function calling.
+</Callout>
+
+<KeyNotes>
+  1. Language models do not execute tools; they emit **structured text representations** (JSON function calls) that an external application runtime intercepts and executes.
+  2. Tools fall into three tiers: **Read** (knowledge, idempotent, low blast radius), **Compute** (isolated capability, transient CPU/RAM), and **Write** (state mutation, non-idempotent, critical blast radius).
+  3. Every tool schema costs **150 to 250 tokens** in the system prompt. Ten tools consume ~2,000 tokens of prefix per turn.
+  4. Without prefix caching, schema injection produces **massive prefill FLOP waste** and rising TTFT across turns. With prefix caching, tool schemas are prefilled once and reused.
+  5. **Constrained decoding** masks invalid vocabulary logits using a finite state machine, guaranteeing **100% syntactically valid JSON** and eliminating parser crashes.
+  6. The **Model Context Protocol (MCP)** standardizes tool and resource integrations across hosts, orchestrator clients, and external servers using JSON-RPC 2.0.
+  7. **Human-In-The-Loop (HITL)** checkpoints are mandatory for write tools. The runtime pauses, presents a dry-run diff, and requires explicit operator authorization before execution.
+  8. Follow the **principle of least privilege**: never grant an agent write access when read access suffices, and never store long-lived write credentials in the agent's context.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'An agent system includes 8 tool schemas averaging 225 tokens each. If an agent trajectory runs for K = 12 turns without prefix caching, how many total tokens are spent prefilling tool schemas alone across the entire session?',
+    numeric: true,
+    answer: 21600,
+    tolerance: 100,
+    unit: 'tokens',
+    why: 'Total schema tokens per turn = 8 × 225 = 1,800 tokens. Across 12 turns without caching: 12 × 1,800 = 21,600 tokens.'
+  },
+  {
+    q: 'In the same scenario (8 tools, 225 tokens each, K = 12 turns), how many tokens are spent prefilling tool schemas if prefix caching is fully utilized?',
+    numeric: true,
+    answer: 1800,
+    tolerance: 10,
+    unit: 'tokens',
+    why: 'With prefix caching, the tool schemas are prefilled only once in Turn 1 (8 × 225 = 1,800 tokens). Turns 2 through 12 hit the KV cache, prefilling 0 additional schema tokens.'
+  },
+  {
+    q: 'Why is dropping database records classified as having a critical blast radius compared to a failed vector search query?',
+    options: [
+      'Database queries use more GPU memory than vector searches',
+      'Vector search uses cosine similarity which is mathematically bounded',
+      'Database deletions permanently mutate external state and cannot be reversed by generating further tokens',
+      'SQL queries cannot be validated using JSON Schema'
+    ],
+    answer: 2,
+    why: 'Write actions have permanent, non-idempotent side effects on external state. A mistake cannot be undone by autoregressive token generation, requiring strict human authorization.'
+  },
+  {
+    q: 'How does constrained decoding (e.g. Outlines) prevent JSON syntax errors during tool call generation?',
+    options: [
+      'It retries the entire generation whenever json.loads() throws an exception',
+      'It fine-tunes the model weights on valid JSON datasets using RLHF',
+      'It sets the logits of vocabulary tokens that violate the JSON schema grammar to -infinity before softmax',
+      'It converts all generated text to lowercase before parsing'
+    ],
+    answer: 2,
+    why: 'Constrained decoding tracks a finite state machine of the grammar and sets invalid token logits to −∞, making it mathematically impossible for the model to sample an invalid character.'
+  },
+  {
+    q: 'In the Model Context Protocol (MCP) architecture, what component coordinates tool discovery and dispatches JSON-RPC requests to external connectors?',
+    options: [
+      'The MCP Server',
+      'The MCP Client',
+      'The PagedAttention kernel',
+      'The Vector Database'
+    ],
+    answer: 1,
+    why: 'The MCP Client resides inside the agent core orchestrator, discovering tools from MCP Servers and routing JSON-RPC 2.0 requests between the host and servers.'
+  },
+  {
+    q: 'A team has 120 internal tools. Why should they NOT inject all 120 JSON schemas directly into the agent’s system prompt?',
+    options: [
+      'JSON schemas can only define up to 10 functions according to the IETF specification',
+      'Injecting 120 schemas would consume 20,000+ prompt tokens, degrading TTFT, blowing context budgets, and confusing model tool selection',
+      'The CUDA compiler cannot compile prompts containing more than 50 functions',
+      'Transformer attention heads cannot attend to more than 16 tools simultaneously'
+    ],
+    answer: 1,
+    why: '120 schemas would consume ~24,000 tokens of prompt context on every request, creating massive prefill latency and degrading tool selection precision. Tool retrieval should be used instead.'
+  }
+]} />

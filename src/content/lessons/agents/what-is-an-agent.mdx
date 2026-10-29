@@ -1,0 +1,380 @@
+---
+title: 'What makes an agent'
+summary: 'From static single-turn prompting to an autonomous runtime loop: how the perceive-plan-act-observe cycle turns an LLM into an agent, and why compounding error arithmetic dictates whether a system succeeds or collapses.'
+objectives:
+  - Contrast a stateless single-turn LLM call with a stateful autonomous agent loop
+  - Trace the four phases of the perceive-plan-act-observe cycle
+  - Derive the compounding error formula P = p^k and compute the half-life horizon k_half
+  - Calculate the token and FLOP overhead of multi-turn agent trajectories with and without prefix caching
+  - Identify why prefix caching transforms agent economics from O(k^2) quadratic waste to O(k) linear efficiency
+---
+import AgentLoopViz from '@/components/viz/agents/AgentLoopViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Imagine a Kubernetes cluster in production where replica 3 of your inference fleet suddenly fails its liveness probe. You submit a prompt to a stateful chatbot: *"Why is replica 3 crashing, and how do I fix it?"*
+
+A standard large language model receives your string, runs a single prefill pass, decodes several hundred tokens, and outputs an answer: *"It is likely an out-of-memory error. Try increasing container memory limits in your Helm values."*
+
+The model might be right by luck, but it did not inspect the cluster. It did not examine container exit codes, parse current GPU High Bandwidth Memory allocation, check kernel dmesg logs, or verify whether node memory pressure evicted the process. It generated a plausibility token sequence based on training weights frozen months ago. If the real cause was a dead CUDA driver or a corrupted model weights mount, the advice is useless.
+
+An <Term t="agent">agent</Term> changes the paradigm entirely. Instead of answering immediately, the model enters a control loop: it queries the cluster API, observes that the container died with exit code 137 (`SIGKILL`), inspects the HBM watermark immediately prior to termination, discovers an unmanaged memory leak in the KV cache allocator, patches the allocation flag, and verifies that the replica restarts cleanly.
+
+## The difference: pipelines vs agents
+
+In previous modules, we treated the LLM as a pure function:
+
+$$
+y = f_\theta(x)
+$$
+
+Given input prompt $x$ and fixed weights $\theta$, the model emits completion $y$. In Module B1, you refined prompt structures with few-shot examples and chain-of-thought scratchpads. In Module B3, you connected retrieval: a deterministic search engine looked up relevant chunks and prepended them to $x$.
+
+Notice what all those architectures have in common: the control flow is hard-coded in Python.
+
+1. **Static Chain:** Prompt → Model → Output.
+2. **Deterministic RAG:** Query → Vector Index → Prompt Augmentation → Model → Output.
+3. **Hard-coded Workflow:** Step A runs, then Step B runs, with conditional if-else branches authored ahead of time by an engineer.
+
+An agent is fundamentally different: **the model itself decides what to do next, which tools to call, whether the intermediate result is sufficient, and when the task is finished.**
+
+<Callout type="intuition" title="The LLM as a CPU, not an encyclopedia">
+  A helpful mental model for systems engineers is viewing the LLM not as a database of facts, but as a central processing unit (CPU). The model’s weights are its instruction decoder and ALU. The context window is its fast registers and RAM. External tools (search engines, Python interpreters, SQL databases, shell terminals) are its I/O buses. An agent is simply an operating system loop running on this CPU.
+</Callout>
+
+## The fundamental cycle: Perceive, Plan, Act, Observe
+
+At the heart of every autonomous agent is a continuous control loop borrowed from classical robotics and control theory:
+
+1. **Perceive:** The agent ingests the current state of the world. This includes the overarching user goal, the system prompt defining its role and constraints, the list of available tools, and the full transcript of past actions and environment observations.
+2. **Plan:** The LLM performs an inference pass to evaluate its current progress. It reasons over what is known, what remains ambiguous, and what sub-goal must be tackled next.
+3. **Act:** The model emits a decision. If the task is finished, it emits the final answer to the user. If further information or mutation is needed, it emits a structured <Term t="tool-call">tool call</Term> (such as a function name and JSON arguments).
+4. **Observe:** The execution runtime intercepts the tool call, verifies permissions, executes the action in the external environment, captures the output string, and appends it back into the agent context as an observation.
+
+The cycle then repeats from Step 1.
+
+<Scrolly>
+  <AgentLoopViz client:visible slot="stage" />
+
+  <Step title="1. The static prompt-response wall">
+    A standard LLM call is stateless. You send prompt tokens; the model returns completion tokens. If the problem requires live environment inspection, computation, or verification, a single pass inevitably hallucinates or fails.
+  </Step>
+
+  <Step title="2. Perceive: Ingest state and user intent">
+    An agent begins by structuring its belief state. The working context window holds the system prompt, available tool schemas, the user goal, and the ongoing execution trajectory.
+  </Step>
+
+  <Step title="3. Plan: Formulate reasoning and action">
+    Before calling external functions, an effective agent plans. It generates internal chain-of-thought tokens assessing what facts are missing and selecting the most direct action.
+  </Step>
+
+  <Step title="4. Act: Issue a structured tool call">
+    The model generates a tool call token payload (e.g., `get_logs(pod="replica-3")`). Generation halts, and the serving engine returns control to the orchestrator.
+  </Step>
+
+  <Step title="5. Observe: Ingest environment feedback">
+    The tool environment runs the function and returns raw results: `Exit code 137: Out of Memory`. This observation is appended to the context. The agent does not have to guess; it sees ground truth.
+  </Step>
+
+  <Step title="6. The closed loop: State accumulation">
+    The loop continues: **Perceive → Plan → Act → Observe**. The agent updates its plan based on the observation, choosing to inspect memory allocations next rather than blind restarts.
+  </Step>
+
+  <Step title="7. Compounding errors: The 0.95^10 cliff">
+    Every turn introduces risk. If step accuracy is 95%, a 10-step trajectory succeeds only 0.95^10 ≈ 59.9% of the time. Slide the controls to see how error rates compound exponentially.
+  </Step>
+
+  <Step title="8. The serving cost: Prefix cache reuse">
+    Each turn appends tokens to the context. Without prefix caching, Turn 10 recomputes the entire prompt from scratch, yielding $O(k^2)$ prefill waste. With RadixAttention, earlier turns are instant cache hits.
+  </Step>
+</Scrolly>
+
+## The mathematics of failure: compounding errors
+
+The single most critical equation in agent engineering is not backpropagation or self-attention. It is the probability of a compound chain of independent steps.
+
+Suppose a complex agent task requires $k$ consecutive steps (e.g., 5 searches, 3 calculations, 2 code edits). Let $p_i$ denote the probability that step $i$ succeeds without an error (valid tool syntax, correct argument extraction, accurate parsing, and sound logical progression).
+
+If each step is independent and succeeds with probability $p$:
+
+$$
+P(\text{task success}) = \prod_{i=1}^k p_i = p^k
+$$
+
+Look closely at what this equation does to intuition. Engineers accustomed to single-turn benchmarks look at a model with 95% accuracy on tool selection and assume the system is production-ready.
+
+Let us evaluate $P_{\text{success}} = p^k$ across different step counts:
+
+| Per-Step Reliability ($p$) | 1 Step ($k=1$) | 3 Steps ($k=3$) | 5 Steps ($k=5$) | 10 Steps ($k=10$) | 20 Steps ($k=20$) |
+|:---|:---|:---|:---|:---|:---|
+| **80% (0.80)** | 80.0% | 51.2% | 32.8% | 10.7% | 1.2% |
+| **90% (0.90)** | 90.0% | 72.9% | 59.0% | 34.9% | 12.2% |
+| **95% (0.95)** | 95.0% | 85.7% | 77.4% | **59.9%** | **35.9%** |
+| **98% (0.98)** | 98.0% | 94.1% | 90.4% | 81.7% | 66.8% |
+| **99% (0.99)** | 99.0% | 97.0% | 95.1% | 90.4% | 81.8% |
+
+At $p = 0.95$, a 10-step agent fails **four out of every ten times** (1 − 0.5987 = 40.1% failure rate). At 20 steps, the agent fails **nearly two out of every three runs** (64.1% failure rate).
+
+<Callout type="math" title="Derivation: The agent half-life horizon">
+  How many steps $k_{\text{half}}$ can an agent execute before its chance of overall success drops to a coin flip (50%)?
+
+  $$
+  p^{k_{\text{half}}} = 0.5 \implies k_{\text{half}} \ln(p) = \ln(0.5) \implies k_{\text{half}} = \frac{\ln(0.5)}{\ln(p)}
+  $$
+
+  Using the first-order Taylor approximation $\ln(p) = \ln(1 - \epsilon) \approx -\epsilon$, where $\epsilon = 1 - p$ is the per-step error rate:
+
+  $$
+  k_{\text{half}} \approx \frac{0.6931}{1 - p}
+  $$
+
+  - If $p = 0.95$ ($\epsilon = 0.05$): $k_{\text{half}} \approx \frac{0.6931}{0.05} \approx 13.86$ steps.
+  - If $p = 0.90$ ($\epsilon = 0.10$): $k_{\text{half}} \approx \frac{0.6931}{0.10} \approx 6.93$ steps.
+  - If $p = 0.99$ ($\epsilon = 0.01$): $k_{\text{half}} \approx \frac{0.6931}{0.01} \approx 69.3$ steps.
+
+  To build an agent capable of reliably executing a 30-step trajectory ($P > 90\%$), your per-step error rate $\epsilon$ must be strictly under:
+
+  $$
+  \epsilon < 1 - 0.90^{1/30} = 1 - 0.9965 = 0.0035 \quad (0.35\% \text{ error rate})
+  $$
+</Callout>
+
+This compounding decay explains why naive agent loops collapse in production. Without error recovery, self-correction, deterministic guards, and constrained action spaces, long autonomous trajectories are mathematical impossibilities.
+
+## The inference systems footprint: quadratic context growth
+
+To an inference engineer, an agent is not just a reasoning loop; it is a specialized traffic pattern on the serving cluster.
+
+Consider what happens inside the KV cache across turns. In turn 1, the prompt contains the system prompt $S$, tool definitions $T_{\text{tools}}$, and user input $U$. The model decodes a thought and a tool call $A_1$. The environment returns observation $O_1$.
+
+In turn 2, the agent must inspect everything that happened so far. Its prompt is:
+
+$$
+\text{Prompt}_2 = [S, T_{\text{tools}}, U, A_1, O_1]
+$$
+
+In turn $k$, the prompt is:
+
+$$
+\text{Prompt}_k = [S, T_{\text{tools}}, U, A_1, O_1, A_2, O_2, \ldots, A_{k-1}, O_{k-1}]
+$$
+
+Let $L_0 = |S| + |T_{\text{tools}}| + |U|$ be the static prefix length in tokens, and let $\Delta = |A_i| + |O_i|$ be the average tokens added per turn (action plus observation).
+
+### Without prefix caching: O(k^2) prefill disaster
+
+If the serving engine evaluates each turn as an independent HTTP request without cache retention:
+
+$$
+\text{Tokens Prefilled in Turn } i = L_0 + (i - 1) \Delta
+$$
+
+The total tokens prefilled across a $K$-turn trajectory is the arithmetic series:
+
+$$
+\text{Total Prefill Tokens} = \sum_{i=1}^K [L_0 + (i - 1) \Delta] = K \cdot L_0 + \Delta \frac{K(K - 1)}{2}
+$$
+
+Let us work out the arithmetic with concrete numbers:
+- Static prefix (system prompt + 8 JSON tool schemas + goal): $L_0 = 1{,}500$ tokens.
+- Average turn payload (tool call + observation output): $\Delta = 500$ tokens.
+- Trajectory length: $K = 10$ turns.
+
+$$
+\text{Total Prefill} = 10 \times 1{,}500 + 500 \times \frac{10 \times 9}{2} = 15{,}000 + 22{,}500 = 37{,}500 \text{ tokens}
+$$
+
+In turn 10 alone, the server prefills ${}1{,}500 + 9 \times 500 = 6{,}000$ tokens!
+
+On an 8B model running at 2 FLOPs per parameter per token, prefilling 37,500 tokens costs:
+
+$$
+2 \times (8 \times 10^9) \times 37{,}500 = 6.0 \times 10^{14} \text{ FLOPs} = 600 \text{ TFLOPs}
+$$
+
+More painfully, TTFT (time to first token) increases at every turn: turn 10 takes roughly 4× longer to start responding than turn 1.
+
+### With prefix caching: linear O(k) efficiency
+
+Now observe what happens when you serve the agent using an engine with prefix caching (such as vLLM's RadixAttention or SGLang).
+
+When Turn $k$ arrives at the engine, the prefix $[S, T_{\text{tools}}, U, A_1, O_1, \ldots, A_{k-2}, O_{k-2}]$ was already processed during Turn $k-1$. Its keys and values already sit in GPU memory inside the paged KV cache blocks!
+
+The engine matches the prefix hash, reuses the existing KV blocks, and prefills **only the newly appended tokens**:
+
+$$
+\text{Tokens Prefilled in Turn } 1 = L_0
+$$
+$$
+\text{Tokens Prefilled in Turn } i = \Delta \quad (\text{for } i \ge 2)
+$$
+
+The total prefill tokens across $K$ turns becomes:
+
+$$
+\text{Total Prefill Tokens (Cached)} = L_0 + (K - 1) \Delta
+$$
+
+Using the same numbers ($L_0 = 1{,}500$, $\Delta = 500$, $K = 10$):
+
+$$
+\text{Total Prefill (Cached)} = 1{,}500 + 9 \times 500 = 6{,}000 \text{ tokens}
+$$
+
+$$
+\text{Compute Saved} = \frac{37{,}500 - 6{,}000}{37{,}500} = \frac{31{,}500}{37{,}500} = 84.0\%
+$$
+
+Prefix caching cuts prefill compute by **84%**, eliminates growing TTFT latency, and slashes cost per task by over 80%.
+
+<Callout type="pitfall" title="The timestamp and random ID trap">
+  Prefix caching requires exact, byte-identical token matches. If your application code dynamically injects a millisecond timestamp, a UUID `request_id`, or variable tool schemas at the start of the system prompt:
+  ```
+  "You are a helpful assistant. Current time: 2026-10-29 07:31:02.492"
+  ```
+  Every single turn will have a completely different prefix hash. Your cache hit rate drops instantly from 95% to **0%**, forcing full quadratic recomputation on every turn! Always keep dynamic tokens at the very end of the prompt.
+</Callout>
+
+## Anatomy of a pure Python agent loop
+
+To demystify agents, look at what an agent loop actually is in code. It requires no heavyweight framework (no LangChain, no CrewAI, no AutoGen). It is a simple `while` loop wrapped around model inference and tool dispatch:
+
+```python
+import json
+from typing import Callable, Any
+
+def run_agent_loop(
+    client,
+    model: str,
+    system_prompt: str,
+    user_goal: str,
+    tools: dict[str, Callable[..., Any]],
+    tool_schemas: list[dict],
+    max_steps: int = 10,
+) -> str:
+    """A clean, minimal perceive-plan-act-observe loop."""
+    # 1. Initialize belief state / context history
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_goal},
+    ]
+
+    for step in range(max_steps):
+        # 2. Plan & Act: Forward pass to generate decision
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tool_schemas,
+            temperature=0.0,  # Deterministic execution
+        )
+        msg = response.choices[0].message
+        messages.append(msg)
+
+        # If model did not call a tool, it has reached a final answer
+        if not msg.tool_calls:
+            return msg.content or "Task completed."
+
+        # 3. Observe: Execute each requested tool call
+        for call in msg.tool_calls:
+            fn_name = call.function.name
+            fn_args = json.loads(call.function.arguments)
+
+            if fn_name not in tools:
+                result = f"Error: Tool '{fn_name}' does not exist."
+            else:
+                try:
+                    result = str(tools[fn_name](**fn_args))
+                except Exception as e:
+                    result = f"Execution Error in {fn_name}: {e}"
+
+            # Append raw environment observation back to context
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": result,
+            })
+
+    return "Failed: Maximum step budget exceeded."
+```
+
+Notice the simplicity:
+1. `messages` is the memory register.
+2. `client.chat.completions.create` runs the LLM forward pass (prefill + decode).
+3. `tools[fn_name](**fn_args)` runs the action in the external environment.
+4. `messages.append` captures the observation, closing the loop.
+
+Everything else in the agent literature — ReAct, Reflexion, tree search, multi-agent debate — is merely a variation on what text is injected into `messages` before the next forward pass.
+
+<Callout type="real" title="Now read the paper">
+  To see how researchers formalized LLM-based autonomous agents from cognitive and systems perspectives, read:
+  - **"A Survey on Large Language Model based Autonomous Agents"** (Wang et al., 2023, [arXiv:2308.11432](https://arxiv.org/abs/2308.11432)).
+  - **Read:** Section 2 ("Architecture of LLM-based Agents: Profiling, Memory, Planning, Action") and Section 3 ("Agent Capability Acquisition").
+  - **Skip:** Section 5 ("Applications in Social Science and Natural Science") unless domain-specific agent simulations interest you.
+  - **What you will recognize:** You will see the exact four-part architecture we established today, and you will understand why memory and tool action spaces dominate agent system design.
+</Callout>
+
+<KeyNotes>
+  1. An **agent** is an autonomous control loop where the model decides its own actions, calls external tools, observes outcomes, and terminates dynamically.
+  2. The core agent cycle consists of four continuous phases: **Perceive** (state ingestion), **Plan** (reasoning & goal decomposition), **Act** (tool execution), and **Observe** (environment feedback).
+  3. Under independent steps, overall success decays exponentially: **P = p^k**. A 95% reliable model achieves only 59.9% success over 10 steps and 35.9% over 20 steps.
+  4. The **half-life step horizon** is $k_{\text{half}} \approx 0.693 / (1 - p)$. A 90% step accuracy limits an agent to a half-life of roughly 7 steps before reliability drops to a coin flip.
+  5. Without prefix caching, multi-turn agent context accumulation generates **O(k^2) prefill token overhead**, causing severe TTFT degradation and compute waste.
+  6. **Prefix caching (RadixAttention)** reuses stored KV cache blocks across turns, reducing prefill overhead from $O(k^2)$ to **O(k) linear efficiency** and cutting prefill FLOPs by over 80%.
+  7. Injected timestamps or random UUIDs in the prefix destroy cache hit rates by altering prefix hashes, forcing full quadratic prefill recomputation.
+  8. A production agent requires strict execution constraints: hard step budgets, loop detectors, deterministic parsers, and deterministic tools.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'An agent tool-selection step has an individual accuracy of p = 0.92. For a task requiring k = 8 consecutive steps, what is the probability of completing the task without error?',
+    numeric: true,
+    answer: 0.513,
+    tolerance: 0.02,
+    why: 'P = p^k = 0.92^8 ≈ 0.5132 (or 51.3%). Even with 92% per-step accuracy, an 8-step trajectory is barely better than a coin flip.'
+  },
+  {
+    q: 'What is the approximate step half-life k_half (number of steps before success probability drops below 50%) for an agent whose step accuracy is p = 0.97?',
+    numeric: true,
+    answer: 22.8,
+    tolerance: 1.0,
+    unit: 'steps',
+    why: 'k_half = ln(0.5) / ln(0.97) = −0.69315 / −0.03046 ≈ 22.76 steps (using the approximation 0.693 / 0.03 = 23.1 steps).'
+  },
+  {
+    q: 'In an agent loop with L0 = 2,000 static prefix tokens and an average turn addition of Δ = 400 tokens, how many total tokens must be prefilled across K = 6 turns WITHOUT prefix caching?',
+    numeric: true,
+    answer: 18000,
+    tolerance: 100,
+    unit: 'tokens',
+    why: 'Total prefill = K·L0 + Δ·K(K−1)/2 = 6 × 2,000 + 400 × (6 × 5 / 2) = 12,000 + 400 × 15 = 12,000 + 6,000 = 18,000 tokens.'
+  },
+  {
+    q: 'For the same agent scenario (L0 = 2,000, Δ = 400, K = 6 turns), how many tokens are prefilled WITH ideal prefix caching?',
+    numeric: true,
+    answer: 4000,
+    tolerance: 50,
+    unit: 'tokens',
+    why: 'With prefix caching, Turn 1 prefills L0 = 2,000 tokens. Each subsequent turn (K−1 = 5 turns) only prefills Δ = 400 new tokens. Total = 2,000 + 5 × 400 = 4,000 tokens (a 77.8% reduction).'
+  },
+  {
+    q: 'Why does placing a dynamic timestamp at the beginning of an agent system prompt harm serving performance?',
+    options: [
+      'It confuses the model tokenizer into generating invalid JSON',
+      'It alters the prefix token hash, causing prefix cache misses and forcing full quadratic prefill on every turn',
+      'It increases model decoding temperature unexpectedly',
+      'It causes CUDA out of memory errors in the softmax layer'
+    ],
+    answer: 1,
+    why: 'Prefix caching relies on exact matching of initial prompt tokens. Any change to the prefix (like a shifting timestamp) invalidates all subsequent cached KV blocks.'
+  },
+  {
+    q: 'What fundamental role does the "Observe" step play in the agent cycle?',
+    options: [
+      'It updates the weights of the transformer via gradient descent',
+      'It pauses GPU execution to reduce power consumption',
+      'It captures the ground-truth output of external tool execution and injects it back into context',
+      'It compiles the Python script into a CUDA kernel'
+    ],
+    answer: 2,
+    why: 'The Observe phase captures real feedback from the environment (API response, command exit code, database row) and appends it to context so the agent grounds its next plan in reality.'
+  }
+]} />

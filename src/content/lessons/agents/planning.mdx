@@ -1,0 +1,415 @@
+---
+title: 'Planning: ReAct, reflection & plan-then-execute'
+summary: 'How agents decompose complex goals: interleaving thoughts and actions with ReAct, decoupling planners from parallel executors in DAG architectures, and learning across trials using verbal Reflexion.'
+objectives:
+  - Contrast ReAct interleaving with pure Chain-of-Thought and Act-only approaches
+  - Design and verify a plan-then-execute DAG architecture with parallel subtask dispatch
+  - Explain the three components of Reflexion and how verbal self-reflection acts as in-context reinforcement learning
+  - Calculate the wall-clock latency and token cost trade-offs of sequential vs parallel agent architectures
+  - Implement a topological DAG scheduler in Python for parallel tool execution
+---
+import PlanningStrategiesViz from '@/components/viz/agents/PlanningStrategiesViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In human problem-solving, you rarely act without thinking, and you rarely think without acting. If you are debugging a high-latency inference server, you do not sit motionless for an hour mentally computing every possible network packet before touching the terminal. Nor do you hammer random bash commands blindly hoping the system recovers.
+
+You operate in a continuous cycle: you form a hypothesis (*"The KV cache allocation might be fragmenting HBM"*), you perform an experiment (*`nvidia-smi --query-gpu=memory.used`*), you observe the measurement (*`78,410 MiB / 81,920 MiB`*), and you update your hypothesis.
+
+For language model agents, structuring this cognitive process is called **planning**.
+
+In early agent experiments, researchers observed two distinct catastrophic failure modes when models attempted complex multi-step tasks:
+
+1. **Reasoning Only (Chain-of-Thought):** The model produces beautiful internal monologues explaining what it believes is happening. But because it has no grounded observations, error drifts accumulate. By step 4, the model hallucinates fictitious error messages and fixes problems that do not exist.
+2. **Acting Only (No Reflection):** The model jumps straight to calling tools without generating intermediate reasoning tokens. It queries a log, receives 500 lines of text, and immediately queries the exact same log again. Without a synthesis step, it lacks strategic continuity and falls into infinite loops.
+
+In this lesson, you will master the three foundational planning architectures that solve this dilemma: **ReAct**, **Plan-then-Execute**, and **Reflexion**.
+
+## ReAct: interleaving reasoning and acting
+
+Introduced by Yao et al. in 2022, **ReAct** (Reasoning + Acting) is the most widely deployed agent planning pattern in industry.
+
+The core insight is simple: **force the model to generate a structured Thought before every Action, and pause generation after every Action until the environment returns an Observation.**
+
+```
+User Goal: "Diagnose why throughput on replica-2 dropped by 40%."
+
+Thought 1: I need to verify whether the drop is caused by hardware throttling or request queueing. I will first query GPU temperature and clock frequency.
+Action 1: get_gpu_metrics(replica_id="replica-2")
+Observation 1: {"temperature_c": 89, "clock_mhz": 810, "throttle_reason": "THERMAL_SLOWDOWN"}
+
+Thought 2: The GPU is severely thermally throttled at 89°C, dropping its clock from 1980 MHz to 810 MHz. I should check node fan status.
+Action 2: get_chassis_status(node_id="node-04")
+Observation 2: {"fan_1_rpm": 0, "fan_2_rpm": 4200, "alert": "FAN_1_FAILURE"}
+
+Thought 3: Chassis fan 1 has completely failed (0 RPM), causing local thermal saturation. I will trigger an automatic replica drain and cordon the node.
+Action 3: cordon_and_drain_node(node_id="node-04", target_replica="replica-2")
+Observation 3: {"status": "success", "rescheduled_to": "node-09"}
+
+Thought 4: The replica has been safely migrated to node-09 and thermal throttling is resolved. I will now inform the user.
+Final Answer: Replica 2 suffered a 40% throughput drop due to GPU thermal throttling (89°C) caused by a hardware fan failure on node-04. The workload has been drained and migrated to node-09.
+```
+
+Notice what makes ReAct work:
+- The **Thought** serves as an explicit working-memory scratchpad. It synthesizes past observations, discards noise, and selects the next specific sub-goal.
+- The **Action** grounds the model's reasoning in external truth.
+- The **Observation** injects real state into the context, preventing hallucination drift.
+
+<Scrolly>
+  <PlanningStrategiesViz client:visible slot="stage" />
+
+  <Step title="1. The planning dilemma: Blind execution vs deliberation">
+    Without structured planning, agents fail reliably. Pure chain-of-thought hallucinates facts because it cannot observe; pure action loops aimlessly because it cannot synthesize.
+  </Step>
+
+  <Step title="2. ReAct: Interleaving reasoning and acting">
+    ReAct executes a strict **Thought → Action → Observation** sequence. Each turn adapts dynamically to new information, allowing the agent to recover if a tool returns an error.
+  </Step>
+
+  <Step title="3. Plan-then-execute: Decoupling planner and executor">
+    ReAct is purely sequential. When tasks contain independent sub-problems, a **Plan-then-Execute** architecture separates the architect (a large planner model) from the executors.
+  </Step>
+
+  <Step title="4. DAG execution: Parallel tool dispatch">
+    Independent subtasks within a Directed Acyclic Graph (DAG) run simultaneously. Parallel dispatch collapses wall-clock time from $K \times T$ to the critical path length.
+  </Step>
+
+  <Step title="5. Reflexion: Episodic verbal self-correction">
+    When a complex trajectory fails, **Reflexion** passes the failed trace to an evaluator. A verbal critique is stored in episodic memory and prepended to retry attempts.
+  </Step>
+
+  <Step title="6. Systems comparison: Wall-clock time and token cost">
+    Every planning architecture imposes a distinct systems profile. Choose ReAct for reactive exploration, Plan-then-Execute for parallel speed, and Reflexion for high-accuracy coding and reasoning.
+  </Step>
+</Scrolly>
+
+## Plan-then-Execute: the decoupled DAG architecture
+
+While ReAct is flexible, it has a glaring systems weakness: **it is strictly sequential.**
+
+If an agent needs to retrieve cluster logs from 5 independent nodes, fetch 5 database schemas, and query 3 microservice health endpoints, a ReAct agent executes 13 serial turns. If each LLM call takes 1.2 seconds and each tool takes 0.5 seconds:
+
+$$
+\text{Total Latency} = 13 \times (1.2 + 0.5) = 22.1 \text{ seconds}
+$$
+
+During all 22 seconds, the user sits waiting. Worse, early steps had no dependency on each other: querying node 1 had nothing to do with querying node 5!
+
+**Plan-then-Execute** decouples this process into two distinct phases:
+
+```
+                          PLAN-THEN-EXECUTE
+  ┌────────────────────────────────────────────────────────┐
+  │                   1. PLANNER MODEL                     │
+  │     (High-capacity 70B/405B model generates subtask DAG)│
+  └───────────────────────────┬────────────────────────────┘
+                              │
+                              ▼
+  ┌────────────────────────────────────────────────────────┐
+  │                    2. DAG SCHEDULER                    │
+  │            (Analyzes task dependency graph)            │
+  └───────┬───────────────────┬────────────────────┬───────┘
+          │                   │                    │
+          ▼                   ▼                    ▼
+  ┌───────────────┐   ┌───────────────┐    ┌───────────────┐
+  │  SUBTASK A    │   │  SUBTASK B    │    │  SUBTASK C    │
+  │ Query Node 1  │   │ Query Node 2  │    │ Query Node 3  │
+  └───────┬───────┘   └───────┬───────┘    └───────┬───────┘
+          │ (Parallel)        │ (Parallel)         │ (Parallel)
+          └───────────────────┼────────────────────┘
+                              │
+                              ▼
+  ┌────────────────────────────────────────────────────────┐
+  │                  3. SYNTHESIZER MODEL                  │
+  │      (Lightweight 8B model aggregates all results)     │
+  └────────────────────────────────────────────────────────┘
+```
+
+### Stage 1: The Planner
+A large, powerful model (such as Llama-3.1-70B) receives the high-level goal and produces a **Directed Acyclic Graph (DAG)** of subtasks serialized as structured JSON:
+
+```json
+{
+  "tasks": [
+    {"id": "t1", "tool": "fetch_logs", "args": {"node": "node-1"}, "deps": []},
+    {"id": "t2", "tool": "fetch_logs", "args": {"node": "node-2"}, "deps": []},
+    {"id": "t3", "tool": "fetch_logs", "args": {"node": "node-3"}, "deps": []},
+    {"id": "t4", "tool": "compare_logs", "args": {"sources": ["t1", "t2", "t3"]}, "deps": ["t1", "t2", "t3"]}
+  ]
+}
+```
+
+### Stage 2: Static plan verification
+Before executing a single tool or spending a cent on compute, your application code validates the plan deterministically:
+1. **Cycle Detection:** Verify the graph is a valid DAG using Kahn's algorithm or depth-first search. If a cycle exists ($A \to B \to A$), reject the plan.
+2. **Tool Existence:** Verify every referenced tool exists in the active registry.
+3. **Dependency Integrity:** Verify that every dependency ID referenced in `deps` is produced by an earlier task.
+4. **Budget Cap:** Check that total estimated subtasks do not exceed the user's execution budget.
+
+### Stage 3: Parallel execution
+The scheduler executes all root nodes (`deps == []`) concurrently using Python `asyncio` or thread pools. As soon as all dependencies for a subsequent node finish, that node is dispatched immediately.
+
+Instead of 13 serial turns taking 22.1 seconds, all independent queries run in parallel, reducing wall-clock latency to the length of the **critical path**:
+
+$$
+T_{\text{wall-clock}} = T_{\text{planner}} + \max(T_{\text{parallel}}) + T_{\text{synthesizer}} \approx 1.5 + 0.6 + 0.8 = 2.9 \text{ seconds}
+$$
+
+The operation runs **7.6× faster** while utilizing server concurrency efficiently.
+
+<Callout type="intuition" title="When to use ReAct vs Plan-then-Execute">
+  - Use **Plan-then-Execute** when the problem domain is structured, predictable, and decomposable into parallel subtasks (e.g. data aggregation, multi-document research, code compilation pipelines).
+  - Use **ReAct** when the environment is highly uncertain, where you cannot know what step 2 should be until you see the output of step 1 (e.g. interactive system debugging, command-line exploration, playing text games).
+</Callout>
+
+## Reflexion: verbal reinforcement learning
+
+What happens when an agent executes a plan, but the outcome fails?
+
+In standard architectures, if a tool returns an error or a generated code script fails a unit test, the agent either crashes or repeats the exact same action. The model has no persistent memory of its mistakes across trials.
+
+In 2023, Shinn et al. introduced **Reflexion: Language Agents with Verbal Reinforcement Learning**.
+
+Traditional Reinforcement Learning (RL) updates the floating-point weights $\theta$ of a policy network via policy gradients:
+
+$$
+\theta \leftarrow \theta + \alpha \nabla_\theta \mathbb{E}[R]
+$$
+
+Updating weights during live inference is impossible on production clusters: backpropagation is orders of magnitude too slow, requires massive GPU memory, and risks catastrophic forgetting.
+
+Reflexion replaces weight updates with **verbal memory updates**:
+
+$$
+M_{t+1} = M_t \cup \{\text{Self-Reflection Critique}\}
+$$
+
+```
+                         THE REFLEXION LOOP
+  ┌────────────────────────────────────────────────────────┐
+  │                    1. ACTOR AGENT                      │
+  │      Executes full trajectory trial: τ_t = (s, a, o)   │
+  └───────────────────────────┬────────────────────────────┘
+                              │
+                              ▼
+  ┌────────────────────────────────────────────────────────┐
+  │                     2. EVALUATOR                       │
+  │       Computes scalar reward: R = 1.0 (pass) / 0.0     │
+  └───────────────────────────┬────────────────────────────┘
+                              │
+                    ┌─────────┴─────────┐
+             R = 1.0│                   │ R = 0.0 (Failed)
+                    ▼                   ▼
+             [TASK SOLVED] ┌───────────────────────────────┐
+                           │      3. SELF-REFLECTION       │
+                           │ LLM diagnoses why trial failed│
+                           └────────────┬──────────────────┘
+                                        │
+                                        ▼
+                           ┌───────────────────────────────┐
+                           │    EPISODIC MEMORY BUFFER     │
+                           │  Stores persistent reflections│
+                           └────────────┬──────────────────┘
+                                        │
+                                        ▼
+                              Trial t+1 includes:
+                         Goal + Trajectory + Memories!
+```
+
+Reflexion consists of three collaborating components:
+1. **The Actor:** An LLM agent (running ReAct or Plan-then-Execute) that attempts the task and produces a trajectory $\tau$.
+2. **The Evaluator:** A deterministic scoring function (e.g., Python unit tests, a compiler exit code, or a strict regex evaluator) that scores the trajectory: $R \in [0, 1]$.
+3. **The Self-Reflection Generator:** If $R < 1$, a specialized reflection prompt passes the failed trajectory to the model:
+   *"You attempted this task and failed with the following error. Analyze what went wrong, identify your incorrect assumptions, and provide a concrete rule for how you will approach this differently in the next attempt."*
+
+The model emits a concise verbal critique:
+```
+Reflexion Memory: "In Trial 1, I assumed the port was 8080 because of the default Helm chart. But the pod was listening on 8443 with TLS enabled. In Trial 2, I will check the Service spec before attempting curl."
+```
+
+This critique is appended to the agent's **episodic memory buffer**. When Trial 2 begins, the system prompt contains the user goal *plus* all past reflections.
+
+On coding benchmarks (such as HumanEval and MBPP), Reflexion improved absolute accuracy from **67% to 91%** over 3 trials, entirely through in-context verbal learning without a single gradient update!
+
+## Systems comparison: the inference engineering trade-off
+
+As an inference systems engineer, you must select the right planning architecture based on your application's Service Level Objectives (SLOs) and financial budget:
+
+| Dimension | ReAct | Plan-then-Execute | Reflexion |
+|:---|:---|:---|:---|
+| **Primary Strength** | Dynamic adaptability | Fast wall-clock latency | High accuracy on hard tasks |
+| **Execution Pattern** | Strictly serial ($K$ turns) | Parallel DAG branches | Multi-trial episodes ($M \times K$) |
+| **TTFT Impact** | Low on Turn 1, grows slowly | High on Turn 1 (Planner model) | Medium |
+| **Wall-Clock Latency** | **High** ($O(K)$ serial calls) | **Lowest** ($O(\text{critical path})$) | **Very High** (Multiple trials) |
+| **Token Volume** | Moderate (2k – 8k) | Low-Moderate (1.5k – 4k) | **High** (10k – 30k) |
+| **Prefix Cache Friendliness** | **Excellent** (monotonically appends) | **Good** (planner prefix shared) | **Moderate** (trial transcripts reset) |
+| **Typical Use Cases** | Interactive debugging, CLI | Bulk research, pipelines | Code generation, mathematics |
+
+### Latency arithmetic: ReAct vs DAG
+
+Let us calculate the exact difference for a realistic workload.
+Suppose a task requires executing 4 independent retrieval operations ($T_{\text{tool}} = 200\text{ ms}$ each) followed by 1 aggregation step.
+- Model prefill + decode latency per call: $T_{\text{LLM}} = 1{,}000\text{ ms}$.
+
+**1. ReAct (Serial):**
+Each step requires an LLM call followed by a tool execution:
+$$
+\text{Total Latency} = 4 \times (T_{\text{LLM}} + T_{\text{tool}}) + T_{\text{final\_LLM}} = 4 \times (1{,}000 + 200) + 1{,}000 = 5{,}800\text{ ms} = 5.8\text{ seconds}
+$$
+
+**2. Plan-then-Execute (Parallel):**
+- Step 1: Planner LLM emits DAG: 1,200 ms.
+- Step 2: All 4 tools execute concurrently in parallel: $\max(200, 200, 200, 200) = 200\text{ ms}$.
+- Step 3: Synthesizer LLM aggregates outputs: 1,000 ms.
+$$
+\text{Total Latency} = 1{,}200 + 200 + 1{,}000 = 2{,}400\text{ ms} = 2.4\text{ seconds}
+$$
+
+The parallel DAG executes in **less than half the time** (2.4 s vs 5.8 s), delivering an immediate 58.6% reduction in user wait time.
+
+## In code: a topological DAG scheduler in Python
+
+Here is a minimal, production-grade DAG scheduler demonstrating how Plan-then-Execute coordinates parallel execution in Python:
+
+```python
+import asyncio
+from dataclasses import dataclass
+from typing import Callable, Any
+
+@dataclass
+class TaskNode:
+    id: str
+    tool_name: str
+    args: dict
+    dependencies: list[str]  # IDs of tasks that must finish before this task runs
+
+async def run_dag_scheduler(
+    tasks: dict[str, TaskNode],
+    tool_handlers: dict[str, Callable[..., Any]],
+) -> dict[str, Any]:
+    """Execute a task DAG with maximum concurrency."""
+    results: dict[str, Any] = {}
+    completed_events: dict[str, asyncio.Event] = {
+        tid: asyncio.Event() for tid in tasks
+    }
+
+    async def execute_task(task: TaskNode):
+        # 1. Wait for all dependencies to complete
+        for dep_id in task.dependencies:
+            if dep_id not in tasks:
+                raise ValueError(f"Task '{task.id}' depends on missing task '{dep_id}'")
+            await completed_events[dep_id].wait()
+
+        # 2. Inject results of dependencies into arguments if referenced
+        resolved_args = {}
+        for k, v in task.args.items():
+            if isinstance(v, str) and v.startswith("$"):
+                dep_key = v[1:]  # e.g. "$t1" -> results["t1"]
+                resolved_args[k] = results.get(dep_key)
+            else:
+                resolved_args[k] = v
+
+        # 3. Execute the tool asynchronously
+        handler = tool_handlers[task.tool_name]
+        if asyncio.iscoroutinefunction(handler):
+            res = await handler(**resolved_args)
+        else:
+            res = handler(**resolved_args)
+
+        results[task.id] = res
+        # 4. Notify dependent downstream tasks
+        completed_events[task.id].set()
+
+    # Launch all tasks concurrently; each waits on its own dependencies
+    await asyncio.gather(*(execute_task(t) for t in tasks.values()))
+    return results
+```
+
+Notice how clean the architecture is:
+- Every task is launched into the event loop simultaneously.
+- Tasks with no dependencies execute instantly.
+- Tasks with dependencies pause non-blockingly on `completed_events[dep_id].wait()`, waking up the microsecond their prerequisite data is ready.
+- Zero CPU spinning, zero thread contention, and maximum hardware utilization.
+
+<Callout type="real" title="Now read the paper">
+  To deepen your understanding of foundational agent planning papers:
+  1. **"ReAct: Synergizing Reasoning and Acting in Language Models"** (Yao et al., 2022, [arXiv:2210.03629](https://arxiv.org/abs/2210.03629)).
+     - **Read:** Section 1 (Introduction), Section 2 ("The ReAct Framework"), and Section 3.1 ("HotpotQA and Fever").
+     - **Skip:** Section 3.2 ("ALFWorld details") unless text game simulation benchmarks interest you.
+  2. **"Reflexion: Language Agents with Verbal Reinforcement Learning"** (Shinn et al., 2023, [arXiv:2303.11366](https://arxiv.org/abs/2303.11366)).
+     - **Read:** Section 1, Section 2 ("Reflexion Framework: Actor, Evaluator, Self-Reflection"), and Figure 1.
+     - **What you will recognize:** You will see the exact formulas and memory structures we analyzed today, proving that verbal reinforcement is a practical alternative to fine-tuning.
+</Callout>
+
+<KeyNotes>
+  1. Planning prevents the dual failures of agents: **hallucination drift** (from pure reasoning) and **aimless looping** (from pure acting).
+  2. **ReAct** interleaves **Thought → Action → Observation**, allowing the model to dynamically update its plan in response to real environment feedback.
+  3. **Plan-then-Execute** decouples the architect (a large planner model) from the executors (fast models or code), representing workflows as **Directed Acyclic Graphs (DAGs)**.
+  4. DAG scheduling enables **parallel tool dispatch**, collapsing wall-clock latency from $O(K)$ serial roundtrips to the critical path length (50% to 75% latency savings).
+  5. Always perform **static plan verification** (cycle detection and dependency integrity) before dispatching any subtasks.
+  6. **Reflexion** achieves verbal reinforcement learning without weight updates by storing natural language critiques of failed trials in an **episodic memory buffer**.
+  7. ReAct offers the highest adaptability for unpredictable environments; Plan-then-Execute offers the best wall-clock latency for parallelizable tasks; Reflexion offers the highest accuracy on hard algorithmic tasks at the cost of high token consumption.
+  8. From an inference perspective, ReAct maintains high **prefix-cache sharing** across turns, whereas Reflexion resets prefixes between distinct trial episodes.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'A ReAct agent executes a 6-turn task. Each turn requires an LLM call taking 900 ms and a tool execution taking 300 ms, plus one final 800 ms synthesis call. What is the total wall-clock time in seconds?',
+    numeric: true,
+    answer: 8.0,
+    tolerance: 0.2,
+    unit: 's',
+    why: 'Total time = 6 × (900 ms + 300 ms) + 800 ms = 6 × 1,200 ms + 800 ms = 7,200 ms + 800 ms = 8,000 ms = 8.0 seconds.'
+  },
+  {
+    q: 'The same 6 retrieval tasks are restructured into a Plan-then-Execute DAG. The planner LLM takes 1,400 ms. All 6 tools run concurrently taking 300 ms. The synthesizer LLM takes 900 ms. What is the new wall-clock time in seconds?',
+    numeric: true,
+    answer: 2.6,
+    tolerance: 0.1,
+    unit: 's',
+    why: 'Total time = T_planner + max(T_tools) + T_synth = 1,400 ms + 300 ms + 900 ms = 2,600 ms = 2.6 seconds (a 67.5% reduction vs ReAct).'
+  },
+  {
+    q: 'What fundamental limitation of pure Chain-of-Thought (CoT) prompting does ReAct address?',
+    options: [
+      'CoT consumes too many GPU tensor cores during decode',
+      'CoT reasons without environmental feedback, leading to ungrounded reasoning and compounded hallucinations',
+      'CoT cannot generate valid JSON schemas',
+      'CoT is incompatible with BF16 precision'
+    ],
+    answer: 1,
+    why: 'Pure Chain-of-Thought generates internal monologues without checking external reality. ReAct inserts Action and Observation steps to ground the model in real data.'
+  },
+  {
+    q: 'How does Reflexion improve task performance across multiple trials without modifying neural network weights?',
+    options: [
+      'By performing quantized LoRA updates on CPU during idle time',
+      'By dynamically adjusting the temperature of the sampling kernel',
+      'By storing verbal critiques of past failures in an episodic memory buffer and including them in subsequent prompts',
+      'By increasing the GPU memory allocation for the KV cache'
+    ],
+    answer: 2,
+    why: 'Reflexion uses verbal reinforcement learning: when a trial fails, an evaluator triggers a self-reflection pass that records what went wrong in text, injecting the critique into the prompt for the next trial.'
+  },
+  {
+    q: 'Before executing a subtask DAG generated by a planner model, what static check must ALWAYS be performed?',
+    options: [
+      'Cycle detection (ensuring the graph is strictly acyclic with no circular dependencies)',
+      'Calculating the dot product between all task embeddings',
+      'Converting all task arguments into FP8 precision',
+      'Re-ranking the tasks using BM25'
+    ],
+    answer: 0,
+    why: 'A planner can hallucinate circular dependencies (e.g. Task A depends on Task B, which depends on Task A). If not caught by cycle detection, the scheduler will deadlock indefinitely.'
+  },
+  {
+    q: 'Why does Reflexion typically cost significantly more tokens than a standard ReAct execution?',
+    options: [
+      'Reflexion requires FP32 weights instead of BF16',
+      'Reflexion re-executes entire multi-step trajectories across multiple trial episodes, accumulating prompt and generation tokens each time',
+      'Reflexion disables prefix caching permanently across the cluster',
+      'Reflexion uses 5 times more query attention heads'
+    ],
+    answer: 1,
+    why: 'Reflexion runs full trial episodes repeatedly until the task passes evaluation. If a task takes 3 trials to solve, total token consumption multiplies by 3x to 5x.'
+  }
+]} />
