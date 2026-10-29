@@ -34,4 +34,9 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Putting hundreds or thousands of examples in a long context window. Some tasks keep improving, but 500 examples of 200 tokens is 100,000 input tokens on every call, which is usually the point where finetuning is cheaper.',
     lesson: 'prompting/in-context',
   },
+  'prompt-chain': {
+    term: 'Prompt chain (decomposition)',
+    def: 'Splitting one job across several model calls, each with a small focused prompt, such as a router that outputs a label and a specialised prompt per label. End-to-end accuracy is the product of the stages; it costs extra round trips but sends only the context each request needs.',
+    lesson: 'prompting/writing-prompts',
+  },
 };
