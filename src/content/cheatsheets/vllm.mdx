@@ -143,21 +143,23 @@ Defaults move between versions: read them from `vllm serve --help`, not from a b
 1. Hardware → 2. Workload → 3. Metrics/SLO → 4. Baseline → 5. Benchmark → 6. Change ONE knob → 7. Record & decide ↺
 ```
 
-1. **Examine hardware:** Audit GPU model, HBM capacity, bandwidth, and NVLink interconnect via `nvidia-smi`.
+1. **Examine hardware:** Audit GPU model, memory capacity, bandwidth, and interconnect (NVLink or PCIe) via `nvidia-smi`.
 2. **Define workload:** Lock prompt and output distributions and arrival rate using a reproducible generator.
-3. **Define metrics & SLO:** Explicit targets for TTFT (prefill/queueing) and TPOT (decode), measured at p95/p99.
+3. **Define metrics & SLO:** Explicit targets for TTFT (prefill/queueing) and ITL/TPOT (decode), including tail percentiles.
 4. **Deploy baseline server:** Standard engine defaults; log weight footprint and KV pool size.
-5. **Benchmark baseline:** Measure reference throughput, TTFT, TPOT, and goodput using native tooling.
+5. **Benchmark baseline:** Measure reference throughput, TTFT, ITL and (against the SLO) goodput using native tooling.
 6. **Change ONE knob:** Formulate one hypothesis; isolate a single configuration variable.
 7. **Record and decide:** Apply keep-or-revert rule immediately: keep wins that preserve SLOs; revert regressions.
 
-### Qwen3-14B on one H100 80GB (first-principles specs)
+### Qwen3-14B on one L40S 48 GB (AWS g6e.2xlarge): predicted vs logged
 
-- **Weights (BF16):** ${}14.8\text{B} \times 2\text{ bytes} \approx 29.6\text{ GB}$
-- **KV cache per token:** ${}2 \times L \times n_{kv} \times d_{head} \times 2 = 2 \times 40 \times 8 \times 128 \times 2 = 163{,}840\text{ bytes} \approx 160\text{ KB}$
-- **KV cache pool (`util 0.90`):** ${}72.0\text{ GB} - 29.6\text{ GB} - 3.2\text{ GB} = 39.2\text{ GB} \approx 239{,}257\text{ tokens}$ ($\approx 14{,}953$ blocks of 16 tokens)
-- **Worst-case concurrency at 4K context:** ${}39.2\text{ GB} \div (4{,}096 \times 160\text{ KB}) \approx 58\text{ concurrent sequences}$
-- **Single-stream decode ceiling:** ${}3.35\text{ TB/s} \div 29.6\text{ GB} \approx 113\text{ tok/s}$ upper bound (ideal); practical $\approx 80\text{ tok/s}$ at 80% MBU + 1.5 ms overhead
+L40S: 48 GB GDDR6 (vLLM sees 45.0 GiB = 46,068 MiB), ~864 GB/s, ~362 TFLOP/s dense BF16, PCIe Gen4, no NVLink.
+
+- **Weights (BF16):** ${}14.8\text{B} \times 2\text{ bytes} \approx 29.5\text{ GB} = 27.5\text{ GiB}$ (logged: 27.5 GiB)
+- **KV cache per token:** ${}2 \times 40 \times 8 \times 128 \times 2 = 163{,}840\text{ bytes} = 160\text{ KiB}$
+- **KV pool (`util 0.90`):** ${}0.90 \times 45.0 - 27.5 - {\approx}2.0 = 11.0\text{ GiB}$ → ${}11.0 \times 2^{30} / 163{,}840 \approx 72{,}089$ tokens (logged: **72,064**, whole 16-token blocks)
+- **Worst-case concurrency at the default 40,960 context:** ${}72{,}064 / 40{,}960 = 1.76\times$ (logged); at `--max-model-len 8192`: 8.8×
+- **Single-stream decode ceiling:** ${}864 \div 29.5 \approx 29\text{ tok/s}$ (≥ 34.2 ms/step); practical ≈ 23 tok/s at 80% of bandwidth + 1.5 ms
 
 ### Production command template
 
@@ -165,8 +167,8 @@ Defaults move between versions: read them from `vllm serve --help`, not from a b
 vllm serve Qwen/Qwen3-14B \
   --dtype bfloat16 \
   --gpu-memory-utilization 0.90 \
-  --max-model-len 4096 \
-  --max-num-seqs 64 \
+  --max-model-len 8192 \
+  --max-num-seqs 32 \
   --max-num-batched-tokens 2048 \
   --tensor-parallel-size 1 \
   --port 8000
@@ -181,20 +183,24 @@ vllm bench serve \
   --model Qwen/Qwen3-14B \
   --dataset-name sharegpt \
   --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 1000 \
+  --num-prompts 2000 \
   --request-rate 10 \
-  --max-concurrency 64 \
+  --max-concurrency 10 \
   --save-result \
   --result-filename baseline_results.json
 ```
 
-### Experimental results ledger template
+### The measured ledger (L40S, ShareGPT, concurrency ≤ 10)
 
-| Exp | Change (ONE knob) | Throughput | TTFT (p50/p99) | TPOT (p50/p99) | Goodput | Decision |
+| Exp | Change (ONE knob) | Total tok/s | Output tok/s | Mean TTFT | ITL mean / p99 | Decision |
 |---|---|---|---|---|---|---|
-| **00** | *Baseline defaults (illustrative)* | 474 tok/s | 104 / 185 ms | 32 / 38 ms | 445 tok/s | **BASELINE** |
-| **01** | `--max-model-len 4096` | 582 tok/s | 98 / 172 ms | 31 / 37 ms | 548 tok/s | **✓ KEEP** |
-| **02** | `--max-num-seqs 512` | 695 tok/s | 165 / 310 ms | 44 / 58 ms | 210 tok/s | **✗ REVERT** |
+| **00** | Baseline BF16, defaults | 474 | 228 | 104 ms | 43 / 72 ms | **BASELINE** |
+| **01** | `Qwen/Qwen3-14B-AWQ` | 1,280 (2.7×) | — | 59 ms | — | **KEEP** if quality holds |
+| **02** | `--max-model-len 8192` | to run | | | | concurrency 1.76× → 8.8× |
+
+- ITL 43 ms ≈ the 29.5 GB weight read at ~80% of 864 GB/s; output 228 tok/s ≈ 10 streams ÷ 0.043 s (Little's law).
+- AWQ: weights 27.5 → 9.36 GiB, KV pool 11.0 → 29.15 GiB (≈ 191K tokens); bound on the gain 27.5 / 9.36 ≈ 2.9×, measured 2.7×.
+- Same server, prefix-repetition workload: 1,123 tok/s total (prefix cache hits). The workload moves the number as much as any flag.
 
 ### Common serving trade-offs
 
