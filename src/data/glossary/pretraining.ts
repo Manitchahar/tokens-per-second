@@ -40,11 +40,6 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Total loss on a text in bits, divided by the text’s size in UTF-8 bytes: (loss per token ÷ ln 2) × tokens ÷ bytes. Unlike per-token loss or perplexity, it is fair across different tokenizers.',
     lesson: 'pretraining/loss-perplexity',
   },
-  'data-contamination': {
-    term: 'Data contamination',
-    def: 'When a benchmark’s test text was in a model’s training data, so the model has partly memorised the answers. An unusually low perplexity on the test set, compared with fresh text of the same style, is a warning sign.',
-    lesson: 'pretraining/loss-perplexity',
-  },
   'masked-language-model': {
     term: 'Masked language model (MLM)',
     def: 'BERT’s training game: hide about 15% of the tokens (80% become [MASK], 10% a random token, 10% stay) and predict the originals using both sides of the context. Only the hidden positions are graded.',
