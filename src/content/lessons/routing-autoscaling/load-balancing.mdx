@@ -33,7 +33,7 @@ $$
 | Short chat | 900 + 250 = 1,150 | 144 MiB | 0.4% |
 | Long RAG | 8,000 + 250 = 8,250 | 1.0 GiB | 3.0% |
 
-One H100 has 80 GB. After the weights (16 GB) and the CUDA context and workspace, roughly **56 GB is KV pool** — about 400,000 tokens. Round robin does not distinguish a request that uses 36 MiB from one that uses 1.0 GiB. It is spreading *counts*, not *load*.
+One H100 has 80 GB. vLLM uses 90% of it (72 GB); after the weights (16.06 GB) and about 3.2 GB of CUDA context and workspace, roughly **52.7 GB is KV pool** — about 402,000 tokens. Round robin does not distinguish a request that uses 36 MiB from one that uses 1.0 GiB. It is spreading *counts*, not *load*.
 
 The alternative signals each try to get closer to the real thing. <Term t="least-connections">Least connections</Term> reacts to load but still counts requests. <Term t="power-of-two-choices">Power of two choices</Term> samples two replicas and picks the better, balancing nearly as well as a full scan at constant cost. And <Term t="least-kv">least-KV-tokens</Term> scores on the resource that actually runs out — which is why it produces the tightest spread of any stateless policy.
 
@@ -91,7 +91,7 @@ $$
 \text{users per replica} = \frac{\text{KV pool tokens}}{\text{context length per user}}
 $$
 
-For our H100 running Llama-3.1-8B with a 56 GB pool, that is about 402,000 tokens. At an average context of 1,150 tokens (the short chat above) a replica holds roughly **350 concurrent users**.
+For our H100 running Llama-3.1-8B with a 52.7 GB pool, that is 52.7 × 10⁹ ÷ 131,072 ≈ 402,000 tokens. At an average context of 1,150 tokens (the short chat above) a replica holds roughly **350 concurrent users**.
 
 Now the timing. Each request occupies a KV slot for its entire life: it waits, prefills, and then generates. Generation alone takes
 
