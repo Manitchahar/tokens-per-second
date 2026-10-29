@@ -17,9 +17,9 @@ const CAPTIONS = [
   'Fix the workload with a reproducible traffic generator: prompt and output token distributions, arrival rate, and concurrency. Tuning against moving traffic measures noise.',
   'Establish explicit SLO targets: TTFT (prefill & queueing), TPOT/ITL (decode streaming), throughput, and goodput (tokens delivered inside the SLO target).',
   'Deploy a baseline server with standard engine defaults. Record memory footprint: model weights, runtime reserve, and the resulting KV cache pool.',
-  'Benchmark the default baseline configuration under target traffic. On the L40S: 474 tok/s total, 228 tok/s output, 104 ms mean TTFT, 43 ms mean ITL. Row zero of the ledger.',
-  'Change exactly ONE thing at a time (here: the 4-bit AWQ checkpoint) and re-benchmark under the exact same traffic. Never move two knobs simultaneously.',
-  'Record results in the optimization ledger and decide: AWQ gave 2.7× the throughput and lower TTFT, so keep it if quality holds. Write the next hypothesis down before running it.',
+  'Benchmark the default baseline configuration under target traffic. This establishes reference numbers for TTFT, TPOT, and goodput in your results table.',
+  'Change exactly ONE parameter at a time (e.g. max-model-len or max-num-seqs) and re-benchmark under the exact same traffic. Never move two knobs simultaneously.',
+  'Record results in the optimization ledger. Compare goodput and latency against baseline to make a clean engineering decision: keep wins, revert regressions.',
 ];
 
 interface StationDef {
@@ -34,9 +34,9 @@ interface StationDef {
 }
 
 const STATIONS: StationDef[] = [
-  { num: '01', title: 'Examine Hardware', detail: 'L40S 48GB · 864 GB/s', x: 18, y: 16, w: 132, h: 42, kind: 'memory' },
+  { num: '01', title: 'Examine Hardware', detail: 'H100 80GB · 3.35 TB/s', x: 18, y: 16, w: 132, h: 42, kind: 'memory' },
   { num: '02', title: 'Define Workload', detail: 'ShareGPT · 10 req/s', x: 178, y: 16, w: 132, h: 42, kind: 'token' },
-  { num: '03', title: 'Metrics & SLO', detail: 'TTFT & ITL targets', x: 338, y: 16, w: 132, h: 42, kind: 'compute' },
+  { num: '03', title: 'Metrics & SLO', detail: 'TTFT & TPOT targets', x: 338, y: 16, w: 132, h: 42, kind: 'compute' },
   { num: '04', title: 'Baseline Server', detail: 'Default vLLM setup', x: 498, y: 16, w: 124, h: 42, kind: 'memory' },
   { num: '05', title: 'Benchmark Run', detail: 'vllm bench serve', x: 498, y: 82, w: 124, h: 42, kind: 'compute' },
   { num: '06', title: 'Change ONE Knob', detail: 'Isolate 1 variable', x: 338, y: 82, w: 132, h: 42, kind: 'comm' },
@@ -51,13 +51,13 @@ export default function OptimizationPlan() {
   // Determine stage readout data
   const readoutData = [
     { label: 'Active station', value: `${STATIONS[curStep].num}. ${STATIONS[curStep].title}`, kind: STATIONS[curStep].kind, note: STATIONS[curStep].detail },
-    { label: 'Target model', value: 'Qwen3-14B (BF16)', kind: 'memory' as const, note: '27.5 GiB weights on an L40S 48GB' },
-    { label: 'Decode ceiling', value: '~29 tok/s (1-stream)', kind: 'compute' as const, note: '864 GB/s ÷ 29.5 GB upper bound' },
+    { label: 'Target model', value: 'Qwen3-14B (BF16)', kind: 'memory' as const, note: '29.6 GB weights on H100 80GB' },
+    { label: 'Decode ceiling', value: '~113 tok/s (1-stream)', kind: 'compute' as const, note: '3.35 TB/s ÷ 29.6 GB upper bound' },
     {
       label: 'Decision status',
-      value: curStep < 4 ? 'Preparing baseline' : curStep === 4 ? 'Baseline recorded' : curStep === 5 ? 'Evaluating Exp 01' : '1 kept · 1 queued',
+      value: curStep < 4 ? 'Preparing baseline' : curStep === 4 ? 'Baseline recorded' : curStep === 5 ? 'Evaluating Exp 01' : '1 Kept · 1 Reverted',
       kind: curStep === 6 ? ('token' as const) : ('compute' as const),
-      note: curStep === 6 ? 'Exp 01 kept if quality holds; Exp 02 next' : 'Discipline: one change at a time',
+      note: curStep === 6 ? 'Exp 01 kept (+23%), Exp 02 reverted' : 'Discipline: one change at a time',
     },
   ];
 
@@ -237,10 +237,10 @@ export default function OptimizationPlan() {
           <rect x={0} y={0} width={604} height={26} rx={6} fill="rgba(255, 255, 255, 0.03)" />
           <line x1={0} y1={26} x2={604} y2={26} stroke="var(--rule-2)" strokeWidth={1} />
           <text x={12} y={17} fontSize={10} fontWeight={700} fill="var(--text)" className="v-label">
-            LEDGER · Qwen3-14B · L40S · ShareGPT · tok/s
+            RESULTS LEDGER: Qwen3-14B on H100 SXM 80GB (ShareGPT workload)
           </text>
           <text x={592} y={17} textAnchor="end" fontSize={9.5} fill="var(--text-3)" className="v-label">
-            SLO: TTFT &lt; 200 ms · p99 ITL &lt; 100 ms
+            SLO: TTFT &lt; 200 ms · TPOT &lt; 40 ms
           </text>
 
           {/* Table Column Headers */}
@@ -250,10 +250,10 @@ export default function OptimizationPlan() {
 
             <text x={12} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">Exp</text>
             <text x={48} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">Change (ONE variable)</text>
-            <text x={232} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">Total</text>
-            <text x={308} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">Output</text>
-            <text x={372} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">TTFT mean</text>
-            <text x={446} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">ITL mean/p99</text>
+            <text x={232} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">Throughput</text>
+            <text x={314} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">TTFT (p50/p99)</text>
+            <text x={410} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">TPOT (p50/p99)</text>
+            <text x={498} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">Goodput</text>
             <text x={552} y={15} fontSize={9.5} fontWeight={600} fill="var(--text-3)" className="v-label">Decision</text>
           </g>
 
@@ -262,7 +262,7 @@ export default function OptimizationPlan() {
             {curStep < 4 ? (
               <g>
                 <rect x={6} y={6} width={592} height={28} rx={4} fill="none" stroke="var(--rule)" strokeDasharray="3 3" />
-                <text x={308} y={24} textAnchor="middle" fontSize={10} fill="var(--text-3)" className="v-label">
+                <text x={302} y={24} textAnchor="middle" fontSize={10} fill="var(--text-3)" className="v-label">
                   Step 1-4: Configuring environment... awaiting baseline benchmark run.
                 </text>
               </g>
@@ -275,14 +275,15 @@ export default function OptimizationPlan() {
                 <text x={12} y={24} fontSize={10.5} fontWeight={700} fill="var(--text-2)" className="v-label">00</text>
                 {/* Change */}
                 <text x={48} y={20} fontSize={10} fontWeight={600} fill="var(--text)" className="v-label sans">Baseline defaults</text>
-                <text x={48} y={32} fontSize={8.5} fill="var(--text-3)" className="v-label">BF16, max-len 40,960</text>
+                <text x={48} y={32} fontSize={8.5} fill="var(--text-3)" className="v-label">util=0.90, max-len=8192, seqs=256</text>
                 {/* Throughput */}
-                <text x={232} y={24} fontSize={10} fill="var(--text)" className="v-label">474</text>
-                <text x={308} y={24} fontSize={10} fill="var(--text)" className="v-label">228</text>
+                <text x={232} y={24} fontSize={10} fill="var(--text)" className="v-label">474 tok/s</text>
                 {/* TTFT */}
-                <text x={372} y={24} fontSize={10} fill="var(--token)" className="v-label">104 ms</text>
-                {/* ITL */}
-                <text x={446} y={24} fontSize={10} fill="var(--token)" className="v-label">43 / 72 ms</text>
+                <text x={314} y={24} fontSize={10} fill="var(--token)" className="v-label">104 / 185 ms</text>
+                {/* TPOT */}
+                <text x={410} y={24} fontSize={10} fill="var(--token)" className="v-label">32 / 38 ms</text>
+                {/* Goodput */}
+                <text x={498} y={24} fontSize={10} fontWeight={700} fill="var(--token)" className="v-label">445 tok/s</text>
                 {/* Decision badge */}
                 <rect x={546} y={12} width={50} height={18} rx={3} fill="rgba(255, 255, 255, 0.08)" stroke="var(--rule-2)" />
                 <text x={571} y={24} textAnchor="middle" fontSize={8.5} fontWeight={600} fill="var(--text-2)" className="v-label">BASELINE</text>
@@ -295,7 +296,7 @@ export default function OptimizationPlan() {
             {curStep < 5 ? (
               <g>
                 <rect x={6} y={4} width={592} height={28} rx={4} fill="none" stroke="var(--rule)" strokeDasharray="3 3" opacity={0.5} />
-                <text x={308} y={21} textAnchor="middle" fontSize={9.5} fill="var(--text-3)" className="v-label">
+                <text x={302} y={21} textAnchor="middle" fontSize={9.5} fill="var(--text-3)" className="v-label">
                   Step 6: Experiment 01 will isolate and test first parameter change.
                 </text>
               </g>
@@ -307,15 +308,16 @@ export default function OptimizationPlan() {
                 {/* Exp Number */}
                 <text x={12} y={23} fontSize={10.5} fontWeight={700} fill="var(--token)" className="v-label">01</text>
                 {/* Change */}
-                <text x={48} y={19} fontSize={10} fontWeight={600} fill="var(--text)" className="v-label sans">Qwen3-14B-AWQ checkpoint</text>
-                <text x={48} y={31} fontSize={8.5} fill="var(--memory)" className="v-label">2.7× total · 9.36 GiB weights</text>
+                <text x={48} y={19} fontSize={10} fontWeight={600} fill="var(--text)" className="v-label sans">--max-model-len 4096</text>
+                <text x={48} y={31} fontSize={8.5} fill="var(--memory)" className="v-label">halved worst-case KV footprint</text>
                 {/* Throughput */}
-                <text x={232} y={23} fontSize={10} fontWeight={700} fill="var(--token)" className="v-label">1,280</text>
-                <text x={308} y={23} fontSize={10} fill="var(--text-3)" className="v-label">—</text>
+                <text x={232} y={23} fontSize={10} fill="var(--text)" className="v-label">582 tok/s</text>
                 {/* TTFT */}
-                <text x={372} y={23} fontSize={10} fill="var(--token)" className="v-label">59 ms</text>
-                {/* ITL */}
-                <text x={446} y={23} fontSize={10} fill="var(--text-3)" className="v-label">—</text>
+                <text x={314} y={23} fontSize={10} fill="var(--token)" className="v-label">98 / 172 ms</text>
+                {/* TPOT */}
+                <text x={410} y={23} fontSize={10} fill="var(--token)" className="v-label">31 / 37 ms</text>
+                {/* Goodput */}
+                <text x={498} y={23} fontSize={10} fontWeight={700} fill="var(--token)" className="v-label">548 tok/s</text>
                 {/* Decision badge */}
                 {curStep === 5 ? (
                   <g>
@@ -325,7 +327,7 @@ export default function OptimizationPlan() {
                 ) : (
                   <g>
                     <rect x={546} y={11} width={50} height={18} rx={3} fill="rgba(46, 189, 133, 0.2)" stroke="var(--token)" />
-                    <text x={571} y={23} textAnchor="middle" fontSize={8.5} fontWeight={700} fill="var(--token)" className="v-label">✓ KEEP*</text>
+                    <text x={571} y={23} textAnchor="middle" fontSize={8.5} fontWeight={700} fill="var(--token)" className="v-label">✓ KEEP</text>
                   </g>
                 )}
               </g>
@@ -337,23 +339,30 @@ export default function OptimizationPlan() {
             {curStep < 6 ? (
               <g>
                 <rect x={6} y={3} width={592} height={26} rx={4} fill="none" stroke="var(--rule)" strokeDasharray="3 3" opacity={0.3} />
-                <text x={308} y={19} textAnchor="middle" fontSize={9.5} fill="var(--text-3)" className="v-label">
-                  Step 7: write down Experiment 02's hypothesis before running it.
+                <text x={302} y={19} textAnchor="middle" fontSize={9.5} fill="var(--text-3)" className="v-label">
+                  Step 7: Experiment 02 evaluates concurrency stress &amp; keep/revert rule.
                 </text>
               </g>
             ) : (
               <g>
-                <rect x={4} y={1} width={596} height={34} rx={4} fill="none" stroke="var(--comm)" strokeDasharray="3 3" strokeWidth={1} />
+                <rect x={4} y={1} width={596} height={34} rx={4} fill="rgba(235, 87, 87, 0.06)" stroke="var(--error)" strokeWidth={1} />
 
                 {/* Exp Number */}
-                <text x={12} y={22} fontSize={10.5} fontWeight={700} fill="var(--comm)" className="v-label">02</text>
+                <text x={12} y={22} fontSize={10.5} fontWeight={700} fill="var(--error)" className="v-label">02</text>
                 {/* Change */}
-                <text x={48} y={18} fontSize={10} fontWeight={600} fill="var(--text)" className="v-label sans">--max-model-len 8192</text>
-                <text x={48} y={30} fontSize={8.5} fill="var(--comm)" className="v-label">concurrency 1.76× → 8.8×</text>
-                <text x={246} y={22} fontSize={10} fill="var(--text-3)" className="v-label">to run: measure every column, then decide</text>
+                <text x={48} y={18} fontSize={10} fontWeight={600} fill="var(--text)" className="v-label sans">--max-num-seqs 512</text>
+                <text x={48} y={30} fontSize={8.5} fill="var(--error)" className="v-label">doubled batch cap; decode saturated</text>
+                {/* Throughput */}
+                <text x={232} y={22} fontSize={10} fill="var(--text-3)" className="v-label">695 tok/s</text>
+                {/* TTFT */}
+                <text x={314} y={22} fontSize={10} fill="var(--error)" className="v-label">165 / 310 ms</text>
+                {/* TPOT */}
+                <text x={410} y={22} fontSize={10} fontWeight={700} fill="var(--error)" className="v-label">44 / 58 ms</text>
+                {/* Goodput */}
+                <text x={498} y={22} fontSize={10} fontWeight={700} fill="var(--error)" className="v-label">210 tok/s</text>
                 {/* Decision badge */}
-                <rect x={546} y={10} width={50} height={18} rx={3} fill="none" stroke="var(--comm)" />
-                <text x={571} y={22} textAnchor="middle" fontSize={8.5} fontWeight={700} fill="var(--comm)" className="v-label">NEXT</text>
+                <rect x={546} y={10} width={50} height={18} rx={3} fill="rgba(235, 87, 87, 0.2)" stroke="var(--error)" />
+                <text x={571} y={22} textAnchor="middle" fontSize={8.5} fontWeight={700} fill="var(--error)" className="v-label">✗ REVERT</text>
               </g>
             )}
           </g>
