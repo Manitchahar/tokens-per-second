@@ -1,0 +1,116 @@
+---
+title: 'Module 3A · One Machine, Two Jobs'
+module: pretraining
+---
+
+## Free labels (self-supervision)
+
+Hide part of the text, predict it from the rest. The hidden part is the label.
+
+$$
+\text{inputs} = x_{1..T}, \qquad \text{targets} = x_{2..T+1} \quad\text{(the same chunk, shifted by one)}
+$$
+
+- A sentence of $n$ tokens → **$n - 1$** next-token examples.
+- A corpus of $N$ tokens cut into windows of $T$: $N/T$ sequences × $T$ targets = **$N$ examples**, whatever $T$ is.
+- ${}10^{12}$ tokens at $T = 4{,}096$: 244,140,625 sequences, ${}10^{12}$ targets. Versus SQuAD's ~100,000 hand-written questions: ${}10^{7}$× more.
+- Hand-labelling at an assumed 10 s per label: ${}10^{6}$ labels = 2,778 h; ${}10^{12}$ labels ≈ **317,000 person-years** (1 year = 3.156 × 10⁷ s).
+- **Causal mask** ⇒ one forward pass over $T$ tokens gives $T$ honest predictions. Remove it and each position copies its answer.
+- **Pretrain once** (huge compute, raw text) → **adapt many times** (finetune a little, or prompt) = a **foundation model**.
+- Llama 3: pretrained on 15T+ tokens.
+
+## Loss, perplexity, bits per byte
+
+$$
+\ell = -\ln p(\text{true token}), \qquad \mathcal{L} = -\frac{1}{N}\sum_t \ln p_\theta(x_t \mid x_{<t}), \qquad \mathrm{PPL} = e^{\mathcal{L}}
+$$
+
+| $p$ | nats | bits | PPL (${}1/p$) |
+|---|---|---|---|
+| 1 | 0 | 0 | 1 |
+| 0.5 | 0.693 | 1 | 2 |
+| 0.25 | 1.386 | 2 | 4 |
+| 0.1 | 2.303 | 3.32 | 10 |
+| 0.01 | 4.605 | 6.64 | 100 |
+
+- **1 nat = 1/ln 2 = 1.443 bits.** Every halving of $p$ adds 0.693 nats = 1 bit.
+- Accuracy can't train: ignores confidence, flat almost everywhere (no slope), punishes honest uncertainty.
+- Gradient w.r.t. logits: $\partial \ell / \partial z_i = q_i - [i = y]$. E.g. $q = [0.25, 0.60, 0.15]$, true = 0 → $[-0.75, 0.60, 0.15]$.
+- PPL = 1 / geometric mean of $p$. Worked: $p$ = 0.10, 0.50, 0.80, 0.25 → losses 2.303, 0.693, 0.223, 1.386 → mean **1.151** nats → PPL **3.16**.
+- Uniform over $V$: loss $\ln V$, PPL $V$. GPT-2: $\ln 50{,}257$ = **10.82**. BERT: $\ln 30{,}522$ = 10.33. Llama 3: $\ln 128{,}256$ = 11.76.
+- Loss → PPL: 1 → 2.72 · 2 → 7.39 · 3 → 20.1 · 4 → 54.6. −0.1 nats = ×0.905 PPL (−9.5%).
+- **Floor:** $H(P,Q) = H(P) + D_{\mathrm{KL}}(P\|Q)$. Training shrinks only the KL. Shannon (1951): English ≈ 0.6–1.3 bits/character.
+- **Contamination:** PPL on a benchmark far below PPL on fresh, similar text ⇒ the test set probably leaked into training.
+- PPL compares only on the **same text and the same tokenizer**.
+
+$$
+\text{BPB} = \frac{\text{total nats}}{\ln 2 \times \text{UTF-8 bytes}} = \frac{\mathcal{L}_{\text{token}}}{\ln 2} \times \frac{\text{tokens}}{\text{bytes}}
+$$
+
+- Worked: A = 3.0 nats/token, 4 bytes/token → **1.082** BPB (PPL 20.1). B = 0.8 nats per byte-token → **1.154** BPB (PPL 2.23). A is better.
+
+## BERT (2018): the masked-word game
+
+- Wall: left-to-right models build each token from its left only. Deleting the causal mask lets a next-word model **copy** its answer. Gluing two one-way models (ELMo) stays shallow.
+- **MLM:** choose **15%** of tokens (never special) → **80%** `[MASK]`, **10%** random token, **10%** unchanged; predict all chosen from both sides. Loss only at chosen positions.
+- Per 512 tokens: **76.8** graded (61.4 / 7.7 / 7.7); 85% of positions give no signal. Random replacement = 1.5% of all tokens.
+- Input: `[CLS] A [SEP] B [SEP]`; embedding = token + segment ($E_A$/$E_B$) + position (learned, **512** max).
+- **NSP:** 50% IsNext / 50% NotNext from `[CLS]`. RoBERTa (2019): dropping it matched or slightly improved results.
+
+| | Layers | Hidden | Heads | MLP | Params |
+|---|---|---|---|---|---|
+| BERT-Base | 12 | 768 | 12 | 3,072 | 110M (109,482,240) |
+| BERT-Large | 24 | 1,024 | 16 | 4,096 | 340M |
+
+- Base count: embeddings 23,837,184 + 12 × 7,087,872 + pooler 590,592 = **109,482,240**. Base = GPT-1's size, on purpose.
+- Data: BooksCorpus **800M** words + English Wikipedia **2,500M** words. WordPiece, ~30,000 vocab (30,522).
+- Training: 256 × 512 = 131,072 tokens/batch × 1M steps ≈ 1.31 × 10¹¹ tokens ≈ **40 epochs** of 3.3B words. 90% of steps at length 128. Base: 16 TPU chips, Large: 64, **4 days** each.
+- Finetune: tiny head, all weights trained, 2–4 epochs, lr 2e-5 to 5e-5, **≤ 1 hour on one Cloud TPU**. Sentiment head ${}768 \times 2 + 2$ = 1,538; QA start/end ${}2 \times 768$ = 1,536.
+- Results: GLUE 80.5 (+7.7), MultiNLI 86.7% (+4.6), SQuAD 1.1 F1 93.2 (+1.5), SQuAD 2.0 F1 83.1 (+5.1).
+- Ablation (Base, SQuAD F1): MLM+NSP 88.5 · MLM only 87.9 · **left-to-right 77.8**.
+- Cost: ≈ 2 × 110M = 0.22 GFLOP/token, one pass, no KV cache. Paper: arXiv 1810.04805.
+
+## GPT-2 (2019): the next-word game
+
+- Wall: BERT needs a labelled dataset + head + finetuning run per task, and cannot write.
+- Bet: $p(\text{output} \mid \text{input}, \text{task})$ with the task **written as text**. No examples, no weight updates = **zero-shot**.
+- **WebText:** outbound Reddit links with **≥ 3 karma** (~45M links) → deduplicated, cleaned, Wikipedia removed → **~8M documents, 40 GB**.
+- **Byte-level BPE:** 256 bytes + **50,000** merges + 1 `<|endoftext|>` = **50,257**. No unknown token. No merges across character categories.
+- Changes from GPT-1: **pre-norm** (LayerNorm at each sub-block's input) + final LayerNorm; residual init × ${}1/\sqrt{N}$; context 512 → **1,024**; batch 512.
+
+| Paper | Released | Layers | $d$ | Heads | FP16 | KV/token FP16 |
+|---|---|---|---|---|---|---|
+| 117M | 124M | 12 | 768 | 12 | 0.25 GB | 36 KiB |
+| 345M | 355M | 24 | 1,024 | 16 | 0.71 GB | 96 KiB |
+| 762M | 774M | 36 | 1,280 | 20 | 1.55 GB | 180 KiB |
+| 1542M | 1.5B | 48 | 1,600 | 25 | 3.12 GB | 300 KiB |
+
+- 124M: 38,597,376 (tokens) + 786,432 (positions) + 12 × 7,087,872 + 1,536 = **124,439,808** (head tied). A GPT-2 block = a BERT-Base layer, weight for weight.
+- KV/token $= 2 \times L \times d \times 2$ bytes (full MHA). 1.5B: 300 KiB > Llama-3.1-8B's 128 KiB (GQA).
+- Prompts: `TL;DR:` + top-k ($k = 2$), 100 tokens; translation primed with `english = french` pairs; QA ends with `A:`.
+- Zero-shot SOTA on **7 of 8** LM benchmarks (not One Billion Word). LAMBADA PPL 99.8 → **8.63**, acc 59.23% → **63.24%**. WikiText-103 PPL 37.50 → 26.37 → 22.05 → 17.48 across sizes. Still underfits WebText.
+- Tasks: CoQA ~55 F1 (no training examples); summaries near weak baselines; En→Fr ~5 BLEU, Fr→En 11.5; Natural Questions ~4%.
+- Staged release: 124M Feb 2019 → 355M May → 774M Aug → **1.5B Nov 2019**.
+
+## Why decoders won
+
+| | Encoder | Decoder | Encoder–decoder |
+|---|---|---|---|
+| Mask | full | causal | full in, causal + cross out |
+| Graded per pass | ~15% | 100% | output tokens |
+| Generates | no | yes | yes |
+| KV cache | impossible | yes | decoder side |
+| Examples | BERT, RoBERTa, embedders | GPT-2, Llama, Qwen | Transformer (2017), T5, Whisper |
+
+- Supervision per pass: $T$ vs ${}0.15\,T$ → **6.67×**.
+- One interface: every task is text to continue → one model, one stack, mixed tasks in one batch.
+- Cacheable: old rows never see new tokens. Generating $n$ after $P$: decoder **$P + n$** token-forwards, re-reading encoder **$nP + n(n+1)/2$**. $P = n = 500$: 1,000 vs **375,250** (375×).
+- Cross-attention: queries from the decoder, keys/values from the encoder.
+- Encoders still win: **search embeddings, rerankers, classifiers**. 200 tokens: BERT-Base 44 GFLOP vs 8B decoder 3.2 TFLOP (**~73×**).
+
+## Lab checks
+
+- `bert-base-uncased` = 109,482,240 params; `gpt2` = 124,439,808.
+- Untrained GPT-2 loss ≈ ln 50,257 = 10.82 nats.
+- MLM collator: ~15% chosen, ~80/10/10. Causal / masked graded positions ≈ 6.7.
+- `model(ids, labels=ids).loss` = mean of $-\log p$ over shifted targets.
