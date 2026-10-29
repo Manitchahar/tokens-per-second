@@ -36,8 +36,10 @@ $$
 ## 2 · Multi-LoRA
 
 $$
-P_{\text{lora}} = r(in + out) \qquad \text{share} = \frac{r(in+out)}{in \cdot out}
+W' = W_0 + \frac{\alpha}{r} BA \qquad P_{\text{lora}} = r(in + out) \qquad \text{share} = \frac{r(in+out)}{in \cdot out}
 $$
+
+$\alpha/r$ is a fixed scale (`lora_alpha`, often $r$ or ${}2r$) that keeps the update's size stable across ranks; merge $\frac{\alpha}{r}BA$, not $BA$. The LoRA paper adapted only $W_q, W_v$ and found $r = 1$–8 enough for GPT-3; today's default is all linear layers with $r = 8$–64.
 
 Llama-3.1-8B (32 layers, $d=4096$, FFN 14336, 8 KV heads × 128):
 
