@@ -13,7 +13,8 @@ const tileBytes = BR * BC * BYTES;
 const sramBytes = 228e3; // H100 shared memory per SM, approximate
 
 /** FlashAttention's actual backward path needs two copies of Q, K, V in SRAM. */
-const stateBytes = (BR: number, bc: number) => BR * D * 2 * BYTES + 2 * bc * D * BYTES;
+// Q tile (BF16) + K and V tiles (BF16) + FP32 output accumulator + m and l (FP32); the score tile is added separately.
+const stateBytes = (BR: number, bc: number) => BR * D * BYTES + 2 * bc * D * BYTES + BR * D * 4 + 2 * BR * 4;
 
 const STEPS = [
   'One query tile, start to finish',
@@ -34,7 +35,7 @@ const CAPTIONS = [
   'Repeat for every key tile. On an H100 the loop runs about four times for 256 tokens of context, and sixteen times for 1,024. The final O is the same answer a two-pass softmax would give.',
   'After the last tile, divide O by ℓ — once, in registers, on a 64x128 tensor. This is the normalisation that eager attention applied to a whole T-by-T matrix.',
   'Because attention is causal, query tile i never needs key tile j for j greater than i. Those tiles are skipped: no load, no matmul. With 64-row tiles that removes a growing fraction of the work as context grows.',
-  'Nothing in this loop wrote S or P to HBM. Peak extra memory is Q plus one tile plus the three state vectors — about 45 KB instead of gigabytes.',
+  'Nothing in this loop wrote S or P to HBM. Peak extra memory is the Q tile, one K and V tile, the score tile, the FP32 output accumulator and m, ℓ — about 89 KB instead of gigabytes.',
 ];
 
 export default function FlashAttention() {
@@ -43,7 +44,8 @@ export default function FlashAttention() {
   const [keyTiles, setKeyTiles] = useState(4);
 
   const loops = Math.max(1, keyTiles);
-  const wasted = Math.round(((loops * (loops + 1)) / 2 / (loops * loops)) * 100);
+  const triTiles = (loops * (loops + 1)) / 2; // tiles on or below the diagonal, over all query tiles
+  const skippedPct = Math.round((1 - triTiles / (loops * loops)) * 100);
 
   const peak = stateBytes(BR, BC) + tileBytes;
   const eager = 2 * HEADS * 4096 * 4096 * BYTES;
@@ -57,6 +59,8 @@ export default function FlashAttention() {
   const cx = (i: number) => GX + i * (CELL + GAP);
   const cy = (i: number) => GY + i * (CELL + GAP);
   const gridSide = N * (CELL + GAP) - GAP;
+  // the highlighted query tile is the last one in this context: it sees key tiles 0..qi and nothing after
+  const qi = Math.min(keyTiles, N) - 1;
 
   return (
     <Stage
@@ -75,7 +79,7 @@ export default function FlashAttention() {
         <Readout items={[
           { label: 'Tile', value: `${BR} x ${BC}`, kind: 'compute', note: 'Q rows x K columns' },
           { label: 'Score tile', value: `${(tileBytes / 1024).toFixed(0)} KB`, kind: 'memory', note: 'in SRAM, never written' },
-          { label: 'Peak extra', value: `${(peak / 1024).toFixed(1)} KB`, kind: 'memory', note: 'Q + K/V + state' },
+          { label: 'Peak extra', value: `${(peak / 1024).toFixed(1)} KB`, kind: 'memory', note: 'Q, K, V, S + O, m, ℓ' },
           { label: 'Eager equivalent', value: fmt.gb(eager), kind: 'error', note: 'one layer, 4096 tokens' },
         ]} />
       }
@@ -112,9 +116,9 @@ export default function FlashAttention() {
           {/* the grid */}
           {Array.from({ length: N }, (_, i) =>
             Array.from({ length: N }, (_, j) => {
-              const isQ = i === 0;
-              const active = isQ && j < keyTiles && s.step >= 2;
-              const masked = isQ && j >= keyTiles;
+              const isQ = i === qi;
+              const active = isQ && j <= qi && s.step >= 2;
+              const masked = isQ && j > qi;
               return (
                 <rect key={`${i}-${j}`} x={cx(j)} y={cy(i)} width={CELL} height={CELL} rx={2}
                   fill={masked ? 'var(--error-dim)' : active ? 'var(--compute)' : isQ ? 'var(--compute-dim)' : j > i ? 'var(--error-dim)' : 'var(--ground-3)'}
@@ -127,16 +131,16 @@ export default function FlashAttention() {
           )}
 
           {/* query tile marker */}
-          <rect x={cx(0) - 2} y={cy(0) - 2} width={CELL + 4} height={CELL + 4} rx={3}
+          <rect x={cx(0) - 2} y={cy(qi) - 2} width={(qi + 1) * (CELL + GAP) - GAP + 4} height={CELL + 4} rx={3}
             fill="none" stroke="var(--compute)" strokeWidth={1.8} />
-          <Label x={cx(0)} y={cy(0) + CELL + 14} tone={3} size={9}>query tile</Label>
+          <Label x={GX + gridSide + 8} y={cy(qi) + 11} tone={3} size={9}>query tile</Label>
 
-          <Label x={GX + gridSide + 10} y={GY + 20} size={9} kind="error">masked</Label>
-          <Label x={GX + gridSide + 10} y={34} size={9} kind="error">above the</Label>
-          <Label x={GX + gridSide + 10} y={45} size={9} kind="error">diagonal</Label>
+          <Label x={GX + gridSide + 8} y={GY + 4} size={9} kind="error">masked:</Label>
+          <Label x={GX + gridSide + 8} y={GY + 15} size={9} kind="error">above the</Label>
+          <Label x={GX + gridSide + 8} y={GY + 26} size={9} kind="error">diagonal</Label>
         </Fade>
 
-        <Dim x1={GX} x2={GX + gridSide} y={GY + gridSide + 30} label={`${N * BR} x ${N * BC} tiles, ${N * BR} tokens`} kind="text" />
+        <Label x={GX} y={GY + gridSide + 22} tone={3} size={9}>{`${N} × ${N} tiles of ${BR} = ${N * BR} tokens (schematic)`}</Label>
 
         {/* ── the loop, drawn as a chain ──────────────────── */}
         <Label x={248} y={28} tone={2} size={11} mono={false} bold>One query tile, the whole loop</Label>
@@ -161,7 +165,7 @@ export default function FlashAttention() {
           <rect x={486} y={38} width={118} height={42} rx={3} fill="var(--ground-3)" stroke="var(--compute)" strokeWidth={1.3} />
           <Label x={545} y={55} anchor="middle" size={9.5} kind="compute" bold>update m, ℓ, O</Label>
           <Label x={545} y={70} anchor="middle" size={9.5}>online softmax</Label>
-          <Label x={545} y={92} anchor="middle" tone={3} size={9}>three vectors, in registers</Label>
+          <Label x={545} y={92} anchor="middle" tone={3} size={9}>kept on chip</Label>
         </Fade>
 
         {/* running state readout */}
@@ -179,14 +183,13 @@ export default function FlashAttention() {
               <text x={288 + k * 116} y={155} className="v-label" style={{ fontSize: 9, fill: 'var(--text-3)' }}>{what}</text>
             </g>
           ))}
-          <Label x={262} y={180} tone={3} size={9}>{`${BR} numbers, or ${BR} x ${D} for O — against ${fmt.gb(eager)} for the eager intermediate`}</Label>
+          <Label x={262} y={180} tone={3} size={9}>{`m, ℓ: ${BR} numbers · O: ${BR}×${D} · vs ${fmt.gb(eager)} eager`}</Label>
         </Fade>
 
         {/* loop count */}
         <Fade show={s.step >= 4}>
           <Arrow x1={545} y1={82} x2={410} y2={82} kind="compute" dashed curve={26} />
-          <Label x={478} y={112} anchor="middle" size={9.5} kind="compute">repeat for every key tile</Label>
-          <Label x={478} y={128} anchor="middle" tone={3} size={9}>{`${loops} times for this context`}</Label>
+          <Label x={604} y={105} anchor="end" size={9} kind="compute">{`repeat for every key tile: ${loops}× here`}</Label>
         </Fade>
 
         {/* divide once */}
@@ -199,15 +202,15 @@ export default function FlashAttention() {
         {/* causal savings */}
         <Fade show={s.step >= 6}>
           <Label x={40} y={292} tone={2} size={11} mono={false} bold>The mask is free speed</Label>
-          <Span x={40} y={304} w={200} h={16} kind="compute" dim label={`${loops} of ${loops * (loops + 1) / 2} tiles needed`} labelTone="light" />
-          <Span x={248} y={304} w={120} h={16} kind="error" dim label={`${wasted}% skipped`} labelTone="light" />
-          <Label x={40} y={338} tone={3} size={9.5}>{`causal work for ${loops} tiles = ${loops * (loops + 1) / 2} of ${loops * loops}; ${wasted}% is never loaded`}</Label>
+          <Span x={40} y={304} w={200} h={16} kind="compute" dim label={`${triTiles} of ${loops * loops} tiles computed`} labelTone="light" />
+          <Span x={248} y={304} w={120} h={16} kind="error" dim label={`${skippedPct}% skipped`} labelTone="light" />
+          <Label x={40} y={338} tone={3} size={9.5}>{`${loops} query tiles × ${loops} key tiles = ${loops * loops}; only ${triTiles} are on or below the diagonal, ${skippedPct}% never loaded`}</Label>
         </Fade>
 
         {/* the punchline */}
         <Fade show={s.step >= 7}>
           <Label x={40} y={358} tone={2} size={11} mono={false} bold>Peak extra memory, one program</Label>
-          <Span x={248} y={346} w={356} h={16} kind="memory" dim label={`${(peak / 1024).toFixed(1)} KB — Q tile + K/V tile + three state vectors`} labelTone="light" />
+          <Span x={248} y={346} w={356} h={16} kind="memory" dim label={`${(peak / 1024).toFixed(1)} KB — Q, K, V and score tiles + O, m, ℓ`} labelTone="light" />
         </Fade>
       </svg>
     </Stage>
