@@ -70,4 +70,14 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'BERT’s second pretraining task: decide from [CLS] whether segment B really followed segment A (50%) or is random text (50%). RoBERTa later showed it could be dropped without loss.',
     lesson: 'pretraining/bert',
   },
+  'byte-level-bpe': {
+    term: 'Byte-level BPE',
+    def: 'BPE whose base alphabet is the 256 possible bytes, so any string in any language can be encoded and there is no unknown token. GPT-2’s 50,257 tokens = 256 bytes + 50,000 merges + 1 end-of-text token.',
+    lesson: 'pretraining/gpt2',
+  },
+  webtext: {
+    term: 'WebText',
+    def: 'GPT-2’s training set: pages linked from Reddit posts with at least 3 karma, deduplicated and cleaned, with Wikipedia removed. Slightly over 8 million documents, about 40 GB of text.',
+    lesson: 'pretraining/gpt2',
+  },
 };
