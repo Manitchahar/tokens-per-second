@@ -1,0 +1,137 @@
+---
+title: 'Module B1 · Prompt Engineering'
+module: prompting
+---
+
+## Chat templates & system prompts
+
+A transformer reads **one stream of token IDs**. The chat template renders your list of messages into it.
+
+| | Llama 3 | ChatML (Qwen2.5) |
+|---|---|---|
+| start of sequence | `<\|begin_of_text\|>` (128000) | none |
+| open a turn | `<\|start_header_id\|>` role `<\|end_header_id\|>` `\n\n` | `<\|im_start\|>` role `\n` |
+| close a turn | `<\|eot_id\|>` (128009) | `<\|im_end\|>` (151645) `\n` |
+| generation prompt | 4 tokens | 3 tokens |
+| template tokens | ${}1 + 5m + 4$ for $m$ messages | ${}5m + 3$ |
+| "You are a terse assistant." + "What is a GPU?" | **26** tokens (11 yours) | **24** tokens (11 yours) |
+
+- Special tokens are reserved IDs past the learned vocabulary (Llama 3: 128,000 + 256 reserved = 128,256; Qwen: from 151,643).
+- **Always** render with `apply_chat_template` (`tokenize=False`, `add_generation_prompt=True`), print the result once per model, then tokenize with `add_special_tokens=False`.
+- Templates are code: Qwen2.5 inserts a default system prompt (21 tokens) if you send none; Llama 3.1 writes "Cutting Knowledge Date" and "Today Date" into the system block (12 → 32 tokens).
+- Silent template failures: wrong family's markers (Llama 3 string through Qwen = **72 tokens, 0 control tokens**), no template, no generation prompt, doubled `<|begin_of_text|>`, wrong stop token (Llama 3 instruct: stop on `<|eot_id|>` 128009, not only `<|end_of_text|>` 128001). They show up in eval scores, never as errors.
+- Users can type special tokens: by default the text `<|im_end|>` becomes token 151645. Escape user text or tokenize it with `split_special_tokens=True`.
+- The system prompt is **just the first tokens**: followed because finetuning rewarded it, not enforced.
+- A static prefix is cacheable: prefill of a 1,500-token system prompt on Llama-3.1-8B, H100 at 55%:
+
+$$
+\frac{2 \times 8.03 \times 10^{9} \times 1{,}500}{0.55 \times 989 \times 10^{12}} \approx 44\ \text{ms per request} \;\Rightarrow\; 12.3 \text{ GPU-hours per million requests}
+$$
+
+- **Static first, dynamic last.** One changed token near the top invalidates the whole cached prefix.
+- Stateless chat resends the history: $P_k = P_1 + \Delta(k-1)$; example ${}565 + 260(k-1)$ → 2,905 tokens at turn 10, 91% seen before; uncached total over 10 turns 17,350 vs 2,905 cached (grows with turns²).
+
+## Zero-shot, few-shot, in-context learning
+
+- Zero-shot = instruction only; one-shot = 1 example; few-shot = $k$ examples. No weight changes: in-context learning (GPT-3).
+- For instruction-tuned models examples mainly **pin the format**, draw **label boundaries**, show **style**. Gains concentrate in the first 2–3.
+- Start zero-shot with an explicit format; add an example only to fix an observed failure.
+- Min et al. (2022): random labels barely hurt; **label space, input distribution and format** matter. Generate the example block with code so every example has one format.
+- Biases (Zhao et al. 2021): majority label, **recency**, common token. Balance labels, interleave, never end on a run, fix the order.
+- Retrieved (dynamic) examples are more relevant but **not cacheable**: put them after the static instruction.
+- Reasoning models (DeepSeek-R1) do **worse** few-shot: prompt them zero-shot.
+
+$$
+\text{extra input tokens/day} = k \times t_{\text{ex}} \times R
+$$
+
+| $k = 5$, $t_{\text{ex}} = 200$, $R = 100{,}000$ | 100 M tokens/day |
+|---|---|
+| at \$0.15 / M (GPT-4o mini launch, Jul 2024) | \$15/day, \$5,475/yr |
+| at \$2.50 / M (GPT-4o, Aug 2024) | \$250/day, \$91,250/yr |
+| prefill latency (8B, H100, 55%) | ≈ 29.5 µs/token → **30 ms** per call |
+| self-hosted compute for 100 M tokens | 1.6 × 10¹⁸ FLOP ≈ 0.82 H100-hours/day |
+
+## Writing prompts
+
+- Brief a capable new colleague: **task** (explicit verb, audience, constraints), **context** (facts it cannot know, only the relevant ones, plus a way out: "escalate if not covered"), **format** (like a function signature, one example, structured output when parsed), **persona** (tone, not knowledge).
+- Say what to do ("at most 120 words"), not only what not to do. Resolve contradictions.
+- Wrap data in labelled delimiters (`<ticket>…</ticket>`) and refer to them by name.
+
+**Chains** (router → focused prompt):
+
+$$
+p_{\text{chain}} = \prod_i p_i \qquad p_{\text{router}}^{*} = \frac{p_{\text{mono}}}{p_{\text{sub}}}
+$$
+
+| Example | Monolith | Chain |
+|---|---|---|
+| accuracy (illustrative) | 82% | 0.97 × 0.94 = **91.2%** (break-even router 87.2%) |
+| input tokens / ticket | 3,150 | 550 + 850 = **1,400** (−56%) |
+| output tokens | 250 | 253 (router outputs a 3-token label) |
+| time to first token (8B, H100, +50 ms/call) | 143 ms | 164 ms; cached 54 vs 131 ms |
+
+- Five stages at 95% each: ${}0.95^5 = 77.4\%$. Long chains need very accurate stages.
+- Keep the router's output a label (each token ≈ 7.5 ms of decode); add an OTHER fallback; test each stage alone; run independent stages in parallel.
+
+## Chain of thought & test-time compute
+
+- Each output token = one forward pass. Writing steps first = more serial computation the answer can read.
+- Few-shot CoT (Wei et al. 2022): ~18% → ~57% on GSM8K for PaLM 540B. Equation-only, filler dots and reasoning-after-answer did **not** help.
+- Zero-shot CoT (Kojima et al. 2022): "Let's think step by step" + answer extraction: MultiArith 17.7% → 78.7%, GSM8K 10.4% → 40.7% (text-davinci-002).
+- **Reasoning before the answer**, including JSON field order; end with a fixed "The answer is N" line.
+- Self-consistency (Wang et al. 2022): sample N, majority-vote the final answer; +17.9 points on GSM8K for PaLM 540B. Needs a comparable final answer.
+- Vote with one dominant wrong answer, N = 3: $P = p^3 + 3p^2(1-p)$: 0.6 → 0.648, but 0.4 → 0.352. The vote amplifies the model's most common answer.
+- Best-of-N with a verifier (Cobbe et al. 2021): 6B + verifier slightly beat a finetuned 175B on GSM8K (≈ 30× model size). Large N finds the verifier's mistakes; prefer programmatic checks.
+
+| Method | Output tokens | 8B, H100, batch 1 |
+|---|---|---|
+| direct | 5 | 38 ms |
+| chain of thought | 250 | 1.9 s |
+| self-consistency N=5, batched | 1,250 | 1.9 s |
+| self-consistency N=32, batched / sequential | 8,000 | 2.0 s / 60 s |
+| reasoning model | ~2,000 | ~15 s |
+
+- Batched paths are nearly free in latency because decode is memory-bound (7.5 → 8.1 ms/step for 1 → 32 paths).
+- Reasoning models: no "think step by step", zero-shot, smallest thinking budget that works; reasoning tokens are billed and timed as output.
+
+## Long prompts: lost in the middle
+
+- Accuracy vs position of the relevant document is **U-shaped** (Liu et al. 2023): primacy > recency > middle; for GPT-3.5-Turbo with 20 documents the middle fell **below closed-book**.
+- Appears at 1.4K–4K tokens; extended-window versions did not use the same context better; query before and after fixed key-value lookup but barely helped QA; more than ~20 retrieved documents added little.
+- Needle in a haystack = one literal fact, no distractors: necessary, not sufficient. RULER (2024): ~half the models claiming ≥ 32K held up at 32K → **effective context length**.
+- Cost: prefill ≈ 29.5 µs/token (8B, H100); KV = ${}2 \times 32 \times 8 \times 128 \times 2$ = 131,072 B/token; 128K tokens = 16.8 GB KV and ≈ 3.8 s linear prefill (+ about as much again in attention).
+- Placement rules: instructions first, **question (and key instruction) last**, rank passages best-first (toy: 57.6% random → 69.3%), fewer better passages, quote-then-answer, label passages and cite, test positions in evals.
+
+## Versioning, testing & optimizing prompts
+
+- A prompt is a triple **(text, model, sampling settings)**; a change to any one is a new version. Pin dated model snapshots.
+- One file per prompt with a header (id, version, model, temperature, owner, eval); log the version on every request; production points at a version so rollback is one line.
+- Eval set from real traffic; add every production failure.
+
+$$
+\text{95\% half-width} = 1.96\sqrt{\frac{p(1-p)}{n}}
+$$
+
+| $p = 0.85$ | n = 50 | 200 | 1,000 | 2,000 | ±1 pt needs |
+|---|---|---|---|---|---|
+| half-width | ±9.9 | ±4.9 | ±2.2 | ±1.6 | n ≈ 4,900 |
+
+- Paired comparison: only disagreements matter; 20 vs 10 of 30 → one-sided 0.049, two-sided ≈ 0.10.
+- Release gate in CI: candidate ≥ production − margin; then canary and watch live metrics per version.
+- Prompt catalog: purpose, owner, live version, model, score, consumers.
+- Optimizers: APE, OPRO (model proposes instructions), DSPy (signatures + modules + optimizer bootstraps demonstrations, scores candidates).
+
+$$
+\text{compile calls} = B \cdot c + C \cdot D \cdot c = 100 \times 3 + 16 \times 200 \times 3 = 9{,}900
+$$
+
+- ≈ 14.85 M input + 1.98 M output tokens: \$3.42 (\$0.15/\$0.60) to \$56.93 (\$2.50/\$10) per compile, dated prices.
+- Recurring cost dominates: +1,500 prompt tokens × 100,000 calls/day = 150 M tokens/day.
+- Best of many noisy scores is biased up: confirm on a held-out test set.
+
+## Lab
+
+- Qwen2.5-1.5B-Instruct (≈ 3.1 GB FP16) on a T4, 50 GSM8K problems: zero-shot, few-shot, chain of thought, self-consistency (N = 5).
+- Qwen2.5 ships `do_sample=True`: pass decoding as explicit `generate()` kwargs when comparing prompts.
+- n = 50 → ±13 points at 65%: trust only large gaps.
