@@ -141,6 +141,9 @@ out = model(input_ids=nxt, past_key_values=out.past_key_values, use_cache=True) 
 model.generate(..., use_cache=False)                    # the naive reference
 ```
 
+- Three moves: `use_cache=True`, thread `past_key_values` back each call, feed **only the new token** (`input_ids` shape `[batch, 1]`). The cache is a `DynamicCache` (`past.get_seq_length()` = rows held); Qwen2.5-0.5B costs 12 KiB/token in FP16.
+- Reported (Qwen2.5-0.5B, 100 tokens): **9.12 s without cache, 3.14 s with: 2.9×**. The arithmetic saved is ~58× (20-token prompt: 6,950 → 119 positions); the rest is per-step overhead (~31 ms/step), which the cache does not touch.
+
 ## Vocabulary
 
 | Term | Meaning |

@@ -234,6 +234,52 @@ You will see something like **1.8e-06** for the difference and `True` for the ar
   A cache bug is not a crash. It is a model that is slightly, subtly wrong, and the wrongness grows with context length, which is precisely where nobody tests. **Any time you touch a cache, run the equivalence test at two context lengths: one short and one long.** The short one catches logic errors; the long one catches layout and masking errors.
 </Callout>
 
+### The same cache, through the Hugging Face interface
+
+You will rarely call your own `Cache` class in practice. Hugging Face Transformers, which most notebooks and many prototypes use, exposes exactly the structure you just built through three moves:
+
+1. **`use_cache=True`** tells the model to return its keys and values instead of throwing them away.
+2. **`past_key_values`** is the returned cache object. You hand it back on the next call, and the model appends one row per layer to it.
+3. **Feed only the new token.** After prefill, each call gets `input_ids` of shape `[batch, 1]`: the token you just sampled. Everything older is already in `past_key_values`.
+
+```python
+import time, torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, device_map="cuda").eval()
+
+@torch.inference_mode()
+def greedy(prompt, n=100, use_cache=True):
+    ids = tok(prompt, return_tensors="pt").input_ids.to(model.device)
+    out = model(input_ids=ids, use_cache=use_cache)            # prefill: the whole prompt, once
+    past = out.past_key_values if use_cache else None
+    nxt = out.logits[:, -1:].argmax(-1)                        # [1, 1]
+    for _ in range(n - 1):
+        if use_cache:
+            out = model(input_ids=nxt, past_key_values=past, use_cache=True)  # ONE token in
+            past = out.past_key_values                         # one row longer per layer
+        else:
+            ids = torch.cat([ids, nxt], dim=-1)
+            out = model(input_ids=ids, use_cache=False)        # the whole sequence, again
+        nxt = out.logits[:, -1:].argmax(-1)
+    return past
+
+for flag in (False, True):
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    past = greedy("Explain the KV cache in one paragraph.", use_cache=flag)
+    torch.cuda.synchronize(); print(flag, f"{time.perf_counter() - t0:.2f} s")
+
+print(past.get_seq_length())          # prompt length + 99: the rows the cache holds
+```
+
+The object in `past` is a `DynamicCache` at the time of writing: per layer, a key and a value tensor shaped `[batch, kv_heads, tokens, head_dim]`, grown by one position each call (the `DynamicCache` versus `StaticCache` distinction in the callout below). For Qwen2.5-0.5B that is 24 layers × 2 KV heads × 64 dims, so in FP16 each token costs ${}2 \times 24 \times 2 \times 64 \times 2 = 12{,}288$ bytes, 12 KiB. `model.generate()` does all of this for you, and `model.generate(..., use_cache=False)` switches it off.
+
+**What it buys, measured.** One reported run of this comparison on Qwen2.5-0.5B (in *Hands-On LLM Serving and Optimization*, Wang & Hu) generated 100 tokens in **9.12 s without a cache and 3.14 s with one: 2.9× faster**.
+
+Is 2.9× the number the arithmetic predicts? With a prompt of about 20 tokens, the no-cache loop processes ${}20 + 21 + \dots + 119 = 6{,}950$ token positions; the cached loop processes ${}20 + 99 = 119$. That is **58× less arithmetic**, yet only 2.9× less time. The gap is the lesson from [Why naive generation wastes almost everything](/learn/kv-cache/recompute-waste/): a 0.5B model in an eager Python loop spends most of each step on fixed costs (Python, kernel launches, small-matrix inefficiency) that do not shrink when the step gets smaller. Divide it out: 3.14 s over 100 steps is about 31 ms per step even with the cache, and most of those 31 ms are overhead, the target of Module 15's CUDA graphs. The cache's win grows with model size and context length, because those are what make the recomputed arithmetic, rather than the overhead, dominate the step.
+
 ### Batching: where the cursor stops being one number
 
 With one sequence, `cache.t` is a single integer. With a batch of 32, it cannot be, because sequence 7 might be at token 200 while sequence 30 has only just started. So the cache grows a **length per batch row**:
@@ -269,7 +315,7 @@ Then attention reads rows 0 to `int(self.lengths.max())` and masks out everythin
   3. Write at index *t*, read 0 … *t*. The slice `cache[:, :, :t]` **is** the causal mask.
   4. Token index last in the shape means consecutive tokens are contiguous, so reading the history is one coalesced strided walk.
   5. The write is one row, O(1) and constant for the life of the request. The read is O(t). Everything downstream inherits that asymmetry.
-  6. Prove correctness by comparing against `use_cache=False`: same tokens, and logits agreeing to about 10⁻⁶ in FP32. Always test at two context lengths.
+  6. Prove correctness by comparing against `use_cache=False`: same tokens, and logits agreeing to about 10⁻⁶ in FP32. Always test at two context lengths. In Hugging Face Transformers the cache is `use_cache=True` plus `past_key_values` handed back each call, with only the new token as input; a reported Qwen2.5-0.5B run went from 9.12 s to 3.14 s for 100 tokens (2.9×), far less than the arithmetic saved, because the small model is overhead-bound.
   7. `torch.cat` every step copies 1 + 2 + … + t rows: **524,800 rows** for a 1,024-token request where 1,024 would do.
   8. Batched caches need a length **per row**, not one cursor, plus a mask — which is why batch memory is `max length × batch`.
   9. A static buffer is mostly empty: 8,192 rows reserved, 1,024 used, 87% wasted per request. Paged attention exists to fix precisely this.
@@ -282,4 +328,5 @@ Then attention reads rows 0 to `int(self.lengths.max())` and masks out everythin
   { q: 'You append with torch.cat on every step of a 1,024-token generation. How many cache rows get copied in total?', numeric: true, answer: 524800, tolerance: 5000, unit: 'rows', why: '1 + 2 + … + 1,024 = 1,024 × 1,025 / 2 = 524,800 rows. The request needed 1,024, so concatenation costs 512× the memory traffic and undoes the entire benefit of caching.' },
   { q: 'What does reading cache[:, :, :t] accomplish, and why is there no separate mask?', options: ['Nothing; attention always needs a mask', 'It returns exactly the valid prefix, so the causal mask is expressed as the slice itself', 'It rotates the keys in place', 'It pads the sequence to max_len'], answer: 1, why: 'Rows 0 to t-1 are the whole conversation so far and everything above is zeros. Every token in the query is allowed to attend to all of them, which is precisely what causal attention means for the last token.' },
   { q: 'Why does a batched KV cache need a separate length for each sequence in the batch?', options: ['Because sequences have different vocabularies', 'Because sequences in a batch reach different lengths, so one shared cursor would overwrite other rows', 'Because the GPU requires uniform tensors', 'To allow different batch sizes per step'], answer: 1, why: 'Sequence 7 may be at token 200 while sequence 30 has just started. A single shared cursor would write into rows another sequence still needs. Engines keep a length per row and mask the padding, which is why batch memory scales with the longest sequence rather than the average.' },
-] } />
+  { q: 'A reported run generated 100 tokens on Qwen2.5-0.5B in 9.12 s without a KV cache and 3.14 s with one. What is the speedup?', numeric: true, answer: 2.9, tolerance: 0.1, unit: '×', why: '9.12 ÷ 3.14 = 2.90×. The cache removed about 58× of the arithmetic for a ~20-token prompt (6,950 token positions down to 119), but at ~31 ms per cached step the small model is dominated by fixed per-step overhead, which the cache does not touch.' },
+]} />
