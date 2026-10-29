@@ -1,0 +1,250 @@
+---
+title: 'Why a base model does not answer you'
+summary: 'Pretraining builds a document completer, not an assistant. See why a question gets more questions back, why the training objective actively prefers that, and the three-stage recipe (pretraining, supervised finetuning, preference tuning) that turns autocomplete into something that answers you.'
+objectives:
+  - Explain, in terms of the pretraining objective, why a base model often answers a question with more questions
+  - Show with a worked cross-entropy example that pretraining loss is minimised by imitating the mix of documents, not by being helpful
+  - Make a base model answer with a prompt format, and name the two problems that trick cannot fix
+  - Name the three training stages and what each one teaches the model
+  - Compute the share of training compute each stage took for InstructGPT
+---
+import BaseVsAssistant from '@/components/viz/alignment/BaseVsAssistant.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Download a small model from Hugging Face, the one *without* "Instruct" in its name: `Qwen/Qwen2.5-0.5B`. Load it, type *"What is the capital of France?"*, and let it generate. There is a good chance it does not say "Paris". It says:
+
+*"What is the capital of Germany? What is the capital of Italy? What is the capital of Spain?"*
+
+and keeps going until you cut it off.
+
+Nothing is broken. This model was trained, at enormous cost, to do exactly one thing, and it is doing it well. The thing it was trained to do just is not "answer the person typing". This module is about the short, cheap, surprisingly powerful stretch of training that closes that gap: how a document completer becomes an assistant. It is also where many of the behaviours you will later serve come from: how long answers are, whether the model stops by itself, when it refuses, and when it makes things up.
+
+## A document completer meets a question
+
+Go back to *Free labels: learning from raw text* (Module 3A). Pretraining takes a mountain of text and asks the model, at every position, to predict the next token. That is the whole job. The model never sees a user, a conversation or a request. It sees **documents**: web pages, books, code, forum threads, worksheets. A model that has had this training and nothing else is called a <Term t="base-model">base model</Term>.
+
+So when you type a question, the model does not hear a question. It sees the first line of some document, and it asks itself the only thing it knows how to ask: *what kind of page starts like this, and how does it usually go on?*
+
+The visual follows that one question through three ways of asking. Watch the colours: green bars are tokens that lead to an answer, red bars are tokens that lead somewhere else.
+
+<Scrolly>
+  <BaseVsAssistant client:visible slot="stage" />
+
+  <Step title="1. A question, to a base model">
+    The prompt is one line of text. The model is a **base model**: pretraining only, nothing after. Its entire experience of the world is predicting the next token of documents written by other people.
+  </Step>
+
+  <Step title="2. It continues the document">
+    The likeliest next token is a **newline**, and after it the likeliest line is another "What is the capital of …?". Only about a quarter of the probability goes to tokens that start an answer. The model knows Paris; it just does not think this is the moment to say it.
+  </Step>
+
+  <Step title="3. Where that line lives">
+    On the web this line appears in **geography quizzes** (followed by question 13), in **forum threads** (followed by an answer) and in **worksheets** (followed by options A, B, C). The next-token distribution is a census of those documents.
+  </Step>
+
+  <Step title="4. The objective rewards the mix">
+    Pretraining minimises cross-entropy, and **the minimum is the true mix**. A model that always tried to answer would score 0.79 nats *worse* on this line. As far as pretraining is concerned, helpfulness is an error to be corrected.
+  </Step>
+
+  <Step title="5. Disguise the prompt as a document">
+    Write "Q: … A:" and an answer becomes the natural next line: **93%** of the mass now starts an answer. But after "Paris" the model writes the next Q, because Q/A pages hold many pairs. It answers, then rambles.
+  </Step>
+
+  <Step title="6. An assistant answers, then stops">
+    The **assistant** checkpoint sees the question wrapped in a chat template. It answers in one sentence and emits the **end-of-turn token**. Same architecture, same parameter count, different weights from a little extra training.
+  </Step>
+
+  <Step title="7. What not stopping costs">
+    Every generated token is one full forward pass. A base model behind a chat endpoint burns decode steps until `max_new_tokens`; the assistant spends **8**. Drag the slider: only the red bars grow.
+  </Step>
+
+  <Step title="8. Three stages, very unequal">
+    For InstructGPT, pretraining took **98.2%** of the training compute, supervised finetuning **0.13%**, and RLHF **1.6%**. Two slivers of training change the model's behaviour completely and its knowledge hardly at all.
+  </Step>
+</Scrolly>
+
+The probabilities in the visual are illustrative: they have the shape you get from a small base model, but they are not a measurement. The *Try it* box below prints the real ones for Qwen2.5-0.5B in ten lines of code.
+
+## Then derive it properly
+
+### What pretraining actually rewards
+
+Recall the loss from *Cross-entropy, perplexity & bits per byte* (Module 3A). At each position the model outputs a distribution $p$ over the vocabulary, the true next token is $x$, and the loss is $-\log p(x)$, averaged over every position of every document.
+
+Now fix one context, the line *"What is the capital of France?"*, and look at every place it occurs in the training data. Some fraction of the time it is followed by another question, some by an answer, some by options. Call that empirical mix $q$. Averaged over all those occurrences, the loss of a model that predicts $p$ is
+
+$$
+\mathcal{L}(p) = -\sum_i q_i \log p_i .
+$$
+
+This expression can be split into two pieces, and the split is the most useful identity in this module:
+
+$$
+-\sum_i q_i \log p_i \;=\; \underbrace{-\sum_i q_i \log q_i}_{H(q):\ \text{fixed by the data}} \;+\; \underbrace{\sum_i q_i \log \frac{q_i}{p_i}}_{\mathrm{KL}(q\,\|\,p)\ \ge\ 0} .
+$$
+
+The first term is the **entropy** of the data: how unpredictable the documents genuinely are. The model cannot change it. The second term is the <Term t="kl-divergence">KL divergence</Term> from $q$ to $p$: a measure of how far the model's distribution is from the data's. It is never negative, and it is zero only when $p = q$ exactly. So the loss is smallest, and gradient descent pushes hardest, toward **one answer: reproduce the mix**. Not the helpful continuation. Not the correct continuation. The *typical* one.
+
+<Callout type="math" title="Worked: the price of being helpful">
+  Group the continuations into three kinds and suppose the data says $q$ = 55% another question, 30% an answer, 15% a list of options. (These shares are invented for the example; real ones would come from counting.)
+
+  A model that imitates the mix exactly, $p = q$, pays only the entropy:
+
+  $$
+  -(0.55 \ln 0.55 + 0.30 \ln 0.30 + 0.15 \ln 0.15) = 0.329 + 0.361 + 0.285 = 0.975\ \text{nats}.
+  $$
+
+  A model with a helpful streak, $p$ = 10% / 85% / 5%, pays
+
+  $$
+  -(0.55 \ln 0.10 + 0.30 \ln 0.85 + 0.15 \ln 0.05) = 1.266 + 0.049 + 0.449 = 1.765\ \text{nats}.
+  $$
+
+  The difference, 0.79 nats, is exactly $\mathrm{KL}(q\,\|\,p)$. Every time the helpful model meets this line in training, the gradient pushes it back toward the census. **The pretraining objective does not merely ignore helpfulness; it penalises it** whenever the data is not itself helpful.
+</Callout>
+
+This is the problem the rest of the module solves. It also explains why the fix cannot be "train longer" or "train bigger". A bigger base model is a *better census*, so it imitates the document mix more faithfully, not less. The OpenAI team that built InstructGPT described the gap this way: the language-modelling objective is *"misaligned"* with the goal of following a user's instructions helpfully and safely (Ouyang et al., 2022).
+
+<Callout type="intuition" title="A census, not a character">
+  It helps to stop picturing the base model as a person who is being unhelpful. Picture a vast statistical record of how text goes on. Ask it a question and it reports how pages that start with your question tend to continue. It has no stake in your question at all.
+
+  An assistant is a model whose record has been reshaped so that, in a particular format, one kind of document dominates: a helpful reply, followed by the end of the turn.
+</Callout>
+
+### The prompting trick, and what it cannot fix
+
+You met the first workaround in *GPT-3: learning from the prompt* (Module 3B). If the model continues documents, write the start of a document in which an answer is the natural next line:
+
+```text
+Q: What is the capital of France?
+A:
+```
+
+In transcripts, an answer follows `A:`, so the probability of answering jumps (93% in the visual). Add two or three worked Q/A pairs above it and it climbs further. That is few-shot prompting, and for a couple of years it was how people used these models.
+
+It is a real technique and you will use it again. But it leaves two problems untouched.
+
+1. **The model does not know when it is done.** A page of Q/A pairs rarely ends after one pair, so after "Paris" the likeliest continuation is the next `Q:`. Base models do learn a document-boundary token (the end-of-text marker between documents in the training stream, a kind of <Term t="eos">EOS token</Term>), but they emit it only when a *document* would end. You end up writing stop-string rules by hand, and they break the moment the format changes.
+2. **The model imitates the average page, warts and all.** If most pages that look like your prompt contain a confident wrong answer, a rude reply or unsafe advice, so will the continuation. Prompting chooses *which documents* the model imitates; it cannot make the output better than those documents.
+
+There is a third, practical problem: **fragility**. Change `A:` to `Answer:`, or add a blank line, and the answer rate moves. A product cannot be built on a model whose behaviour depends on punctuation in the prompt.
+
+### The fix: train the behaviour in
+
+If the census is the problem, change the census. Everything that happens to a model after pretraining is called <Term t="post-training">post-training</Term>, and its first job is exactly this: show the model new documents of exactly the kind you want: a user turn, then a helpful assistant turn, then an end-of-turn marker. Train on them until that document type dominates whenever the model sees the chat format. That is the recipe, in three stages:
+
+| Stage | Training data | What it teaches | InstructGPT-175B compute |
+|---|---|---|---|
+| 1 · **Pretraining** | ~300 billion tokens of web text, books, code | language, facts, skills, styles | 3,640 PF-days |
+| 2 · **Supervised finetuning** (SFT) | 12,725 prompts with responses written by people | the *format*: answer the user, in turns, then stop | 4.9 PF-days |
+| 3 · **Preference tuning** (here RLHF) | rankings on 33k prompts, then RL on 31k prompts | *which* of its possible answers people prefer | 60 PF-days |
+
+A petaflop/s-day (PF-day) is a computer running at ${}10^{15}$ FLOP/s for a whole day: ${}10^{15} \times 86{,}400 = 8.64 \times 10^{19}$ FLOPs. The three compute figures are the ones the InstructGPT paper reports for its 175B models (the GPT-3 figure is the pretraining cost of the model it started from).
+
+<Callout type="math" title="Worked: where the compute went">
+  First, check the pretraining number with the rule from *Counting training compute: C ≈ 6ND* (Module 3B). GPT-3 has $N = 175 \times 10^9$ parameters and was trained on $D = 300 \times 10^9$ tokens:
+
+  $$
+  C \approx 6ND = 6 \times 175 \times 10^{9} \times 300 \times 10^{9} = 3.15 \times 10^{23}\ \text{FLOPs}
+  $$
+
+  $$
+  \frac{3.15 \times 10^{23}}{8.64 \times 10^{19}} = 3{,}646\ \text{PF-days} \approx 3{,}640.
+  $$
+
+  Now the shares. The total is ${}3{,}640 + 4.9 + 60 = 3{,}704.9$ PF-days, so
+
+  $$
+  \text{pretraining} = \tfrac{3{,}640}{3{,}704.9} = 98.2\%, \quad \text{SFT} = \tfrac{4.9}{3{,}704.9} = 0.13\%, \quad \text{RLHF} = \tfrac{60}{3{,}704.9} = 1.6\%.
+  $$
+
+  Under 2% of the compute turned GPT-3 into a model that labelers preferred most of the time. Lesson 3C.4 has the numbers.
+</Callout>
+
+Read the "What it teaches" column carefully, because the whole module hangs on it. **Stage 1 puts the knowledge in.** Stages 2 and 3 mostly do not add knowledge; they change which of the model's existing behaviours comes out when someone asks it something. The Q/A trick already showed the knowledge was there: the base model knew Paris all along. Lesson 3C.2 meets a paper (LIMA) that pushes this idea to an extreme, and lesson 3C.6 shows what goes wrong when finetuning tries to teach facts the model never learned.
+
+<Callout type="real" title="The recipe since 2022">
+  InstructGPT's three stages are still the skeleton of post-training, but the flesh has grown. At the time of writing, open-model reports describe several rounds of SFT and preference tuning, much larger preference sets, preference methods that skip the RL step (lesson 3C.5, DPO), and for reasoning models long reinforcement-learning runs that cost far more than InstructGPT's 60 PF-days. The proportions vary by lab and are often not published. The division of labour has held up: pretraining builds the knowledge, post-training shapes the behaviour.
+</Callout>
+
+### Base and instruct checkpoints in the wild
+
+Open-model families usually ship both halves of this story side by side:
+
+| Base checkpoint | Assistant checkpoint |
+|---|---|
+| `Qwen/Qwen2.5-0.5B` | `Qwen/Qwen2.5-0.5B-Instruct` |
+| `meta-llama/Llama-3.1-8B` | `meta-llama/Llama-3.1-8B-Instruct` |
+
+Open their `config.json` files and they are identical: the same layers, heads and hidden size. The weights file is the same size and every token costs exactly the same to compute. The difference is entirely in the *values* of the weights, and therefore in what comes out.
+
+For an inference engineer that difference is not cosmetic. The cost of a request is roughly proportional to the number of tokens generated, since each one is a full forward pass (*The whole forward pass*, Module 03). An assistant that answers in 8 tokens and stops is cheap. A base model asked the same thing runs until `max_new_tokens`: at 256, that is 32 times the decode work for a worse answer. You will choose between these checkpoints in *Choosing an open model* (Module 04), and the special tokens that mark the turns are the subject of [Chat templates & system prompts](/learn/prompting/chat-templates/) (Module B1).
+
+Base checkpoints are not useless. They are the usual starting point for your own finetuning (Module B5), they are better calibrated about their own uncertainty (lesson 3C.6), and for pure completion tasks, such as continuing code in an editor, completing documents is exactly the job.
+
+<Callout type="pitfall" title="A base model behind a chat endpoint">
+  A very common first-week mistake: serving a base checkpoint through an OpenAI-style `/v1/chat/completions` endpoint. The server applies a chat template the model was never trained on (or none at all), the model treats the special tokens as unfamiliar text, and every request runs to `max_tokens`. Latency looks terrible, the GPU is busy generating rubbish, and nothing in the logs says why. If replies never stop by themselves, check the checkpoint name before you check anything else.
+</Callout>
+
+<Callout type="try" title="Print the real distributions">
+  On a free Colab T4 this takes a minute. It prints the five likeliest next tokens for the plain question and the Q/A format on the base model, then for the chat format on the instruct model.
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def top_next(name, text, k=5):
+    tok = AutoTokenizer.from_pretrained(name)
+    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).to("cuda")
+    ids = tok(text, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        logits = model(**ids).logits[0, -1].float()
+    probs = torch.softmax(logits, dim=-1)
+    top = torch.topk(probs, k)
+    print(name)
+    for p, i in zip(top.values, top.indices):
+        print(f"   {tok.decode(i)!r:>14}  {p.item():6.1%}")
+
+q = "What is the capital of France?"
+top_next("Qwen/Qwen2.5-0.5B", q)
+top_next("Qwen/Qwen2.5-0.5B", f"Q: {q}\nA:")
+
+chat_tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+chat = chat_tok.apply_chat_template([{"role": "user", "content": q}],
+                                    tokenize=False, add_generation_prompt=True)
+print(chat)          # the template adds a default system turn for Qwen2.5
+top_next("Qwen/Qwen2.5-0.5B-Instruct", chat)
+```
+
+  Then generate 60 tokens greedily from each and count how many are an answer. Your numbers will differ from the visual's; the pattern should not.
+</Callout>
+
+## What the rest of this module builds
+
+Each remaining lesson answers a problem the previous one leaves open:
+
+- **3C.2 Supervised finetuning.** Show the model examples of the documents you want. Why the loss must ignore the prompt, and why 1,000 good examples can beat 50,000 mediocre ones.
+- **3C.3 Preference data & reward models.** Writing ideal answers is slow and inconsistent; *comparing* two answers is fast. Turn comparisons into a score with one formula.
+- **3C.4 RLHF.** Use that score to train the model, without letting it wander off and fool the scorer.
+- **3C.5 DPO.** Get the same effect with one supervised-looking loss, no reward model and no sampling loop.
+- **3C.6 Hallucination.** Why a model trained this way still states false things confidently, and what actually helps.
+- **3C.7 Lab.** Train a small reward model on real preference data, then use it to pick the best of four answers.
+
+<KeyNotes>
+  1. A **base model** is trained only to predict the next token of documents. A question is, to it, the first line of a document, and it continues the way such documents usually continue.
+  2. For a fixed context, pretraining loss is $H(q) + \mathrm{KL}(q\,\|\,p)$, minimised exactly when the model reproduces the mix of continuations in the data. In the worked example, imitating the mix costs 0.975 nats and a helpful-leaning model 1.765 nats: the objective penalises helpfulness.
+  3. Prompt formats like `Q: … A:` make an answer the likely continuation, but they cannot teach the model **when to stop**, cannot lift quality above the documents it imitates, and are fragile to small format changes.
+  4. The recipe has three stages: **pretraining** (knowledge and language), **supervised finetuning** (the format and role of an assistant), and **preference tuning** (which answers people prefer).
+  5. For InstructGPT-175B the compute was 3,640, 4.9 and 60 petaflop/s-days: **98.2%, 0.13% and 1.6%**. The 3,640 checks out against $C \approx 6ND$: 3.15 × 10²³ FLOPs.
+  6. Base and instruct checkpoints share architecture, size and per-token cost. They differ in their weights, and therefore in how many tokens they generate and whether they stop by themselves.
+  7. Stopping is a learned behaviour: the end-of-turn token must be in the finetuning data. A model that never stops runs to `max_new_tokens`, and each of those tokens is a full forward pass you pay for.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'Why does a base model often answer “What is the capital of France?” with “What is the capital of Germany?”', options: ['It does not know the answer', 'Its training rewards reproducing how documents containing that line usually continue, and many such documents are quizzes', 'Its sampling temperature is set too high', 'Base models are too small to answer questions'], answer: 1, why: 'Pretraining minimises cross-entropy against real documents, and the minimum is the true mix of continuations. Quiz pages follow a question with another question, so that continuation gets a large share of the probability. The Q/A trick shows the model does know Paris.' },
+  { q: 'For one context the data says: 60% of the time another question follows, 40% an answer. A model predicts 20% question, 80% answer. What is its expected loss on this context, in nats?', numeric: true, answer: 1.055, tolerance: 0.03, unit: 'nats', why: '−(0.6 ln 0.2 + 0.4 ln 0.8) = 0.6 × 1.609 + 0.4 × 0.223 = 0.966 + 0.089 = 1.055 nats. Imitating the mix would cost only −(0.6 ln 0.6 + 0.4 ln 0.4) = 0.673 nats, so the helpful-leaning model pays 0.38 nats of KL.' },
+  { q: 'InstructGPT-175B: pretraining 3,640 PF-days, SFT 4.9, PPO-ptx 60. What percentage of the total did the RLHF stage use?', numeric: true, answer: 1.62, tolerance: 0.05, unit: '%', why: 'Total = 3,640 + 4.9 + 60 = 3,704.9 PF-days. 60 / 3,704.9 = 0.0162 = 1.62%. Pretraining is 98.2% and SFT 0.13%.' },
+  { q: 'A base model is served behind a chat endpoint with max_tokens = 512. A proper answer needs 12 tokens including the end-of-turn token. How many forward passes are wasted per request?', numeric: true, answer: 500, tolerance: 0, unit: 'passes', why: 'The base model never emits the end-of-turn token, so it generates all 512 tokens. Only 12 were needed: 512 − 12 = 500 wasted forward passes, about 42.7× the necessary decode work.' },
+  { q: 'Which statement about the stages is most accurate?', options: ['SFT and preference tuning are where most of the model’s facts come from', 'Pretraining supplies the knowledge; SFT and preference tuning mainly change which behaviour comes out, using a small fraction of the compute', 'Preference tuning replaces pretraining for modern models', 'SFT makes the model faster at inference'], answer: 1, why: 'Pretraining used 98.2% of InstructGPT’s compute and is where language and facts are learned. The later stages reshape behaviour: answering in turns, stopping, and preferring the answers people rate highly.' },
+  { q: 'What differs between Llama-3.1-8B and Llama-3.1-8B-Instruct?', options: ['The instruct model has more layers', 'Only the values of the weights: same architecture and per-token cost, different behaviour and output lengths', 'The instruct model is quantized to 4 bits', 'The base model has a smaller vocabulary'], answer: 1, why: 'Their config files are identical, so every token costs the same to compute. Post-training changed the weights, which changes what is generated, how long it is, and whether it stops.' },
+]} />
