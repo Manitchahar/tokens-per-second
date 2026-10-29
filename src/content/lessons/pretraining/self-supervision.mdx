@@ -1,0 +1,232 @@
+---
+title: 'Free labels: learning from raw text'
+summary: 'Supervised learning needs a person to write every answer, and no amount of money buys a trillion answers. Raw text answers its own questions: hide part of it, and the hidden part is the label. That one trick turns a trillion tokens into a trillion training examples, and it is why one pretrained model can be adapted to almost any language task.'
+objectives:
+  - Explain why human-labelled data cannot reach the scale a language model needs
+  - Turn a sentence into (context, target) training pairs by hand, for both next-token and masked-token prediction
+  - Count the training examples in a sentence, a sequence and a whole corpus
+  - Explain how the causal mask lets one forward pass grade every position at once without cheating
+  - Describe the pretrain-then-adapt recipe and what people mean by a foundation model
+---
+import FreeLabels from '@/components/viz/pretraining/FreeLabels.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In *How a model learns: loss & gradient descent* (Module 03) you watched a network get better by a simple loop: make a guess, compare it with the correct answer, measure how wrong it was, and nudge every weight a little in the direction that would have made it less wrong. Run that loop millions of times and the weights end up encoding whatever pattern connects the inputs to the answers.
+
+Read that loop again and notice the phrase hiding in the middle: **the correct answer**. Every single step needs one. A model with billions of weights needs billions of steps, and every step needs an answer that somebody, somewhere, knows is right.
+
+So where do the answers come from? For most of the history of machine learning the honest reply was: *people wrote them*. This module is about the moment that stopped being true for language, and the two different games that came out of it. This first lesson is the trick both games share.
+
+## The wall: answers written by hand
+
+The classic setup is called <Term t="supervised-learning">supervised learning</Term>. You collect pairs of (input, label): a photo and the word "cat", a product review and the word "negative", a question and the span of text that answers it. A person produces every label. The model learns to map inputs to labels.
+
+It works, and it powered a decade of progress. Two of the most famous datasets show what it costs:
+
+| Dataset | What a person wrote | Size |
+|---|---|---|
+| ImageNet (the competition training set) | the object class of each photo | about 1.28 million images |
+| SQuAD 1.1 | a question, and where in a Wikipedia paragraph its answer is | about 100,000 questions |
+
+Those were huge efforts. Now put them next to what a modern language model reads. Meta reported pretraining Llama 3 on **over 15 trillion tokens**. Suppose — generously — that a person could write one correct label every 10 seconds, never sleeping:
+
+$$
+10^{12}\ \text{labels} \times 10\ \text{s} = 10^{13}\ \text{s}, \qquad \frac{10^{13}\ \text{s}}{3.156 \times 10^{7}\ \text{s per year}} \approx 317{,}000\ \text{person-years}
+$$
+
+That is for one trillion, not fifteen. Even a modest million labels is ${}10^{6} \times 10\ \text{s} = 10^{7}\ \text{s}$, which is 2,778 hours, about 1.4 years of someone's full-time work.
+
+And cost is only the first problem. A sentiment dataset teaches sentiment and nothing else; when you need translation you start over. The labels are also limited to whatever questions somebody thought to ask. **Hand-labelling does not get you to trillions. It does not even get you to billions.**
+
+<Callout type="intuition" title="The wall in one sentence">
+  The learning loop needs a correct answer at every step, and people are far too slow to write a trillion of them. Any way forward has to get the answers from somewhere other than a person.
+</Callout>
+
+## The trick: let the text grade itself
+
+Read this and fill in the blank: *"The cat sat on the ___."*
+
+You guessed "mat", or "floor", or "sofa". Now suppose the sentence was taken from a real book, and in that book the next word really was "mat". Then **you have a training example, and the book supplied the answer.** Nobody had to label it. Whoever wrote the book wrote the label, years ago, without knowing.
+
+That is the whole idea. Take ordinary text, hide part of it, and ask the model to predict the hidden part from what is left. The hidden part *is* the label. This is called <Term t="self-supervised-learning">self-supervised learning</Term>: it is still supervised (every guess is graded against a correct answer), but the supervision comes from the data itself, not from an annotator.
+
+The visual builds this up one move at a time. Scroll through it, and use the slider to hide different tokens.
+
+<Scrolly>
+  <FreeLabels client:visible slot="stage" />
+
+  <Step title="1. Labels cost people">
+    Supervised learning: every input arrives with an answer that a person wrote. At an assumed **10 seconds per label**, a million labels is 2,778 hours of work, and a trillion is about 317,000 person-years. A new task means a new dataset.
+  </Step>
+
+  <Step title="2. Raw text has no labels… or does it?">
+    An ordinary sentence of 11 tokens. Nobody labelled it. But every token in it is the answer to a question the sentence itself can ask: **given the tokens to my left, what comes next?** The labels were never missing. They are the text, shifted by one position.
+  </Step>
+
+  <Step title="3. Hide the next token">
+    Keep the tokens before a position, hide the token at that position. The kept tokens are the **context** (the input); the hidden token is the **target** (the label). Drag the slider: each choice of position is a different exam question with a different, already-known answer.
+  </Step>
+
+  <Step title="4. Slide: every position is an example">
+    Slide the window along and every position after the first emits one (context → target) pair. **Eleven tokens give ten free training examples.** A book gives one per token. So does every web page, every forum post, every line of code anyone ever published.
+  </Step>
+
+  <Step title="5. One pass trains every position">
+    You do not need ten separate passes. With the **causal mask** from *Attention from scratch*, row *t* of the attention can only see tokens up to *t*. So the model's output at position *t* is an honest guess for token *t + 1*, and one forward pass over the sentence makes all ten guesses at once.
+  </Step>
+
+  <Step title="6. Or hide a token in the middle">
+    A second way to hide: cover a token in the middle and predict it **from both sides**. The answer is still free. This is BERT's game (lesson 3). Its catch: only the hidden tokens count as examples, so each pass learns from far fewer positions.
+  </Step>
+
+  <Step title="7. A corpus is a pile of examples">
+    Scale it up. **A corpus of N tokens is about N next-token examples.** Drag the slider to a trillion and compare with the hand-labelled datasets in red. Text corpora are not a little bigger than labelled datasets; they are millions of times bigger.
+  </Step>
+
+  <Step title="8. Pretrain once, adapt many times">
+    Spend the huge compute once, learning from raw text. The result is a single set of weights that already knows grammar, facts and a great deal more. Adapting it to a task is cheap: a little labelled data, or just a well-written prompt. That reusable model is a **foundation model**.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### The examples in a sentence
+
+Write a sentence as a list of $n$ tokens $x_1, x_2, \dots, x_n$. The next-token game asks the model to predict each token from the ones before it:
+
+$$
+(x_1) \to x_2, \quad (x_1, x_2) \to x_3, \quad \dots, \quad (x_1, \dots, x_{n-1}) \to x_n
+$$
+
+That is one pair per position after the first: **$n - 1$ examples from $n$ tokens.** The 11-token sentence in the visual gives 10. Each pair is a complete supervised example: an input (the context) and a correct output (the target).
+
+The name for the whole set-up — predict the hidden part of the data from the visible part — is the <Term t="training-objective">training objective</Term>, or the pretraining task. "Predict the next token" is one objective. "Predict a masked token from both sides" is another. The model architecture is almost the same for both; what differs is what is hidden and what the model may look at.
+
+### The examples in a training sequence
+
+In practice nobody trains on single sentences. The text is concatenated into one enormous stream of tokens and cut into chunks the length of the model's context window, say $T = 4{,}096$ tokens. To make $T$ input/target pairs you cut $T + 1$ tokens and use the same chunk twice, shifted by one:
+
+```python
+chunk   = ids[i : i + T + 1]     # T + 1 consecutive tokens from the stream
+inputs  = chunk[:-1]             # positions 0 .. T-1  -> what the model reads
+targets = chunk[1:]              # positions 1 .. T    -> what it must predict
+# targets[t] is the token that followed inputs[0..t] in the real text
+```
+
+That shift-by-one is the entire labelling process. There is no annotation file, no label column, nothing to pay for: the targets are the inputs, one step later.
+
+### The examples in a corpus
+
+A corpus of $N$ tokens cut into chunks of $T$ gives $N / T$ sequences, each with $T$ targets:
+
+$$
+\frac{N}{T} \times T = N \ \text{examples}
+$$
+
+The window length cancels. **A corpus of $N$ tokens holds about $N$ next-token training examples**, whatever context length you choose.
+
+<Callout type="math" title="Worked: a trillion tokens">
+  Take $N = 10^{12}$ tokens and a context of $T = 4{,}096$.
+
+  $$
+  \frac{10^{12}}{4{,}096} = 244{,}140{,}625 \ \text{sequences}, \qquad 244{,}140{,}625 \times 4{,}096 = 10^{12} \ \text{targets}
+  $$
+
+  A quarter of a billion sequences, a trillion graded predictions, and not one of them written by a person. Compared with SQuAD's roughly 100,000 hand-written questions, that is ${}10^{12} / 10^{5} = 10^{7}$: **ten million times more supervision**, for free.
+</Callout>
+
+### One forward pass grades every position
+
+Here is the part that makes this practical on a GPU, not just possible in principle. You might think 4,096 examples per sequence means 4,096 forward passes, one per context length. It does not.
+
+Recall the <Term t="causal-mask">causal mask</Term> from *Attention from scratch* (Module 03): before the softmax, every score where the key comes *after* the query is set to $-\infty$, so token $t$ can only attend to tokens ${}1 \dots t$. Every other part of the transformer — the MLP, the norms, the residual stream — works on each position separately. So nothing about tokens after $t$ can leak into the hidden state at position $t$.
+
+That means the output head at position $t$ produces a probability distribution over the vocabulary that was computed from $x_1 \dots x_t$ only. It is a legitimate guess for $x_{t+1}$. **One forward pass over $T$ tokens produces $T$ honest guesses**, and the training loss is just their average.
+
+$$
+\text{one pass over } T \text{ tokens} \;\Rightarrow\; T \ \text{predictions, each seeing only its own past}
+$$
+
+<Callout type="pitfall" title="Remove the mask and the model cheats">
+  If you deleted the causal mask, position $t$ could attend to position $t + 1$ — which is exactly the token it is being asked to predict. The model would learn to copy the answer from one position over, the loss would collapse toward zero, and it would have learned nothing about language. The mask is not a detail of attention; it is what makes the next-token exam honest. Lesson 3 shows what BERT does instead when it wants to look both ways.
+</Callout>
+
+For an inference engineer this should look familiar in advance. Pushing a whole sequence through the model in one parallel pass, with the causal mask, is exactly what a serving engine does with your prompt. Module 05 calls it *prefill*. Training is a prefill over every chunk of the corpus, followed by a backward pass to compute the weight updates. Module 3B counts what that costs.
+
+### What the next token forces a model to learn
+
+The objective sounds narrow: guess the next token. But think about what you would need to know to guess well on real text. Each row below is one next-token example that could appear in a corpus:
+
+| Context | Target | What a model must know to get it right |
+|---|---|---|
+| "The keys to the old cabinet ___" | are | grammar: the verb agrees with "keys", not "cabinet" |
+| "The capital of France is ___" | Paris | a fact about the world |
+| "17 + 25 = ___" | 42 | arithmetic |
+| "She dropped the glass and it ___" | shattered | physical common sense |
+| "def add(a, b): return ___" | a + b | programming |
+| "I loved the first half, but the ending was ___" | disappointing | how "but" flips the sentiment |
+
+None of these is labelled "grammar task" or "arithmetic task". They are all just next-token examples, mixed together in one stream. But a model that wants low loss on all of them has to get better at all of those skills at once. **One objective, applied to text written by millions of people about everything, is secretly millions of tasks.** That is why a model trained only to continue text turns out to be useful for so much else.
+
+<Callout type="intuition" title="Prediction needs a model of the world">
+  To predict what someone will write next, it helps enormously to understand what they are writing about. A model that has noticed that "Paris" follows "the capital of France is" in thousands of documents has, in a real if limited sense, stored a fact. The objective never asks for understanding directly; it just rewards whatever internal machinery makes the next token less surprising.
+</Callout>
+
+### Two ways to hide
+
+Both games in this module are self-supervised. They differ in what is hidden and what the model may look at:
+
+| | Next-token (causal) | Masked-token |
+|---|---|---|
+| What is hidden | every token, one position at a time | a random ~15% of tokens |
+| What the model may see | only tokens to the left | tokens on both sides |
+| Examples per pass over $T$ tokens | $T$ | about ${}0.15\,T$ |
+| Famous example | GPT-2 (lesson 4) | BERT (lesson 3) |
+| Natural at | writing: continuing text | reading: understanding text it is given |
+
+Hold onto the third row. A masked model sees more of the sentence for each guess, but makes far fewer guesses per pass. Lesson 5 shows how much that trade-off mattered.
+
+## Pretrain once, adapt many times
+
+Self-supervision changes the economics of the whole field. Training splits into two very unequal phases:
+
+1. **<Term t="pretraining">Pretraining</Term>.** Learn from a gigantic amount of raw text with a self-supervised objective. This is where nearly all the compute goes: thousands of accelerators for weeks or months for a frontier model. It happens once.
+2. **Adaptation.** Take the pretrained weights and specialise them: train a little more on a small labelled dataset (finetuning), or simply describe the task in the prompt. This is cheap and happens many times, once per use.
+
+You will see both phases with real numbers in this module. In lesson 3, BERT's pretraining runs for days on dozens of TPU chips, while finetuning it for a new task takes at most an hour on one. In lesson 4, GPT-2 skips finetuning entirely and performs tasks it was never trained on, just from how the prompt is worded.
+
+A pretrained model that is broad enough to be adapted to many downstream tasks is called a <Term t="foundation-model">foundation model</Term>. The name was popularised by a 2021 report from Stanford researchers (Bommasani et al., "On the Opportunities and Risks of Foundation Models"). The word *foundation* is meant literally: the expensive part is built once, and many different things are built on top of it.
+
+<Callout type="real" title="Why an inference engineer cares">
+  Three consequences reach all the way to the serving stack.
+
+  **The objective decides the serving loop.** A model trained to predict the next token is used by predicting the next token, again and again. That loop — one forward pass per generated token — is the decode loop that the KV cache (Module 05) and nearly every later module exist to speed up.
+
+  **Almost every model you serve is a base plus a small delta.** Chat models, code models and domain models are usually one pretrained base with comparatively little extra training on top. Methods like LoRA (Module B5) make that delta tiny, which is why one GPU can serve one shared base with many small adapters.
+
+  **Pretraining fixes things you cannot change later.** The tokenizer, the vocabulary, the maximum context the positions were trained for, and the architecture are all decided before the first gradient step. Every one of them shows up later as a serving constraint.
+</Callout>
+
+<Callout type="pitfall" title="Free labels are not free data">
+  Self-supervision removes the annotator, not the work. The text still has to be collected, filtered, deduplicated and cleaned, and the compute bill is enormous (Module B6 covers the data side, Module 3B the compute). And the model learns whatever the text contains, including mistakes, spam and bias. Nobody checked those labels; they are just whatever the author happened to write.
+</Callout>
+
+<KeyNotes>
+  1. Supervised learning needs a correct answer for every training step. People write them too slowly: at 10 s per label, a trillion labels is about 317,000 person-years.
+  2. **Self-supervised learning** hides part of the data and asks the model to predict it. The hidden part is the label, so the text grades itself.
+  3. A sentence of $n$ tokens gives $n - 1$ next-token examples. In practice the targets are just the inputs shifted by one position.
+  4. A corpus of $N$ tokens holds about $N$ next-token examples, whatever the context length: $N/T$ sequences × $T$ targets each.
+  5. Thanks to the **causal mask**, one forward pass over $T$ tokens makes $T$ honest predictions at once. Without the mask, each position could copy its own answer.
+  6. One objective over text about everything is secretly millions of tasks: grammar, facts, arithmetic, code and common sense all reduce next-token loss.
+  7. Masked-token prediction is the other way to hide: it sees both sides but learns from only about 15% of positions per pass.
+  8. **Pretrain once, adapt many times.** The expensive self-supervised model is a **foundation model**; finetuning or prompting adapts it cheaply. The objective chosen at pretraining decides the decode loop you will later serve.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A sentence is 12 tokens long. How many next-token training examples does it contain?', numeric: true, answer: 11, tolerance: 0.4, unit: 'examples', why: 'One (context → target) pair per position after the first: 12 − 1 = 11. The first token has no context to be predicted from.' },
+  { q: 'A corpus of 2 trillion tokens is cut into training sequences of 8,192 tokens. About how many sequences is that, in millions?', numeric: true, answer: 244, tolerance: 6, unit: 'million', why: '2 × 10¹² / 8,192 = 244,140,625 ≈ 244 million sequences. Each has 8,192 targets, so the total is still 2 × 10¹² examples: the window length cancels.' },
+  { q: 'Why can one forward pass over a sequence train the model on every position at once without cheating?', options: ['Because the MLP is applied to all positions in parallel', 'Because the causal mask stops each position from seeing any later token, so its output is an honest guess for the next one', 'Because the loss is averaged over the sequence', 'Because the targets are stored in a separate file'], answer: 1, why: 'Attention is the only place positions mix, and the causal mask removes every later key. So the hidden state at position t depends on tokens 1..t only, and its prediction for t + 1 cannot have seen the answer.' },
+  { q: 'A team wants to hand-label 100 million examples at 5 seconds each, with one person working nonstop. About how many years is that?', numeric: true, answer: 15.8, tolerance: 0.5, unit: 'years', why: '10⁸ × 5 s = 5 × 10⁸ s. A year is 365.25 × 24 × 3,600 ≈ 3.156 × 10⁷ s, so 5 × 10⁸ / 3.156 × 10⁷ ≈ 15.8 years — for a corpus thousands of times smaller than a modern pretraining set.' },
+  { q: 'Which of these is NOT self-supervised?', options: ['Predicting the next token of a web page', 'Predicting a masked word from the words around it', 'Classifying reviews as positive or negative using labels written by annotators', 'Predicting a deleted sentence from the paragraph around it'], answer: 2, why: 'In the other three the answer was already in the raw data and was hidden on purpose. Sentiment labels written by people are classic supervised learning.' },
+  { q: 'What do people mean by a “foundation model”?', options: ['Any model with more than a billion parameters', 'A model trained only on labelled data', 'A model pretrained once on broad data, then adapted cheaply to many downstream tasks', 'The first layer of a transformer'], answer: 2, why: 'The expensive, general part is built once by self-supervised pretraining; finetuning or prompting then builds many specific things on top of it.' },
+]} />
