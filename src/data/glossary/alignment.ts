@@ -58,4 +58,34 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Generate N answers, score each with a reward model, return the highest. Costs N generations plus N scoring passes; the larger N, the more it also selects for the reward model’s mistakes.',
     lesson: 'alignment/reward-models',
   },
+  rlhf: {
+    term: 'RLHF',
+    def: 'Reinforcement learning from human feedback: the policy samples answers, a reward model trained on human comparisons scores them, and an RL algorithm (classically PPO) makes high-scoring answers likelier, with a KL penalty to the SFT model.',
+    lesson: 'alignment/rlhf-instructgpt',
+  },
+  policy: {
+    term: 'Policy',
+    def: 'Reinforcement-learning name for the model being trained: given the prompt and the tokens so far, it chooses the next token. In RLHF the policy starts as the SFT model.',
+    lesson: 'alignment/rlhf-instructgpt',
+  },
+  'kl-penalty': {
+    term: 'KL penalty (KL leash)',
+    def: 'β × log(π_RL(y|x) / π_SFT(y|x)), subtracted from the reward during RLHF. Summed over tokens, it grows as the policy drifts from the SFT model, keeping it where the reward model’s scores can be trusted.',
+    lesson: 'alignment/rlhf-instructgpt',
+  },
+  'reward-hacking': {
+    term: 'Reward hacking',
+    def: 'When optimisation raises a learned reward without raising real quality, by exploiting the reward model’s mistakes: padding, flattery, a tone it over-rewards. Its score keeps rising while human judgement peaks and falls.',
+    lesson: 'alignment/rlhf-instructgpt',
+  },
+  ppo: {
+    term: 'PPO (proximal policy optimisation)',
+    def: 'The RL algorithm InstructGPT used: raise the probability of sampled answers in proportion to their advantage (reward minus a value-model baseline), with the probability ratio clipped to [1 − ε, 1 + ε] so each update stays small.',
+    lesson: 'alignment/rlhf-instructgpt',
+  },
+  'alignment-tax': {
+    term: 'Alignment tax',
+    def: 'Performance lost on skills the reward model never checks (InstructGPT: SQuAD, DROP, HellaSwag, translation) when a model is tuned to human preferences. PPO-ptx reduced it by mixing pretraining gradients into each RL update.',
+    lesson: 'alignment/rlhf-instructgpt',
+  },
 };
