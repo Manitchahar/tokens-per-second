@@ -19,7 +19,7 @@ This lab has two notebooks. **04a** is the model itself — loading, tokenizing,
 
 ### 1. Predict before you load
 
-Section 1 asks you to compute `parameters × bytes per weight` for Qwen2.5-0.5B **before** downloading it. Write the number down. Section 2 then prints the measured figure and the error between them. Doing this correctly on the first try is the point — it is the arithmetic from lesson 04.1.
+Section 1 asks you to compute `parameters × bytes per weight` for Qwen2.5-0.5B **before** downloading it. Write the number down. Section 2 then prints the measured figure and the error between them. Doing this correctly on the first try is the point — it is the arithmetic from lesson 04.2.
 
 <Callout type="real" title="Why FP16 and not BF16 on a T4">
   The T4 is a Turing GPU: FP16 tensor cores, but **no native BF16** and no FP8. So the notebook uses `torch.float16`. On an A100 or H100 you would use BF16. Both are 2 bytes per weight, so every memory calculation in this course is identical — only the hardware support differs.
@@ -27,7 +27,7 @@ Section 1 asks you to compute `parameters × bytes per weight` for Qwen2.5-0.5B 
 
 ### 2. Load, and read the config back
 
-Section 2 loads the model and prints `model.config`: layers, hidden size, query heads, KV heads, vocabulary. Those are the numbers you estimated in lesson 04.1. **Check them against your prediction.** `num_key_value_heads` in particular explains your KV cache size — the GQA factor from the lesson, made concrete.
+Section 2 loads the model and prints `model.config`: layers, hidden size, query heads, KV heads, vocabulary. Those are the numbers you estimated in lesson 04.2. **Check them against your prediction.** `num_key_value_heads` in particular explains your KV cache size — the GQA factor from the lesson, made concrete.
 
 ### 3. Tokenize, and see the chat template
 
@@ -57,7 +57,7 @@ Open the second notebook once 04a has run to the end — it reloads the model, a
 
 ### 1. Read the server before you run it
 
-Section 2 defines a complete FastAPI server. Read it first. It is the code from lesson 04.4 with the real-world correctness fixes:
+Section 2 defines a complete FastAPI server. Read it first. It is the code from lesson 04.5 with the real-world correctness fixes:
 
 - `generate` runs on its own thread and the async side awaits a queue. **Calling it directly inside `async def` blocks the event loop** and the whole server stops answering. That is the single most common bug in a first FastAPI LLM server.
 - `max_tokens` is clamped server-side, because the client is not trusted.

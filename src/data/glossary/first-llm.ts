@@ -7,7 +7,7 @@ export const terms: Record<string, GlossaryEntry> = {
   'open-weights': {
     term: 'Open weights',
     def: 'A model whose trained weights are published for anyone to download and run. The code may be open source or not; what matters for inference is that the numbers in the checkpoint are yours to fetch.',
-    lesson: 'first-llm/choose-a-model',
+    lesson: 'first-llm/open-weights-llama',
   },
   checkpoint: {
     term: 'Checkpoint',
@@ -118,5 +118,25 @@ export const terms: Record<string, GlossaryEntry> = {
     term: 'Idle time',
     def: 'Time when the GPU is running no useful kernel — waiting on Python, sampling, or the host. Shown as hatched grey in this course’s diagrams. It is why GPU utilization and efficiency are different numbers.',
     lesson: 'first-llm/watch-the-gpu',
+  },
+  'pre-norm': {
+    term: 'Pre-norm',
+    def: 'Normalising the input of each sublayer, x + Sublayer(Norm(x)), instead of normalising after the residual add as the 2017 Transformer did. The residual stream is never normalised on its way up, which makes deep stacks train stably. Used by GPT-2/3, LLaMA and nearly every model since.',
+    lesson: 'first-llm/open-weights-llama',
+  },
+  'over-training': {
+    term: 'Over-training (past compute-optimal)',
+    def: 'Training a model on many more tokens than the ~20 per parameter that minimises loss for a fixed training budget. It costs extra training compute once, but gives a smaller model of the same quality, which is cheaper on every token served. LLaMA-7B saw ~150 tokens per parameter.',
+    lesson: 'first-llm/open-weights-llama',
+  },
+  'model-license': {
+    term: 'Model licence',
+    def: 'The terms under which released weights may be used. Custom licences (Llama) allow use with conditions such as an acceptable-use policy or a user-count threshold; standard ones (Apache 2.0, MIT) allow almost anything. Check the exact checkpoint you deploy.',
+    lesson: 'first-llm/open-weights-llama',
+  },
+  'open-source-model': {
+    term: 'Open-source model',
+    def: 'A model released with its weights, training code and training data under terms that let anyone use, study, modify and share it, so the training itself can be reproduced (OLMo, Pythia). Stricter than open weights, which only publishes the trained numbers.',
+    lesson: 'first-llm/open-weights-llama',
   },
 };
