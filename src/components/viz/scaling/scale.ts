@@ -124,7 +124,7 @@ export function hours(h: number) {
 export function usd(x: number) {
   if (!isFinite(x)) return '∞';
   if (x >= 1e9) return `$${(x / 1e9).toFixed(x >= 1e10 ? 0 : 1)}B`;
-  if (x >= 1e6) return `$${(x / 1e6).toFixed(x >= 1e7 ? 0 : 1)}M`;
+  if (x >= 1e6) return `$${(x / 1e6).toFixed(x >= 1e8 ? 0 : 1)}M`;
   if (x >= 1e3) return `$${(x / 1e3).toFixed(0)}k`;
   return `$${x.toFixed(0)}`;
 }
