@@ -1,0 +1,244 @@
+---
+title: 'Chat templates & system prompts'
+summary: 'You send a list of messages; the model reads one stream of tokens. See exactly how roles become special tokens, why the wrong template fails without a single error, and why the system prompt, being the first tokens of every request, is the cheapest thing you will ever cache.'
+objectives:
+  - Turn a list of chat messages into the exact token stream a Llama 3 or Qwen2.5 model reads
+  - Count the template overhead of a conversation and the prompt length at any turn
+  - Use apply_chat_template correctly and name five ways a template mismatch silently degrades quality
+  - Explain why the system prompt has no special power except being first, and what that buys in prefix caching
+---
+import ChatTemplate from '@/components/viz/prompting/ChatTemplate.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every chat API you will ever call takes the same shape of input: a list of messages, each with a role. A `system` message says how to behave, a `user` message asks something, and the model replies as the `assistant`. In Module 04 you passed such a list to `apply_chat_template`, printed the answer, and moved on.
+
+Now look at the transformer you built in Module 03. It has exactly one input: a sequence of integers. There is no "list" argument, no "role" argument, no slot labelled *instructions*. Attention mixes every position with every earlier position, and that is all it does.
+
+So here is the wall. **You send a list; the model only ever sees one stream.** Something has to turn one into the other, and how it does that decides whether your carefully written prompt is read as instructions, as a question, or as gibberish. This is the first piece of prompt engineering, because every prompt you write in this module is wrapped in it before the model sees a single token.
+
+## The wall: a list goes in, a stream comes out
+
+<Scrolly>
+  <ChatTemplate client:visible slot="stage" />
+
+  <Step title="1. What you send: a list of messages">
+    Three boxes: a <Term t="system-prompt">system prompt</Term> ("You are a terse assistant."), a user question ("What is a GPU?") and an empty assistant turn for the model to fill. **This structure exists only in your JSON.** The network has no input for it.
+  </Step>
+
+  <Step title="2. Glue the strings together, and watch it fail">
+    The obvious approach: join the two strings with a newline and tokenize. You get **11 tokens and no boundaries**. Nothing says the first six are instructions, nothing says where the question ends, and nothing says an answer should start. The model sees a short document and continues it, which might mean writing more questions.
+  </Step>
+
+  <Step title="3. Roles become special tokens">
+    The Llama 3 <Term t="chat-template">chat template</Term> wraps each message in a header, `<|start_header_id|>` role `<|end_header_id|>`, and closes it with `<|eot_id|>`. These are <Term t="special-tokens">special tokens</Term>: reserved IDs (128,006, 128,007, 128,009) past the 128,000 learned text pieces. **26 tokens: 11 of yours, 15 added by the template.**
+  </Step>
+
+  <Step title="4. The generation prompt hands over the turn">
+    The last four tokens are the header of an assistant turn with nothing in it. That is the <Term t="generation-prompt">generation prompt</Term>, and it is the model's cue to answer. It writes the answer in green, then emits `<|eot_id|>`, the token finetuning taught it to end every turn with. The engine stops there.
+  </Step>
+
+  <Step title="5. Another family, another dialect: ChatML">
+    Qwen2.5 uses <Term t="chatml">ChatML</Term>: `<|im_start|>` role, a newline, the content, `<|im_end|>`. Same idea, different spelling: **24 tokens, 13 of them template**. Toggle between the two. Your 11 content tokens glide; only the scaffolding changes.
+  </Step>
+
+  <Step title="6. The wrong template">
+    Now send the Llama 3 string to Qwen. Qwen's tokenizer has no `<|start_header_id|>`, so it spells the marker out as ordinary pieces: `<`, `|`, `start`, `_header`, `_id`, `|`, `>`. **72 tokens, zero control tokens**, and two of yours swallowed (`.<`, `?<`). Nothing raises an error. The model just sees strange text it was never trained on.
+  </Step>
+
+  <Step title="7. The system prompt is just the first tokens">
+    The underlined block opens every request, token for token. It has no special channel into the model; it is simply first. Identical first tokens produce identical keys and values, so an engine can keep them and skip the work. That is <Term t="prefix-caching">prefix caching</Term>, the subject of Module 10.
+  </Step>
+
+  <Step title="8. Every turn resends the whole conversation">
+    Chat APIs remember nothing between calls. At turn 10 of a conversation with a 500-token system prompt, the prompt is **2,905 tokens, and 91% of it was sent before**. Drag the turn slider: without a cache the GPU recomputes the history every time; with one, only the amber part is new.
+  </Step>
+</Scrolly>
+
+## Try the obvious thing first
+
+Before learning the real answer, take the naive one seriously. Join the strings:
+
+```python
+prompt = "You are a terse assistant.\nWhat is a GPU?"
+```
+
+The Llama 3 tokenizer turns that into 11 tokens. Feed them to a model and it does what a language model does: predicts the next token of *this document*. Module 3C showed you what a **base** model does with such a document: it continues it. It might add a second question, or a heading, or the next line of a forum thread, because those are all plausible continuations of a text that looks like this.
+
+An instruction-tuned model is better, but you have now taken it **off the distribution it was finetuned on**. Its finetuning data never contained a bare question glued to an instruction with a newline. It has no marker telling it where the user's words end, so it cannot know whether "What is a GPU?" is the start of a longer message. And it has no marker telling it where *its* turn ends, so it has no learned reason to stop.
+
+Three things are missing, and the template supplies all three:
+
+1. **Who is speaking**: a role label around each message.
+2. **Where each message ends**: an end-of-turn marker.
+3. **Whose turn it is now**: an open assistant header at the very end.
+
+## Roles are tokens the model learned in finetuning
+
+Module 3C taught supervised finetuning: show the model thousands of example conversations and train it to produce the assistant's parts. Those conversations were not stored as JSON. They were rendered into one token stream in a fixed layout, and the model learned that layout the way it learned grammar. After `<|start_header_id|>assistant<|end_header_id|>` and two newlines, an answer follows. After the answer, `<|eot_id|>`. The role words themselves (`system`, `user`, `assistant`) are ordinary tokens; what makes them roles is that they sit between header tokens.
+
+Here is the full Llama 3 stream from the visual, token by token:
+
+| Position | Token | ID | Who added it |
+|---|---|---|---|
+| 0 | `<\|begin_of_text\|>` | 128000 | template (start of sequence) |
+| 1–4 | `<\|start_header_id\|>` `system` `<\|end_header_id\|>` `\n\n` | 128006, 9125, 128007, 271 | template |
+| 5–10 | `You` ` are` ` a` ` terse` ` assistant` `.` | 2675 … 13 | you |
+| 11 | `<\|eot_id\|>` | 128009 | template (end of turn) |
+| 12–15 | `<\|start_header_id\|>` `user` `<\|end_header_id\|>` `\n\n` | 128006, 882, 128007, 271 | template |
+| 16–20 | `What` ` is` ` a` ` GPU` `?` | 3923 … 30 | you |
+| 21 | `<\|eot_id\|>` | 128009 | template |
+| 22–25 | `<\|start_header_id\|>` `assistant` `<\|end_header_id\|>` `\n\n` | 128006, 78191, 128007, 271 | template (generation prompt) |
+
+The special tokens live at IDs 128,000 and above. Llama 3's tokenizer has 128,000 learned text pieces plus 256 reserved IDs, which is where its vocabulary of 128,256 comes from. **No ordinary text ever tokenizes into a reserved ID**, so the model can trust that a header token really is structure. (Almost: there is one trap, below.)
+
+### Counting the overhead
+
+Each Llama 3 message costs exactly 5 template tokens (start header, role, end header, the double newline, end of turn), plus 1 for `<|begin_of_text|>` and 4 for the generation prompt:
+
+$$
+\text{template tokens} = 1 + 5m + 4
+$$
+
+for $m$ messages. Two messages: ${}1 + 10 + 4 = 15$, and with your 11 content tokens that is the 26 in the visual. ChatML costs 5 per message as well (`<|im_start|>`, role, newline, `<|im_end|>`, newline), no start token, and 3 for the generation prompt: ${}10 + 3 = 13$, total 24.
+
+Fifteen tokens is nothing next to a real prompt. The reason to count them is not their cost; it is that **you should be able to predict the token stream exactly**. If you cannot, you cannot debug it.
+
+## ChatML, and the dialect problem
+
+Every model family invented its own layout, and each model understands only the one it was finetuned on.
+
+| | Llama 3 | ChatML (Qwen2.5) |
+|---|---|---|
+| start of sequence | `<\|begin_of_text\|>` | none |
+| open a turn | `<\|start_header_id\|>` role `<\|end_header_id\|>` `\n\n` | `<\|im_start\|>` role `\n` |
+| close a turn | `<\|eot_id\|>` (128009) | `<\|im_end\|>` (151645) then `\n` |
+| generation prompt | `<\|start_header_id\|>assistant<\|end_header_id\|>\n\n` (4 tokens) | `<\|im_start\|>assistant\n` (3 tokens) |
+| our example | 26 tokens | 24 tokens |
+
+Templates are also **code, not just markers**, and they make decisions you did not ask for. Two real examples, at the time of writing:
+
+- **Qwen2.5 adds a default system prompt.** If your list has no system message, its template inserts "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." That is a 21-token system block you never wrote.
+- **Llama 3.1 writes dates into the system block.** Its template prepends "Cutting Knowledge Date: December 2023" and "Today Date: 26 Jul 2024" (a fixed default unless you pass a date) to the system message. The system block grows from 12 tokens to 32.
+
+Neither is a bug. Both are things you must know are there.
+
+## Let the tokenizer do it: `apply_chat_template`
+
+You should never assemble these strings by hand. The template ships with the model, written in Jinja (a small templating language) inside the tokenizer's configuration, and the tokenizer renders it for you. Here is a simplified sketch of what a Llama 3 style template does, written as plain Python so you can see there is no magic:
+
+```python
+def render_llama3(messages, add_generation_prompt=True):
+    out = "<|begin_of_text|>"
+    for m in messages:
+        out += f"<|start_header_id|>{m['role']}<|end_header_id|>\n\n{m['content']}<|eot_id|>"
+    if add_generation_prompt:
+        out += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    return out
+```
+
+The real one, with tools and dates, is longer, but this loop is its core. In practice:
+
+```python
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+messages = [
+    {"role": "system", "content": "You are a terse assistant."},
+    {"role": "user", "content": "What is a GPU?"},
+]
+
+text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+print(text)                       # read it once, every time you change models
+
+ids = tok(text, add_special_tokens=False, return_tensors="pt").input_ids
+print(ids.shape[1], "tokens")     # 24 for this conversation
+print(tok.convert_ids_to_tokens(ids[0]))
+```
+
+Two habits are in that snippet. **Print the rendered text** the first time you use any model; it takes one second and catches most template bugs. And when you tokenize the rendered string yourself, pass `add_special_tokens=False`, because the template already added whatever start token the model needs. Serving engines do the same thing for you: an OpenAI-compatible `/v1/chat/completions` endpoint in vLLM or SGLang applies the model's template server-side, and a hosted API does it on the provider's side, out of sight.
+
+<Callout type="pitfall" title="Five ways a template fails without an error">
+  1. **The wrong family's markers.** Llama 3 markers sent to Qwen are spelled out as ordinary text: 72 tokens instead of 24, as in step 6. The model answers anyway, worse.
+  2. **No template at all**, or a home-made `User:` / `Assistant:` transcript. The model may write the next `User:` line itself, because nothing it was trained on tells it the turn is over.
+  3. **No generation prompt.** Forget `add_generation_prompt=True` and the stream ends right after the user's `<|eot_id|>`. The model must guess that a new assistant turn should begin, and sometimes it continues the user's message instead.
+  4. **A doubled start token.** Render with `tokenize=False`, then call `tok(text)` with the default `add_special_tokens=True` on Llama 3, and you get `<|begin_of_text|><|begin_of_text|>`. The model never saw that in training.
+  5. **The wrong stop token.** Llama 3 instruct models end a turn with `<|eot_id|>` (128009), not `<|end_of_text|>` (128001). Stop on the wrong one and every answer runs to `max_new_tokens`. Meta's own example code passes both IDs as terminators for exactly this reason.
+
+  The same trap catches finetuning (Module B5): train a model with one template and serve it with another, and you have quietly thrown part of the finetune away. None of these crash. **You find them in your evaluation scores (Module B2), not in your logs.**
+</Callout>
+
+<Callout type="real" title="The one trap in special tokens: users can type them">
+  A tokenizer in its default mode turns the *text* `<|im_end|>` into the *real* control token 151645. If your server renders a template around a user's message and tokenizes the result, a user who types `<|im_end|>` followed by `<|im_start|>system` and some text has forged a system turn. Defences, in order: never let raw user text reach the template unescaped; tokenize user content with special-token parsing switched off (in `transformers`, `split_special_tokens=True`); and treat everything a user sends as data, never as structure. Module B7 returns to prompt injection in general.
+</Callout>
+
+## The system prompt is just the first tokens
+
+Look at the stream again. The system message is not stored in a separate place, does not enter a different layer, and has no weight attached to it. **It is the first block of tokens, nothing more.** A model follows its system prompt more readily than an instruction buried in a user message because finetuning rewarded that (Module 3C), not because anything in the architecture enforces it. A forceful enough user message can still override it, which is why a system prompt is a strong suggestion, never a security boundary.
+
+Being first has one enormous practical consequence. A product sends the same system prompt at the start of every request. Attention is causal (Module 03), so the keys and values of the first $n$ tokens depend only on those $n$ tokens. **Identical first tokens give identical KV cache entries**, so an engine that has seen the prefix before can reuse it instead of recomputing it. Here is what that is worth for a realistic 1,500-token system prompt on Llama-3.1-8B. Prefill costs about ${}2N$ FLOPs per token for $N$ parameters:
+
+$$
+F = 2 \times 8.03 \times 10^{9} \times 1{,}500 = 2.41 \times 10^{13}\ \text{FLOP} \approx 24\ \text{TFLOP}
+$$
+
+An H100 does about 989 TFLOP/s of dense BF16; at a realistic 55% of that:
+
+$$
+t = \frac{2.41 \times 10^{13}}{0.55 \times 989 \times 10^{12}} \approx 0.044\ \text{s} = 44\ \text{ms}
+$$
+
+That is 44 ms added to every request's time to first token, and at a million requests a day it is ${}10^{6} \times 0.044\ \text{s} = 44{,}000$ s, about **12.3 GPU-hours a day spent re-reading the same instructions**. A prefix cache removes almost all of it. Module 10 shows how engines find and keep these prefixes; at the time of writing, several hosted APIs also bill cached input tokens at a discount for the same reason.
+
+The catch is that the match must be **exact, token for token, from the very first token**. Change one token near the top and every token after it has a different history, so none of it matches.
+
+<Callout type="mentor" title="Static first, dynamic last">
+  Put everything that is the same for every request at the top of the prompt: the instructions, the tool definitions, the examples. Put what changes (today's date, the user's name, the retrieved documents, the question) after it. A system prompt that opens with "Current time: 14:03:27" has a different prefix every second and will never hit the cache. This is also why Llama 3.1's date line, near the top of its system block, is harmless with its fixed default and costly if you pass a timestamp.
+</Callout>
+
+## Every turn, the whole conversation again
+
+Chat APIs are stateless: the server forgets you between calls. To continue a conversation your code sends the **entire history** every turn, including the model's own earlier answers, rendered into the template again.
+
+Take a conversation with a 500-token system prompt, 50-token questions and 200-token answers on Llama 3. Turn 1's prompt is the start token, the system block, the first user block and the generation prompt:
+
+$$
+P_1 = 1 + (5 + 500) + (5 + 50) + 4 = 565
+$$
+
+Each later turn adds the previous answer and its `<|eot_id|>` (201 tokens), a new user block (55) and a fresh generation prompt (4), so $\Delta = 260$ and
+
+$$
+P_k = 565 + 260\,(k - 1)
+$$
+
+At turn 10 that is ${}565 + 2{,}340 = 2{,}905$ tokens, of which only the last 260 are new: ${}2{,}645 / 2{,}905 = 91\%$ was sent before. Without any caching, the GPU prefills every turn from scratch, and the total over ten turns is
+
+$$
+\sum_{k=1}^{10} P_k = 10 \times 565 + 260 \times \frac{10 \times 9}{2} = 5{,}650 + 11{,}700 = 17{,}350\ \text{tokens}
+$$
+
+With a perfect prefix cache it is just $P_{10} = 2{,}905$: six times less work. Note the shape of that sum. The uncached cost grows with the **square** of the number of turns, because each turn pays for all the turns before it. Long conversations are expensive in a way that a per-message mental model hides, and eventually the history outgrows the context window and must be trimmed or summarised, a problem Module B4 picks up as agent memory.
+
+<Callout type="real" title="Read the real templates">
+  There is no paper to read here, but there is source. Open the tokenizer configuration of a Llama 3.1 Instruct model and of `Qwen/Qwen2.5-1.5B-Instruct` on the Hugging Face Hub and find the `chat_template` field (newer releases may store it in a separate `chat_template.jinja` file). Read the loop, then find the date logic in the Llama one and the default system prompt in the Qwen one. The Hugging Face documentation page on chat templates explains the Jinja variables. After this lesson every line will be readable. The lab prints these templates token by token.
+</Callout>
+
+<KeyNotes>
+  1. A transformer has one input, a sequence of token IDs. A list of chat messages reaches it only after a **chat template** renders the list into one stream.
+  2. Roles become **special tokens**: reserved IDs past the learned vocabulary (Llama 3: 128,000 and up; Qwen: 151,643 and up) that ordinary text never produces, learned as structure during finetuning.
+  3. Llama 3 costs 5 template tokens per message, 1 start token and 4 for the generation prompt; ChatML costs 5 per message and 3. Our two-message example is 26 and 24 tokens, 11 of them yours.
+  4. The **generation prompt** is an open assistant header at the end of the stream; the model answers into it and stops on its end-of-turn token (`<|eot_id|>` 128009, `<|im_end|>` 151645).
+  5. Template mistakes fail **silently**: wrong markers (72 shattered tokens instead of 24), no template, no generation prompt, a doubled start token, the wrong stop token. They show up in eval scores, not errors. Print the rendered prompt once per model.
+  6. The **system prompt** is just the first tokens. It is followed because finetuning rewarded it, not because anything enforces it, and a user who can type special tokens can forge one.
+  7. Being first and identical makes the system prompt a cacheable prefix: a 1,500-token prompt on an 8B model is about 24 TFLOP, roughly 44 ms of H100 prefill per request. Keep static text first and dynamic text last.
+  8. Chat APIs are stateless, so turn $k$ resends everything: $P_k = 565 + 260(k-1)$ in the example, 91% repeated by turn 10, and uncached cost grows with the square of the number of turns.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A Llama 3 prompt has a system message, a user message, an assistant answer, a second user message, and the generation prompt. How many template tokens does it contain (not counting any content)?', numeric: true, answer: 25, tolerance: 0, unit: 'tokens', why: 'Four messages at 5 template tokens each is 20, plus 1 for <|begin_of_text|> and 4 for the generation prompt: 1 + 20 + 4 = 25.' },
+  { q: 'You render a Qwen2.5 prompt with the Llama 3 markers written as plain text. What does the model actually receive?', options: ['The same 24 tokens, because tokenizers translate between families', 'The markers split into ordinary text pieces such as <, |, start, _header, so the model sees no turn structure at all', 'An error from the tokenizer, because the markers are unknown', 'Only the content tokens, because unknown markers are dropped'], answer: 1, why: 'Qwen’s tokenizer has no <|start_header_id|> entry, so it spells the string out with ordinary pieces: 72 tokens, zero control tokens. No error is raised, which is what makes this failure dangerous.' },
+  { q: 'Llama-3.1-8B (8.03B parameters) on an H100 at 989 TFLOP/s and 55% utilisation. How many milliseconds of prefill does a 1,500-token system prompt cost per request, using 2N FLOPs per token?', numeric: true, answer: 44, tolerance: 2, unit: 'ms', why: '2 × 8.03e9 × 1,500 = 2.41e13 FLOP. Divided by 0.55 × 989e12 = 5.44e14 FLOP/s gives 0.0443 s ≈ 44 ms. A prefix cache skips nearly all of it.' },
+  { q: 'Using the lesson’s conversation (P_k = 565 + 260(k − 1)), how many prompt tokens does the GPU prefill in total over the first 5 turns if nothing is cached?', numeric: true, answer: 5425, tolerance: 0, unit: 'tokens', why: 'Sum of P_1..P_5 = 5 × 565 + 260 × (0 + 1 + 2 + 3 + 4) = 2,825 + 2,600 = 5,425. With a perfect prefix cache it would be P_5 = 1,605.' },
+  { q: 'Your app’s system prompt starts with "Current time: " and the time to the second, followed by 2,000 tokens of fixed instructions. What happens to prefix caching?', options: ['Nothing; the cache matches the fixed instructions anyway', 'It never hits: the prefix differs every second, and everything after a changed token has a different history', 'It hits half the time', 'The engine reorders the prompt to make it cacheable'], answer: 1, why: 'A cache match must be exact from the first token. Change a token near the top and every later key and value depends on it, so none of the 2,000 instruction tokens can be reused. Put the time at the end.' },
+  { q: 'You render with apply_chat_template(..., tokenize=False) and then call tok(text) with default settings on a Llama 3 model. What goes wrong?', options: ['The generation prompt is removed', 'The prompt starts with two <|begin_of_text|> tokens, a layout the model never saw in training', 'The content tokens are lowercased', 'Nothing; this is the recommended pattern'], answer: 1, why: 'The template already wrote <|begin_of_text|>; tok() adds another by default. Pass add_special_tokens=False when tokenizing a rendered template, or let apply_chat_template tokenize for you.' },
+]} />
