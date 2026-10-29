@@ -1,0 +1,378 @@
+---
+title: 'QLoRA & finetuning on one GPU'
+summary: 'Analyze the three breakthroughs of QLoRA (arXiv:2305.14314): NormalFloat4 (NF4) optimal quantiles, Double Quantization scale compression, and Paged Optimizers to train a 65B model on a single 48 GB GPU.'
+objectives:
+  - 'Explain why NormalFloat4 (NF4) is information-theoretically optimal for zero-mean normally distributed weights'
+  - 'Calculate memory savings from Double Quantization (slashing scale constants from 0.5 to 0.127 bits per parameter)'
+  - 'Describe the mechanism of Paged Optimizers using CUDA Unified Memory to eliminate transient OOM spikes'
+  - 'Compute exact VRAM footprints for 8B and 65B models under QLoRA versus 16-bit LoRA and full finetuning'
+  - 'Trace the forward pass: 4-bit storage in HBM to on-the-fly dequantization into BF16 in SRAM'
+---
+import QloraViz from '@/components/viz/finetuning/QloraViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+LoRA was a massive leap forward. By freezing the foundation weights and training only 0.3% of parameters in low-rank adapter matrices, it eliminated 99% of optimizer states and gradients.
+
+Yet for independent practitioners and enterprise teams with modest GPU budgets, standard LoRA still hit an immovable wall: **the frozen base weights themselves**.
+
+Consider fine-tuning a 65-billion parameter model like LLaMA-65B. Even with rank-8 LoRA adapters requiring less than 500 megabytes of memory, the 65 billion base weights still had to reside in GPU memory in 16-bit precision (BF16 or FP16):
+
+$$
+M_{\text{weights}} = 65 \times 10^9 \times 2 \text{ bytes} = 130 \text{ GB}
+$$
+
+No single commercial GPU—not an 80 GB A100, not an 80 GB H100, and certainly not a 24 GB consumer card—could even *load* the frozen base model into memory. Fine-tuning a 65B model still required an expensive multi-GPU cluster with tensor parallelism or FSDP sharding.
+
+In May 2023, Tim Dettmers and colleagues at the University of Washington published <Term t="qlora">QLoRA</Term> (*QLoRA: Efficient Finetuning of Quantized LLMs*, arXiv:2305.14314).
+
+QLoRA showed how to compress the frozen base model from 16-bit to **4-bit** without destroying the gradient landscape or degrading downstream quality. Through three interlocking innovations—<Term t="nf4">NF4 (4-bit NormalFloat)</Term>, <Term t="double-quantization">Double Quantization (DQ)</Term>, and <Term t="paged-optimizer">Paged Optimizers</Term>—QLoRA enabled an inference engineer to fine-tune a **65B model on a single 48 GB GPU**, and an **8B model on a free 16 GB Google Colab T4 GPU**.
+
+<Scrolly>
+  <QloraViz client:visible slot="stage" />
+
+  <Step title="1. The 4-bit barrier">
+    In standard LoRA, base weights remain in 16-bit precision. An 8B model requires 16 GB of weights; a 65B model requires 130 GB. To democratize training, the base weights must be compressed to 4-bit while maintaining full training fidelity.
+  </Step>
+
+  <Step title="2. NF4: Optimal quantile grid">
+    Pretrained neural network weights follow a normal distribution $\mathcal{N}(0, \sigma^2)$. NF4 builds a theoretical quantile grid of 16 bins such that **each bin contains exactly 6.25% of the parameter probability mass**, with an exact zero-point.
+  </Step>
+
+  <Step title="3. On-the-fly dequantization: 4-bit to BF16">
+    Weights are stored in 4-bit in High Bandwidth Memory (HBM). When an attention or MLP layer executes, a fused CUDA kernel loads the 4-bit values into on-chip SRAM, dequantizes them to BF16, and computes the GEMM at full hardware speed.
+  </Step>
+
+  <Step title="4. Double Quantization: Squeezing the scales">
+    Standard block quantization (block size 64) requires an FP32 scale every 64 parameters (0.5 bits/param). Double Quantization (DQ) quantizes these scale constants into 8-bit FP with block size 256, **slashing scale memory to 0.127 bits/param**.
+  </Step>
+
+  <Step title="5. Paged Optimizers: Taming memory spikes">
+    During long-context sequences, activation memory surges and causes transient Out-Of-Memory (OOM) crashes. Paged Optimizers allocate AdamW states in CUDA Unified Memory, automatically paging idle states to host CPU RAM over PCIe during spikes.
+  </Step>
+
+  <Step title="6. The milestone: 65B on a single 48 GB GPU">
+    With NF4 and Double Quantization, an 8B model compresses to **~4.1 GB** and a 65B model to **~33.5 GB**. Adding 16-bit LoRA adapters allows full fine-tuning of 65B on a single 48 GB workstation GPU (RTX 6000 Ada or A6000).
+  </Step>
+</Scrolly>
+
+## The First Pillar: NormalFloat4 (NF4)
+
+When engineers first attempted to fine-tune 4-bit quantized models, performance degraded catastrophically. The reason lies in the mismatch between standard integer/floating-point formats and the empirical distribution of neural network weights.
+
+### The Problem with Linear Integer (INT4) and Standard FP4
+In standard uniform INT4 quantization, the range $[-c, c]$ is sliced into 16 evenly spaced intervals:
+
+$$
+q_i = -c + i \cdot \frac{2c}{15}, \qquad i \in \{0, 1, \dots, 15\}
+$$
+
+However, pretrained transformer weights are **not uniformly distributed**. Because of weight decay and layer normalization during pretraining, transformer weights follow a near-perfect zero-mean Gaussian distribution:
+
+$$
+W \sim \mathcal{N}\left(0, \sigma^2\right)
+$$
+
+Under a Gaussian distribution:
+- Over **68%** of the weights lie within $[-1\sigma, +1\sigma]$.
+- Over **95%** of the weights lie within $[-2\sigma, +2\sigma]$.
+- Less than **0.3%** of weights lie in the extreme tails beyond $\pm 3\sigma$.
+
+If you use a uniform quantization grid, the majority of your 16 bins are wasted capturing the empty tails, while the dense cluster of weights near zero is coarsened into just two or three bins, introducing massive **quantization noise**.
+
+```
+Standard Uniform Quantization (INT4):
+[ -3σ | -2.6σ | -2.2σ | ... | -0.2σ | +0.2σ | ... | +2.6σ | +3σ ]
+   ▲      ▲       ▲             ▲       ▲           ▲      ▲
+ Wasted empty tail bins      Dense bulk of weights squashed here!
+```
+
+### The NF4 Solution: Equal-Mass Quantiles
+Information theory dictates that a discrete quantization code achieves maximum entropy (and minimum reconstruction error) when **every discrete bin has an equal probability of being assigned an input value**.
+
+NormalFloat4 (NF4) constructs an asymmetric 16-bin grid based on the quantiles of a standard normal distribution:
+
+$$
+q_i = Q_X\left(\frac{i}{2^k}\right), \qquad i = 0, \dots, 2^k - 1
+$$
+
+Where $Q_X(\cdot)$ is the quantile function (inverse CDF) of $\mathcal{N}(0, 1)$.
+
+To ensure exact representation of zeros (which are crucial for padding, masking, and sparse operations), Dettmers et al. designed NF4 with two separate quantile grids:
+- 7 bins for the negative numbers $[-1.0, 0)$.
+- 8 bins for the positive numbers $(0, +1.0]$.
+- Exactly one bin for **0.0**.
+
+The resulting exact 16 discrete points of the NF4 data type are:
+
+```python
+NF4_BINS = [
+    -1.0000000, -0.6961928, -0.5250731, -0.3949175,
+    -0.2844414, -0.1845100, -0.0910500,  0.0000000,
+     0.0795802,  0.1609302,  0.2461123,  0.3379152,
+     0.4407098,  0.5626170,  0.7229568,  1.0000000
+]
+```
+
+Because each bin captures exactly $\frac{1}{16} = 6.25\%$ of the weights, NF4 preserves significantly more structural information than uniform INT4 or standard IEEE FP4 formats.
+
+---
+
+## The Second Pillar: Double Quantization (DQ)
+
+Quantization scales real weights into discrete indices using a block-wise scale factor $c$:
+
+$$
+W^{\text{quant}} = \text{round}\left( \frac{W}{c} \right)
+$$
+
+To prevent outliers from distorting an entire tensor, weights are partitioned into small blocks of size $B = 64$. Each block of 64 parameters requires its own FP32 scale factor $c_1$.
+
+How much memory do these scale factors consume?
+
+$$
+\text{Memory per block} = 32 \text{ bits}
+$$
+
+$$
+\text{Scale Overhead} = \frac{32 \text{ bits}}{64 \text{ parameters}} = 0.5 \text{ bits per parameter}
+$$
+
+When the base weights themselves are only 4 bits per parameter, adding $0.5$ bits of scale constants represents a **$12.5\%$ memory overhead**! For a 65B model:
+
+$$
+M_{\text{scales}} = 65 \times 10^9 \times \frac{0.5 \text{ bits}}{8 \text{ bits/byte}} \approx 4.06 \text{ GB}
+$$
+
+In a GPU constrained to 48 GB, burning 4 gigabytes on floating-point scale constants is unacceptable.
+
+### The Double Quantization Solution
+Double Quantization applies quantization to the quantization scales themselves:
+
+1. **First quantization:** Quantize base weights to 4-bit NF4 with block size $B_1 = 64$. This yields scale constants $c_1$ in FP32.
+2. **Second quantization:** Treat the $c_1$ scale constants as a continuous tensor. Quantize them into **8-bit FP (FP8)** with a wider block size $B_2 = 256$, with a single second-stage FP32 scale $c_2$.
+
+What is the resulting memory overhead per parameter?
+
+$$
+\text{Overhead}_{\text{DQ}} = \frac{8 \text{ bits}}{B_1} + \frac{32 \text{ bits}}{B_1 \times B_2} = \frac{8}{64} + \frac{32}{64 \times 256} = 0.125 + 0.00195 \approx 0.127 \text{ bits per parameter}
+$$
+
+Double Quantization drops scale overhead from **0.500 bits/param down to 0.127 bits/param**—a reduction of **0.373 bits per parameter**.
+
+For a 65B model, this single mathematical trick saves:
+
+$$
+\text{Memory Saved} = 65 \times 10^9 \times \frac{0.373 \text{ bits}}{8 \text{ bits/byte}} \approx 3.03 \times 10^9 \text{ bytes} \approx 3.03 \text{ GB}
+$$
+
+Those 3 saved gigabytes are often the exact margin that prevents an Out-Of-Memory crash when sequence length expands.
+
+---
+
+## The Third Pillar: Paged Optimizers
+
+Even with 4-bit weights and Double Quantization, long-context training runs routinely crashed from transient memory spikes.
+
+During training:
+- Model weights remain constant in memory.
+- LoRA adapter parameters and optimizer states remain constant.
+- **Activations fluctuate wildly:** When a micro-batch contains a sequence of length 2,048 or 4,096 tokens, activation memory spikes temporarily during the forward pass, crowding out available VRAM.
+
+In traditional PyTorch training, if total memory usage exceeds GPU VRAM by even a single megabyte for a fraction of a millisecond, the CUDA runtime immediately aborts the process with an unrecoverable `OutOfMemoryError`.
+
+### The Paged AdamW Mechanism
+To solve this, QLoRA introduced **Paged Optimizers**, built upon NVIDIA CUDA Unified Virtual Memory (UVM):
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 CUDA UNIFIED VIRTUAL MEMORY                 │
+├──────────────────────────────┬──────────────────────────────┤
+│ GPU High Bandwidth Memory    │ Host System CPU RAM          │
+│ • NF4 Base Weights (Active)  │ • Inactive AdamW Paged Tensors│
+│ • Current Layer Activations  │ • Pre-allocated Swap Pool    │
+│ • LoRA Gradients             │                              │
+└──────────────▲───────────────┴──────────────▲───────────────┘
+               │           PCIe Gen4/5        │
+               └───────────◄─────────►────────┘
+                 Page-fault migration on spike
+```
+
+1. The AdamW optimizer states for the LoRA adapters (FP32 master weights, momentum $m$, variance $v$) are allocated as unified memory pages.
+2. Under normal operation, these pages reside in GPU HBM for fast tensor core access.
+3. When a long prompt causes an activation memory spike that threatens to exceed VRAM capacity, the NVIDIA driver automatically evicts inactive optimizer state pages across the PCIe bus to host system CPU RAM.
+4. Once the activation tensor is consumed during backpropagation and freed, the driver seamlessly pages the optimizer states back to GPU memory before the optimizer update step.
+
+Because optimizer states are accessed only once per training step (during `optimizer.step()`), paging them over PCIe introduces negligible throughput overhead (typically under 1–2% total slowdown) while providing 100% immunity to activation spike crashes.
+
+---
+
+## The Forward Pass: How QLoRA Executes
+
+A frequent misconception is that QLoRA performs 4-bit integer matrix arithmetic during training.
+
+It does not. NVIDIA consumer and enterprise GPUs before Blackwell (such as Turing T4, Ampere A100, and Ada Lovelace) do not have 4-bit floating point tensor core instructions for backpropagation.
+
+QLoRA uses **storage quantization, not compute quantization**:
+
+```
+      NF4 Base Weights in HBM (4-bit, 0.5 B/param)
+                         │
+                         │ (Read over high-speed HBM bus)
+                         ▼
+             Fused Dequantization Kernel
+       (Decompressed to BF16 inside on-chip SRAM)
+                         │
+                         ▼
+        Full BF16 Tensor Core GEMM: x @ W_0
+                         │
+                         ▼
+          Sum with LoRA adapter branch:
+       h = (x @ W_0) + (α/r) * (x @ A.T) @ B.T
+```
+
+1. **Storage:** Base weights $W_0$ remain in 4-bit NF4 throughout the entire training run, consuming only 0.5 bytes per parameter in VRAM.
+2. **Dequantization on-the-fly:** When a specific linear layer executes, a custom fused CUDA kernel loads the 4-bit NF4 numbers into the SM's fast on-chip SRAM / L1 cache.
+3. The kernel immediately multiplies each 4-bit index by its double-quantized scale factor, materializing the weight as **BF16 in SRAM**.
+4. The standard matrix multiplication $\mathbf{x} W_0$ executes using high-throughput **BF16 Tensor Cores**.
+5. The adapter branch computes $\frac{\alpha}{r} (\mathbf{x} A^\top) B^\top$ in parallel in BF16.
+6. The two outputs are summed into the layer output $\mathbf{h}$.
+
+The dequantized BF16 weights are never written back to HBM; they are discarded as soon as the GEMM finishes. Compute precision remains at full BF16 throughout.
+
+---
+
+## VRAM Economics: Full Training vs LoRA vs QLoRA
+
+Let us inspect the concrete memory requirements for an 8B model (such as Llama-3.1-8B) and a 65B model (such as LLaMA-65B) across all three training paradigms.
+
+### 8B Parameter Model ($P = 8 \times 10^9$)
+- **Full-Parameter SFT (Mixed-Precision AdamW):**
+  $M = 16 \text{ bytes/param} \times 8 \times 10^9 = 128 \text{ GB}$ static $+ \sim 20 \text{ GB}$ activations = **$\approx 148 \text{ GB}$** (Requires 2× 80 GB A100s).
+- **16-bit LoRA ($r = 16$, All Linear):**
+  Frozen weights (16-bit) = $16 \text{ GB}$. Adapter + optimizer + activations = $\sim 6 \text{ GB}$. Total = **$\approx 22 \text{ GB}$** (Requires an A100, A5000, or RTX 3090/4090 24 GB).
+- **QLoRA (NF4 + DQ + $r = 16$):**
+  Base weights in NF4 = $8 \times 10^9 \times 0.5 \text{ B} = 4.0 \text{ GB}$. DQ scales = $0.13 \text{ GB}$. Adapter + activations = $\sim 2.5 \text{ GB}$. Total = **$\approx 6.8 \text{ GB}$**!
+  **Fits comfortably on a single 16 GB GPU (NVIDIA T4 on free Google Colab, RTX 4060, or RTX 3060)!**
+
+### 65B Parameter Model ($P = 65 \times 10^9$)
+- **Full-Parameter SFT:**
+  $M = 16 \times 65 = 1,040 \text{ GB} = \mathbf{1.04 \text{ TB}}$ (Requires sixteen 80 GB GPUs).
+- **16-bit LoRA:**
+  Base weights = $130 \text{ GB}$. Total with activations = **$\approx 160 \text{ GB}$** (Requires two 80 GB GPUs).
+- **QLoRA (NF4 + DQ):**
+  Base weights in NF4 = $32.5 \text{ GB}$. DQ scales = $1.03 \text{ GB}$. LoRA adapters + activations = $\sim 8.0 \text{ GB}$. Total = **$\approx 41.5 \text{ GB}$**!
+  **Fits entirely on a single 48 GB workstation GPU (NVIDIA RTX 6000 Ada or A6000)!**
+
+```python
+# Calculating exact QLoRA base weight memory with Double Quantization
+def calculate_qlora_weight_memory(param_count_billions: float):
+    p = param_count_billions * 1e9
+    
+    # 1. 4-bit NF4 weights: 4 bits per parameter
+    nf4_bytes = p * 0.5
+    
+    # 2. Double Quantization scale constants:
+    # First level: block size 64, quantized to FP8 (8 bits / 64)
+    # Second level: block size 256, FP32 scale (32 bits / (64 * 256))
+    dq_bits_per_param = (8.0 / 64.0) + (32.0 / (64.0 * 256.0))
+    scale_bytes = p * (dq_bits_per_param / 8.0)
+    
+    total_weight_bytes = nf4_bytes + scale_bytes
+    
+    print(f"=== Model: {param_count_billions}B Parameters ===")
+    print(f"Standard FP16 Weights:      {p * 2 / 1e9:6.2f} GB")
+    print(f"4-bit NF4 Pure Weights:     {nf4_bytes / 1e9:6.2f} GB")
+    print(f"Double Quant Scale Overhead:{scale_bytes / 1e9:6.2f} GB ({dq_bits_per_param:.3f} bits/param)")
+    print(f"Total QLoRA Base Weights:   {total_weight_bytes / 1e9:6.2f} GB\n")
+
+calculate_qlora_weight_memory(8.0)
+calculate_qlora_weight_memory(65.0)
+```
+
+<Callout type="real" title="Now read the paper">
+  **Paper:** *QLoRA: Efficient Finetuning of Quantized LLMs* (Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, Luke Zettlemoyer, 2023) — [arXiv:2305.14314](https://arxiv.org/abs/2305.14314)
+  
+  **What you should read:**
+  - **Section 1 & 2:** Introduction and Background (how they establish the 4-bit fine-tuning challenge).
+  - **Section 3:** QLoRA Tuning (read Subsection 3.1 for NF4 math, 3.2 for Double Quantization, and 3.3 for Paged Optimizers).
+  - **Section 4 & 5:** Guanaco model results and benchmark comparisons against 16-bit full SFT.
+  
+  **What you can skip:**
+  - Appendix C detailed proofs of quantile distributions unless you want the rigorous measure theory.
+  
+  **What you will recognize:**
+  You will recognize the NF4 quantile values, the $\frac{32}{64 \times 256}$ double quantization scale math, the CUDA Unified Virtual Memory paging mechanism, and the empirical proof that 4-bit QLoRA matches 16-bit performance across 26 academic benchmarks.
+</Callout>
+
+<KeyNotes>
+  1. QLoRA solves the hardware barrier of standard LoRA by compressing frozen base weights to **4-bit precision** while training 16-bit adapters.
+  2. **NormalFloat4 (NF4)** builds an information-theoretically optimal quantile grid where each of the 16 bins carries exactly $6.25\%$ of the Gaussian weight distribution.
+  3. NF4 features an exact zero-point representation, avoiding the quantization distortion common in uniform integer or standard FP4 formats.
+  4. **Double Quantization (DQ)** quantizes the first-stage FP32 quantization scales into 8-bit FP, reducing scale overhead from $0.500$ down to **$0.127$ bits per parameter** (saving $\approx 3\text{ GB}$ on a 65B model).
+  5. **Paged Optimizers** leverage CUDA Unified Virtual Memory to page adapter optimizer states to CPU host RAM during transient activation spikes, eliminating OOM crashes.
+  6. Base weights are dequantized to BF16 inside fast on-chip SRAM during layer execution; tensor core operations run at full BF16 floating-point precision.
+  7. QLoRA enables training an **8B model on a single 16 GB GPU** ($\sim 6.8\text{ GB}$ VRAM) and a **65B model on a single 48 GB GPU** ($\sim 41.5\text{ GB}$ VRAM).
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why is NormalFloat4 (NF4) superior to standard uniform INT4 for quantizing pretrained LLM weights?',
+    options: [
+      'Pretrained transformer weights are normally distributed; NF4 creates quantiles with equal probability mass per bin rather than wasting bins on empty tails',
+      'NF4 uses 6 bits per weight instead of 4 bits',
+      'Uniform INT4 does not support negative numbers',
+      'NF4 requires no GPU memory bandwidth'
+    ],
+    answer: 0,
+    why: 'Because transformer weights follow a zero-mean Gaussian distribution, uniform spacing allocates too many bins to the sparse tails. NF4 allocates bin edges so each of the 16 bins holds exactly 6.25% of the probability mass, maximizing information entropy.'
+  },
+  {
+    q: 'In Double Quantization, block size 1 is B1 = 64 (quantized to 8-bit floats) and block size 2 is B2 = 256 (FP32 scale). Exactly how many bits per parameter are consumed by the quantization scales?',
+    numeric: true,
+    answer: 0.127,
+    tolerance: 0.003,
+    unit: 'bits/param',
+    why: 'Overhead = 8/64 + 32/(64 × 256) = 0.125 + 32/16384 = 0.125 + 0.001953 = 0.126953 ≈ 0.127 bits per parameter.'
+  },
+  {
+    q: 'How does QLoRA perform the forward matrix multiplication during training?',
+    options: [
+      'It executes INT4 integer tensor core math directly on the weights',
+      'It dequantizes the 4-bit weights into BF16 in on-chip SRAM and executes standard BF16 tensor core GEMMs',
+      'It sends all activations to the CPU for floating-point calculation',
+      'It converts the input activations to 4-bit NF4 to match the weights'
+    ],
+    answer: 1,
+    why: 'QLoRA uses storage quantization. Weights are stored in 4-bit NF4 in HBM. During layer execution, a fused CUDA kernel reads the 4-bit weights into SRAM, dequantizes them to BF16, and performs the GEMM in full BF16 precision.'
+  },
+  {
+    q: 'Approximately what is the total memory footprint of an 8B model base weights stored in 4-bit NF4 with Double Quantization, in GB (10^9 bytes)?',
+    numeric: true,
+    answer: 4.13,
+    tolerance: 0.15,
+    unit: 'GB',
+    why: '8B × 4 bits/weight = 4.0 GB. Adding Double Quantization scales (0.127 bits/weight) = 8B × 0.127 / 8 ≈ 0.127 GB. Total ≈ 4.127 GB ≈ 4.13 GB.'
+  },
+  {
+    q: 'What is the role of Paged Optimizers in QLoRA?',
+    options: [
+      'They page model weights between GPU and NVMe disk during inference',
+      'They allocate adapter optimizer states in CUDA Unified Memory, automatically paging them to CPU RAM over PCIe during transient activation spikes',
+      'They prune unused pages in the KV cache during decoding',
+      'They compile PyTorch autograd graphs into static CUDA graphs'
+    ],
+    answer: 1,
+    why: 'Paged optimizers allocate optimizer states across CUDA Unified Virtual Memory. When a sudden activation surge threatens to trigger an OOM, inactive optimizer states page out to host CPU memory over PCIe, preventing crashes.'
+  },
+  {
+    q: 'What single-GPU hardware milestone was demonstrated by Dettmers et al. in the QLoRA paper?',
+    options: [
+      'Training a 70B model on an iPhone',
+      'Fine-tuning a 65B parameter model on a single 48 GB GPU (e.g. RTX 6000 Ada / A6000)',
+      'Pretraining GPT-4 on a single gaming laptop',
+      'Running 10,000 concurrent streams on an RTX 3060'
+    ],
+    answer: 1,
+    why: 'QLoRA famously proved that a 65B parameter model could be fully fine-tuned on a single 48 GB workstation GPU, matching 16-bit full finetuning quality across 26 benchmarks.'
+  }
+]} />

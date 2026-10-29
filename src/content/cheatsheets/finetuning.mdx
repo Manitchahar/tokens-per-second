@@ -1,0 +1,182 @@
+---
+title: 'Module B5 · Finetuning'
+module: finetuning
+---
+
+## The golden rule of customization
+
+> **Finetune for form, behaviour, and syntax; retrieve for volatile facts.**
+
+- **Finetuning (SFT / LoRA):** Embeds strict output syntax (JSON/SQL), domain persona, conversational style, and distills 70B teacher reasoning into 1.5B edge models with zero added prompt tokens.
+- **RAG:** Provides verifiable citations, auditable source attribution, and real-time updates for volatile facts with zero parameter updates.
+- **The Knowledge Injection Fallacy:** Gradient descent is sample-inefficient for discrete memorization; factual recall in fine-tuned models lags 30–50% behind RAG.
+
+---
+
+## The customization ladder
+
+| Method | Setup / Training Cost | Prompt Overhead | Best Used For |
+|---|---|---|---|
+| **Zero-Shot Prompting** | \$0, instant iteration | 0 extra tokens | Prototyping, broad reasoning |
+| **Few-Shot (ICL)** | \$0, instant iteration | +500 to 2,000 prompt tokens | Nuanced formatting at low request volume |
+| **RAG** | Low (Vector embedding) | +500 to 3,000 context tokens | Dynamic docs, verified facts, citations |
+| **Finetuning (LoRA)** | Moderate (GPU hours) | **0 prompt tokens** | Strict schemas, high-throughput APIs, distillation |
+
+---
+
+## Training memory: The 16-byte breakdown
+
+Under standard mixed-precision AdamW, static parameter memory requires **16 bytes per parameter**:
+
+$$
+M_{\text{static}} = M_{\text{weights}} + M_{\text{gradients}} + M_{\text{optimizer}} = 2P + 2P + 12P = 16 \cdot P \text{ bytes}
+$$
+
+| Component | Precision | Bytes / Param | 8B Model (Llama-3.1) | 70B Model (Llama-3.1) |
+|---|---|---|---|---|
+| **Model Weights** | BF16 / FP16 | 2 B | 16.06 GB | 141.2 GB |
+| **Gradients** | BF16 / FP16 | 2 B | 16.06 GB | 141.2 GB |
+| **FP32 Master Weights** | FP32 | 4 B | 32.12 GB | 282.4 GB |
+| **AdamW Momentum ($m$)** | FP32 | 4 B | 32.12 GB | 282.4 GB |
+| **AdamW Variance ($v$)** | FP32 | 4 B | 32.12 GB | 282.4 GB |
+| **Total Static State** | Mixed | **16 B** | **128.48 GB** | **1,129.6 GB (1.13 TB)** |
+
+> FP32 master weights and optimizer buffers are mandatory to prevent gradient updates ($\sim 10^{-6}$) from underflowing to zero in 16-bit floats.
+
+---
+
+## Activations & gradient checkpointing
+
+### Activation Scaling
+$$
+M_{\text{act}} \approx b \cdot s \cdot L \cdot h \cdot \left(34 + 5 \frac{a \cdot s}{h}\right) \text{ bytes (in 16-bit)}
+$$
+- Scales linearly with batch size $b$, hidden dimension $h$, and layer depth $L$.
+- Scales **quadratically** with sequence length $s$ through the attention score matrix $b \cdot a \cdot s^2$.
+
+### Gradient Checkpointing (Activation Recomputation)
+- Stashes only block boundary activations; recomputes internal attention and MLP tensors on-demand during the backward pass.
+- Slashes activation memory by **70% to 90%**.
+- **The 33.3% Compute Penalty:**
+  - Standard training: $2P\text{ (fwd)} + 4P\text{ (bwd)} = 6P\text{ FLOPs/token}$.
+  - Checkpointed training: $2P\text{ (fwd)} + 2P\text{ (recompute)} + 4P\text{ (bwd)} = 8P\text{ FLOPs/token}$.
+  - $\frac{8P - 6P}{6P} = \frac{2}{6} = \mathbf{33.3\%}\text{ added compute}$.
+
+---
+
+## LoRA: Low-rank adaptation (Hu et al., 2021)
+
+### Forward Equation
+$$
+\mathbf{h} = \mathbf{x} W_0 + \frac{\alpha}{r} (\mathbf{x} A^\top) B^\top
+$$
+- **Down-projection ($A$):** Shape $[r \times k]$, initialized from $\mathcal{N}(0, \sigma^2)$.
+- **Up-projection ($B$):** Shape $[d \times r]$, initialized to **exactly zero** ($\Delta W = 0$ at step 0).
+- **Scaling factor:** $\frac{\alpha}{r}$, typically configured with $\alpha = 2r$.
+
+### Parameter Reduction ($d = k = 4096, r = 8$)
+$$
+P_{\text{dense}} = 4096 \times 4096 = 16{,}777{,}216 \text{ parameters}
+$$
+$$
+P_{\text{LoRA}} = (4096 \times 8) + (8 \times 4096) = 65{,}536 \text{ parameters} \quad \left(\mathbf{0.39\%}\text{ of dense layer}\right)
+$$
+- **GPT-3 (175B):** 10,000× fewer trainable parameters, 3× less training VRAM.
+- **Target modules:** Adapting both $W_q$ and $W_v$ with low rank ($r = 1\text{–}4$) outperforms adapting only $W_q$ with high rank. All-linear LoRA adapts all 7 projection matrices.
+
+### Zero-Latency Merging
+$$
+W_{\text{merged}} = W_0 + \frac{\alpha}{r} B \cdot A
+$$
+Precomputed before single-tenant deployment: **zero added inference latency**.
+
+---
+
+## QLoRA: 4-bit fine-tuning on one GPU (Dettmers et al., 2023)
+
+### The Three Pillars
+
+#### 1. NormalFloat4 (NF4)
+- Information-theoretically optimal quantile grid for $\mathcal{N}(0, \sigma^2)$ distributed weights.
+- 16 discrete bins, each containing exactly **6.25% of the parameter probability mass**.
+- Features an exact zero-point representation.
+
+#### 2. Double Quantization (DQ)
+- Quantizes the first-stage FP32 block-quantization scale constants ($B_1 = 64$) into 8-bit FP with block size $B_2 = 256$:
+$$
+\text{Scale Overhead} = \frac{8}{64} + \frac{32}{64 \times 256} = 0.125 + 0.00195 \approx \mathbf{0.127 \text{ bits/param}}
+$$
+- Slashes scale memory from $0.500$ down to $0.127$ bits/param, saving **$\approx 3\text{ GB}$ on a 65B model**.
+
+#### 3. Paged Optimizers
+- Allocates AdamW states across CUDA Unified Virtual Memory (UVM).
+- Pages inactive optimizer tensors to host CPU RAM during transient activation spikes, eliminating OOM crashes.
+
+### Hardware Footprint Comparison
+- **8B Model:** 4-bit weights = **$4.13\text{ GB}$**; full training fits in **$\sim 6.8\text{ GB}$ VRAM** (single 16 GB T4 / RTX 4060).
+- **65B Model:** 4-bit weights = **$33.5\text{ GB}$**; full training fits in **$\sim 41.5\text{ GB}$ VRAM** (single 48 GB RTX 6000 Ada / A6000).
+
+---
+
+## Finetuning tactics & hyperparameters
+
+### 1. Loss Masking (`labels = -100`)
+- Set prompt and padding token labels to `-100`.
+- PyTorch `nn.CrossEntropyLoss(ignore_index=-100)` ignores them during loss and backward passes.
+- Prevents template parroting, prompt echoing, and capacity waste.
+
+### 2. Effective Batch Size Formula
+$$
+\text{Effective Batch Size} = b_{\text{micro}} \times K_{\text{accum}} \times N_{\text{GPUs}}
+$$
+- Target **32 to 128 sequences** for stable instruction tuning.
+
+### 3. Learning Rate Selection
+- **Full SFT:** $1 \times 10^{-5}$ to $3 \times 10^{-5}$.
+- **LoRA / QLoRA ($r = 8\text{–}16$):** $1 \times 10^{-4}$ to $2 \times 10^{-4}$ (~$10\times$ higher).
+- **Schedule:** 3–5% linear warmup followed by cosine decay down to $10\%$ peak LR.
+- **Gradient Clipping:** `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)` to eliminate `NaN` crashes.
+
+### 4. Epoch Budgeting (The LIMA Principle)
+- Budget **1 to 3 epochs**.
+- Fine-tuning teaches style and format; training past 3 epochs causes catastrophic forgetting of pre-trained reasoning.
+
+---
+
+## Model merging & task arithmetic
+
+### Linear Mode Connectivity (LMC)
+Models fine-tuned from the same shared pre-trained base model $\theta_{\text{base}}$ remain in the same convex loss basin: paths between them have zero energy loss barriers.
+
+### Task Vector Arithmetic
+$$
+\tau_t = \theta_t - \theta_{\text{base}}
+$$
+- **Addition (Skill Fusion):** $\theta_{\text{merged}} = \theta_{\text{base}} + \lambda_A \tau_A + \lambda_B \tau_B$.
+- **Subtraction (Unlearning):** $\theta_{\text{clean}} = \theta_{\text{base}} - \lambda_{\text{toxic}} \tau_{\text{toxic}}$.
+
+### Merging Algorithms
+
+#### 1. Model Soups (Linear Average)
+$$
+\theta_{\text{soup}} = \frac{1}{M} \sum_{i=1}^{M} \theta_i
+$$
+- Simple average across diverse training seeds; dampens noise.
+
+#### 2. SLERP (Spherical Linear Interpolation)
+$$
+\theta_{\text{slerp}}(t) = \frac{\sin\left((1 - t)\Omega\right)}{\sin\Omega} \theta_A + \frac{\sin\left(t\Omega\right)}{\sin\Omega} \theta_B, \qquad \Omega = \arccos\left(\frac{\theta_A \cdot \theta_B}{\|\theta_A\| \|\theta_B\|}\right)
+$$
+- Interpolates along the constant-radius spherical geodesic, preventing high-dimensional **norm collapse**.
+
+#### 3. TIES-Merging
+1. **Trim:** Retain top 20% largest magnitude deltas $|\tau|$; zero out the bottom 80% noise.
+2. **Elect Sign:** Determine parameter consensus direction $\gamma_p = \text{sign}(\sum_m \tau_m)$.
+3. **Disjoint Merge:** Average only parameter deltas that match the elected sign.
+
+#### 4. DARE (Drop And REscale)
+$$
+\hat{\tau}_i = \frac{m_i}{1 - p} \cdot \tau_i, \qquad m_i \sim \text{Bernoulli}(1 - p)
+$$
+- Drops up to **90% of delta weights** ($p = 0.90$) and rescales surviving weights by $\frac{1}{1 - p} = 10\times$.
+- Preserves expected values while reducing multi-model parameter collision probability to under $1\%$.

@@ -1,0 +1,367 @@
+---
+title: 'Finetuning tactics: learning rate, loss masking & epochs'
+summary: 'Master the empirical mechanics of post-training: why loss masking on prompt tokens is mandatory, calculate effective batch sizes, select learning rates for LoRA vs full SFT, and diagnose loss curves in real time.'
+objectives:
+  - 'Implement loss masking with label index -100 so cross-entropy gradients evaluate only response tokens'
+  - 'Calculate effective batch size from micro-batch size, gradient accumulation steps, and GPU worker counts'
+  - 'Explain why LoRA requires an order-of-magnitude higher learning rate (1e-4) than full-parameter fine-tuning (2e-5)'
+  - 'Identify the risk of catastrophic forgetting when training beyond 1 to 3 epochs on narrow datasets'
+  - 'Diagnose training failure modes from loss curves: overfitting, underfitting, gradient explosion, and loss spikes'
+---
+import TacticsViz from '@/components/viz/finetuning/TacticsViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have designed your architecture, chosen between full fine-tuning and LoRA, and allocated your GPU memory. You launch your training script. The loss begins printing to your terminal.
+
+Ten minutes later, the loss has dropped from 2.4 down to 0.15. The training run appears to be a glorious success. 
+
+You save the adapter checkpoint, load the model into an inference engine, and submit a test prompt:
+```text
+User: Extract the order status from this ticket.
+Model: Extract the order status from this ticket. User: Extract the order status...
+```
+
+The model parrots your prompt back to you. It repeats its own system tags, loops through conversational headers, and generates nonsense.
+
+What went wrong? You omitted **loss masking**. The model spent hundreds of gradient updates learning to predict the user's prompt rather than the assistant's answer.
+
+Fine-tuning large language models is not just about linear algebra and GPU memory; it is governed by strict empirical tactics. In this lesson, you will master the operational playbook of post-training: the mathematics of **loss masking**, <Term t="effective-batch-size">effective batch sizes</Term>, **learning rate schedules**, **epoch budgeting**, and **loss curve interpretation**.
+
+<Scrolly>
+  <TacticsViz client:visible slot="stage" />
+
+  <Step title="1. Loss Masking: Target only the response">
+    In supervised fine-tuning, the model must learn *how to answer*, not *how to ask*. By replacing prompt token target IDs with **-100**, PyTorch cross-entropy completely ignores prompt positions during the backward pass.
+  </Step>
+
+  <Step title="2. The failure mode: What unmasked loss causes">
+    If prompt tokens are included in the loss, parameter updates are wasted memorizing user inputs and prompt templates. The model loses instruction adherence, echoes system headers, and starts hallucinating user turns.
+  </Step>
+
+  <Step title="3. Effective Batch: Micro-batch × Accumulation × GPUs">
+    VRAM limits allow only small micro-batches (e.g. 2 sequences). By accumulating gradients over multiple forward/backward micro-steps before calling `optimizer.step()`, you simulate a large, stable batch (e.g. 64 sequences) with zero extra memory.
+  </Step>
+
+  <Step title="4. Learning Rate: Why LoRA needs 1e-4">
+    Full-parameter fine-tuning updates all 8 billion weights and requires tiny step sizes ($1 \times 10^{-5}$ to $2 \times 10^{-5}$). LoRA constrains updates to a low-rank subspace and must take **order-of-magnitude larger steps** ($1 \times 10^{-4}$ to $2 \times 10^{-4}$).
+  </Step>
+
+  <Step title="5. Epochs 1 to 3: The forgetting boundary">
+    Instruction alignment is superficial: the model already possesses reasoning from pretraining. Training for **1 to 3 epochs** teaches format and style. Pushing past 4–5 epochs induces catastrophic forgetting of general intelligence.
+  </Step>
+
+  <Step title="6. Reading Loss Curves: Healthy vs Overfitting">
+    Always monitor a held-out validation loss. If validation loss begins curving upward while training loss plunges toward zero, the model is memorizing exact training strings. Stop training immediately.
+  </Step>
+</Scrolly>
+
+## Tactic 1 · Loss Masking: Target Only the Response
+
+The standard auto-regressive pretraining objective computes next-token cross-entropy over every single position in a text document:
+
+$$
+\mathcal{L}_{\text{pretrain}}(\theta) = -\frac{1}{T} \sum_{t=1}^{T} \log P_\theta(x_t \mid x_{&lt;t})
+$$
+
+During pretraining, this is correct: every token on the internet is equal target data.
+
+During Supervised Finetuning (SFT), this objective is disastrously wrong. A training example consists of a **Prompt** (user question, system instruction, schema) paired with a **Response** (desired output):
+
+$$
+X = [p_1, p_2, \dots, p_m, r_1, r_2, \dots, r_n]
+$$
+
+If you train on all tokens, the model's loss is:
+
+$$
+\mathcal{L}_{\text{naive}} = -\sum_{i=1}^{m} \log P(p_i \mid p_{&lt;i}) - \sum_{j=1}^{n} \log P(r_j \mid p_{\le m}, r_{&lt;j})
+$$
+
+Notice the first summation: you are forcing gradient descent to optimize the model to predict the user prompt!
+
+### Why Unmasked Prompt Loss Breaks the Model
+1. **User prompts are heterogeneous and noisy:** User queries have diverse phrasing, erratic grammar, and unpredictable typos. Penalizing an LLM for not predicting the user's specific sentence structure forces the optimizer to distort general linguistic representations.
+2. **Template parroting:** If every prompt begins with `<|im_start|>user\nExtract entities\n<|im_end|>\n<|im_start|>assistant\n`, the model notices that predicting these formatting tokens yields easy loss reductions. At test time, the model begins generating its own user prompts and conversation turns instead of stopping at `<|im_end|>`.
+3. **Capacity waste:** In parameter-efficient tuning like LoRA, you have a limited rank capacity ($r = 8$ or $16$). Spending 60% of adapter rank learning to reproduce prompt templates starves the adapter of capacity needed for task reasoning.
+
+### The Implementation: `ignore_index = -100`
+PyTorch's cross-entropy loss function (`nn.CrossEntropyLoss`) features a parameter named `ignore_index`, which defaults to `-100`. Any label set to `-100` contributes zero to the loss and produces zero backward gradients:
+
+```python
+import torch
+import torch.nn as nn
+
+loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+
+# Suppose vocabulary size is 32,000, sequence length is 8 tokens
+logits = torch.randn(1, 8, 32000, requires_grad=True)
+
+# 4 prompt tokens (masked to -100), 3 response tokens, 1 pad token (masked)
+labels = torch.tensor([[-100, -100, -100, -100, 1542, 8821, 2, -100]])
+
+loss = loss_fn(logits.view(-1, 32000), labels.view(-1))
+loss.backward()
+
+# Gradients flow ONLY from positions 4, 5, and 6!
+```
+
+In your dataset tokenization pipeline, always identify the token boundary where the assistant turn begins, and overwrite all preceding label token IDs with `-100`.
+
+---
+
+## Tactic 2 · Effective Batch Size and Gradient Accumulation
+
+In deep learning optimization, the variance of the stochastic gradient estimate is inversely proportional to batch size:
+
+$$
+\text{Var}(\nabla \mathcal{L}_{\mathcal{B}}) \propto \frac{1}{|\mathcal{B}|}
+$$
+
+If batch size $|\mathcal{B}|$ is too small (e.g. 1 or 2 sequences), gradient estimates are noisy and erratic, leading to unstable weight updates and poor convergence. For stable fine-tuning of 8B models, empirical practice recommends an **effective batch size between 32 and 128 sequences**.
+
+However, as derived in Lesson 2, activation memory limits GPU micro-batch size. On a 16 GB T4 or 24 GB RTX 4090, training with sequence length 2,048 forces a micro-batch size of $b_{\text{micro}} = 1$ or $2$.
+
+How do we train with an effective batch size of 64 on hardware that can only hold 2 sequences?
+
+### The Mathematics of Gradient Accumulation
+Gradient accumulation exploits the linearity of the differentiation operator:
+
+$$
+\nabla_\theta \left( \frac{1}{K} \sum_{k=1}^{K} \mathcal{L}_k \right) = \frac{1}{K} \sum_{k=1}^{K} \nabla_\theta \mathcal{L}_k
+$$
+
+Instead of updating model weights on every forward/backward micro-step:
+1. Run forward pass on micro-batch $k$.
+2. Compute loss divided by accumulation steps: $\mathcal{L}_{\text{scaled}} = \frac{\mathcal{L}_k}{K}$.
+3. Call `loss.backward()`. PyTorch **accumulates** (sums) the partial derivatives into the existing `.grad` tensor buffer.
+4. Repeat for $K$ micro-steps without calling `optimizer.step()`.
+5. Call `optimizer.step()` once after $K$ steps, applying the averaged gradient.
+6. Zero out gradients (`optimizer.zero_grad()`).
+
+The fundamental formula for **Effective Batch Size** across a distributed cluster is:
+
+$$
+\text{Effective Batch Size} = b_{\text{micro}} \times K_{\text{accum}} \times N_{\text{GPUs}}
+$$
+
+```
+   Micro-Step 1:  [Seq 1, Seq 2] ──► Forward/Backward ──► Grad += G1/4
+   Micro-Step 2:  [Seq 3, Seq 4] ──► Forward/Backward ──► Grad += G2/4
+   Micro-Step 3:  [Seq 5, Seq 6] ──► Forward/Backward ──► Grad += G3/4
+   Micro-Step 4:  [Seq 7, Seq 8] ──► Forward/Backward ──► Grad += G4/4
+                                                            │
+   Optimizer Step: θ = θ - η * Grad (Effective Batch = 8) ◄─┘
+   Zero Gradients: Grad = 0
+```
+
+### Worked Numeric Example
+Suppose you are fine-tuning on a node with $N_{\text{GPUs}} = 2$.
+- Due to VRAM limits with sequence length 4,096, your micro-batch per GPU is $b_{\text{micro}} = 2$.
+- You want an effective batch size of 64 sequences.
+
+How many gradient accumulation steps $K_{\text{accum}}$ must you set?
+
+$$
+64 = 2 \times K_{\text{accum}} \times 2 \quad \Longrightarrow \quad K_{\text{accum}} = \frac{64}{4} = 16 \text{ steps}
+$$
+
+The optimizer will perform one parameter update every 16 forward-backward iterations, achieving the exact mathematical stability of a 64-sequence batch without consuming additional VRAM.
+
+---
+
+## Tactic 3 · Learning Rate: LoRA vs Full SFT
+
+Selecting the correct maximum learning rate $\eta_{\max}$ is the most critical hyperparameter decision in fine-tuning. 
+
+There is an order-of-magnitude difference between full-parameter fine-tuning and parameter-efficient LoRA:
+
+| Fine-Tuning Regime | Typical Learning Rate ($\eta$) | Rationale |
+|---|---|---|
+| **Full-Parameter SFT** | $1 \times 10^{-5}$ to $3 \times 10^{-5}$ | All 8B weights update; larger steps cause catastrophic weight displacement |
+| **LoRA / QLoRA ($r = 8\text{–}16$)** | $1 \times 10^{-4}$ to $3 \times 10^{-4}$ | Constrained low-rank subspace; matrix B starts at zero and needs aggressive exploration |
+| **LoRA / QLoRA ($r = 64\text{–}128$)** | $5 \times 10^{-5}$ to $1 \times 10^{-4}$ | Higher rank provides more parameters, requiring slightly smaller step sizes |
+
+### Why Does LoRA Need a 10× Higher Learning Rate?
+1. **Low-rank bottleneck damping:** In full fine-tuning, a gradient update can move parameters along 4,096 orthogonal directions per layer. In LoRA with $r = 8$, the update is strictly confined to an 8-dimensional projection. To achieve the same functional behavioral displacement, the optimizer must take significantly larger steps along those 8 dimensions.
+2. **Cold-start initialization:** Matrix $B$ is initialized to zero. During the first few iterations, the gradient signal must rapidly push $B$ away from zero. A tiny learning rate ($1 \times 10^{-5}$) leaves $B$ near zero for dozens of steps, severely delaying convergence.
+
+### Learning Rate Schedule: Warmup + Cosine Decay
+Never use a constant learning rate. Standard practice pairs the optimizer with a **Cosine Annealing Schedule with Linear Warmup**:
+
+$$
+\eta(t) = 
+\begin{cases} 
+\eta_{\max} \cdot \frac{t}{T_{\text{warmup}}}, & t \le T_{\text{warmup}} \\
+\eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\left(\frac{t - T_{\text{warmup}}}{T_{\text{total}} - T_{\text{warmup}}} \pi\right)\right), & t > T_{\text{warmup}}
+\end{cases}
+$$
+
+- **Warmup:** Warm up the learning rate linearly over the first **3% to 5% of total steps**. This prevents chaotic initial gradients from destabilizing the optimizer's second-moment accumulator ($v_t$ in AdamW).
+- **Cosine Decay:** Gradually decay $\eta$ down to $10\%$ of its peak value ($\eta_{\min} = 0.1 \eta_{\max}$) by the end of training.
+
+---
+
+## Tactic 4 · Epoch Budgeting & The LIMA Rule
+
+A common trap for engineers coming from classical supervised learning (like image classification or tabular XGBoost) is running training for 20, 50, or 100 epochs.
+
+In LLM fine-tuning, training for more than 3 epochs is almost always an engineering mistake.
+
+### The Superficial Alignment Hypothesis
+In May 2023, Meta AI researchers published the influential LIMA paper (*Less Is More for Alignment*, Zhou et al., 2023). They fine-tuned a 65B LLaMA model on just **1,000 carefully curated demonstration examples** for only **2 epochs**.
+
+The resulting model outperformed standard aligned baselines trained on 50,000+ noisy examples. Their conclusion:
+> A model's knowledge and reasoning abilities are acquired almost entirely during pretraining. Post-training supervised fine-tuning mostly teaches the model which sub-style, formatting conventions, and tone to adopt when interacting with humans.
+
+Because SFT is teaching *style* rather than fundamental *knowledge*:
+- **Epoch 1:** The model rapidly aligns with the target syntax (JSON tags, markdown headers, conciseness). Training loss drops steeply.
+- **Epoch 2–3:** The model refines subtle edge-case handling and phrasing consistency.
+- **Epoch 4+:** The model begins memorizing specific training phrases. Training loss continues falling, but validation perplexity deteriorates. General reasoning degrades due to catastrophic forgetting.
+
+**Rule of thumb:** Budget for **1 to 3 epochs**. If your model has not mastered your target syntax after 3 epochs, the problem is noisy data or poor prompt formatting (Module B6), not insufficient epochs.
+
+---
+
+## Tactic 5 · Reading Loss Curves in Real Time
+
+Modern experiment trackers (Weights & Biases, MLflow, TensorBoard) display real-time loss trajectories. An inference engineer must be able to diagnose a run within the first 100 steps.
+
+```
+Loss
+ │
+ │  ● (Initial loss ~2.2 - 2.8)
+ │   \
+ │    \   Run A: Healthy Convergence (Train & Val decline together)
+ │     \─────────────────────────────
+ │      \          Run B: Overfitting (Val climbs upward!)
+ │       \           /─────────────── (Val)
+ │        \─────────/──────────────── (Train)
+ │
+ └──────────────────────────────────────── Steps
+```
+
+### Pattern 1: Healthy Convergence
+- **Signature:** Training loss drops smoothly from ~2.5 to ~1.0. Validation loss (evaluated on 200 held-out examples) tracks training loss downward, settling slightly above it.
+- **Action:** Allow training to complete. Save the checkpoint with the lowest validation loss.
+
+### Pattern 2: Severe Overfitting
+- **Signature:** Training loss continues plunging toward zero (e.g. 0.08), while validation loss reaches a minimum at epoch 1.5 and begins steadily climbing upward.
+- **Diagnosis:** The model is memorizing training prompt-response pairs word for word.
+- **Action:** Stop training immediately. Roll back to the checkpoint at the validation loss minimum. Reduce LoRA rank or add 10% general instruction data to regularize.
+
+### Pattern 3: Gradient Explosion & NaN Collapse
+- **Signature:** Loss oscillates violently between 1.0 and 8.0, and suddenly prints `loss: nan`.
+- **Diagnosis:** A large gradient produced an update that pushed weights into extreme values, causing 16-bit exponent overflow in the forward pass.
+- **Action:** 
+  1. Enable **Gradient Clipping**: `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)`.
+  2. Increase warmup steps from 3% to 6%.
+  3. Reduce peak learning rate $\eta_{\max}$ by $2\times$.
+
+```python
+# PyTorch production training loop snippet demonstrating these tactics
+import torch
+from torch.utils.data import DataLoader
+
+def train_one_epoch(model, dataloader, optimizer, scheduler, accum_steps=8, max_grad_norm=1.0):
+    model.train()
+    total_loss = 0.0
+    optimizer.zero_grad()
+    
+    for step, batch in enumerate(dataloader):
+        input_ids = batch["input_ids"].cuda()
+        labels = batch["labels"].cuda() # Masked: prompt tokens are -100!
+        
+        # 1. Forward pass (loss automatically ignores -100)
+        outputs = model(input_ids=input_ids, labels=labels)
+        loss = outputs.loss / accum_steps # Scale for accumulation
+        
+        # 2. Backward pass (accumulate gradients)
+        loss.backward()
+        total_loss += loss.item() * accum_steps
+        
+        # 3. Optimizer step every accum_steps
+        if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
+            # Clip gradients to prevent NaN explosions
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            
+    return total_loss / len(dataloader)
+```
+
+<KeyNotes>
+  1. **Loss masking** is mandatory in supervised fine-tuning: overwrite all prompt tokens and padding positions with label **-100** so cross-entropy gradients evaluate only assistant responses.
+  2. Unmasked prompt loss forces the model to memorize user phrasing, leading to template echoing, prompt hallucination, and wasted adapter capacity.
+  3. **Effective batch size** equals $b_{\text{micro}} \times K_{\text{accum}} \times N_{\text{GPUs}}$. Accumulating gradients over multiple micro-steps simulates large batches without VRAM growth.
+  4. LoRA requires approximately an **order of magnitude higher learning rate** ($1\text{–}2 \times 10^{-4}$) than full fine-tuning ($1\text{–}3 \times 10^{-5}$) because parameter adaptation is constrained to a low-rank subspace.
+  5. Always pair the optimizer with a **linear warmup** (3–5% of steps) and a **cosine decay schedule** down to 10% of peak learning rate.
+  6. Restrict fine-tuning to **1 to 3 epochs** (the LIMA principle). SFT primarily teaches style and syntax; training beyond 3 epochs triggers catastrophic forgetting.
+  7. Prevent `NaN` gradient explosions by enforcing **gradient clipping** (`max_norm = 1.0`) and monitoring validation loss to detect overfitting before deployment.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'In PyTorch Supervised Finetuning, why are prompt token labels replaced with -100?',
+    options: [
+      '-100 is the ASCII code for newline characters',
+      'PyTorch CrossEntropyLoss has ignore_index = -100 by default, ensuring gradients are computed exclusively on response tokens',
+      'It forces the GPU memory manager to compress prompt activations into 4 bits',
+      'It signals the tokenizer to pad the batch with special tokens'
+    ],
+    answer: 1,
+    why: 'Setting target labels to -100 causes nn.CrossEntropyLoss to completely skip those positions during loss calculation and backpropagation, focusing model learning purely on generating the response.'
+  },
+  {
+    q: 'You train on 4 GPUs with a micro-batch size of 2 sequences per GPU. You configure 8 gradient accumulation steps. What is the total effective batch size in sequences?',
+    numeric: true,
+    answer: 64,
+    tolerance: 0,
+    unit: 'sequences',
+    why: 'Effective Batch Size = micro_batch × accumulation_steps × num_gpus = 2 × 8 × 4 = 64 sequences.'
+  },
+  {
+    q: 'Why does LoRA fine-tuning typically require a learning rate around 1e-4 to 2e-4, whereas full-parameter fine-tuning uses 1e-5 to 2e-5?',
+    options: [
+      'LoRA uses 8-bit integers that require higher numerical thresholds',
+      'LoRA updates are constrained to a low-dimensional rank bottleneck and matrix B starts at zero, requiring larger step sizes to achieve behavioral shifts',
+      'Full fine-tuning automatically halves the learning rate on every step',
+      'FP16 tensor cores only activate when learning rate exceeds 1e-4'
+    ],
+    answer: 1,
+    why: 'Because LoRA restricts weight updates to a low-rank subspace (r = 8 or 16) and initializes matrix B to zero, it requires larger step sizes (~10×) to traverse the loss landscape compared to full fine-tuning where all parameters can shift simultaneously.'
+  },
+  {
+    q: 'You are fine-tuning an 8B model on a dataset of 5,000 high-quality JSON extraction examples. According to the LIMA principle and empirical best practices, how many epochs should you budget?',
+    options: [
+      '1 to 3 epochs',
+      '15 to 20 epochs',
+      '50 to 100 epochs',
+      'At least 200 epochs'
+    ],
+    answer: 0,
+    why: 'SFT teaches format and syntax, not foundational reasoning. 1 to 3 epochs are sufficient for the model to absorb the format; training for 15+ epochs leads to severe catastrophic forgetting of pre-trained knowledge.'
+  },
+  {
+    q: 'During training, your script runs for 200 steps and then abruptly crashes with loss: nan. What tactic should be applied FIRST to prevent this failure?',
+    options: [
+      'Increase the learning rate by 10x',
+      'Remove loss masking so prompt tokens absorb the gradient shock',
+      'Enable gradient norm clipping (e.g. max_norm = 1.0) and verify a 3–5% linear warmup schedule',
+      'Switch the model precision from BF16 to pure INT4'
+    ],
+    answer: 2,
+    why: 'Loss: nan typically indicates gradient explosion where large gradient norms cause 16-bit float overflow. Clipping gradient norms to 1.0 and ensuring a linear warmup smoothly stabilizes the optimizer.'
+  },
+  {
+    q: 'You observe that training loss has dropped from 2.0 to 0.1, while validation loss dropped to 1.1 at step 300 and has since steadily climbed to 2.4 at step 800. What is happening?',
+    options: [
+      'The learning rate is too low',
+      'The model is severely overfitting and memorizing training examples; you should roll back to the checkpoint around step 300',
+      'The GPU is experiencing thermal throttling',
+      'The tokenizer vocabulary is missing common tokens'
+    ],
+    answer: 1,
+    why: 'Divergence where training loss continues falling while validation loss climbs is the textbook signature of overfitting. The checkpoint with lowest validation loss (~step 300) should be retained.'
+  }
+]} />

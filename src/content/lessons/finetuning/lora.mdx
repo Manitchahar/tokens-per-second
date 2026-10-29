@@ -1,0 +1,402 @@
+---
+title: 'LoRA: low-rank adaptation'
+summary: 'Master the mechanics of Low-Rank Adaptation (arXiv:2106.09685): factorize weight updates into BA, calculate parameter reduction down to 0.39%, scale with α/r, and eliminate serving latency via weight merging.'
+objectives:
+  - 'Derive the Low-Rank Adaptation equation: h = xW_0 + (α/r)xAB'
+  - 'Calculate exact trainable parameter counts for adapter matrices across ranks r = 1 to 64'
+  - 'Explain why B is initialized to zero while A is initialized with Gaussian noise'
+  - 'Describe the weight merging operation and why merged LoRA introduces zero inference latency overhead'
+  - 'Analyze the trade-offs of adapting attention projections (W_q, W_v) versus all linear layers'
+---
+import LoraViz from '@/components/viz/finetuning/LoraViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In the previous lesson, you saw the brutal memory barrier of full-parameter training: mixed-precision AdamW demands **16 bytes per parameter** in static GPU memory. An 8-billion parameter model locks 128 gigabytes of VRAM before computing a single activation. For a 175-billion parameter model like GPT-3, full fine-tuning requires 2.8 terabytes of static memory spread across dozens of interconnected GPUs.
+
+Yet intuitively, teaching a model to adopt a new medical persona or output strict JSON should not require rewriting all 8 billion parameters. When a human lawyer learns a new regulatory format, they do not rewrite their entire visual cortex, grammatical memory, and common-sense knowledge. They adjust a specialized behavioral layer while leaving foundational reasoning untouched.
+
+In 2021, Edward Hu and colleagues at Microsoft published a landmark paper: *LoRA: Low-Rank Adaptation of Large Language Models* (arXiv:2106.09685). 
+
+LoRA showed that task-specific weight updates have an extremely low **intrinsic rank**. By freezing the original foundation weights and training two tiny factorized matrices in parallel, LoRA reduces trainable parameter counts by **10,000×** and slashes training GPU memory by **3×**, while matching or exceeding full-parameter fine-tuning accuracy.
+
+<Scrolly>
+  <LoraViz client:visible slot="stage" />
+
+  <Step title="1. The rank bottleneck intuition">
+    When adapting a model to a specific task, the parameter change matrix $\Delta W \in \mathbb{R}^{d \times k}$ is highly over-parameterized. The actual degrees of freedom necessary to adapt the behavior occupy a tiny, low-dimensional subspace.
+  </Step>
+
+  <Step title="2. The factorisation: ΔW = B × A">
+    Instead of learning a massive $4096 \times 4096$ matrix directly, LoRA decomposes the update into the product of two low-rank matrices: $A \in \mathbb{R}^{r \times k}$ and $B \in \mathbb{R}^{d \times r}$, where rank $r \ll \min(d, k)$.
+  </Step>
+
+  <Step title="3. Clean initialization: B = 0">
+    Matrix $A$ is initialized with random Gaussian noise $\mathcal{N}(0, \sigma^2)$, while matrix $B$ is initialized to **exactly zero**. At training step 0, $\Delta W = B \cdot A = 0$, so the model begins in the exact state of the original base model.
+  </Step>
+
+  <Step title="4. The scaling hyperparameter: α / r">
+    The adapter activation is scaled by a constant factor $\frac{\alpha}{r}$. Keeping $\alpha$ fixed while varying $r$ stabilizes the effective learning rate, allowing engineers to experiment with rank without retuning the optimizer.
+  </Step>
+
+  <Step title="5. Parameter efficiency: 0.39% trainable weights">
+    For a $4096 \times 4096$ projection with rank $r = 8$, dense weights contain $16.78\text{M}$ parameters. The adapter matrices contain only **65,536 parameters**—a **$256\times$ reduction**. Gradients and AdamW states shrink to megabytes.
+  </Step>
+
+  <Step title="6. Zero-latency deployment: Folding ΔW into W0">
+    During inference, you can fold the adapter directly into the base weights: $W_{\text{merged}} = W_0 + \frac{\alpha}{r} B A$. The serving engine executes a single standard matrix multiply with **zero latency overhead**.
+  </Step>
+</Scrolly>
+
+## The Mathematics of Low-Rank Adaptation
+
+Consider a single dense linear layer in a transformer (such as the query projection $W_q$ or value projection $W_v$). During the forward pass, an input activation vector $\mathbf{x} \in \mathbb{R}^{1 \times k}$ is multiplied by the weight matrix $W_0 \in \mathbb{R}^{k \times d}$:
+
+$$
+\mathbf{h} = \mathbf{x} W_0
+$$
+
+During standard full fine-tuning, the weight matrix is updated by an additive delta $\Delta W$:
+
+$$
+\mathbf{h} = \mathbf{x} (W_0 + \Delta W)
+$$
+
+Where $W_0$ and $\Delta W$ have the exact same shape ($k \times d$). If $k = d = 4096$, $\Delta W$ contains $4096 \times 4096 = 16{,}777{,}216$ parameters.
+
+### Decomposing the Delta: $\Delta W = B \cdot A$
+LoRA hypothesizes that $\Delta W$ has a very small intrinsic rank $r \ll \min(d, k)$. Therefore, $\Delta W$ can be represented without quality loss as the product of two low-rank matrices:
+
+$$
+\Delta W = \frac{\alpha}{r} B \cdot A
+$$
+
+Where:
+- $A \in \mathbb{R}^{r \times k}$ is the **down-projection matrix**, compressing the input from dimension $k$ to rank $r$.
+- $B \in \mathbb{R}^{d \times r}$ is the **up-projection matrix**, expanding the representation from rank $r$ back to output dimension $d$.
+- $\alpha$ is a constant scaling hyperparameter.
+
+The complete forward pass of a LoRA-adapted linear layer is:
+
+$$
+\mathbf{h} = \mathbf{x} W_0 + \frac{\alpha}{r} (\mathbf{x} A^\top) B^\top
+$$
+
+```
+           Input x  [1 × 4096]
+           ┌───┴───────────────┐
+           │                   │
+           ▼                   ▼
+    ┌──────────────┐     ┌───────────┐
+    │  Frozen W_0  │     │  Down: A  │  [8 × 4096] (Trainable)
+    │ [4096×4096]  │     └─────┬─────┘
+    │              │           ▼  Intermediate [1 × 8]
+    │  (No Grads)  │     ┌───────────┐
+    │              │     │   Up: B   │  [4096 × 8] (Trainable)
+    └──────┬───────┘     └─────┬─────┘
+           │                   ▼
+           │             Scale: × (α/r)
+           │                   │
+           └─────────►(+)◄─────┘
+                      │
+                      ▼
+                 Output h  [1 × 4096]
+```
+
+<Callout type="intuition" title="The Bottleneck Analogy">
+  Think of matrix $A$ as an encoder that asks: *"What are the 8 most important task-specific features in this 4,096-dimensional activation?"* 
+  Matrix $B$ then asks: *"How do I translate those 8 features into adjustments across the 4,096 output dimensions?"* 
+  By forcing the update through an 8-dimensional bottleneck, the optimizer cannot overfit or memorise arbitrary noise; it is forced to learn generalizable task shifts.
+</Callout>
+
+---
+
+## Parameter Arithmetic: 65,536 vs 16.8 Million
+
+Let us compute the exact parameter counts for a typical transformer projection layer, such as in Llama-3.1-8B ($d = k = 4096$).
+
+### Full Fine-Tuning
+$$
+P_{\text{full}} = d \times k = 4096 \times 4096 = 16{,}777{,}216 \text{ parameters}
+$$
+
+### LoRA Adaptation ($r = 8$)
+$$
+P_{\text{LoRA}} = (k \times r) + (r \times d) = (4096 \times 8) + (8 \times 4096) = 32{,}768 + 32{,}768 = 65{,}536 \text{ parameters}
+$$
+
+Comparing the two:
+
+$$
+\text{Parameter Fraction} = \frac{65{,}536}{16{,}777{,}216} = \frac{1}{256} \approx 0.003906 = 0.39\%
+$$
+
+You are updating **less than four-tenths of one percent** of the weights in that layer!
+
+| Rank ($r$) | Parameters in $A$ | Parameters in $B$ | Total LoRA Params | Fraction of Full Layer | Storage in FP16 |
+|---|---|---|---|---|---|
+| **$r = 1$** | 4,096 | 4,096 | 8,192 | 0.049% | 16 KB |
+| **$r = 2$** | 8,192 | 8,192 | 16,384 | 0.098% | 32 KB |
+| **$r = 4$** | 16,384 | 16,384 | 32,768 | 0.195% | 64 KB |
+| **$r = 8$** | 32,768 | 32,768 | 65,536 | 0.391% | 128 KB |
+| **$r = 16$** | 65,536 | 65,536 | 131,072 | 0.781% | 256 KB |
+| **$r = 64$** | 262,144 | 262,144 | 524,288 | 3.125% | 1.0 MB |
+
+Even if you apply rank-8 LoRA across **all 7 linear projections** in all 32 layers of Llama-3.1-8B (query, key, value, output, gate, up, down):
+- Total base parameters: $8.03 \times 10^9$.
+- Total LoRA adapter parameters: $\approx 22.5 \times 10^6$ parameters (**0.28% of the model**).
+- Entire adapter file on disk: **~45 megabytes** in FP16!
+
+---
+
+## The Initialization Mystery: Why $B = 0$?
+
+A crucial detail in the LoRA formulation is its asymmetric initialization:
+
+1. **Matrix $A$** is drawn from a zero-mean Gaussian distribution with standard deviation $\sigma = \frac{1}{r}$:
+   $$
+   A \sim \mathcal{N}\left(0, \sigma^2\right)
+   $$
+2. **Matrix $B$** is initialized to **identically zero**:
+   $$
+   B = 0
+   $$
+
+Why not initialize both matrices with Gaussian noise?
+
+If both $A$ and $B$ were initialized randomly, their product $B \cdot A$ would be non-zero at step 0. 
+Adding a random matrix to the carefully aligned pre-trained weights $W_0$ would instantly destroy the model's capabilities: initial perplexity would explode, generating gibberish before gradient descent began recovering.
+
+By setting $B = 0$:
+
+$$
+\Delta W = B \cdot A = 0 \cdot A = 0
+$$
+
+At training step 0, the adapter contributes exactly zero to the layer output:
+
+$$
+\mathbf{h} = \mathbf{x} W_0 + 0 = \mathbf{x} W_0
+$$
+
+The model begins training with its exact pre-trained performance intact. During backpropagation, gradients flow into $B$ first, gradually shaping the adapter trajectory.
+
+---
+
+## The Scaling Hyperparameter: Why $\frac{\alpha}{r}$?
+
+In standard deep learning without LoRA, if you change a layer's dimension, you must retune the optimizer learning rate $\eta$.
+
+In LoRA, the forward contribution is multiplied by $\frac{\alpha}{r}$, where $\alpha$ is a fixed scalar constant (typically set to 16, or $2 \times r$).
+
+When you increase the rank $r$ (say, from $r = 4$ to $r = 64$), each output neuron sums over more random directions. The factor $\frac{1}{r}$ normalizes the magnitude of the adapter's update vector. 
+
+As established in the original paper:
+> When optimizing with Adam, tuning $\alpha$ is roughly the same as tuning the learning rate if the initialization is scaled appropriately. As a result, we simply set $\alpha$ to the first $r$ we try and do not tune it.
+
+A standard convention in modern fine-tuning libraries (such as Hugging Face PEFT) is to set:
+
+$$
+\alpha = 2 \cdot r \quad \Longrightarrow \quad \frac{\alpha}{r} = 2.0
+$$
+
+---
+
+## What Matrices Should You Adapt?
+
+In the original 2021 paper, Hu et al. evaluated LoRA on GPT-3 (175B parameters) under a strict parameter budget ($P_{\text{adapter}} \approx 18\text{M}$ parameters, or $0.01\%$ of the model). 
+
+They experimented with adapting different projection subsets:
+- Adapting only $W_q$
+- Adapting only $W_v$
+- Adapting both $W_q$ and $W_v$
+- Adapting all attention matrices ($W_q, W_k, W_v, W_o$)
+
+Their key empirical finding:
+> Adapting both $W_q$ and $W_v$ with a very low rank ($r = 1$ or $r = 2$) yielded significantly better downstream accuracy than adapting only $W_q$ with a higher rank ($r = 8$), even when total trainable parameter budgets were identical.
+
+In modern post-training (such as LLaMA-3 and Qwen2.5 fine-tuning), compute is cheaper and rank is less constrained. The modern standard is **All-Linear LoRA**: applying adapters to all 7 weight matrices in every transformer block:
+- Attention: $W_q, W_k, W_v, W_o$
+- MLP / Feed-Forward: $W_{\text{gate}}, W_{\text{up}}, W_{\text{down}}$
+
+Adapting MLP layers is especially critical for tasks requiring structured syntax (JSON, code, SQL) because knowledge of syntax and token transitions is predominantly stored in the feed-forward network.
+
+---
+
+## Inference Economics: Merging vs Multi-LoRA
+
+The single greatest practical advantage of LoRA over other parameter-efficient methods (such as prompt tuning or adapter layer insertion) is that **it introduces zero inference latency when deployed for a single task**.
+
+### 1. Single-Tenant Deployment: Weight Merging
+Because matrix multiplication is distributive:
+
+$$
+\mathbf{x} W_0 + \frac{\alpha}{r} (\mathbf{x} A^\top) B^\top = \mathbf{x} \left( W_0 + \frac{\alpha}{r} B \cdot A \right)
+$$
+
+Before serving the model, you perform a one-time matrix multiplication and addition:
+
+$$
+W_{\text{serving}} = W_0 + \frac{\alpha}{r} B \cdot A
+$$
+
+You save $W_{\text{serving}}$ as a standard checkpoint (`safetensors`). At runtime:
+- No extra branches exist in the compute graph.
+- No parallel kernel launches occur.
+- No additional memory bandwidth is consumed reading adapter weights from HBM.
+- **Inference latency, throughput, and memory consumption are 100% identical to the base model.**
+
+### 2. Multi-Tenant Serving (Multi-LoRA)
+What if your platform hosts 50 different fine-tuned models for 50 different customers?
+
+Merging weights would force you to store $50 \times 16\text{ GB} = 800\text{ GB}$ of base models in GPU memory, requiring 10× A100 GPUs.
+
+Instead, modern inference engines like vLLM and SGLang support **Multi-LoRA serving** (which you will study in depth in Module 26):
+1. Keep **one single copy** of the base weights $W_0$ in GPU memory (16 GB).
+2. Store the 50 adapter weights ($A_i, B_i$) in CPU system RAM or a compact GPU adapter pool (~45 MB each).
+3. As requests arrive in a continuous batch, the engine dynamically applies the specific customer's adapter during the forward pass.
+
+```python
+# Implementing LoRA forward and merge from scratch in PyTorch
+import torch
+import torch.nn as nn
+import math
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, r: int = 8, lora_alpha: float = 16.0):
+        super().__init__()
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = lora_alpha / r
+        
+        # 1. Base linear layer (frozen)
+        self.base = nn.Linear(in_features, out_features, bias=False)
+        self.base.weight.requires_grad = False
+        
+        # 2. Low-rank adapter matrices
+        if r > 0:
+            # Down-projection: r x in_features
+            self.lora_A = nn.Parameter(torch.empty(r, in_features))
+            # Up-projection: out_features x r
+            self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+            
+            # Initialization
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B) # Guarantees Delta W = 0 at start!
+            
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Base forward pass
+        result = self.base(x)
+        if self.r > 0:
+            # Low-rank parallel branch: x @ A.T @ B.T * scaling
+            adapter_out = (x @ self.lora_A.T) @ self.lora_B.T * self.scaling
+            result += adapter_out
+        return result
+
+    def merge_weights(self):
+        """Fold adapter into base weights for zero-latency serving."""
+        if self.r > 0:
+            # Compute Delta W = (alpha/r) * (B @ A)
+            delta_w = (self.lora_B @ self.lora_A) * self.scaling
+            self.base.weight.data += delta_w
+            self.r = 0  # Disable adapter branch
+            print("LoRA adapter merged successfully into base weights.")
+
+# Test initialization behavior
+layer = LoRALinear(in_features=4096, out_features=4096, r=8, lora_alpha=16.0)
+sample_input = torch.randn(2, 4096)
+
+# Output before training matches base layer exactly because B = 0
+with torch.no_grad():
+    base_only = layer.base(sample_input)
+    lora_out = layer(sample_input)
+    assert torch.allclose(base_only, lora_out), "Delta W must be 0 at step 0!"
+print("Assertion verified: Delta W is exactly 0.0 at initialization.")
+```
+
+<Callout type="real" title="Now read the paper">
+  **Paper:** *LoRA: Low-Rank Adaptation of Large Language Models* (Edward Hu et al., 2021) — [arXiv:2106.09685](https://arxiv.org/abs/2106.09685)
+  
+  **What you should read:**
+  - **Section 1 & 2:** Introduction and Problem Formulation (notice how clearly they formulate the intrinsic rank hypothesis).
+  - **Section 4:** Method (equations 1, 2, 3 and the initialization strategy).
+  - **Section 7.1 & 7.2:** Understanding the Low-Rank Matrices (which matrices to adapt, and what the optimal rank $r$ is).
+  
+  **What you can skip:**
+  - Section 5 & 6 tables on RoBERTa and DeBERTa (historical context from 2021 before open decoder LLMs dominated).
+  
+  **What you will recognize:**
+  You will immediately recognize the $\Delta W = B A$ factorisation, the zero-initialization of $B$, the $\frac{\alpha}{r}$ scaling constant, and the GPT-3 parameter reduction calculations.
+</Callout>
+
+<KeyNotes>
+  1. LoRA factorizes weight updates into two thin matrices: $\Delta W = \frac{\alpha}{r} B \cdot A$, where $r \ll \min(d, k)$.
+  2. For a $4096 \times 4096$ matrix with $r = 8$, LoRA requires only **65,536 trainable parameters** compared to $16.78\text{M}$ dense weights (**0.39%**).
+  3. Matrix $A$ is initialized with Gaussian noise while **matrix $B$ is initialized to zero**, ensuring $\Delta W = 0$ at step 0 so pre-trained capabilities are fully preserved.
+  4. The scaling factor $\frac{\alpha}{r}$ stabilizes the optimization trajectory across changes in rank, allowing rank sweeps without retuning the learning rate.
+  5. The original paper demonstrated that adapting both $W_q$ and $W_v$ with low rank ($r = 1\text{–}4$) outperformed adapting only $W_q$ with higher rank.
+  6. For single-task deployment, LoRA can be merged directly into the base weights ($W_0 + \frac{\alpha}{r} BA$) with **zero added inference latency**.
+  7. Multi-LoRA serving retains a single frozen base model in VRAM and dynamically applies task-specific adapters per token, enabling cost-effective multi-tenant serving.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'In LoRA, what are the dimensions of matrices A and B when adapting a weight matrix W of shape [d_out, d_in] = [4096, 4096] with rank r = 16?',
+    options: [
+      'A is [16, 4096] and B is [4096, 16]',
+      'A is [4096, 4096] and B is [16, 16]',
+      'A is [4096, 16] and B is [16, 4096]',
+      'A is [16, 16] and B is [4096, 4096]'
+    ],
+    answer: 0,
+    why: 'Matrix A down-projects from d_in (4096) to rank r (16), so shape is [16, 4096]. Matrix B up-projects from rank r (16) back to d_out (4096), so shape is [4096, 16].'
+  },
+  {
+    q: 'A linear layer has dimension d = 4096 and k = 4096 (16,777,216 parameters). You apply LoRA with rank r = 4. Exactly how many trainable parameters are in this adapter (A + B)?',
+    numeric: true,
+    answer: 32768,
+    tolerance: 0,
+    unit: 'parameters',
+    why: 'Parameters in A = 4 × 4096 = 16,384. Parameters in B = 4096 × 4 = 16,384. Total = 16,384 + 16,384 = 32,768 parameters.'
+  },
+  {
+    q: 'Why is matrix B initialized to zero at the start of LoRA training?',
+    options: [
+      'To prevent gradients from propagating through matrix A',
+      'Because floating-point zeros require no GPU memory allocation',
+      'To ensure Delta W = B·A = 0 at step 0, so the initial forward pass matches the base model exactly',
+      'Because AdamW cannot optimize non-zero initialization values'
+    ],
+    answer: 2,
+    why: 'Setting B = 0 ensures that Delta W = B·A = 0 at initialization. This guarantees that the model begins training with its exact pre-trained capabilities and zero initial loss distortion.'
+  },
+  {
+    q: 'For GPT-3 (175B parameters), by approximately what factor did LoRA reduce the number of trainable parameters according to Hu et al. (2021)?',
+    numeric: true,
+    answer: 10000,
+    tolerance: 500,
+    unit: 'x',
+    why: 'Hu et al. (2021) showed that LoRA reduced trainable parameters by 10,000× (from 175B down to ~18M parameters) while reducing training VRAM by 3×.'
+  },
+  {
+    q: 'How does merged LoRA affect inference latency when deployed for a single-tenant workload?',
+    options: [
+      'It increases latency by 33% due to matrix factorization overhead',
+      'It introduces zero added latency because W_merged = W0 + (α/r)BA is pre-computed into a single dense matrix',
+      'It doubles latency because both branches must execute sequentially',
+      'It reduces latency by 50% by pruning unneeded attention heads'
+    ],
+    answer: 1,
+    why: 'Because matrix multiplication is distributive, the adapter weights can be algebraically folded into the base weights prior to deployment: W_merged = W0 + (alpha/r)·BA. The serving engine runs a standard GEMM with zero added latency.'
+  },
+  {
+    q: 'In the original LoRA paper, what was the empirical finding when comparing adapting only W_q with rank r = 8 versus adapting both W_q and W_v with rank r = 4?',
+    options: [
+      'Adapting only W_q with higher rank performed significantly better',
+      'Adapting both W_q and W_v with lower rank outperformed adapting only W_q with higher rank, for the same parameter budget',
+      'Adapting W_v had zero effect on downstream accuracy',
+      'Adapting both caused severe gradient explosions'
+    ],
+    answer: 1,
+    why: 'Hu et al. discovered that spreading the rank budget across multiple weight matrices (e.g. both W_q and W_v with r = 1–4) yielded better downstream accuracy than concentrating all rank capacity into a single matrix.'
+  }
+]} />

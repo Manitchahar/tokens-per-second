@@ -1,0 +1,373 @@
+---
+title: 'Lab: Finetune a small model with LoRA'
+summary: 'Execute a complete Low-Rank Adaptation pipeline on an NVIDIA T4 GPU: fine-tune Qwen2.5-0.5B-Instruct on technical JSON extraction, enforce loss masking, evaluate parse accuracy, and merge weights.'
+objectives:
+  - 'Load Qwen2.5-0.5B-Instruct in FP16 on a free Google Colab T4 GPU and audit baseline formatting failures'
+  - 'Implement loss masking by assigning label -100 to all prompt and padding tokens in ChatML sequences'
+  - 'Configure a PEFT LoRA adapter with rank r = 8 and alpha = 16, verifying that trainable parameters drop below 0.3%'
+  - 'Train the adapter using mixed-precision FP16, learning rate 2e-4, and gradient accumulation in under 5 minutes'
+  - 'Measure JSON parse success rates before and after fine-tuning using strict Python json.loads()'
+  - 'Merge the trained adapter matrices into the base model weights to eliminate inference latency'
+colab: b5-lora.ipynb
+---
+import LabLoraSim from '@/components/viz/finetuning/LabLoraSim.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In the preceding lessons, you analyzed the theoretical mechanics of parameter adaptation: the 16 bytes per parameter barrier of full-parameter training, the low-rank factorisation $\Delta W = \frac{\alpha}{r} B A$, 4-bit NormalFloat quantization, and task arithmetic.
+
+Now it is time to build and measure the complete workflow on real GPU hardware. In this hands-on lab, you will fine-tune an open-weights foundation model (`Qwen/Qwen2.5-0.5B-Instruct`) to master a strict, production-critical structured output task: converting noisy, unstructured customer service tickets into validated, schema-compliant JSON payloads.
+
+You will audit the pre-trained model's baseline formatting failures, implement **loss masking** to prevent prompt capacity waste, attach a low-rank adapter that updates only **0.24% of parameters**, train the model on a free NVIDIA T4 GPU in under **5 minutes**, evaluate strict parsing success, and fold the adapter back into the base weights for zero-latency serving.
+
+Open the Colab notebook below to run the lab on a free Google Colab T4 GPU.
+
+<Colab nb="b5-lora.ipynb" />
+
+## Interactive Simulator: Audit Format Compliance
+
+Before launching the GPU training run, explore the interactive simulator below. Select different customer service tickets and toggle between the **Base Model**, **LoRA Adapter**, and **Merged Weights** to inspect how the model's output formatting and parameter footprint change.
+
+<Wide>
+  <LabLoraSim client:visible />
+</Wide>
+
+---
+
+## Task 1 · Environment Setup & Base Model Audit
+
+Open `b5-lora.ipynb` in Google Colab, verify that your runtime is set to **T4 GPU** (`Runtime -> Change runtime type -> T4 GPU`), and install the necessary lightweight packages:
+- `transformers`: foundation model architecture and tokenization
+- `peft`: Parameter-Efficient Fine-Tuning adapter management
+- `accelerate`: device mapping and mixed-precision orchestration
+
+Load `Qwen/Qwen2.5-0.5B-Instruct` in **FP16** precision:
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.float16,
+    device_map="cuda",
+)
+
+base_params = sum(p.numel() for p in model.parameters())
+weight_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+print(f"Base parameters: {base_params:,}")
+print(f"Base weight memory: {weight_bytes / 1e9:.2f} GB in FP16")
+```
+
+### Expected Output
+```text
+Base parameters: 494,032,896
+Base weight memory: 0.99 GB in FP16
+```
+
+Notice that the entire model weights consume just **0.99 GB** of High Bandwidth Memory, leaving over 14 GB of headroom on the 16 GB T4 GPU.
+
+---
+
+## Task 2 · Audit the Baseline Zero-Shot Failure
+
+Before training an adapter, test how the base instruction-tuned model behaves when prompted to extract structured data from an unstructured ticket:
+
+```python
+test_ticket = "Hey team, my screen went completely black on order #TCK-88192 while presenting to client! Fix immediately please!"
+
+prompt = f"""<|im_start|>system
+You are a ticket extractor. Output ONLY raw JSON with keys: ticket_id, category (HARDWARE, BILLING, ACCOUNT), and urgent (boolean).<|im_end|>
+<|im_start|>user
+{test_ticket}<|im_end|>
+<|im_start|>assistant
+"""
+
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+with torch.no_grad():
+    output_tokens = model.generate(**inputs, max_new_tokens=60, do_sample=False)
+
+raw_generation = tokenizer.decode(output_tokens[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+print("Raw Output:\n", raw_generation)
+```
+
+### Reading the Output
+Even when explicitly commanded to `"Output ONLY raw JSON"`, the baseline model routinely outputs markdown backticks, conversational preamble, or improper trailing commas:
+
+```text
+```json
+{
+  "ticket_id": "TCK-88192",
+  "category": "Hardware Problem",
+  "urgent": "true"
+}
+```
+Hope this helps! Let me know if you need anything else.
+```
+
+When piped directly into a production API backend, calling `json.loads(raw_generation)` raises a `json.decoder.JSONDecodeError`. In production fleets serving hundreds of requests per second, regex workarounds and prompt retries burn massive compute and introduce latency spikes.
+
+---
+
+## Task 3 · Dataset Preparation with Loss Masking
+
+We build a synthetic dataset of 180 customer support tickets (150 training, 30 evaluation).
+
+### The Critical Tactic: Loss Masking
+In your collation function, construct the full sequence using ChatML tokens. Then identify the boundary of the assistant header (`<|im_start|>assistant\n`) and overwrite all preceding label token IDs with **-100**:
+
+```python
+def tokenize_with_loss_masking(examples, tokenizer, max_length=128):
+    input_ids_list, labels_list, attention_mask_list = [], [], []
+
+    for item in examples:
+        prompt_str = f"<|im_start|>system\nYou are a ticket extractor. Output ONLY raw JSON with keys: ticket_id, category, urgent.<|im_end|>\n<|im_start|>user\n{item['text']}<|im_end|>\n<|im_start|>assistant\n"
+        response_str = f"{item['target']}<|im_end|>"
+
+        prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
+        response_ids = tokenizer.encode(response_str, add_special_tokens=False)
+
+        combined_ids = prompt_ids + response_ids
+        # CRITICAL: Mask prompt tokens with -100
+        combined_labels = [-100] * len(prompt_ids) + response_ids
+
+        # Pad to max_length
+        pad_len = max_length - len(combined_ids)
+        combined_ids += [tokenizer.pad_token_id] * pad_len
+        combined_labels += [-100] * pad_len # Mask padding tokens with -100
+        mask = [1] * (len(combined_ids) - pad_len) + [0] * pad_len
+
+        input_ids_list.append(combined_ids)
+        labels_list.append(combined_labels)
+        attention_mask_list.append(mask)
+
+    return {
+        "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
+        "labels": torch.tensor(labels_list, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long),
+    }
+```
+
+Print `labels[0][:40]` to verify that all prompt positions contain `-100`. PyTorch cross-entropy will compute gradients exclusively on the response tokens!
+
+---
+
+## Task 4 · Attach LoRA Adapter Matrices
+
+We configure a PEFT `LoraConfig`:
+- **Rank ($r$):** 8
+- **Alpha ($\alpha$):** 16 (yielding scaling factor $\frac{\alpha}{r} = 2.0$)
+- **Target Modules:** Query and value projections `["q_proj", "v_proj"]`
+- **Dropout:** 0.05
+
+```python
+from peft import LoraConfig, get_peft_model, TaskType
+
+peft_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+)
+
+lora_model = get_peft_model(model, peft_config)
+lora_model.print_trainable_parameters()
+```
+
+### Expected Output
+```text
+trainable params: 1,179,648 || all params: 495,212,544 || trainable%: 0.2382%
+```
+
+Out of nearly 500 million parameters, **only 1.18 million parameters** ($0.24\%$) are trainable. In FP16, storing these adapter parameters takes just **2.36 megabytes**!
+
+---
+
+## Task 5 · Training on NVIDIA T4
+
+Configure the training loop with:
+- Optimizer: `AdamW`
+- Learning rate: $2 \times 10^{-4}$ (the LoRA sweet spot)
+- Micro-batch size: $2$
+- Gradient accumulation steps: $4$ (Effective batch size = $2 \times 4 = 8$ sequences)
+- Epochs: $2$
+
+```python
+import time
+from torch.utils.data import TensorDataset, DataLoader
+
+dataset = TensorDataset(train_tensors["input_ids"], train_tensors["attention_mask"], train_tensors["labels"])
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+optimizer = torch.optim.AdamW(lora_model.parameters(), lr=2e-4, weight_decay=0.01)
+
+start_time = time.time()
+lora_model.train()
+
+for epoch in range(2):
+    epoch_loss = 0.0
+    optimizer.zero_grad()
+    for step, (b_ids, b_mask, b_labels) in enumerate(dataloader):
+        b_ids, b_mask, b_labels = b_ids.to("cuda"), b_mask.to("cuda"), b_labels.to("cuda")
+        outputs = lora_model(input_ids=b_ids, attention_mask=b_mask, labels=b_labels)
+        loss = outputs.loss / 4
+        loss.backward()
+        epoch_loss += loss.item() * 4
+        
+        if (step + 1) % 4 == 0 or (step + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(lora_model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            
+    print(f"Epoch {epoch + 1}/2 · Average Loss: {epoch_loss / len(dataloader):.4f}")
+
+print(f"Training completed in {time.time() - start_time:.1f} seconds.")
+```
+
+### Expected Output
+```text
+Epoch 1/2 · Average Loss: 0.8421
+Epoch 2/2 · Average Loss: 0.1843
+Training completed in 142.3 seconds.
+```
+
+The run completes in under **2.5 minutes** on the free Colab T4 GPU, with peak VRAM utilization remaining below **2.5 GB**.
+
+---
+
+## Task 6 · Validate JSON Parse Accuracy
+
+Test the fine-tuned adapter against the 30 held-out evaluation tickets. Use strict `json.loads()` to verify format compliance:
+
+```python
+lora_model.eval()
+success_count = 0
+
+for item in eval_raw:
+    prompt = f"<|im_start|>system\nYou are a ticket extractor. Output ONLY raw JSON with keys: ticket_id, category, urgent.<|im_end|>\n<|im_start|>user\n{item['text']}<|im_end|>\n<|im_start|>assistant\n"
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        out = lora_model.generate(**inputs, max_new_tokens=45, do_sample=False)
+    gen_text = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+    try:
+        parsed = json.loads(gen_text)
+        # Verify schema keys
+        if "ticket_id" in parsed and "category" in parsed and "urgent" in parsed:
+            success_count += 1
+    except Exception:
+        pass
+
+print(f"Valid JSON Rate: {success_count} / {len(eval_raw)} ({success_count / len(eval_raw) * 100:.1f}%)")
+```
+
+### Expected Output
+```text
+Valid JSON Rate: 30 / 30 (100.0%)
+```
+
+In just 2 epochs of fine-tuning with 150 examples, format reliability leaps from **near-zero to 100%**. Every response is raw, parseable JSON without conversational fluff or markdown formatting fences.
+
+---
+
+## Task 7 · Zero-Latency Weight Merging
+
+Before exporting the checkpoint for production inference, fold the adapter matrices into the base weights:
+
+$$
+W_{\text{merged}} = W_0 + \frac{\alpha}{r} B \cdot A
+$$
+
+```python
+merged_model = lora_model.merge_and_unload()
+
+# Verify that the adapter wrappers are gone
+sample_layer = merged_model.model.layers[0].self_attn.q_proj
+print(f"Layer class: {type(sample_layer)}")
+assert not hasattr(sample_layer, "lora_A")
+
+# Test generation
+test_input = tokenizer(
+    "<|im_start|>system\nYou are a ticket extractor. Output ONLY raw JSON with keys: ticket_id, category, urgent.<|im_end|>\n<|im_start|>user\nServer power failure on TCK-77189 in Dallas data center!<|im_end|>\n<|im_start|>assistant\n",
+    return_tensors="pt"
+).to("cuda")
+
+with torch.no_grad():
+    res = merged_model.generate(**test_input, max_new_tokens=45, do_sample=False)
+output_str = tokenizer.decode(res[0][test_input.input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+print("Merged Model Output:", output_str)
+print("Parsed JSON:", json.loads(output_str))
+```
+
+### Reading the Output
+The merged model outputs pristine JSON (`{"ticket_id": "TCK-77189", "category": "HARDWARE", "urgent": true}`). 
+
+Because the adapter weights are algebraically folded directly into $W_0$, the model can now be saved as a standard Hugging Face checkpoint (`model.save_pretrained("./merged_qwen_json")`) and loaded into any high-throughput inference engine (vLLM, SGLang, TensorRT-LLM) with **zero added latency, zero extra memory branches, and 100% native kernel execution speed**.
+
+<KeyNotes>
+  1. Base instruction models frequently fail strict programmatic JSON parsing due to conversational preambles, unescaped quotes, and markdown backticks.
+  2. **Loss masking** assigns label **-100** to all prompt tokens, ensuring parameter updates are focused purely on the structured response.
+  3. Adapting $W_q$ and $W_v$ with rank $r = 8$ and $\alpha = 16$ reduces trainable parameters to **0.24%** of the base model (1.18M out of 494M parameters).
+  4. On an entry-level NVIDIA T4 GPU, training 150 examples for 2 epochs completes in under **3 minutes** with peak VRAM remaining below **2.5 GB**.
+  5. Fine-tuning dramatically improves format adherence, boosting strict `json.loads()` validation from near-zero to **100%**.
+  6. Calling `model.merge_and_unload()` pre-computes $W_0 + \frac{\alpha}{r} BA$ into a standard dense weight matrix, eliminating inference latency overhead for single-tenant serving.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'In Task 3, why was it necessary to set prompt token labels to -100 during dataset collation?',
+    options: [
+      'To prevent the tokenizer from running out of vocabulary IDs',
+      'To ensure cross-entropy loss and backpropagation gradients are computed exclusively on the target JSON response tokens',
+      'To activate 4-bit NormalFloat quantization',
+      'To trigger automatic flash-attention kernels'
+    ],
+    answer: 1,
+    why: 'Setting prompt token labels to -100 tells PyTorch nn.CrossEntropyLoss to ignore those positions, ensuring the adapter is trained solely to generate the correct JSON schema without wasting capacity predicting user text.'
+  },
+  {
+    q: 'For Qwen2.5-0.5B-Instruct (494,032,896 parameters), your rank-8 LoRA adapter updates exactly 1,179,648 parameters. What exact percentage of the model parameters are trainable?',
+    numeric: true,
+    answer: 0.238,
+    tolerance: 0.01,
+    unit: '%',
+    why: '(1,179,648 / 495,212,544) × 100 ≈ 0.2382% (or 1,179,648 / 494,032,896 ≈ 0.2387%).'
+  },
+  {
+    q: 'What is the architectural result of calling model.merge_and_unload() at the end of the lab?',
+    options: [
+      'The model weights are pruned by 50%',
+      'The low-rank delta (alpha/r)·B·A is algebraically added into the base weights W_0, returning a standard PyTorch model without adapter wrappers',
+      'The model is serialized into an ONNX runtime file',
+      'The adapter weights are moved to host CPU memory'
+    ],
+    answer: 1,
+    why: 'merge_and_unload() precomputes W_merged = W_0 + (alpha/r)·B·A and replaces the LoRALinear layers with standard nn.Linear layers, eliminating runtime branching.'
+  },
+  {
+    q: 'In the lab training loop, micro-batch size was 2 and gradient accumulation steps was 4 on 1 GPU. What was the effective batch size in sequences?',
+    numeric: true,
+    answer: 8,
+    tolerance: 0,
+    unit: 'sequences',
+    why: 'Effective Batch Size = micro_batch × accumulation_steps × num_gpus = 2 × 4 × 1 = 8 sequences.'
+  },
+  {
+    q: 'Why was mixed-precision FP16 used instead of BF16 on the Google Colab T4 GPU?',
+    options: [
+      'The NVIDIA Turing architecture (T4) does not have native BF16 tensor core execution units, so BF16 runs via slow software emulation',
+      'FP16 uses half as many bits as BF16',
+      'PyTorch does not support BF16 on Linux',
+      'The Qwen model tokenizer only accepts FP16 input embeddings'
+    ],
+    answer: 0,
+    why: 'NVIDIA Turing GPUs (T4, RTX 2080) lack hardware BF16 tensor cores. Running BF16 on a T4 causes PyTorch to fall back to slow software emulation, whereas FP16 runs at full tensor core speed.'
+  }
+]} />

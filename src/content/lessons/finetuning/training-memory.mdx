@@ -1,0 +1,392 @@
+---
+title: 'Training memory: weights, gradients & optimizer states'
+summary: 'Deconstruct why training requires 16 bytes per parameter under mixed-precision AdamW, calculate static and activation memory, and derive the 33% compute cost of gradient checkpointing.'
+objectives:
+  - 'Derive the 16 bytes per parameter breakdown across weights, gradients, master weights, and optimizer momentum'
+  - 'Calculate total static memory for 1.5B, 8B, and 70B parameter models under mixed precision'
+  - 'Explain why FP32 master weights and momentum states are mandatory for numerical stability in AdamW'
+  - 'Derive the mathematical 33.3% compute penalty of gradient checkpointing from forward and backward FLOP ratios'
+  - 'Size activation memory across sequence length and batch size with and without activation recomputation'
+---
+import TrainingMemoryViz from '@/components/viz/finetuning/TrainingMemoryViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+During inference, memory arithmetic is simple. An 8-billion parameter model stored in 16-bit precision (BF16 or FP16) consumes exactly:
+
+$$
+M_{\text{weights}} = 8 \times 10^9 \times 2 \text{ bytes} = 16 \times 10^9 \text{ bytes} \approx 16 \text{ GB}
+$$
+
+Add a few gigabytes for the KV cache and runtime scratch buffers, and the entire model fits comfortably on a single consumer or enterprise GPU with 24 GB of VRAM.
+
+Then an engineer attempts to finetune that same 8B model using full-parameter gradient descent. They launch `torchrun`, allocate a micro-batch of just 2 sequences, and watch the job immediately crash with an unceremonious error:
+
+```text
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB 
+(GPU 0; 79.15 GiB total capacity; 78.82 GiB already allocated)
+```
+
+The GPU had 80 gigabytes of High Bandwidth Memory. The model weights were only 16 gigabytes. Where did the remaining 64+ gigabytes go?
+
+In this lesson, you will derive every byte of GPU memory consumed during model training from first principles. You will see why mixed-precision AdamW demands **16 bytes per parameter** before storing a single activation tensor, and how gradient checkpointing trades compute to prevent activation blowups.
+
+<Scrolly>
+  <TrainingMemoryViz client:visible slot="stage" />
+
+  <Step title="1. The 16-byte parameter stack">
+    While inference needs only the 2-byte weights, full-parameter mixed-precision AdamW requires **16 bytes per parameter** locked in VRAM before processing the first token. For an 8B model, that is **128 GB of static state**.
+  </Step>
+
+  <Step title="2. Weights: 2 bytes in BF16 / FP16">
+    The active model parameters are stored in 16-bit precision. They are read during the forward pass to compute layer activations, and read again during the backward pass to backpropagate error signals.
+  </Step>
+
+  <Step title="3. Gradients: 2 bytes in BF16 / FP16">
+    Every trainable parameter requires an identical tensor to accumulate its partial derivative with respect to the loss: $\nabla_\theta \mathcal{L}$. At 2 bytes per float, gradients add another 16 GB for an 8B model.
+  </Step>
+
+  <Step title="4. Optimizer states: 12 bytes for AdamW">
+    AdamW maintains three separate 32-bit floating point tensors per parameter: an FP32 master weight (4 B), a first momentum vector $m_t$ (4 B), and a second momentum variance $v_t$ (4 B). The optimizer alone consumes **75% of static memory**.
+  </Step>
+
+  <Step title="5. Activations: The context length explosion">
+    The backward pass needs intermediate forward tensors to compute gradients. Without checkpointing, activation memory scales with batch size, sequence length, and layer depth, easily demanding 40–100 GB.
+  </Step>
+
+  <Step title="6. Gradient checkpointing: The 33% compute trade">
+    By discarding intermediate activations and recomputing them on-demand during the backward pass, activation memory drops by **70% to 80%**. The cost: exactly **33.3% more floating-point operations**.
+  </Step>
+</Scrolly>
+
+## The Four Memory Buckets of Training
+
+When training or fine-tuning a transformer on a GPU, memory consumption divides into four distinct categories:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   TOTAL TRAINING MEMORY                     │
+├──────────────────────────────┬──────────────────────────────┤
+│ 1. Model Weights (2 B/p)     │ 3. Optimizer States (12 B/p) │
+│ • Forward & backward compute │ • FP32 Master copy (4 B)     │
+│ • Stored in BF16 / FP16      │ • Momentum m & v (8 B)       │
+├──────────────────────────────┼──────────────────────────────┤
+│ 2. Gradients (2 B/p)         │ 4. Activations (Dynamic)     │
+│ • Loss partial derivatives   │ • LayerNorm, Attention, MLP  │
+│ • Accumulated per parameter  │ • Scaled by batch × context  │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+The first three categories (weights, gradients, optimizer states) are **static**: their size depends solely on the number of parameters $P$ and precision choices. They remain allocated across every batch, even when the batch size is zero. The fourth category (activations) is **dynamic**: it scales with sequence length and batch size.
+
+---
+
+## Static Memory: The 16-Byte Breakdown
+
+Standard LLM post-training uses mixed-precision AdamW. Here is why each byte is required.
+
+### 1. Model Parameters (2 Bytes per Parameter)
+During the forward and backward passes, matrix multiplications execute on specialized tensor cores in 16-bit precision (typically Bfloat16 to avoid exponent underflow, or FP16). For a model with $P$ parameters:
+
+$$
+M_{\text{weights}} = 2 \cdot P \text{ bytes}
+$$
+
+For Llama-3.1-8B ($P \approx 8.03 \times 10^9$):
+
+$$
+M_{\text{weights}} = 2 \times 8.03 \times 10^9 = 16.06 \times 10^9 \text{ bytes} \approx 16.06 \text{ GB}
+$$
+
+### 2. Gradients (2 Bytes per Parameter)
+The backward pass computes the gradient of the scalar loss $\mathcal{L}$ with respect to every weight tensor $W$:
+
+$$
+G = \frac{\partial \mathcal{L}}{\partial W}
+$$
+
+These gradients are computed by GEMM operations in 16-bit precision and must be buffered before the optimizer update step:
+
+$$
+M_{\text{gradients}} = 2 \cdot P \text{ bytes}
+$$
+
+For Llama-3.1-8B, this adds another **16.06 GB**.
+
+### 3. Optimizer States: Mixed-Precision AdamW (12 Bytes per Parameter)
+This is where the massive memory expansion occurs. The AdamW optimizer tracks historical gradient moments to adapt per-parameter learning rates:
+
+$$
+m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t \qquad \text{(First moment: running mean)}
+$$
+
+$$
+v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2 \qquad \text{(Second moment: running uncentered variance)}
+$$
+
+$$
+\theta_{t} = \theta_{t-1} - \frac{\eta}{\sqrt{\hat{v}_t} + \epsilon} \hat{m}_t - \eta \lambda \theta_{t-1} \qquad \text{(Weight update with weight decay)}
+$$
+
+Why can these not be kept in BF16?
+1. **Numerical underflow in weight updates:** In a typical training run, the learning rate $\eta \approx 10^{-4}$ or $10^{-5}$, and gradients are often $\sim 10^{-3}$. The update term $\Delta \theta \approx 10^{-7}$. In FP16/BF16, the smallest representable increment relative to a weight of magnitude $1.0$ is $2^{-10} \approx 9.7 \times 10^{-4}$ or $2^{-7} \approx 7.8 \times 10^{-3}$. Adding $10^{-7}$ to $1.0$ in BF16 produces **exactly 1.0**. The update vanishes completely!
+2. **Variance tracking:** Squaring tiny gradients ($g_t^2 \sim 10^{-6}$) in FP16 causes immediate underflow to zero.
+
+To preserve updates, AdamW must store **FP32 master weights** and update them in 32-bit floating point arithmetic. After the update, the FP32 master weights are rounded back to BF16 for the next forward pass.
+
+Therefore, AdamW allocates three 4-byte FP32 tensors per parameter:
+- **FP32 Master Weights:** $4 \cdot P \text{ bytes}$
+- **FP32 Momentum ($m_t$):** $4 \cdot P \text{ bytes}$
+- **FP32 Variance ($v_t$):** $4 \cdot P \text{ bytes}$
+
+$$
+M_{\text{optimizer}} = 4P + 4P + 4P = 12 \cdot P \text{ bytes}
+$$
+
+For Llama-3.1-8B:
+
+$$
+M_{\text{optimizer}} = 12 \times 8.03 \times 10^9 = 96.36 \text{ GB}
+$$
+
+### Total Static Footprint
+Summing all three static buckets gives the fundamental constant of deep learning training memory:
+
+$$
+M_{\text{static}} = M_{\text{weights}} + M_{\text{gradients}} + M_{\text{optimizer}} = 2P + 2P + 12P = 16 \cdot P \text{ bytes}
+$$
+
+| Model | Parameters ($P$) | Weights (BF16) | Gradients (BF16) | AdamW States (FP32) | Total Static Memory |
+|---|---|---|---|---|---|
+| **Qwen2.5-0.5B** | 0.49 B | 0.98 GB | 0.98 GB | 5.88 GB | **7.84 GB** |
+| **Qwen2.5-1.5B** | 1.54 B | 3.08 GB | 3.08 GB | 18.48 GB | **24.64 GB** |
+| **Llama-3.1-8B** | 8.03 B | 16.06 GB | 16.06 GB | 96.36 GB | **128.48 GB** |
+| **Llama-3.1-70B** | 70.6 B | 141.2 GB | 141.2 GB | 847.2 GB | **1,129.6 GB (1.13 TB)** |
+
+<Callout type="math" title="Why an 8B Model Cannot Be Trained on One 80 GB GPU">
+  Notice the stark reality: an 8B model requires **128.5 GB** just for the static parameters. 
+  Even on an NVIDIA H100 SXM5 (80 GB VRAM), you are 48.5 GB short of even loading the optimizer into memory—before processing a single token. 
+  Full finetuning of an 8B model requires at least **two 80 GB GPUs** (sharding with DeepSpeed ZeRO-3 or PyTorch FSDP) or using parameter-efficient methods like LoRA.
+</Callout>
+
+---
+
+## Dynamic Memory: The Activation Footprint
+
+Static memory does not change whether your sequence length is 10 tokens or 4,096 tokens. But during the forward pass, every layer computes intermediate tensors that must be retained in memory until the backward pass reaches that layer.
+
+These stored tensors are <Term t="activation">activations</Term>.
+
+In a standard transformer block with hidden dimension $h$, $a$ attention heads, sequence length $s$, and batch size $b$, the activation tensors saved per layer include:
+1. **Self-Attention Q, K, V projections:** $3 \times (2 \cdot b \cdot s \cdot h)$ bytes.
+2. **Attention score matrix ($QK^\top$):** $2 \cdot b \cdot a \cdot s^2$ bytes (before softmax).
+3. **Softmax output probabilities:** $2 \cdot b \cdot a \cdot s^2$ bytes.
+4. **Attention value mix ($PV$):** $2 \cdot b \cdot s \cdot h$ bytes.
+5. **Attention output projection ($W_O$):** $2 \cdot b \cdot s \cdot h$ bytes.
+6. **MLP SwiGLU projections (gate, up, down):** $3 \times (2 \cdot b \cdot s \cdot \frac{8}{3}h)$ bytes.
+7. **RMSNorm inputs (2 per layer):** $2 \times (2 \cdot b \cdot s \cdot h)$ bytes.
+
+Summing these up across $L$ layers yields the total uncheckpointed activation memory:
+
+$$
+M_{\text{act}} \approx b \cdot s \cdot L \cdot h \cdot \left(34 + 5 \frac{a \cdot s}{h}\right) \text{ bytes (in 16-bit)}
+$$
+
+Notice the quadratic term: as sequence length $s$ expands, the attention score matrix $b \cdot a \cdot s^2$ grows aggressively.
+
+### Worked Numeric Example: Llama-3.1-8B Activations
+Let us calculate uncheckpointed activation memory for Llama-3.1-8B ($L = 32, h = 4096, a = 32$) with a modest micro-batch size $b = 2$ and sequence length $s = 2048$:
+
+- Linear terms per token: $\approx 34 \times 4096 \times 2 \text{ bytes} \approx 278.5\text{ KB per layer}$.
+- Attention quadratic term: $2 \times 32 \times (2048)^2 \times 2 \text{ bytes} \approx 536.8\text{ MB}$ across all layers.
+- Across 32 layers and $2 \times 2048 = 4096$ tokens:
+
+$$
+M_{\text{act}} \approx 32 \text{ layers} \times \left(4096 \text{ tokens} \times 278.5 \text{ KB} + 16.8 \text{ MB}\right) \approx 36.8 \text{ GB}
+$$
+
+If you increase sequence length to $s = 4096$, activation memory expands to **over 78 GB**, completely filling an entire GPU with activations alone!
+
+---
+
+## Gradient Checkpointing: The 33.3% Compute Trade
+
+How do training frameworks train long-context models without drowning in activation memory? Through <Term t="activation-checkpointing">gradient checkpointing</Term> (also called activation recomputation).
+
+### The Core Mechanism
+Instead of caching every single intermediate tensor inside every attention and MLP layer during the forward pass:
+1. **Forward pass:** Store *only* the input activation tensor at the boundary of each transformer block ($2 \cdot b \cdot s \cdot h$ bytes per layer). Discard all internal intermediate projections (Q, K, V, softmax, MLP hidden layers).
+2. **Backward pass:** When the backpropagation pass reaches layer $l$, run a *local forward pass* on layer $l$ using its stored block input, regenerating the intermediate tensors on the fly.
+3. Compute the layer gradients immediately.
+4. Discard the recomputed activations and free the memory for the next layer.
+
+This reduces activation memory from $O(L)$ across the network to $O(1)$ per layer plus the boundary states:
+
+$$
+M_{\text{act\_checkpointed}} \approx 2 \cdot b \cdot s \cdot h \cdot L \text{ bytes}
+$$
+
+For our Llama-3.1-8B example ($b = 2, s = 2048$):
+
+$$
+M_{\text{act\_checkpointed}} = 2 \times 2 \times 2048 \times 4096 \times 32 \times 2 \text{ bytes} \approx 2.15 \text{ GB}
+$$
+
+Activation memory drops from **36.8 GB down to 2.15 GB**—a reduction of over **${}94\%$**!
+
+### The Compute Penalty: Deriving 33.3%
+Memory is never free; it is traded for compute. How much extra math does activation recomputation perform?
+
+Recall the standard floating-point operations (FLOPs) for training a transformer parameter over one token:
+- **Forward pass:** Each parameter participates in one multiply-accumulate (MAC), which equals **2 FLOPs per parameter**.
+- **Backward pass:** Backpropagation must compute two distinct gradients:
+  1. Gradient with respect to the weights ($\nabla_W \mathcal{L}$): 2 FLOPs.
+  2. Gradient with respect to the layer inputs ($\nabla_X \mathcal{L}$): 2 FLOPs.
+  Total backward pass = **4 FLOPs per parameter**.
+
+Thus, standard training costs:
+
+$$
+F_{\text{standard}} = 2P + 4P = 6P \text{ FLOPs per token}
+$$
+
+With gradient checkpointing, we repeat the forward pass inside each block during the backward step:
+- Initial forward pass: $2P$ FLOPs.
+- Recomputed forward pass: $2P$ FLOPs.
+- Backward pass: $4P$ FLOPs.
+
+$$
+F_{\text{checkpointed}} = 2P + 2P + 4P = 8P \text{ FLOPs per token}
+$$
+
+Comparing the two:
+
+$$
+\text{Compute Increase} = \frac{F_{\text{checkpointed}} - F_{\text{standard}}}{F_{\text{standard}}} = \frac{8P - 6P}{6P} = \frac{2}{6} = \frac{1}{3} \approx 33.3\%
+$$
+
+<Callout type="intuition" title="Why Every Training Engine Enables Checkpointing">
+  A 33% increase in compute sounds expensive until you consider the alternative. 
+  Without gradient checkpointing, you would need to cut your batch size by ${}8\times$ or buy four times as many GPUs to prevent OOM errors. 
+  In practice, paying 33% more FLOPs to slash activation memory by 80% is the single most cost-effective trade-off in deep learning systems.
+</Callout>
+
+```python
+# Verifying training memory allocations with PyTorch
+import torch
+import torch.nn as nn
+
+def estimate_training_memory(params_b: float, seq_len: int, batch_size: int, hidden: int, layers: int, checkpointing: bool):
+    p = params_b * 1e9
+    
+    # 1. Static memory
+    m_weights = 2 * p
+    m_grads = 2 * p
+    m_optimizer = 12 * p  # AdamW (4B master + 4B m + 4B v)
+    m_static = m_weights + m_grads + m_optimizer
+    
+    # 2. Dynamic activations
+    if checkpointing:
+        # Only block inputs stored
+        m_act = 2 * batch_size * seq_len * hidden * layers * 2
+    else:
+        # Rough non-checkpointed activations
+        m_act = batch_size * seq_len * layers * hidden * 38
+        
+    total_bytes = m_static + m_act
+    
+    print(f"--- Model: {params_b}B Params | Batch: {batch_size} | Seq: {seq_len} ---")
+    print(f"Weights (BF16):     {m_weights / 1e9:6.2f} GB")
+    print(f"Gradients (BF16):   {m_grads / 1e9:6.2f} GB")
+    print(f"AdamW States (FP32):{m_optimizer / 1e9:6.2f} GB")
+    print(f"Static Subtotal:    {m_static / 1e9:6.2f} GB (16 bytes/param)")
+    print(f"Activations:        {m_act / 1e9:6.2f} GB (Checkpointing: {checkpointing})")
+    print(f"TOTAL VRAM NEEDED:  {total_bytes / 1e9:6.2f} GB\n")
+
+# Llama-3.1-8B without checkpointing
+estimate_training_memory(params_b=8.0, seq_len=2048, batch_size=2, hidden=4096, layers=32, checkpointing=False)
+
+# Llama-3.1-8B with checkpointing
+estimate_training_memory(params_b=8.0, seq_len=2048, batch_size=2, hidden=4096, layers=32, checkpointing=True)
+```
+
+## How Parameter-Efficient Tuning Upends the Math
+
+Everything in this lesson explains why full-parameter finetuning is so inaccessible for small teams. If all 8 billion parameters are trainable:
+- You must maintain 8 billion gradients ($16\text{ GB}$).
+- You must maintain 8 billion Adam states ($96\text{ GB}$).
+
+In the next lesson, you will see how **LoRA (Low-Rank Adaptation)** changes this arithmetic entirely. By freezing the original weights and training only low-rank adapter matrices representing under $0.5\%$ of the model:
+- Gradients drop from $16\text{ GB}$ to under **$50\text{ MB}$**.
+- Optimizer states drop from $96\text{ GB}$ to under **$300\text{ MB}$**.
+
+The static memory requirement collapses from **16 bytes per parameter** across the full model down to **2 bytes per parameter** (the frozen weights) plus a tiny slice for the adapter.
+
+<KeyNotes>
+  1. Full-parameter mixed-precision AdamW requires **16 bytes per parameter** in static memory: weights ($2\text{ B}$), gradients ($2\text{ B}$), FP32 master weights ($4\text{ B}$), momentum $m$ ($4\text{ B}$), and variance $v$ ($4\text{ B}$).
+  2. For an 8B model, static training memory is **128.5 GB**—exceeding the 80 GB capacity of an A100 or H100 before allocating a single activation tensor.
+  3. AdamW states alone consume **12 bytes per parameter** (75% of static memory). FP32 precision is necessary to prevent small learning updates from underflowing to zero in 16-bit floats.
+  4. Activations scale linearly with batch size, hidden dimension, and layer count, and quadratically with attention context length.
+  5. **Gradient checkpointing** discards intermediate layer activations during the forward pass and recomputes them on demand during the backward pass.
+  6. Gradient checkpointing reduces activation memory by **70% to 90%**, but increases training compute by exactly **33.3%** ($6P \rightarrow 8P$ FLOPs per token).
+  7. Parameter-Efficient Finetuning (LoRA) eliminates gradients and optimizer states for 99.5%+ of parameters, reducing static memory back toward inference levels.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'How many total bytes per parameter are required for static memory during mixed-precision AdamW training?',
+    numeric: true,
+    answer: 16,
+    tolerance: 0,
+    unit: 'bytes',
+    why: 'Weights (2 B in BF16) + Gradients (2 B in BF16) + FP32 Master Weights (4 B) + FP32 Momentum m (4 B) + FP32 Variance v (4 B) = 2 + 2 + 4 + 4 + 4 = 16 bytes per parameter.'
+  },
+  {
+    q: 'You are performing full-parameter finetuning of a 14B parameter model using mixed-precision AdamW. What is the static memory footprint in GB (10^9 bytes)?',
+    numeric: true,
+    answer: 224,
+    tolerance: 2,
+    unit: 'GB',
+    why: '14 × 10^9 parameters × 16 bytes/parameter = 224 × 10^9 bytes = 224 GB.'
+  },
+  {
+    q: 'Why must the AdamW optimizer maintain master weights in FP32 rather than BF16?',
+    options: [
+      'BF16 cannot represent negative numbers',
+      'Weight updates (learning rate × gradient) are frequently smaller than the precision resolution of BF16, causing updates to underflow to zero',
+      'NVIDIA tensor cores do not support matrix multiplication in BF16',
+      'PyTorch autograd requires all loss functions to return FP32 tensors'
+    ],
+    answer: 1,
+    why: 'In BF16, the gap between 1.0 and the next representable float is ~7.8e-3. Weight updates are typically ~1e-6 or smaller, which completely vanishes if added directly to a BF16 weight.'
+  },
+  {
+    q: 'A standard training step costs 6P FLOPs per token (2P forward + 4P backward). Gradient checkpointing recomputes the forward pass during backprop (2P forward + 2P recompute + 4P backward = 8P). By what exact percentage does compute increase?',
+    numeric: true,
+    answer: 33.3,
+    tolerance: 0.5,
+    unit: '%',
+    why: '(8P − 6P) / 6P = 2P / 6P = 1/3 ≈ 33.33% increase in compute.'
+  },
+  {
+    q: 'Which memory component scales quadratically with sequence length s during uncheckpointed transformer training?',
+    options: [
+      'The model weights W_Q and W_K',
+      'The AdamW momentum buffers',
+      'The attention score matrix (QK^T) before softmax',
+      'The RMSNorm input activations'
+    ],
+    answer: 2,
+    why: 'Attention scores require computing all pairs between s queries and s keys, producing a score tensor of shape [batch, heads, s, s], which scales quadratically with s.'
+  },
+  {
+    q: 'What is the primary benefit of activation checkpointing (gradient checkpointing)?',
+    options: [
+      'It speeds up the backward pass by 33%',
+      'It slashes activation memory by 70–90% at the cost of recomputing forward activations during the backward pass',
+      'It eliminates the need for FP32 master weights in AdamW',
+      'It automatically quantizes the model weights to 4 bits'
+    ],
+    answer: 1,
+    why: 'Gradient checkpointing stores only layer boundary activations, recomputing internal layer activations during the backward pass. This trades 33.3% extra FLOPs for up to 90% savings in activation VRAM.'
+  }
+]} />

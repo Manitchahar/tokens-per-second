@@ -1,0 +1,390 @@
+---
+title: 'Model merging & task arithmetic'
+summary: 'Combine distinct model capabilities with zero GPU compute: understand Linear Mode Connectivity, manipulate task vectors through arithmetic, and master modern merging algorithms including SLERP, TIES, and DARE.'
+objectives:
+  - 'Explain why Linear Mode Connectivity allows models fine-tuned from a shared initialization to be merged without loss barriers'
+  - 'Compute task vectors and perform task arithmetic to add skills or unlearn undesirable behaviors'
+  - 'Derive why naive linear interpolation causes norm collapse and how Spherical Linear Interpolation (SLERP) solves it'
+  - 'Describe the three stages of TIES-Merging: Trimming, Sign Election, and Disjoint Average'
+  - 'Explain how DARE (Drop And REscale) prunes 90% of task deltas to eliminate multi-model interference'
+---
+import ModelMergingViz from '@/components/viz/finetuning/ModelMergingViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In every preceding lesson of this course, creating a capable model required running backpropagation on a cluster of GPUs: calculating gradients, updating AdamW momentum states, and burning kilowatts of electrical power.
+
+Now consider a radical alternative. 
+
+You have an 8-billion parameter model fine-tuned for high-speed Python coding (`Llama-3.1-8B-Python`). Your colleague has an 8-billion parameter model fine-tuned for multi-step mathematical reasoning (`Llama-3.1-8B-Math`). 
+
+Can you combine them into a single 8B model that excels at **both Python and Math**—in **three minutes, on a consumer laptop CPU, using zero training data and zero floating-point backpropagation**?
+
+Until recently, classical deep learning intuition said this was impossible. Neural network weight spaces are notoriously non-convex and permutation-invariant: if you take two independently trained image classifiers and average their weights, the resulting network outputs 0% accuracy.
+
+Yet in 2022 and 2023, a series of breakthrough papers (*Model Soups*, *Task Arithmetic*, *TIES-Merging*, and *DARE*) revealed an extraordinary property of foundation models: **models fine-tuned from the same pre-trained base checkpoint occupy the same convex loss basin**. In this shared manifold, fine-tuning directions act as linear <Term t="task-vector">task vectors</Term> that can be added, subtracted, scaled, and merged like words in an embedding space.
+
+<Scrolly>
+  <ModelMergingViz client:visible slot="stage" />
+
+  <Step title="1. Linear mode connectivity">
+    Independently trained networks occupy distant, disconnected local minima separated by high energy barriers. But models fine-tuned from the **same pre-trained base model** stay inside a single convex loss basin. The linear path between them has zero loss barrier.
+  </Step>
+
+  <Step title="2. Task Arithmetic: The task vector">
+    Subtracting the base weights from the fine-tuned weights isolates the pure behavioral displacement: $\tau = \theta_{\text{ft}} - \theta_{\text{base}}$. Capabilities can be added ($\theta_{\text{base}} + \tau_{\text{code}} + \tau_{\text{math}}$) or subtracted to negate toxicity.
+  </Step>
+
+  <Step title="3. Linear Merging & Model Soups">
+    A simple weighted average ($\theta_{\text{merged}} = 0.5 \theta_A + 0.5 \theta_B$) works remarkably well for checkpoints fine-tuned on similar distributions. However, cutting straight across high-dimensional space causes **norm shrinkage**, dampening output confidence.
+  </Step>
+
+  <Step title="4. SLERP: Spherical linear interpolation">
+    Rather than cutting through the interior of the hypersphere, SLERP rotates along the constant-radius geodesic. It preserves the exact geometric length and angular distribution of weight vectors, preventing degradation on distinct tasks.
+  </Step>
+
+  <Step title="5. TIES: Resolving sign interference">
+    When merging three or more expert models, parameter updates often pull in opposite directions. TIES trims the bottom 80% noise deltas, calculates a **majority sign consensus** per parameter, and averages only aligned weights.
+  </Step>
+
+  <Step title="6. DARE: Random pruning & rescaling">
+    DARE proves that task vectors are massively redundant: it randomly drops up to **90% of delta weights** with a Bernoulli mask and scales remaining weights by $\frac{1}{1-p}$. It eliminates cross-task interference without hyperparameter tuning.
+  </Step>
+</Scrolly>
+
+## Why Merging Works: Linear Mode Connectivity
+
+To understand why model merging is theoretically valid, we must examine the topology of deep learning loss landscapes.
+
+Suppose two neural networks $f(\theta_1)$ and $f(\theta_2)$ are initialized with different random seeds and trained from scratch on the same dataset. If you interpolate linearly between their weights:
+
+$$
+\theta(\alpha) = (1 - \alpha)\theta_1 + \alpha \theta_2, \qquad \alpha \in [0, 1]
+$$
+
+At $\alpha = 0.5$, the test loss spikes to catastrophic levels. The two models found different permutation symmetries in weight space (e.g., neuron 12 in layer 4 performs one feature in model 1, but neuron 89 does that feature in model 2). Averaging them destroys both representations.
+
+### The Shared Basin Phenomenon
+However, fine-tuning an LLM does not train from random initialization. All downstream models (e.g. WizardLM, OpenCodeInterpreter, MetaMath) start from the exact same pre-trained checkpoint $\theta_{\text{base}}$.
+
+As shown by Neyshabur et al. (2020) and Frankle et al. (2020), pretraining pushes the parameters into a broad, flat **basin of attraction**. Subsequent supervised fine-tuning updates parameters by less than $1\%$ to $3\%$ in relative Euclidean distance:
+
+$$
+\frac{\|\theta_{\text{ft}} - \theta_{\text{base}}\|_2}{\|\theta_{\text{base}}\|_2} \ll 0.05
+$$
+
+Because the fine-tuned models never leave this shared basin, the loss surface between them is essentially convex. This is the <Term t="linear-mode-connectivity">Linear Mode Connectivity (LMC)</Term> hypothesis:
+
+$$
+\forall \alpha \in [0, 1]: \quad \mathcal{L}\left((1 - \alpha)\theta_A + \alpha \theta_B\right) \le (1 - \alpha)\mathcal{L}(\theta_A) + \alpha \mathcal{L}(\theta_B) + \epsilon
+$$
+
+There is no loss barrier along the linear path connecting the two models.
+
+---
+
+## Task Arithmetic: Vectors in Parameter Space
+
+In 2023, Gabriel Ilharco and colleagues introduced **Task Arithmetic** (*Editing Models with Task Arithmetic*, arXiv:2212.04089).
+
+They defined the **Task Vector** $\tau_t$ for a model fine-tuned on task $t$:
+
+$$
+\tau_t = \theta_t - \theta_{\text{base}}
+$$
+
+A task vector $\tau_t$ has the exact same tensor shape as the full model weights, but contains only the directional displacement induced by fine-tuning on task $t$.
+
+Just as word embeddings famously allowed semantic vector algebra ($\vec{v}_{\text{King}} - \vec{v}_{\text{Man}} + \vec{v}_{\text{Woman}} \approx \vec{v}_{\text{Queen}}$), task vectors allow **algebra over entire foundation models**.
+
+```
+                           θ_merged = θ_base + τ_code + τ_math
+                                    ▲
+                                   / \
+                                  /   \
+                         τ_code  /     \  τ_math
+                                /       \
+                               /         \
+                            θ_code      θ_math
+                               ▲         ▲
+                                \       /
+                         τ_code  \     /  τ_math
+                                  \   /
+                                   \ /
+                                  θ_base
+```
+
+### 1. Task Addition (Multi-Task Fusion)
+Suppose you have a model fine-tuned on Code ($\theta_{\text{code}}$) and a model fine-tuned on Mathematical Reasoning ($\theta_{\text{math}}$). You can construct a combined expert with zero training:
+
+$$
+\theta_{\text{combined}} = \theta_{\text{base}} + \lambda_{\text{code}} \tau_{\text{code}} + \lambda_{\text{math}} \tau_{\text{math}}
+$$
+
+Where scaling coefficients $\lambda_i \in [0.3, 0.8]$ prevent parameter magnitudes from blowing up when adding multiple vectors.
+
+### 2. Task Negation (Machine Unlearning)
+What if a base model frequently generates toxic language or hallucinates biased stereotypes?
+1. Fine-tune a copy of the base model intentionally on toxic text to obtain $\theta_{\text{toxic}}$.
+2. Compute the toxic task vector: $\tau_{\text{toxic}} = \theta_{\text{toxic}} - \theta_{\text{base}}$.
+3. **Subtract** the task vector from the base model:
+
+$$
+\theta_{\text{unlearned}} = \theta_{\text{base}} - \lambda \cdot \tau_{\text{toxic}}
+$$
+
+Ilharco et al. proved that subtracting negative task vectors effectively neutralizes targeted behaviors without destroying general capabilities.
+
+### 3. Task Analogies
+You can even transfer stylistic shifts across languages:
+
+$$
+\theta_{\text{target}} = \theta_{\text{base}} + (\tau_{\text{French\_Law}} - \tau_{\text{French\_General}})
+$$
+
+---
+
+## Merging Methods: From Soups to Hyperspheres
+
+While simple task addition works for two models with small deltas, combining multiple large models requires principled geometric algorithms.
+
+### 1. Model Soups (Uniform / Greedy Linear Averaging)
+Introduced by Mitchell Wortsman et al. (2022), <Term t="model-soup">Model Soups</Term> average the weights of multiple fine-tuned models trained with different hyperparameters (different learning rates, seeds, or data augmentations):
+
+$$
+\theta_{\text{soup}} = \frac{1}{M} \sum_{i=1}^{M} \theta_i
+$$
+
+**Why it works:** Individual fine-tuning runs overfit to random noise in their respective training subsets. Averaging their weights cancels out uncorrelated noise while reinforcing consistent feature directions, boosting test set accuracy by 1–3% without retraining.
+
+### 2. SLERP: Spherical Linear Interpolation
+When merging two models fine-tuned on very different domains, simple linear interpolation ($\theta_{\text{linear}} = (1 - t)\theta_A + t \theta_B$) suffers from a geometric flaw known as **norm collapse**.
+
+In high-dimensional spaces ($\mathbb{R}^D$ where $D \approx 8 \times 10^9$), weight vectors lie near the surface of a high-dimensional hypersphere. A linear interpolation cuts straight through the interior of the sphere (along a chord rather than the surface arc):
+
+$$
+\|\theta_{\text{linear}}\|_2 = \sqrt{(1-t)^2 \|\theta_A\|^2 + t^2 \|\theta_B\|^2 + 2t(1-t)\theta_A \cdot \theta_B}
+$$
+
+If $\theta_A$ and $\theta_B$ have angle $\Omega$, at $t = 0.5$ the vector norm shrinks by:
+
+$$
+\frac{\|\theta_{\text{linear}}\|}{\|\theta_A\|} = \sqrt{\frac{1 + \cos\Omega}{2}} = \cos\left(\frac{\Omega}{2}\right)
+$$
+
+If $\Omega = 60^\circ$, the merged parameter vector shrinks in magnitude by **${}13.4\%$**! This shrinkage dampens layer activation gains, leading to flat logit distributions and degraded reasoning.
+
+**<Term t="slerp">SLERP</Term>** eliminates norm collapse by interpolating along the spherical geodesic (the great-circle arc):
+
+$$
+\theta_{\text{slerp}}(t) = \frac{\sin\left((1 - t)\Omega\right)}{\sin\Omega} \theta_A + \frac{\sin\left(t\Omega\right)}{\sin\Omega} \theta_B
+$$
+
+Where the angle $\Omega$ between the two normalized parameter vectors is:
+
+$$
+\Omega = \arccos\left( \frac{\theta_A \cdot \theta_B}{\|\theta_A\| \|\theta_B\|} \right)
+$$
+
+SLERP guarantees that the merged parameter vector retains the exact norm and variance of the parent models throughout the entire interpolation trajectory.
+
+---
+
+## TIES-Merging: Resolving Directional Interference
+
+When you attempt to merge three, five, or ten models simultaneously, a fatal problem emerges: **destructive parameter interference**.
+
+For any specific weight parameter $w_{i,j}$ in a transformer layer:
+- Model A might push $w_{i,j}$ by $+0.04$ (positive update).
+- Model B might push $w_{i,j}$ by $-0.05$ (negative update).
+- Model C might push $w_{i,j}$ by $+0.001$ (insignificant noise).
+
+A simple average produces $(0.04 - 0.05 + 0.001) / 3 = -0.003$. The two dominant, confident updates cancel each other out!
+
+In 2023, Prateek Yadav and colleagues published <Term t="ties-merging">TIES-Merging</Term> (*Resolving Interference When Merging Models*, NeurIPS 2023). TIES (TRIM, ELECT SIGN & MERGE) resolves interference in three sequential steps:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   THE THREE STAGES OF TIES                  │
+├─────────────────────────────────────────────────────────────┤
+│ 1. TRIM (Top-k Density Filtering)                           │
+│ • For each model, keep only top 20% largest |Δw| deltas     │
+│ • Set the remaining 80% small noise updates to exactly 0    │
+├─────────────────────────────────────────────────────────────┤
+│ 2. ELECT SIGN (Consensus Direction)                         │
+│ • Compute the total mass of positive vs negative updates:   │
+│   γ_p = sign(Σ_m Δw_m)                                      │
+│ • Elect the dominant sign (+1 or -1) for each parameter     │
+├─────────────────────────────────────────────────────────────┤
+│ 3. DISJOINT MERGE (Filtered Average)                        │
+│ • Zero out any model delta that disagrees with elected sign │
+│ • Average only the deltas that agree with the consensus     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+By eliminating sign conflicts, TIES allows combining 5 to 10 distinct models without mutual capability cancellation.
+
+---
+
+## DARE: Extreme Sparsification via Bernoulli Rescaling
+
+In late 2023, Le Yu and colleagues introduced <Term t="dare">DARE</Term> (*Language Models are Super Mario: Absorbing Abilities from Homologous Models*, arXiv:2311.03099).
+
+DARE makes an astonishing empirical observation: **over 90% of parameter deltas in a fine-tuned model are completely redundant**.
+
+### The DARE Algorithm
+For each parameter delta $\tau_i$ in a task vector:
+1. Drop the parameter with probability $p$ (typically $p = 0.90$) using a random Bernoulli mask $m_i \sim \text{Bernoulli}(1 - p)$.
+2. **Rescale** the surviving $10\%$ of parameters by $\frac{1}{1 - p}$:
+
+$$
+\hat{\tau}_i = \frac{m_i}{1 - p} \cdot \tau_i = \begin{cases} \frac{1}{1 - p} \tau_i & \text{with probability } 1 - p \\ 0 & \text{with probability } p \end{cases}
+$$
+
+Notice that the expected value of the parameter update is perfectly preserved:
+
+$$
+\mathbb{E}\left[\hat{\tau}_i\right] = (1 - p) \cdot \left(\frac{1}{1 - p} \tau_i\right) + p \cdot 0 = \tau_i
+$$
+
+Because $90\%$ of the weights in each model's delta are now zero, the probability of two models having non-zero values at the exact same parameter coordinate drops to:
+
+$$
+P(\text{collision}) = (1 - p)^2 = (0.10)^2 = 0.01 = 1\%
+$$
+
+Parameter collisions and destructive interference virtually vanish! DARE can be paired with TIES (DARE-TIES) or linear merging (DARE-Linear) to merge dozens of task-specific models into a single high-performing generalist.
+
+```python
+# Implementing Task Vector addition, SLERP, and DARE in pure Python/PyTorch
+import torch
+
+def create_task_vector(fine_tuned_weights: torch.Tensor, base_weights: torch.Tensor) -> torch.Tensor:
+    """Isolate pure behavioral displacement."""
+    return fine_tuned_weights - base_weights
+
+def slerp(t: float, v0: torch.Tensor, v1: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Spherical Linear Interpolation preserving vector norms."""
+    # Flatten tensors to compute angle
+    v0_flat = v0.view(-1)
+    v1_flat = v1.view(-1)
+    
+    # Compute angle Omega via dot product of normalized vectors
+    u0 = v0_flat / (torch.norm(v0_flat) + eps)
+    u1 = v1_flat / (torch.norm(v1_flat) + eps)
+    dot = torch.clamp(torch.dot(u0, u1), -1.0, 1.0)
+    omega = torch.acos(dot)
+    
+    sin_omega = torch.sin(omega)
+    if sin_omega < eps:
+        # Collinear vectors: fallback to linear interpolation
+        return (1.0 - t) * v0 + t * v1
+        
+    scale0 = torch.sin((1.0 - t) * omega) / sin_omega
+    scale1 = torch.sin(t * omega) / sin_omega
+    return scale0 * v0 + scale1 * v1
+
+def dare_mask_and_rescale(task_vector: torch.Tensor, drop_rate: float = 0.90) -> torch.Tensor:
+    """Random Bernoulli pruning + rescaling by 1/(1-p)."""
+    keep_prob = 1.0 - drop_rate
+    # Bernoulli mask: 1 with probability keep_prob, 0 with probability drop_rate
+    mask = torch.bernoulli(torch.full_like(task_vector, keep_prob))
+    # Rescale surviving weights
+    return (task_vector * mask) / keep_prob
+```
+
+## The Production Reality of Model Merging
+
+In the open-source community, <Term t="model-merging">model merging</Term> has exploded into an essential discipline. Tools like **MergeKit** allow practitioners to specify YAML merge configurations and produce frontier-tier checkpoints on CPU RAM:
+
+```yaml
+# Example MergeKit configuration
+models:
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    # No parameters: acts as base
+  - model: cognitivecomputations/dolphin-2.9-llama3-8b
+    parameters:
+      weight: 0.6
+      density: 0.7
+  - model: MaziyarPanahi/Calme-7.8-Instruct-8B
+    parameters:
+      weight: 0.4
+      density: 0.7
+merge_method: dare_ties
+base_model: meta-llama/Llama-3.1-8B-Instruct
+dtype: bfloat16
+```
+
+Many models leading open LLM leaderboards (such as the Hugging Face Open LLM Leaderboard) are not raw SFT runs; they are **DARE-TIES merges** of multiple specialized community fine-tunes.
+
+<KeyNotes>
+  1. **Linear Mode Connectivity (LMC)** ensures that models fine-tuned from the same shared pre-trained base checkpoint occupy the same convex loss basin with zero energy barriers between them.
+  2. A **task vector** ($\tau = \theta_{\text{ft}} - \theta_{\text{base}}$) isolates the behavioral displacement of a skill. Task vectors can be added to fuse capabilities or subtracted to unlearn toxic behaviors.
+  3. Simple linear averaging (Model Soups) cuts straight across high-dimensional space, causing **parameter norm collapse** that dampens model confidence.
+  4. **SLERP** (Spherical Linear Interpolation) interpolates along the constant-radius spherical geodesic, preserving the exact vector magnitude and angular relationships of the parent models.
+  5. **TIES-Merging** resolves multi-model destructive interference in three steps: **Trimming** low-magnitude noise (top 20%), **Electing sign consensus** per parameter, and **Disjoint merging** aligned deltas.
+  6. **DARE** drops up to **90% of task deltas** via Bernoulli masking and rescales surviving weights by $\frac{1}{1-p}$, virtually eliminating parameter collisions across multiple tasks.
+  7. Model merging requires **zero training data, zero GPU compute, and zero backpropagation**, allowing engineers to create multi-domain foundation models on a CPU in minutes.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why can two models fine-tuned from the same base checkpoint (e.g. Llama-3.1-8B) be merged successfully, whereas two models trained from different random seeds cannot?',
+    options: [
+      'Models trained from different seeds have incompatible vocabulary sizes',
+      'Models fine-tuned from a shared base model remain in the same convex loss basin (Linear Mode Connectivity), avoiding permutation symmetry barriers',
+      'Fine-tuned models do not have activation functions',
+      'The PyTorch compiler converts fine-tuned weights into linear scalar vectors'
+    ],
+    answer: 1,
+    why: 'Because both models began at the exact same base weights and updated them by only 1–2%, they reside in the same local minimum basin. Linear paths between them contain no high-loss energy barriers.'
+  },
+  {
+    q: 'You have a base model θ_base, a model fine-tuned on coding θ_code, and a model fine-tuned on toxic internet chat θ_toxic. How do you construct a coding model with reduced toxicity using task arithmetic?',
+    options: [
+      'θ_base + (θ_code - θ_base) - (θ_toxic - θ_base)',
+      'θ_code × θ_toxic / θ_base',
+      'θ_base - (θ_code + θ_toxic)',
+      '(θ_code + θ_toxic) / 2'
+    ],
+    answer: 0,
+    why: 'Task vector for coding is τ_code = θ_code − θ_base. Task vector for toxicity is τ_toxic = θ_toxic − θ_base. Adding the coding vector while subtracting the toxic vector yields θ_base + τ_code − τ_toxic.'
+  },
+  {
+    q: 'Two weight vectors θ_A and θ_B of equal length ||θ|| have an angle of 60 degrees (cos Ω = 0.5) between them. At the linear midpoint t = 0.5, by what percentage has the vector norm shrunk compared to the original length?',
+    numeric: true,
+    answer: 13.4,
+    tolerance: 0.5,
+    unit: '%',
+    why: '||θ_linear|| / ||θ|| = sqrt((1 + cos(60°))/2) = sqrt((1 + 0.5)/2) = sqrt(0.75) ≈ 0.8660. The norm is 86.6% of original, which is a shrinkage of 100% − 86.6% = 13.4%.'
+  },
+  {
+    q: 'In DARE (Drop And REscale), you drop 90% of delta weights (p = 0.90) using a random Bernoulli mask. By what factor must the surviving 10% of weights be multiplied to preserve expected values?',
+    numeric: true,
+    answer: 10,
+    tolerance: 0,
+    unit: 'x',
+    why: 'Rescaling factor = 1 / (1 − p) = 1 / (1 − 0.90) = 1 / 0.10 = 10×.'
+  },
+  {
+    q: 'What is the primary purpose of the "Elect Sign" stage in TIES-Merging?',
+    options: [
+      'To verify that all floating point numbers are formatted as IEEE 754',
+      'To determine the consensus direction (+ or −) for each parameter across models and prevent contradictory updates from canceling each other out',
+      'To convert all weights to positive absolute values',
+      'To ensure gradients are strictly non-negative'
+    ],
+    answer: 1,
+    why: 'When merging multiple models, updates often pull in opposite directions, causing destructive interference. The Elect Sign stage identifies the dominant direction across models and discards updates that contradict the consensus.'
+  },
+  {
+    q: 'Why is Spherical Linear Interpolation (SLERP) generally preferred over simple linear interpolation when merging two fine-tuned LLMs?',
+    options: [
+      'SLERP runs 10x faster on CUDA GPUs',
+      'SLERP interpolates along the spherical geodesic, preserving the vector magnitude and angular variance of parent weights without norm collapse',
+      'SLERP requires training data to compute optimal curvature',
+      'SLERP automatically quantizes weights to 4-bit NF4'
+    ],
+    answer: 1,
+    why: 'High-dimensional neural weights lie near a hypersphere surface. Simple linear interpolation cuts through the interior, shrinking parameter norm and dulling logits. SLERP preserves vector norms by traveling along the spherical geodesic.'
+  }
+]} />

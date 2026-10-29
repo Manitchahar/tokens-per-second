@@ -1,0 +1,307 @@
+---
+title: 'When to finetune (and when not to)'
+summary: 'Navigate the customization ladder: when to rely on system prompts and RAG, when finetuning is mandatory for syntax and tone, and the hidden costs of data, compute, and catastrophic forgetting.'
+objectives:
+  - 'Explain why supervised finetuning is exceptionally effective for form and poor for dynamic facts'
+  - 'Calculate the serving token cost and TTFT penalty of few-shot prompt stuffing versus adapter finetuning'
+  - 'Identify the four primary justifications for finetuning: strict syntax, behavioral persona, edge distillation, and air-gapped privacy'
+  - 'Quantify the hidden engineering costs of post-training: annotation friction, evaluation drift, and catastrophic forgetting'
+---
+import WhenToFinetuneViz from '@/components/viz/finetuning/WhenToFinetuneViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every engineering team building with large language models eventually encounters the same temptation. The prototype works reasonably well with a system prompt, but on complex domain queries it occasionally stumbles: it misplaces a closing brace in a JSON payload, rambles when it should be concise, or fails to know the latest internal company acronyms.
+
+The immediate reaction is almost universal: *"Let us finetune our own model."*
+
+In the imagination of a newcomer, finetuning resembles downloading an open-weights foundation model, passing it a folder of internal PDF documents and company manuals, running backpropagation overnight, and waking up to a bespoke intelligence that knows every proprietary fact perfectly. In practice, this intuition is completely inverted. When you attempt to teach an LLM factual knowledge by adjusting its weights, you are using the most expensive, least reliable database ever invented.
+
+This lesson establishes the first-principles economics of model customization. You will see why modern inference engineering treats finetuning not as a knowledge-injection tool, but as a **form, syntax, and behavioral compiler**.
+
+<Scrolly>
+  <WhenToFinetuneViz client:visible slot="stage" />
+
+  <Step title="1. Level 1: System prompt & zero-shot">
+    Always start by instructing the model in plain language. Zero training compute, instant deployment updates, and zero extra GPU infrastructure. If zero-shot prompting satisfies your accuracy budget, stop here.
+  </Step>
+
+  <Step title="2. Level 2: Few-shot in-context learning">
+    When instructions alone fail to enforce edge-case handling, provide three to eight golden input-output pairs inside the prompt. Format adherence rises sharply, but **every single query now carries hundreds of prefix tokens** into your prefill pass and KV cache.
+  </Step>
+
+  <Step title="3. Level 3: Retrieval-augmented generation">
+    When your application requires private, verified, or rapidly changing ground truth, decouple memory from compute. Retrieve relevant chunks at query time. Factuality reaches **95%+**, and documents can be updated every second without retraining.
+  </Step>
+
+  <Step title="4. The knowledge injection fallacy">
+    Attempting to bake changing domain facts directly into model parameters via backpropagation fails reliably. Gradient descent adjusts weights statistically; the model still hallucinates obscure numbers, suffers catastrophic forgetting, and provides no audit trail.
+  </Step>
+
+  <Step title="5. Level 4: Supervised finetuning">
+    Finetuning modifies the network weights ($W + \Delta W$) to permanently absorb complex schemas, specialized grammars, and nuanced conversational tone. The prompt shrinks back to zero overhead, TTFT drops, and format reliability approaches 100%.
+  </Step>
+
+  <Step title="6. The complete decision matrix">
+    The golden rule: **Finetune for form, style, and distillation; retrieve for facts.** Select different workload profiles in the visual to inspect the trade-off frontier between training FLOPs, prompt memory, and factual grounding.
+  </Step>
+</Scrolly>
+
+## The Customization Ladder
+
+When an inference engineer faces a gap between model performance and application requirements, they have four escalating architectural tiers. Each rung increases engineering complexity, maintenance surface, and deployment cost.
+
+| Strategy | Primary Mechanism | Training Compute | Added Prompt Tokens | Factual Grounding | Best For |
+|---|---|---|---|---|---|
+| **Zero-Shot Prompt** | Natural language steering | 0 FLOPs | 0 tokens | Low | General reasoning, prototyping |
+| **Few-Shot (ICL)** | In-context demonstration | 0 FLOPs | 500–2,000 tokens | Medium | Rare formatting nuances, low volume |
+| **RAG** | Dynamic context injection | Low (Embeddings) | 500–3,000 tokens | **Very High (95%+)** | Fresh facts, private docs, citations |
+| **Finetuning (SFT/LoRA)** | Weight adaptation ($W + \Delta W$) | High (GPU clusters) | **0 tokens** | Moderate | Strict syntax, tone, small model distillation |
+
+Notice the clean inversion between **Few-Shot / RAG** and **Finetuning**:
+- In RAG and Few-Shot, you pay **zero training cost**, but you pay an **ongoing tax on every single inference request** in prompt tokens, TTFT latency, and KV cache memory.
+- In Finetuning, you pay a **heavy upfront training and evaluation tax**, but your inference requests run at **maximum speed with zero wasted prompt overhead**.
+
+<Callout type="intuition" title="The Database vs The Grammar Engine">
+  Think of foundation model weights as an engine that learned the grammatical, logical, and structural regularities of human language over trillions of tokens. 
+  When you want the engine to search through 10,000 customer tickets, you do not melt down the engine pistons and recast the metal to stamp the ticket numbers into the steel. You hand the engine the relevant ticket at runtime. Weight adaptation is a structural change; retrieval is an informational lookup.
+</Callout>
+
+## Why Finetuning Fails for Facts: The Arithmetic
+
+Why is gradient descent so remarkably inefficient at memorizing discrete facts?
+
+Consider what happens during supervised finetuning. You provide a prompt $x$ and a target factual answer $y$ (for example, a technical product catalog: `"SKU-99214 has a tolerance of 0.04 mm"`). The cross-entropy training loss minimizes:
+
+$$
+\mathcal{L}_{\text{SFT}}(\theta) = - \sum_{t=1}^{T} \log P_\theta(y_t \mid x, y_{&lt;t})
+$$
+
+To push the probability of the token `"0.04"` higher, the optimizer computes gradients across millions of attention and MLP weights:
+
+$$
+\theta \leftarrow \theta - \eta \cdot \nabla_\theta \mathcal{L}_{\text{SFT}}
+$$
+
+This gradient update does not write to a dedicated key-value slot. It gently nudges continuous projection matrices that are simultaneously responsible for English grammar, coding logic, and common sense. 
+
+This introduces three structural failure modes:
+
+### 1. Sample Inefficiency & The Re-learning Tax
+To reliably retrieve an arbitrary factual association from parametric weights without context, an LLM typically requires dozens of varied paraphrases across several epochs. In contrast, an embedding lookup in a vector database takes a single vector insert:
+
+$$
+C_{\text{vector\_insert}} = 2 \cdot P_{\text{embed}} \cdot N_{\text{tokens}}
+$$
+
+For an embedding model with $P_{\text{embed}} = 33\text{M}$ parameters and a 500-token document:
+
+$$
+C_{\text{vector\_insert}} = 2 \times (33 \times 10^6) \times 500 = 3.3 \times 10^{10}\ \text{FLOPs}
+$$
+
+On an NVIDIA T4 GPU (65 TFLOP/s FP16), indexing that document takes **0.5 milliseconds** and costs approximately $0.0000002. Retraining an 8B model on a corpus of 10M tokens requires $3 \times 6 P N \approx 1.44 \times 10^{18}$ FLOPs—hundreds of GPU-hours.
+
+### 2. The Lack of Verifiable Citations
+When an LLM produces a fact stored purely in its weights, there is no pointer to the source document, no timestamp, and no cryptographic hash. It cannot answer: *"Which paragraph on which page told you this?"* For legal, medical, and financial applications, ungrounded parametric generation violates compliance contracts.
+
+### 3. Empirical Superiority of Retrieval
+In systematic benchmarks comparing factual question answering (e.g. Ovadia et al., 2023, *Fine-Tuning or Retrieval?*), RAG consistently outperforms fine-tuned models on factual recall by **30 to 50 percentage points**. Even when a model is fine-tuned directly on the evaluation documents, its ability to recall specific numeric figures or named entities falls far short of providing the text directly in the prompt.
+
+<Callout type="pitfall" title="The Knowledge Cutoff Mirage">
+  If your team says: *"Our documentation updates every Tuesday, so we will set up an automated weekly finetuning pipeline,"* sound the alarm. 
+  A weekly finetuning loop guarantees three things: (1) your evaluation suite will constantly break, (2) the model will hallucinate obsolete versions of deleted policies, and (3) your cloud compute bill will surge. Use RAG for anything that changes faster than your major model deprecation cycle.
+</Callout>
+
+## When Finetuning Is Unbeatable
+
+If finetuning is the wrong tool for factual knowledge, why does every frontier AI lab and sophisticated enterprise maintain extensive post-training pipelines? Because for **form, syntax, style, and efficiency**, finetuning is unmatched.
+
+### 1. Strict Output Schemas (JSON, SQL, DSLs)
+Suppose your application extracts structured entities from messy customer transcripts and outputs a strict JSON schema with 18 fields. 
+
+Using prompt engineering, your system prompt must define every field name, types, allowable enum values, and edge-case instructions:
+
+```text
+You are an entity extractor. Return ONLY valid JSON adhering to this schema:
+{
+  "customer_id": string (UUIDv4),
+  "sentiment": "positive" | "neutral" | "negative",
+  "issues": [ { "category": string, "severity": int between 1 and 5 } ],
+  ... 40 more lines of schema ...
+}
+```
+
+This prompt consumes 1,200 tokens. If you serve 5,000,000 requests per month:
+
+$$
+\text{Wasted Prompt Tokens} = 5{,}000{,}000 \times 1{,}200 = 6 \times 10^9 \text{ tokens/month}
+$$
+
+At an inference input price of $0.20 per million tokens (typical for an 8B model), you are paying:
+
+$$
+\text{Monthly Schema Tax} = \frac{6 \times 10^9}{10^6} \times $0.20 = $1{,}200\text{ per month}
+$$
+
+Even worse than dollar cost is **Time to First Token (TTFT)**. Prefilling 1,200 tokens takes substantial GPU time on every call, and consumes $1{,}200 \times 128\text{ KiB} \approx 150\text{ MB}$ of KV cache memory per concurrent stream.
+
+By finetuning a model on 2,000 high-quality schema examples, the model learns the schema implicitly in its weights. The system prompt becomes: `"Extract entities."` (3 tokens). Format errors drop from 6% to 0.01%, TTFT drops by 70%, and the KV cache footprint is negligible.
+
+### 2. Behavioral Persona and Conversational Steering
+Teaching a model to adopt a subtle, domain-specific tone through prompting is fragile. A medical intake assistant must be empathetic, concise, never offer speculative diagnoses, and always ask clarifying triage questions.
+
+In a pure prompt-engineered setup, complex system prompts frequently suffer from **instruction drift**: as multi-turn conversations grow long, the model pays more attention to the recent user context than to the distant system prompt at token position 0. Finetuning permanently steers the model's activation trajectories toward the target behavioral manifold.
+
+### 3. Model Distillation (Shrinking 70B to 1.5B)
+This is the single most lucrative technique in production inference engineering.
+
+Running an open frontier model like Llama-3.1-70B requires two NVIDIA A100/H100 GPUs (160 GB VRAM) and generates roughly 30–50 tokens per second per user. Running a small model like Qwen2.5-1.5B requires under 4 GB of VRAM, runs comfortably on a cheap edge chip or a single legacy T4 GPU, and generates 150+ tokens per second.
+
+Out of the box, Qwen2.5-1.5B lacks the complex reasoning needed for intricate business logic. However, you can use the 70B model as a **teacher**:
+1. Run 50,000 production prompts through Llama-3.1-70B.
+2. Filter the responses for high accuracy and clean formatting.
+3. Finetune Qwen2.5-1.5B on these 50,000 teacher demonstrations.
+
+The resulting 1.5B student model matches the 70B teacher on your specific task while costing **${}30\times$ less to serve**.
+
+```python
+# Conceptual serving comparison: Prompt-stuffed 70B vs Distilled 1.5B
+import time
+
+def evaluate_inference_cost(batch_size: int, prompt_tokens: int, gen_tokens: int, model_size_b: float):
+    # Rough memory bandwidth calculation for decoding
+    bytes_per_param = 2.0  # FP16
+    weight_bytes = model_size_b * 1e9 * bytes_per_param
+    # Bandwidth of an A100 (2,000 GB/s) vs T4 (300 GB/s)
+    bandwidth = 2.0e12 if model_size_b > 10 else 300e9
+    
+    # Decode time per token is memory-bound: weight_bytes / bandwidth
+    sec_per_token = weight_bytes / bandwidth
+    total_decode_time = gen_tokens * sec_per_token
+    
+    print(f"Model: {model_size_b}B params | Weight footprint: {weight_bytes / 1e9:.1f} GB")
+    print(f"Decode latency for {gen_tokens} tokens: {total_decode_time * 1000:.1f} ms")
+
+# Case A: 70B foundation model with 1,500 prompt tokens
+evaluate_inference_cost(batch_size=1, prompt_tokens=1500, gen_tokens=100, model_size_b=70.0)
+
+# Case B: Finetuned 1.5B distilled model with 20 prompt tokens
+evaluate_inference_cost(batch_size=1, prompt_tokens=20, gen_tokens=100, model_size_b=1.5)
+```
+
+<Callout type="mentor" title="The Distillation Rule of Thumb">
+  Never deploy a 70B model to production for a high-volume, repetitive task without first asking: *Can we collect 10,000 outputs from this 70B model and distill them into an 8B or 1.5B model via LoRA?* In over 80% of structured production workloads, the distilled small model equals or surpasses the teacher within two weeks of data collection.
+</Callout>
+
+## The Hidden Costs of Finetuning
+
+Before committing to a finetuning workflow, an inference engineer must audit the four non-obvious costs that do not appear in cloud GPU brochures.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 THE FOUR POST-TRAINING TAXES                │
+├──────────────────────────────┬──────────────────────────────┤
+│ 1. Data Curation Tax         │ 2. Catastrophic Forgetting   │
+│ • Annotation & cleaning      │ • Alignment tax              │
+│ • Dedup & schema consistency │ • Degradation of general QA  │
+├──────────────────────────────┼──────────────────────────────┤
+│ 3. Serving Fragmentation     │ 4. Maintenance / Drift Tax   │
+│ • Adapter routing overhead   │ • Base model deprecation     │
+│ • Cold-start memory swaps    │ • Schema version retraining  │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+### 1. The Data Curation Tax
+Training data is never free. A dataset of 2,000 examples with noisy labels, conflicting formatting, or subtle hallucinations will actively degrade model performance. Cleaning, deduplicating, synthetically filtering, and validating data (the core focus of Module B6) represents 85% of total project labor.
+
+### 2. Catastrophic Forgetting & The Alignment Tax
+When you train a model on a narrow domain dataset $\mathcal{D}_{\text{task}}$, the parameter updates that decrease loss on $\mathcal{D}_{\text{task}}$ frequently overwrite fragile representations learned during pretraining and safety alignment.
+
+This phenomenon is known as <Term t="catastrophic-forgetting">catastrophic forgetting</Term>. A model fine-tuned aggressively on legal contracts might suddenly lose its ability to write basic Python functions, solve simple arithmetic, or refuse dangerous requests. Mitigating this requires mixing in 10%–20% of general instruction-following data (replay buffer) during training.
+
+### 3. Serving Infrastructure Fragmentation
+If you serve one base model (e.g. `Llama-3.1-8B-Instruct`), every incoming user request shares the same GPU memory pool, benefiting from continuous batching, prefix caching, and unified paging (Module 08).
+
+If you maintain five separate full-weight finetuned models for different enterprise customers:
+- You must either provision five separate GPU replicas (multiplying hardware costs $5\times$).
+- Or incur massive cold-start penalties by swapping 16 GB weights in and out of HBM over PCIe.
+
+Parameter-Efficient Finetuning (PEFT), and specifically <Term t="lora">LoRA</Term>, solves this serving fragmentation by keeping the base model frozen and loading tiny adapter matrices on the fly. You will study LoRA mechanics in Lesson 3 and multi-LoRA serving in Module 26.
+
+### 4. Upstream Base Model Deprecation
+Foundation models improve rapidly. When Meta releases Llama-4 or Qwen releases their next flagship revision, your team will naturally want to upgrade to take advantage of superior reasoning and lower inference prices.
+
+If your application relies on prompt engineering and RAG, upgrading is often as simple as changing an environment variable (`MODEL_ID="llama-4-8b"`). If your application relies on full-model finetuning, every adapter and checkpoint in your fleet is instantly obsolete. You must rebuild the training harness, re-verify hyperparameter convergence, and re-run your entire evaluation battery.
+
+<KeyNotes>
+  1. **Finetune for form, retrieve for facts.** Use RAG for dynamic ground truth, private knowledge, and verifiable citations; use finetuning for syntax, tone, and format.
+  2. Attempting to inject knowledge via backpropagation is sample-inefficient, expensive, and fails to stop hallucinations.
+  3. System prompts and few-shot in-context learning carry an ongoing **per-request memory and latency penalty** on every single inference pass.
+  4. Finetuning shines in four domains: **strict output formatting** (JSON/SQL), **domain persona/steering**, **model distillation** (70B down to 1.5B), and **data privacy compliance**.
+  5. Distilling a high-capacity teacher model into a small student model can reduce serving VRAM requirements by over 80% while preserving task accuracy.
+  6. The four hidden costs of finetuning are **data curation**, **catastrophic forgetting**, **serving fragmentation**, and **maintenance drift** across upstream model releases.
+  7. Parameter-Efficient Finetuning (LoRA) prevents serving fragmentation by keeping base weights shared and adapting only small low-rank matrices.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'An engineering team needs their customer-facing assistant to reference company return policies that change every two weeks. Which architecture should they choose?',
+    options: [
+      'Supervised finetuning (SFT) on the policies every Monday morning',
+      'Retrieval-Augmented Generation (RAG) querying a vector/keyword index of the policies',
+      'Full parameter pretraining from scratch on the policy PDFs',
+      'Hardcoding the policies directly into the model weights using weight merging'
+    ],
+    answer: 1,
+    why: 'Policies change frequently (every two weeks). Finetuning is slow, expensive, prone to factual hallucinations, and cannot guarantee exact citations. RAG decouples knowledge from weights and updates instantly.'
+  },
+  {
+    q: 'A high-throughput API processes 10,000,000 requests per month. A few-shot prompt uses 1,500 tokens of schema examples per request. At \$0.20 per million input tokens, how much does this schema tax cost per month in USD?',
+    numeric: true,
+    answer: 3000,
+    tolerance: 10,
+    unit: 'USD',
+    why: '10,000,000 requests × 1,500 tokens = 15,000,000,000 tokens (15 billion tokens). 15,000 × \$0.20 = \$3,000 per month.'
+  },
+  {
+    q: 'Why does supervised finetuning on domain text fail to reliably prevent factual hallucinations?',
+    options: [
+      'Gradient descent treats weights as statistical priors across language rather than discrete key-value lookups',
+      'Loss masking prevents gradients from reaching the attention layers',
+      'Modern GPUs do not support FP16 backpropagation on factual statements',
+      'Cross-entropy loss can only be computed on mathematical equations'
+    ],
+    answer: 0,
+    why: 'Backpropagation updates continuous distributed representations across the entire transformer. It does not write to a dedicated database record, meaning obscure numbers and facts remain fuzzy associations prone to hallucination.'
+  },
+  {
+    q: 'You distill a 70B parameter model (FP16, 2 bytes/param = 140 GB) into an 8B model (FP16 = 16 GB). By what factor has the model weight memory footprint decreased?',
+    numeric: true,
+    answer: 8.75,
+    tolerance: 0.1,
+    unit: 'x',
+    why: '140 GB / 16 GB = 8.75× reduction in weight memory footprint (or 70B / 8B = 8.75×).'
+  },
+  {
+    q: 'What is "catastrophic forgetting" in the context of LLM finetuning?',
+    options: [
+      'The GPU memory manager drops the KV cache when batch size exceeds limits',
+      'The model loses general reasoning, coding, or safety alignment while learning a specialized domain dataset',
+      'The loss curve drops to NaN due to mixed-precision overflow',
+      'The tokenizer discards rare vocabulary tokens during dataset preprocessing'
+    ],
+    answer: 1,
+    why: 'Catastrophic forgetting occurs when updates to model parameters during domain-specific finetuning overwrite previously learned representations, degrading general knowledge and safety behaviors.'
+  },
+  {
+    q: 'Which of the following scenarios is the STRONGEST candidate for supervised finetuning rather than pure RAG?',
+    options: [
+      'A news aggregator answering questions about today’s headlines',
+      'An enterprise search engine over 500,000 PDF user manuals',
+      'Converting unstructured text into a strict, validated 15-field custom JSON schema at 500 requests per second',
+      'A legal research assistant citing verbatim court rulings with paragraph numbers'
+    ],
+    answer: 2,
+    why: 'Converting text to a strict schema at high request volume is a problem of syntax, form, and inference latency. Finetuning permanently embeds the schema into the weights, eliminating prompt token overhead and guaranteeing valid JSON.'
+  }
+]} />
