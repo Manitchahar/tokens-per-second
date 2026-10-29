@@ -1,0 +1,246 @@
+---
+title: 'DPO: preference tuning without RL'
+summary: 'RLHF needs four models, a sampling loop and a lot of tuning. Direct Preference Optimization notices that the best policy for the RLHF objective has a closed form, flips it around, and ends up with one supervised-looking loss on preference pairs. Derive it step by step, compute it by hand, and see what it gives up.'
+objectives:
+  - Derive the optimal policy of KL-regularised reward maximisation, π* ∝ π_ref · e^{r/β}, and compute it on a toy example
+  - Explain why the partition function Z cancels when the implicit reward is plugged into Bradley-Terry
+  - Compute the DPO loss and its gradient weight for one preference pair
+  - Compare the memory and compute of DPO and PPO-based RLHF
+  - Name what DPO gives up and the failure modes to watch for
+---
+import DPOBars from '@/components/viz/alignment/DPOBars.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson's recipe works, and it is heavy. To run PPO-based RLHF you hold four models in memory (policy, frozen reference, reward model, value model), generate thousands of fresh answers every iteration, and tune a dozen hyperparameters that interact in ways nobody fully understands. Many teams that tried to reproduce RLHF in 2022 and early 2023 found it fragile: runs that diverged, reward hacking that crept in, results that changed with the random seed.
+
+Meanwhile, look at what you actually have. A dataset of preference pairs $(x, y_w, y_l)$, sitting on disk. A model you want to nudge toward the $y_w$s and away from the $y_l$s, without drifting too far from where it started. That sounds like a supervised learning problem. Why are we training a separate reward model, and then running a reinforcement-learning loop against it, just to move probability from one fixed answer to another?
+
+Rafailov et al. (2023) asked exactly this and found that the detour is mathematically unnecessary. Their method, **Direct Preference Optimization**, gets the same objective as KL-regularised RLHF from a single loss on the preference pairs. The derivation takes five lines, and every line uses something you already know.
+
+## The idea in one breath
+
+RLHF's objective has a known best answer: the optimal policy is the reference policy reweighted by $e^{r/\beta}$. Flip that around and the reward becomes a function of the policy. Plug that reward into the Bradley-Terry formula from lesson 3C.3 and an awkward normalising constant cancels. What is left is a loss on the policy alone. No reward model, no sampling.
+
+<Scrolly>
+  <DPOBars client:visible slot="stage" />
+
+  <Step title="1. Start: the policy is the reference">
+    Copy the SFT model twice. One copy is trained (the **policy** $\pi$), the other is frozen (the **reference** $\pi_{\text{ref}}$). At the start they agree on everything: every log-ratio $\log \pi - \log \pi_{\text{ref}}$ is 0, and the loss is $\ln 2 = 0.693$.
+  </Step>
+
+  <Step title="2. RLHF's target has a formula">
+    The policy that maximises reward minus $\beta \cdot \mathrm{KL}$ to the reference is **$\pi^* = \pi_{\text{ref}} \cdot e^{r/\beta} / Z$**. Drag β on the three-answer toy: small β piles probability on the best answer, large β stays near the reference.
+  </Step>
+
+  <Step title="3. Flip it: a reward hiding in the policy">
+    Take logs and solve for $r$: **$r = \beta \log(\pi^*/\pi_{\text{ref}}) + \beta \log Z$**. Read it backwards: any policy implies a reward, namely how much more likely it makes an answer than the reference does.
+  </Step>
+
+  <Step title="4. In a comparison, Z cancels">
+    $Z(x)$ is a sum over every possible answer, impossible to compute. But both answers in a pair reply to the same prompt, so they share $Z(x)$, and in the Bradley-Terry difference $r_w - r_l$ **it cancels exactly**.
+  </Step>
+
+  <Step title="5. The DPO loss, on one pair">
+    Fit the policy to the preferences directly: $-\log \sigma(\beta[\text{ratio}_w - \text{ratio}_l])$. With log-ratios +1.0 and −0.5 and β = 0.1, the margin is 0.15 and the loss **0.621 nats**. Drag β.
+  </Step>
+
+  <Step title="6. Training pulls the log-ratios apart">
+    Each step raises the chosen answer's log-ratio relative to the rejected one's, weighted by **σ(−margin)**. As the margin grows, the weight shrinks: pairs the policy already ranks correctly stop pulling.
+  </Step>
+
+  <Step title="7. Both can fall: only the gap is trained">
+    Watch the green bar. Nothing in the loss pins the chosen answer's own probability, only the gap. In practice the rejected answer's probability plunges and the **chosen one often drifts down too**.
+  </Step>
+
+  <Step title="8. What DPO skips">
+    No reward model, no value model, no generation loop: **two models instead of four**, one forward pass each per pair. The price: it learns only from the pairs on disk, never from its own new answers.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### Step 1: the best policy for RLHF's objective
+
+Strip the RLHF objective from lesson 3C.4 down to its core (no pretraining mix). For one prompt $x$, find the distribution $\pi(y)$ over answers that maximises expected reward minus a KL penalty to the reference:
+
+$$
+\max_{\pi} \; \sum_y \pi(y)\, r(y) \;-\; \beta \sum_y \pi(y) \log \frac{\pi(y)}{\pi_{\text{ref}}(y)} .
+$$
+
+This has an exact solution. Every answer gets the reference's probability, multiplied by an exponential bonus for its reward:
+
+$$
+\pi^*(y \mid x) = \frac{1}{Z(x)} \, \pi_{\text{ref}}(y \mid x) \, e^{\,r(x, y)/\beta}, \qquad Z(x) = \sum_y \pi_{\text{ref}}(y \mid x)\, e^{\,r(x, y)/\beta}.
+$$
+
+$Z(x)$, the **partition function**, just makes the probabilities sum to 1. Notice how β behaves. Small β makes $e^{r/\beta}$ explode for high rewards, so the optimum piles onto the best answer; large β flattens the bonus, so the optimum stays near the reference. It is the same knob as temperature in *Logits to tokens: sampling* (Module 03), applied to rewards.
+
+<Callout type="math" title="Where the formula comes from">
+  Treat each $\pi(y)$ as a variable, add a Lagrange multiplier $\lambda$ for the constraint $\sum_y \pi(y) = 1$, and set the derivative with respect to $\pi(y)$ to zero:
+
+  $$
+  r(y) - \beta\Big(\log \frac{\pi(y)}{\pi_{\text{ref}}(y)} + 1\Big) - \lambda = 0
+  \quad\Rightarrow\quad
+  \log \frac{\pi(y)}{\pi_{\text{ref}}(y)} = \frac{r(y)}{\beta} - \text{const}.
+  $$
+
+  Exponentiate: $\pi(y) \propto \pi_{\text{ref}}(y)\, e^{r(y)/\beta}$. The constant becomes $Z$ once you normalise.
+</Callout>
+
+<Callout type="math" title="Worked: the optimum on three answers">
+  A prompt has three possible answers. The reference gives them probabilities 0.5, 0.3 and 0.2, and the rewards are 0, 1 and 2. With β = 1:
+
+  $$
+  0.5 \cdot e^{0} = 0.500, \qquad 0.3 \cdot e^{1} = 0.815, \qquad 0.2 \cdot e^{2} = 1.478, \qquad Z = 2.793 .
+  $$
+
+  So $\pi^* = (0.179,\ 0.292,\ 0.529)$. The best answer went from 20% to 53%, but the others kept some probability: the KL term refuses to let the policy bet everything on the reward. With β = 0.5 the optimum is $(0.037, 0.163, 0.801)$; with β = 2 it is $(0.325, 0.322, 0.353)$, barely moved. The visual's step 2 lets you sweep β.
+</Callout>
+
+Why can't we just compute $\pi^*$ and be done? Because for a language model, "every possible answer" means every possible token sequence. $Z(x)$ is a sum over more sequences than there are atoms in the universe. PPO-based RLHF is, in this light, a slow and noisy way of approaching a distribution you could write down but never normalise.
+
+### Step 2: flip it around
+
+Take the log of the optimum and solve for the reward:
+
+$$
+r(x, y) = \beta \log \frac{\pi^*(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \beta \log Z(x).
+$$
+
+Read it backwards. If the optimal policy is known, the reward is known, up to a term $\beta \log Z(x)$ that depends only on the prompt. So any policy $\pi$ defines an <Term t="implicit-reward">implicit reward</Term>:
+
+$$
+\hat r(x, y) = \beta \log \frac{\pi(y \mid x)}{\pi_{\text{ref}}(y \mid x)} ,
+$$
+
+β times how much more likely the policy makes the answer than the reference does. This is the meaning of the DPO paper's subtitle, *"Your language model is secretly a reward model"*.
+
+### Step 3: Z cancels in a comparison
+
+Recall from lesson 3C.3 that rewards have no zero: Bradley-Terry only ever looks at a difference between two answers *to the same prompt*. Put the flipped reward into it:
+
+$$
+r(x, y_w) - r(x, y_l) = \beta \log \frac{\pi^*(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} + \beta \log Z(x) - \beta \log \frac{\pi^*(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} - \beta \log Z(x).
+$$
+
+The two $\beta \log Z(x)$ terms cancel. The impossible sum is gone, and the probability that people prefer $y_w$ is written entirely in terms of the policy and the reference.
+
+### Step 4: the loss
+
+Now do what we did for the reward model: maximise the likelihood of the choices people actually made, but with the policy itself in place of the reward model. The <Term t="dpo">DPO</Term> loss for one pair is
+
+$$
+\mathcal{L}_{\text{DPO}}(\pi_\theta) = -\log \sigma\Big( \beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} \;-\; \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} \Big),
+$$
+
+averaged over the preference dataset. It is the reward-model loss from lesson 3C.3, $-\log\sigma(r_w - r_l)$, with $r$ replaced by the implicit reward. Each $\log \pi(y \mid x)$ is the sum of the token log-probabilities of the answer given the prompt, exactly what SFT computes, with the prompt masked out (lesson 3C.2).
+
+<Callout type="math" title="Worked: the DPO loss on one pair">
+  After some training, the policy assigns the chosen answer a total log-probability of −12.0, against the reference's −13.0. For the rejected answer it is −15.0 against −14.5. So
+
+  $$
+  \text{ratio}_w = -12.0 - (-13.0) = +1.0, \qquad \text{ratio}_l = -15.0 - (-14.5) = -0.5 .
+  $$
+
+  With β = 0.1 the margin is ${}0.1 \times (1.0 - (-0.5)) = 0.15$, so
+
+  $$
+  \mathcal{L} = -\ln \sigma(0.15) = -\ln 0.5374 = 0.621\ \text{nats}.
+  $$
+
+  At the start of training both ratios are 0, so the margin is 0 and the loss is $-\ln \sigma(0) = \ln 2 = 0.693$ for every pair. A model that has learned nothing is a coin flip, as it should be.
+</Callout>
+
+### What the gradient does
+
+Differentiating gives the update DPO actually applies, with $\hat r$ the implicit reward:
+
+$$
+\nabla_\theta \mathcal{L}_{\text{DPO}} = -\beta\, \sigma\big(\hat r(x, y_l) - \hat r(x, y_w)\big) \Big[ \nabla_\theta \log \pi_\theta(y_w \mid x) - \nabla_\theta \log \pi_\theta(y_l \mid x) \Big].
+$$
+
+Two parts. The bracket says: raise the log-probability of the chosen answer, lower that of the rejected one. The weight in front, $\sigma(\hat r_l - \hat r_w) = \sigma(-\text{margin})$, says how hard: in the worked example it is $\sigma(-0.15) = 0.463$, almost the maximum of 0.5. Once the policy ranks a pair correctly by a wide margin, the weight falls toward 0 and that pair stops pulling. The DPO authors stress that this weighting matters: without it, simply pushing chosen up and rejected down tends to degenerate.
+
+The whole loss is a few lines once you have per-answer log-probabilities:
+
+```python
+import torch
+import torch.nn.functional as F
+
+def answer_logprob(model, input_ids, labels):
+    """Sum of log p(token) over the answer tokens; prompt positions have label -100."""
+    logits = model(input_ids).logits[:, :-1]
+    labels = labels[:, 1:]
+    mask = labels != -100
+    logp = logits.log_softmax(-1).gather(-1, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    return (logp * mask).sum(-1)
+
+def dpo_loss(policy, ref, chosen, rejected, beta=0.1):
+    pw, pl = answer_logprob(policy, *chosen), answer_logprob(policy, *rejected)
+    with torch.no_grad():                               # the reference never trains
+        rw, rl = answer_logprob(ref, *chosen), answer_logprob(ref, *rejected)
+    margin = beta * ((pw - rw) - (pl - rl))
+    return -F.logsigmoid(margin).mean()
+```
+
+Compare it with the reward-model loss in lesson 3C.3: same `logsigmoid`, same pairs. The reward model's scalar head has been replaced by the policy's own log-probabilities.
+
+### Why it is simpler, in numbers
+
+| | PPO-based RLHF | DPO |
+|---|---|---|
+| Models in memory | policy, reference, reward, value | policy, reference |
+| Trained models | policy and value | policy |
+| Generation during training | every iteration | none |
+| Separate reward-model training | yes | no |
+| Weights for a 7B model (16-bit) | 4 × 14 GB = 56 GB | 2 × 14 GB = 28 GB |
+
+The reference model's log-probabilities never change, so they can even be computed once before training and stored with the dataset, leaving a single model on the GPU. And because nothing is generated, a DPO step is a pair of ordinary forward and backward passes. For an inference engineer the contrast with lesson 3C.4 is stark: PPO's cost is dominated by the generation loop, DPO has none.
+
+DPO caught on fast. The paper reports matching or beating PPO on its tests: controlled sentiment generation, Reddit TL;DR summarisation (where, with GPT-J, DPO reached a win rate of about 61% against reference summaries versus about 57% for PPO, both at temperature 0) and single-turn dialogue on Anthropic's HH data. It also notes DPO was far less sensitive to sampling temperature. Their default was β = 0.1. Within months it was used for open models such as Zephyr-7B, and Meta's Llama 3 report describes using DPO rather than PPO in its post-training rounds, citing lower compute for large models and better instruction following.
+
+### What DPO gives up
+
+DPO optimises the same objective as KL-regularised RLHF in theory. In practice the two behave differently, and you should know where DPO's edges are.
+
+1. **It is offline.** DPO only sees the pairs in the dataset. PPO generates new answers every iteration and gets them scored, so it can discover and correct its own new mistakes. If the pairs were produced by a different model, or the policy moves far from the answers in the data, DPO is learning about answers it no longer writes. A common remedy is to iterate: generate new pairs with the current model, label or judge them, run DPO again.
+2. **Only the gap is trained.** As the visual's step 7 shows, the loss is happy if both answers lose probability as long as the rejected one loses more. Practitioners regularly observe the chosen answers' log-probabilities falling during DPO, with probability flowing to answers nobody labelled. Watch the chosen log-probs, not just the loss.
+3. **It can still be gamed.** There is no reward model to hack, but the preference data has its own biases: if chosen answers tend to be longer, DPO learns "longer", just as a reward model would.
+4. **β still needs choosing.** Too small and the policy drifts far from the reference on the strength of a few pairs; too large and it barely moves. The paper's default of 0.1 is a starting point, not a law.
+
+<Callout type="pitfall" title="A falling loss is not the goal">
+  DPO's loss can be driven very low by pushing rejected answers to near-zero probability, which says little about how good the policy's own answers are. Track three things during a run: the loss, the margin, and the chosen log-probabilities. Then evaluate generations (Module B2). A run whose chosen log-probs fall steadily is redistributing probability somewhere you never looked.
+</Callout>
+
+<Callout type="mentor" title="Which one should you use?">
+  At the time of writing, a reasonable default for preference tuning an open model on a fixed dataset is DPO or one of its many variants: it is cheap, stable and needs no reward model. Online methods with a live reward signal earn their extra cost when the reward can be checked (tests passing, a maths answer matching) or when the model must keep improving on its own outputs. You will meet both again when you finetune in Module B5.
+</Callout>
+
+<Callout type="real" title="Now read the paper">
+  **Direct Preference Optimization: Your Language Model is Secretly a Reward Model** (Rafailov et al., 2023), [arXiv 2305.18290](https://arxiv.org/abs/2305.18290).
+
+  - **Read:** Section 3, a compact recap of the RLHF pipeline you now know; Section 4, the derivation (the optimal policy, the reparameterisation, and the loss), including the paragraph on what the DPO update does and why the weighting matters; and the main results figures in Section 6.
+  - **Skim:** Section 5's theoretical analysis, and Appendix A if you want the optimum derived in full.
+  - **Skip on a first read:** the experiment-specific appendices.
+
+  You will now recognise $\pi_r(y \mid x) = \frac{1}{Z(x)}\pi_{\text{ref}}(y \mid x)\exp(r/\beta)$, the cancellation of $Z(x)$ in the Bradley-Terry difference, the loss you computed by hand, and the σ weight in its gradient.
+</Callout>
+
+<KeyNotes>
+  1. KL-regularised reward maximisation has a closed-form optimum: $\pi^* = \pi_{\text{ref}}\, e^{r/\beta} / Z$. Worked: reference (0.5, 0.3, 0.2), rewards (0, 1, 2), β = 1 → (0.179, 0.292, 0.529).
+  2. Solving for the reward gives $r = \beta\log(\pi^*/\pi_{\text{ref}}) + \beta \log Z$: every policy defines an **implicit reward** $\beta \log(\pi/\pi_{\text{ref}})$.
+  3. In a Bradley-Terry comparison both answers share $Z(x)$, so it **cancels**. The preference probability depends only on the policy and the reference.
+  4. **DPO loss:** $-\log\sigma\big(\beta[\log\frac{\pi(y_w)}{\pi_{\text{ref}}(y_w)} - \log\frac{\pi(y_l)}{\pi_{\text{ref}}(y_l)}]\big)$. Ratios +1.0 and −0.5 with β = 0.1 give margin 0.15 and loss 0.621; at the start every pair costs ln 2 = 0.693.
+  5. The gradient raises chosen and lowers rejected log-probs, weighted by **σ(−margin)**, so pairs already ranked correctly fade out.
+  6. DPO needs **two models instead of four** and **no generation loop**: 28 GB of 16-bit weights for a 7B pair versus 56 GB for PPO, and reference log-probs can be precomputed.
+  7. It gives up **online exploration**, trains only the gap (chosen log-probs often fall), and still inherits the biases of its preference data. β (0.1 by default in the paper) still needs tuning.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'β = 0.1. The chosen answer’s log-ratio log π − log π_ref is +2.0 and the rejected answer’s is −1.0. What is the DPO loss, in nats?', numeric: true, answer: 0.554, tolerance: 0.01, unit: 'nats', why: 'Margin = 0.1 × (2.0 − (−1.0)) = 0.3. σ(0.3) = 0.5744. Loss = −ln 0.5744 = 0.554 nats.' },
+  { q: 'At the very start of DPO training the policy equals the reference. What is the loss on every pair, in nats?', numeric: true, answer: 0.693, tolerance: 0.01, unit: 'nats', why: 'Both log-ratios are 0, so the margin is 0 and the loss is −ln σ(0) = −ln 0.5 = ln 2 = 0.693 nats.' },
+  { q: 'β = 0.1. The policy gives an answer a total log-probability of −20.0, and the reference gives it −23.0. What is its implicit reward β·log(π/π_ref)?', numeric: true, answer: 0.3, tolerance: 0.01, why: 'log π − log π_ref = −20.0 − (−23.0) = 3.0 nats. Times β = 0.1 gives an implicit reward of 0.3.' },
+  { q: 'Two possible answers, reference probabilities 0.5 and 0.5, rewards 0 and ln 3, β = 1. What probability does the optimal policy π* give the second answer?', numeric: true, answer: 0.75, tolerance: 0.01, why: 'Weights: 0.5·e⁰ = 0.5 and 0.5·e^{ln 3} = 1.5. Z = 2.0. π* = (0.25, 0.75).' },
+  { q: 'Why does the partition function Z(x) disappear from the DPO loss?', options: ['It is approximated by sampling during training', 'It depends only on the prompt, and Bradley-Terry uses the difference of two rewards for the same prompt, so the two β·log Z(x) terms cancel', 'It is always equal to 1 for language models', 'DPO uses a reward model to compute it'], answer: 1, why: 'Z(x) sums over every possible answer and cannot be computed, but it is the same for y_w and y_l because both answer the same x. In r_w − r_l it cancels exactly.' },
+  { q: 'Which is a genuine limitation of DPO compared with PPO-based RLHF?', options: ['It needs a separate reward model', 'It is offline: it learns only from the fixed preference pairs and never scores the new answers the policy itself produces', 'It needs four models in memory', 'It cannot use a KL constraint'], answer: 1, why: 'DPO has no reward model, uses two models, and the KL constraint is built into its derivation through β and the reference. Its weakness is being offline: no exploration and no feedback on its own new outputs unless you iterate with fresh pairs.' },
+]} />

@@ -88,4 +88,14 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'Performance lost on skills the reward model never checks (InstructGPT: SQuAD, DROP, HellaSwag, translation) when a model is tuned to human preferences. PPO-ptx reduced it by mixing pretraining gradients into each RL update.',
     lesson: 'alignment/rlhf-instructgpt',
   },
+  dpo: {
+    term: 'DPO (Direct Preference Optimization)',
+    def: 'Preference tuning with one supervised-style loss, −log σ(β[log π(y_w)/π_ref(y_w) − log π(y_l)/π_ref(y_l)]), derived from the closed-form optimum of KL-regularised RLHF. No reward model, no value model, no sampling loop.',
+    lesson: 'alignment/dpo',
+  },
+  'implicit-reward': {
+    term: 'Implicit reward',
+    def: 'β · log(π(y|x) / π_ref(y|x)): the reward a policy implicitly assigns an answer, by how much more likely it makes it than the reference model does. DPO trains this quantity with the Bradley-Terry loss.',
+    lesson: 'alignment/dpo',
+  },
 };
