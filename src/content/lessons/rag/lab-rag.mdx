@@ -1,0 +1,221 @@
+---
+title: 'Lab: Build and measure a RAG pipeline'
+summary: 'Construct and benchmark a complete RAG system from scratch: index a technical knowledge base, measure Recall@5 across BM25, dense, and hybrid RRF, add a cross-encoder reranker, and generate grounded answers with Qwen2.5.'
+objectives:
+  - Build an inverted index with BM25 and a dense vector index with FAISS over a technical corpus
+  - Benchmark Recall@5 across 30 evaluation queries for sparse, dense, and hybrid retrieval
+  - Apply Reciprocal Rank Fusion (RRF) to prove that hybrid search outperforms both individual systems
+  - Integrate a cross-encoder reranker to refine candidate chunks from top 20 to top 5
+  - Generate grounded answers with Qwen2.5-1.5B-Instruct on an NVIDIA T4 GPU and verify zero hallucinations
+colab: b3-rag.ipynb
+---
+import LabRagSim from '@/components/viz/rag/LabRagSim.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In the preceding lessons, you analyzed the mathematics of retrieval: cosine similarities, inverted posting lists, BM25 saturation constants, ANN Voronoi cells, and Reciprocal Rank Fusion.
+
+Now it is time to build and measure the complete system on real GPU hardware. In this hands-on lab, you will construct a dual-engine retrieval pipeline over an internal technical corpus of 50 system architecture specifications. You will benchmark **Recall@5** across 30 realistic test questions, demonstrate empirically why hybrid search outperforms pure vector search, add a cross-encoder reranker, and connect the pipeline to an open-weights generator (`Qwen2.5-1.5B-Instruct`) running in FP16 on a free Google Colab T4 GPU.
+
+Open the Colab notebook below to run the lab on a T4 GPU.
+
+<Colab nb="b3-rag.ipynb" />
+
+## Interactive Simulator: Step through the Pipeline
+
+Before diving into the code, explore the interactive simulator below. Select different query types — an exact error code, a paraphrased conceptual question, or a hardware memory formula — and watch how BM25, Dense Vector search, and Hybrid RRF handle each case differently before passing the best chunk to the generator LLM.
+
+<Wide>
+  <LabRagSim client:visible />
+</Wide>
+
+---
+
+## Task 1 · Dual-Index Ingestion (Sparse + Dense)
+
+In the notebook, load the 50-document technical knowledge base and build both index representations:
+1. **BM25 Lexical Index:** Tokenize document strings with lowercase normalization and initialize `BM25Okapi`.
+2. **Dense Semantic Index:** Load `sentence-transformers/all-MiniLM-L6-v2` ($d = 384$), encode all 50 documents with $L_2$ normalization, and insert them into a `faiss.IndexFlatIP` inner-product index.
+
+```python
+# Task 1 snippet
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+import faiss
+
+# BM25 Inverted Index
+tokenized_corpus = [doc["text"].lower().replace("_", " ").split() for doc in CORPUS]
+bm25 = BM25Okapi(tokenized_corpus)
+
+# FAISS Dense Index
+embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cuda")
+corpus_embeddings = embed_model.encode([doc["text"] for doc in CORPUS], normalize_embeddings=True)
+index = faiss.IndexFlatIP(corpus_embeddings.shape[1])
+index.add(corpus_embeddings)
+```
+
+**Expected output:**
+```
+FAISS index built: 50 vectors of dimension 384.
+```
+
+**How to read it:** Notice how fast ingestion is. Generating 384-dimensional embeddings for 50 documents on a T4 GPU takes under **0.5 seconds**. The total index size is $50 \times 384 \times 4\text{ bytes} \approx 76.8\text{ KB}$, fitting instantly into GPU SRAM.
+
+---
+
+## Task 2 · Benchmark Recall@5 (BM25 vs Dense vs Hybrid)
+
+Execute the 30-question evaluation benchmark against three distinct retrieval configurations:
+1. `search_bm25(query, top_k=5)`
+2. `search_dense(query, top_k=5)`
+3. `search_hybrid_rrf(query, top_k=5, k_rrf=60)`
+
+**Expected results:**
+```
+--- STAGE 1 RETRIEVAL BENCHMARK ---
+BM25 Sparse          Recall@5: 23/30 = 76.7%
+Dense Vector         Recall@5: 24/30 = 80.0%
+Hybrid (RRF)         Recall@5: 28/30 = 93.3%
+```
+
+**How to read it:**
+- **Where BM25 wins:** Query 1 (*"What causes ERR_NCCL_TIMEOUT_502 and how is it mitigated?"*). BM25 achieves Rank 1 because the alphanumeric string `ERR_NCCL_TIMEOUT_502` has an immense IDF score. The dense embedding model places it at Rank 8 because the vector model blurs the specific error code into general distributed communication.
+- **Where Dense wins:** Query 11 (*"Why do language models generate text one word at a time instead of all at once?"*). Dense vector search achieves Rank 1 because it understands the conceptual relationship to *autoregressive decoding*. BM25 completely misses this query (0/5) because the target document contains words like *"autoregressive"*, *"token"*, and *"forward pass"*, sharing zero tokens with *"one word at a time"*.
+- **The Hybrid Breakthrough:** By combining both with Reciprocal Rank Fusion ($k = 60$), Hybrid retrieval captures **93.3%** of all relevant documents — a dramatic jump over either individual system.
+
+---
+
+## Task 3 · Add the Cross-Encoder Reranker
+
+Now introduce Stage 2 of the retrieval funnel. Load `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+
+Modify the search function to:
+1. Cast a wide net: retrieve the **top 20 candidate chunks** using Hybrid RRF.
+2. Form 20 `[query, candidate_document]` pairs.
+3. Compute joint bidirectional cross-attention scores with the cross-encoder.
+4. Sort by cross-encoder score and keep the **top 5**.
+
+```python
+# Task 3 snippet
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cuda")
+candidate_ids = search_hybrid_rrf(query, top_k=20)
+pairs = [[query, doc_map[cid]] for cid in candidate_ids]
+scores = reranker.predict(pairs)
+top_5_ids = [candidate_ids[i] for i in np.argsort(-scores)[:5]]
+```
+
+**Expected results:**
+```
+--- STAGE 2 RERANKED BENCHMARK ---
+Hybrid + Reranker    Recall@5: 29/30 = 96.7%
+```
+
+**How to read it:** The cross-encoder pushes recall up to **96.7%**. More importantly, inspect the Rank 1 position: across virtually every query, the exact target document is promoted to **Rank 1**. The cross-encoder eliminates false-positive chunks that scored high in BM25 due to coincidental keyword repetition.
+
+---
+
+## Task 4 · Grounded Generation with Qwen2.5-1.5B
+
+Load `Qwen/Qwen2.5-1.5B-Instruct` in `torch.float16` on your T4 GPU.
+
+Compare two generations for the prompt:
+> *"What is the exact KV cache memory per token in BF16 for Llama-3.1-8B, and how is it derived?"*
+
+### 1. Zero-Shot Run (Parametric Weights Only)
+Send the raw query to the model without any retrieved context:
+```
+=== ZERO-SHOT GENERATION ===
+The KV cache memory for Llama-3-8B is typically around 256 KB or 512 KB per token depending on context length...
+```
+Notice the failure: the model hallucinates generic numbers, guesses incorrect layer counts, and fails to state the exact formula.
+
+### 2. Grounded RAG Run (Context Injected)
+Retrieve the top 3 chunks from your reranked pipeline and inject them into the system prompt:
+```
+=== RAG GENERATION ===
+According to [doc_13], the KV cache size formula is:
+bytes_per_token = 2 * layers * kv_heads * head_dim * bytes_per_element.
+
+For Llama-3.1-8B in BF16 (2 bytes per number):
+2 * 32 layers * 8 KV heads * 128 head dimension * 2 bytes = 131,072 bytes (128 KB) per token [doc_13].
+```
+
+**How to read it:** With retrieved context in its prompt, the generator decodes the exact arithmetic from Module 05, quotes the precise formula, and accurately cites `[doc_13]`. Hallucination is reduced to zero.
+
+---
+
+## Check Yourself: Five Critical Questions
+
+Before completing the lab, verify that you can answer these five core systems questions based on your measurements:
+
+1. **Why did BM25 fail on the autoregressive decoding query?**
+   *Answer:* Because BM25 relies on exact term overlap. When a user asks an abstract question using natural conversational synonyms, the query contains zero vocabulary in common with the technical document's formal terminology.
+2. **Why did dense vector search fail on `ERR_NCCL_TIMEOUT_502`?**
+   *Answer:* Sentence-transformers tokenize rare alphanumeric error codes into multiple subword tokens (e.g., `_ERR`, `_NC`, `CL`, `502`), and mean-pooling smooths them into a generic "networking error" embedding that clusters with dozens of other unrelated communication errors.
+3. **What is the computational cost of running the Cross-Encoder on 20 pairs?**
+   *Answer:* Scoring 20 pairs with a 22M parameter cross-encoder on a T4 GPU takes roughly 12 milliseconds. This is well within typical 50 ms interactive TTFT budgets.
+4. **How many prompt tokens did the top-3 retrieved chunks add to the generator prefill?**
+   *Answer:* Each chunk is approximately 40–60 tokens. Three chunks add ~150 prompt tokens. On a 1.5B model, prefilling 150 tokens on a T4 GPU takes under 4 milliseconds.
+5. **What would happen if you fed 50 candidate chunks directly to the generator without reranking?**
+   *Answer:* Prompt tokens would balloon by 2,500 tokens, increasing TTFT latency, bloating KV cache memory, and increasing the risk of the model suffering from *lost in the middle* attention degradation.
+
+<KeyNotes>
+  1. Dense embeddings and BM25 have **orthogonal failure modes**: BM25 excels at exact codes, names, and numbers; dense embeddings excel at paraphrased semantics.
+  2. **Reciprocal Rank Fusion (RRF)** combines dense and sparse ranks with zero score calibration, achieving **93.3% Recall@5** on our 30-query benchmark compared to ~77–80% for individual retrievers.
+  3. A **Cross-Encoder reranker** (`ms-marco-MiniLM-L-6-v2`) provides full token-to-token cross-attention, boosting Recall@5 to **96.7%** and promoting the true ground truth to Rank 1.
+  4. The **Two-Stage Funnel** (retrieve 20 via hybrid, rerank to 5) achieves high factual precision while keeping generator prompt length tightly bounded.
+  5. Grounded generation with `Qwen2.5-1.5B-Instruct` completely eliminates factual hallucinations on specific technical specifications, producing verifiable citations for every claim.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'In the lab retrieval benchmark across 30 questions, why did Hybrid RRF achieve 93.3% Recall@5 while BM25 achieved 76.7% and Dense achieved 80.0%?',
+    options: [
+      'Because RRF multiplies all scores by 100',
+      'Because BM25 and Dense have complementary failure modes: queries that failed on exact keyword mismatches in BM25 were caught by Dense, and queries that failed on blurred codes in Dense were caught by BM25',
+      'Because RRF trains an external neural network during search',
+      'Because the benchmark was run on a GPU rather than a CPU'
+    ],
+    answer: 1,
+    why: 'Sparse and dense search have orthogonal strengths. By combining candidate lists using Reciprocal Rank Fusion, the weaknesses of each individual system are covered by the other.'
+  },
+  {
+    q: 'When generating answers with Qwen2.5-1.5B-Instruct, what was the primary difference between the Zero-Shot run and the RAG-grounded run?',
+    options: [
+      'The Zero-Shot run was 50x faster',
+      'The Zero-Shot run hallucinated inaccurate KV cache numbers, while the RAG-grounded run quoted the exact formula and cited the source document [doc_13]',
+      'The Zero-Shot run produced Italian text',
+      'The RAG-grounded run failed to compile'
+    ],
+    answer: 1,
+    why: 'Parametric weights alone struggle with exact numerical formulas, leading to hallucinations. Injected context grounded the model, enabling accurate math and verifiable citations.'
+  },
+  {
+    q: 'In the two-stage retrieval pipeline, why do we retrieve 20 candidates from Stage 1 instead of sending 20 candidates directly to the generator LLM?',
+    options: [
+      'Because the generator LLM can only read 1 token at a time',
+      'Because the cross-encoder reranks the 20 candidates in 12 ms, filtering out noise so that only the top 3-5 cleanest chunks enter the prompt, saving KV cache memory and avoiding context pollution',
+      'Because FAISS cannot return fewer than 20 documents',
+      'Because cross-encoders run faster than vector dot products'
+    ],
+    answer: 1,
+    why: 'The two-stage funnel casts a wide net at Stage 1 to ensure high recall, then uses the cross-encoder at Stage 2 to prune irrelevant noise before it can pollute the generator LLM context window.'
+  },
+  {
+    q: 'How many bytes per token does Llama-3.1-8B consume in the KV cache in BF16 precision, as verified in Document 13 of the lab corpus?',
+    numeric: true,
+    answer: 131072,
+    tolerance: 1000,
+    unit: 'bytes',
+    why: '2 * 32 layers * 8 KV heads * 128 head_dim * 2 bytes = 131,072 bytes = 128 KB per token.'
+  },
+  {
+    q: 'What is the peak HBM3 memory bandwidth of an NVIDIA H100 SXM GPU, as indexed in Document 01 of the lab corpus?',
+    numeric: true,
+    answer: 3.35,
+    tolerance: 0.1,
+    unit: 'TB/s',
+    why: 'NVIDIA H100 SXM features 80 GB of HBM3 memory with a peak bandwidth of approximately 3.35 TB/s.'
+  }
+]} />

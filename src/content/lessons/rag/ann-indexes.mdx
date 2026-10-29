@@ -1,0 +1,333 @@
+---
+title: 'Approximate nearest neighbours: HNSW & IVF'
+summary: 'Why linear scan breaks at scale, how Inverted File indexes and Hierarchical Navigable Small World graphs prune 99% of search space, and how Product Quantization compresses vector memory by 32x.'
+objectives:
+  - Explain the trade-off between search recall, query latency, and RAM consumption in vector indexing
+  - Trace query execution through an Inverted File (IVF) index and evaluate the impact of `nprobe`
+  - Walk step by step through a Hierarchical Navigable Small World (HNSW) graph traversal
+  - Calculate memory compression and Asymmetric Distance Computation speedups from Product Quantization (PQ)
+  - Select the optimal FAISS index type based on dataset size, hardware budgets, and latency SLOs
+---
+import AnnIndexes from '@/components/viz/rag/AnnIndexes.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In the previous lessons, you calculated the physical cost of an exact linear scan: searching a 1,000,000-document vector database of 768-dimensional embeddings requires reading 3.07 gigabytes of memory and computing 768 million Multiply-Accumulate operations (MACs). On a modern server CPU, that single query takes over 60 milliseconds.
+
+Now imagine scaling your production RAG pipeline to a standard enterprise corpus of **10,000,000 vectors**:
+- Raw float memory: **30.7 GB**
+- Compute per query: **7.68 billion MACs** (15.36 GFLOPs)
+- Latency per query: **614 milliseconds** on CPU
+
+If 100 users make concurrent queries, your vector database requires 61 seconds of continuous memory bus saturation per second. The server collapses, queues backlog, and Service-Level Objectives (SLOs) are breached.
+
+To build an interactive AI system that responds in under 50 milliseconds end to end, retrieval cannot afford to spend 600 ms scanning irrelevant vectors. We need an algorithm that finds the nearest neighbors in **sub-linear time** — $O(\log N)$ or $O(\sqrt{N})$.
+
+The solution is **Approximate Nearest Neighbor (ANN)** search. By accepting a tiny compromise — allowing the search engine to find the true nearest neighbor 98% of the time instead of 100% — we reduce query latency from 60 milliseconds to **1.2 milliseconds**, a 50× speedup.
+
+This lesson explores the three architectural pillars of modern vector indexing: **Inverted File Indexes (IVF)**, **Hierarchical Navigable Small World (HNSW)** graphs, and **Product Quantization (PQ)**.
+
+## The index taxonomy: Partitions, graphs, and quantization
+
+All approximate nearest neighbor indexes achieve speed by discarding candidates without computing their distance. They achieve this through three complementary strategies:
+
+1. **Space Partitioning (IVF):** Group vectors into clusters during an offline training phase. At query time, identify which clusters are close to the query and scan *only* the vectors inside those clusters.
+2. **Proximity Graphs (HNSW):** Build a multi-layered navigable graph where vectors are nodes and edges connect semantic neighbors. Traversal begins on a sparse top layer with long-range "express highway" edges before descending to fine-grained local layers.
+3. **Quantization (PQ):** Compress high-dimensional floating-point vectors into short integer byte arrays. Compute distances using precomputed lookup tables rather than floating-point math.
+
+<Scrolly>
+  <AnnIndexes client:visible slot="stage" />
+
+  <Step title="1. The Linear Scan Wall">
+    Exact linear scan computes $N \times d$ MACs by comparing the query against every vector. At 1M+ vectors, memory bandwidth limits query throughput and introduces unacceptable latency.
+  </Step>
+
+  <Step title="2. IVF: Voronoi Partitioning">
+    The Inverted File Index (IVF) clusters the vector space into $C$ centroids using $k$-means. Every vector in the dataset is assigned to the posting list of its nearest centroid.
+  </Step>
+
+  <Step title="3. IVF Tuning: The nprobe Knob">
+    At query time, the engine calculates distance to all $C$ centroids and inspects only the closest `nprobe` cells. A small `nprobe` is lightning-fast; a larger `nprobe` catches vectors near cell boundaries.
+  </Step>
+
+  <Step title="4. HNSW: Multi-Layer Graph">
+    HNSW arranges vectors into a hierarchical skip-graph. The top layer contains very few nodes with long-range links; bottom layers contain all vectors with dense local connectivity.
+  </Step>
+
+  <Step title="5. HNSW: Greedy Highway Descent">
+    Search starts at the top-layer entry point, greedily hopping along long-range edges toward the query. When a local minimum is reached, search drops to the next layer, executing in $O(\log N)$ time.
+  </Step>
+
+  <Step title="6. Product Quantization (PQ)">
+    Product Quantization decomposes a 768-d vector into 96 sub-vectors of 8 dimensions. Each sub-vector is replaced by a 1-byte centroid index, compressing 3,072 bytes down to 96 bytes ($32\times$).
+  </Step>
+
+  <Step title="7. The Pareto Frontier">
+    Different architectures occupy distinct points on the Pareto frontier: Flat has 100% recall at high latency; HNSW delivers sub-2ms latency at the cost of higher RAM; IVF-PQ maximizes memory density.
+  </Step>
+</Scrolly>
+
+## Inverted File Index (IVF): Voronoi clustering
+
+The **Inverted File Index (IVF)** applies the concept of inverted text indexes to continuous geometric space.
+
+### 1. Offline Training Phase
+1. Collect all $N$ document vectors.
+2. Run $k$-means clustering to partition the space into $C$ cluster centroids $\{\mu_1, \mu_2, \dots, \mu_C\}$, where each $\mu_i \in \mathbb{R}^d$. A typical rule of thumb is $C \approx 4\sqrt{N}$ (for 1M vectors, $C \approx 4{,}000$).
+3. These centroids define a Voronoi diagram: every point in space belongs to the Voronoi cell of its closest centroid.
+4. For every vector in the dataset, find its closest centroid $\mu_c$ and append its ID to centroid $c$'s posting list:
+   $$
+   \text{Centroid } c \to [\text{vec}_{42}, \text{vec}_{819}, \text{vec}_{1004}, \dots]
+   $$
+
+### 2. Online Query Phase
+When query $q$ arrives:
+1. Compute the dot product between $q$ and all $C$ centroids: $s_c = q \cdot \mu_c$. This requires only $C \times d$ MACs (e.g., $4{,}000 \times 768 \approx 3\text{M MACs}$, less than 0.4% of a full 1M scan).
+2. Sort centroids and select the top `nprobe` closest centroids.
+3. Fetch the posting lists for those `nprobe` centroids.
+4. Perform an exact scan *only* across the vectors inside those selected lists.
+
+### The nprobe Trade-off
+The parameter `nprobe` controls the recall vs. latency trade-off:
+- If `nprobe = 1`: The engine checks only the single nearest Voronoi cell. For 1,000,000 vectors partitioned into 1,024 cells, it scans only $\approx 1{,}000$ vectors. Query time drops to under **0.5 milliseconds**. However, if the true nearest neighbor lies just across the boundary inside an adjacent cell, it is missed entirely (recall drops to 70–80%).
+- If `nprobe = C`: The engine checks all cells, degenerating into a full linear scan (100% recall, 60 ms latency).
+- Production sweet spot: Setting `nprobe` between 8 and 32 typically recovers **95% to 99% recall** while scanning less than 3% of the total vectors.
+
+## HNSW: Hierarchical Navigable Small World graphs
+
+While IVF is simple and effective, the undisputed king of low-latency vector search is **Hierarchical Navigable Small World (HNSW)**, introduced by Malkov and Yashunin in 2018.
+
+HNSW is based on two computer science concepts:
+1. **Navigable Small World (NSW) graphs:** Graphs where any node can reach any other node in a small number of hops (the "six degrees of separation" phenomenon).
+2. **Skip Lists:** Probabilistic data structures that layer linked lists, allowing $O(\log N)$ search by taking long jumps at higher levels before dropping to lower levels.
+
+### The Multi-Layer Graph Architecture
+HNSW creates a hierarchy of proximity graphs labeled Layer 0, Layer 1, ..., up to Layer $L_{\max}$:
+- **Layer 0 (Bottom):** Contains every single vector $N$ in the dataset. Edges connect vectors to their closest spatial neighbors (dense connectivity).
+- **Layer 1:** Contains a randomly sampled subset of vectors (roughly $1/m_L$ fraction, where $m_L \approx 1/\ln(M)$).
+- **Layer $k$:** Contains an exponentially smaller fraction of vectors with longer physical distance between connected nodes.
+
+Each node has a maximum number of bidirectional edges $M$ (typically $M = 16$ to $64$).
+
+```
+Layer 2 (Express):    [ Node A ] ───────────────────────────────────────────> [ Node K ]
+                           │                                                       │
+                           ▼                                                       ▼
+Layer 1 (Regional):   [ Node A ] ───────────────> [ Node E ] ───────────────> [ Node K ]
+                           │                           │                           │
+                           ▼                           ▼                           ▼
+Layer 0 (Local/All):  [ Node A ] ─> [ Node B ] ─> [ Node E ] ─> [ Node G ] ─> [ Node K ]
+```
+
+### The Search Algorithm: Greedy Routing
+1. Search begins at a fixed **Entry Point** node on the top layer ($L_{\max}$).
+2. The engine computes the distance from query $q$ to the current node and all its outgoing neighbors.
+3. If a neighbor is closer to $q$ than the current node, the engine hops to that neighbor (**greedy walk**).
+4. When no neighbor is closer to $q$ than the current node (a local minimum on this layer is reached), search drops down to the same node in the layer below.
+5. This process repeats until reaching Layer 0.
+6. On Layer 0, the engine maintains a dynamic candidate priority queue of size `efSearch`. It continues expanding neighbors until the closest unvisited candidate is farther than the $k$-th best result found so far.
+
+Because higher layers bridge vast geometric distances in single hops, the search avoids getting trapped in local clusters and converges in **$O(\log N)$ time**.
+
+### Tuning HNSW: M, efConstruction, and efSearch
+- **$M$ (connections per node):** Higher $M$ (e.g., 32 or 64) improves recall on high-dimensional or clustered datasets, but increases graph build time and memory usage.
+- **`efConstruction` (build depth):** Controls candidate queue size during graph creation. Higher values produce higher-quality graphs at the cost of slower indexing.
+- **`efSearch` (query depth):** The runtime knob. Larger `efSearch` explores more neighbors on Layer 0, increasing recall from 95% to 99.5% at the cost of slightly higher query latency (e.g., 1.0 ms $\to$ 2.5 ms).
+
+<Callout type="pitfall" title="The HNSW Memory Penalty">
+  HNSW delivers extraordinary speed, but it carries a steep memory tax.
+  
+  In addition to storing raw floating-point vectors ($N \times d \times 4$ bytes), HNSW must store graph connectivity. Each node stores up to $M$ integer neighbor pointers per layer (at 4 or 8 bytes per pointer). 
+  
+  For 1M vectors with $M = 32$, graph overhead adds **1.2 to 2.0 GB** of RAM on top of the 3.07 GB vector data. For memory-constrained servers, pure HNSW may cause Out-Of-Memory crashes.
+</Callout>
+
+## Product Quantization (PQ): Compressing vector memory
+
+When your dataset scales to 50 million vectors, storing 768-dimensional floats requires:
+
+$$
+50{,}000{,}000 \times 768 \times 4\text{ B} = 153.6\text{ GB of RAM}
+$$
+
+Add HNSW graph pointers, and you need a dedicated server with 256 GB of memory just to hold vectors.
+
+**Product Quantization (PQ)**, pioneered by Jégou, Douze, and Schmid (2011), solves this by compressing high-dimensional vectors by **$16\times$ to $64\times$**.
+
+### The Math of Product Quantization
+Suppose our vectors have dimension $d = 768$.
+1. We split the $d$-dimensional space into $m$ orthogonal sub-spaces:
+   $$
+   d^* = \frac{d}{m}
+   $$
+   For $m = 96$, each sub-space has dimension $d^* = 768 / 96 = 8$. A vector $v$ is sliced into 96 sub-vectors:
+   $$
+   v = [u_1, u_2, \dots, u_{96}], \quad \text{where } u_i \in \mathbb{R}^8
+   $$
+2. In each sub-space, we run $k$-means clustering across the dataset with $k^* = 256$ centroids. These 256 centroids form a **codebook** for that sub-space.
+3. Since $256 = 2^8$, any centroid ID from $0$ to $255$ can be represented by exactly **one 8-bit byte** (`uint8`).
+4. To compress vector $v$: for each sub-vector $u_i$, find the closest centroid in codebook $i$, and store its 1-byte ID.
+
+<Callout type="math" title="Worked: 32x Memory Reduction with PQ">
+  Original vector:
+  $$
+  768\ \text{floats} \times 4\ \text{bytes} = \mathbf{3{,}072\ \text{bytes}}
+  $$
+
+  Quantized vector ($m = 96$ sub-vectors, 1 byte each):
+  $$
+  96\ \text{sub-vectors} \times 1\ \text{byte} = \mathbf{96\ \text{bytes}}
+  $$
+
+  $$
+  \text{Compression Ratio} = \frac{3{,}072}{96} = \mathbf{32\times}
+  $$
+
+  For our 1,000,000 vector corpus:
+  - Uncompressed FP32: **3.07 GB**
+  - Quantized with PQ-96: **96 MB**!
+  
+  The entire vector database fits inside the L3 CPU cache or a low-end smartphone's memory.
+</Callout>
+
+### Asymmetric Distance Computation (ADC)
+How do we compute the distance between an uncompressed query vector $q \in \mathbb{R}^{768}$ and a compressed document vector $\tilde{d} \in \{0, \dots, 255\}^{96}$?
+
+We use **Asymmetric Distance Computation (ADC)**:
+1. Squeeze query $q$ into $96$ sub-vectors: $[q_1, \dots, q_{96}]$.
+2. For each sub-space $i$, compute the dot product between $q_i$ and all 256 centroids in codebook $i$.
+3. Store these distances in a precomputed **lookup table** $T$ of size $96 \times 256$.
+4. Now, to compute the distance to any document $\tilde{d}$:
+   $$
+   \text{Distance}(q, \tilde{d}) = \sum_{i=1}^{96} T[i, \tilde{d}_i]
+   $$
+   Instead of multiplying floating-point numbers, the processor performs **96 memory table lookups and 95 additions**!
+
+## Practical FAISS: Index selection in Python
+
+FAISS (Facebook AI Similarity Search) is the industry-standard C++/Python library for ANN.
+
+Here is how you configure the major index types:
+
+```python
+import faiss
+import numpy as np
+
+d = 768          # Embedding dimension
+N = 100_000      # 100k vectors
+np.random.seed(42)
+data = np.random.randn(N, d).astype(np.float32)
+faiss.normalize_L2(data)
+
+# 1. Exact Brute-Force Index (IndexFlatIP)
+# Zero training, 100% recall, high latency
+index_flat = faiss.IndexFlatIP(d)
+index_flat.add(data)
+
+# 2. Inverted File Index (IndexIVFFlat)
+# Requires training centroids. Fast search with nprobe
+n_centroids = 256
+quantizer = faiss.IndexFlatIP(d)
+index_ivf = faiss.IndexIVFFlat(quantizer, d, n_centroids, faiss.METRIC_INNER_PRODUCT)
+index_ivf.train(data)       # Clusters centroids
+index_ivf.add(data)
+index_ivf.nprobe = 8        # Inspect top 8 centroids at query time
+
+# 3. Hierarchical Navigable Small World (IndexHNSWFlat)
+# Graph-based, sub-millisecond, higher RAM usage
+M = 32                      # Edges per node
+index_hnsw = faiss.IndexHNSWFlat(d, M, faiss.METRIC_INNER_PRODUCT)
+index_hnsw.hnsw.efSearch = 64  # Search candidate queue size
+index_hnsw.add(data)
+
+# 4. IVF with Product Quantization (IndexIVFPQ)
+# 32x memory compression + fast centroid pruning
+m = 96                      # Number of sub-vector slices (768 / 96 = 8 dims)
+nbits = 8                   # 256 centroids per sub-space = 1 byte
+index_ivfpq = faiss.IndexIVFPQ(quantizer, d, n_centroids, m, nbits)
+index_ivfpq.train(data)
+index_ivfpq.add(data)
+index_ivfpq.nprobe = 8
+```
+
+| Index Type | Search Time (1M docs) | RAM (1M docs) | Recall@10 | When to use |
+|---|---|---|---|---|
+| **IndexFlatIP** | ~60 ms | 3.07 GB | **100%** | Small corpora ($N < 50{,}000$) or ground-truth evaluation |
+| **IndexIVFFlat** | ~3–5 ms | 3.07 GB | **95–98%** | Datasets up to 5M vectors with balanced RAM/latency |
+| **IndexHNSWFlat** | **~1.2 ms** | ~4.5 GB | **98–99.5%** | Production serving with strict latency SLOs (&lt;5 ms) |
+| **IndexIVFPQ** | **~0.8 ms** | **~0.15 GB** | **85–92%** | Massive datasets ($N > 10\text{M}$) on budget hardware |
+
+<KeyNotes>
+  1. Exact brute-force search scales as $O(N)$, becoming a severe memory-bandwidth bottleneck at $N > 10^5$ vectors.
+  2. **Approximate Nearest Neighbor (ANN)** algorithms trade 1–2% recall for 50× to 1,000× speedups, achieving sub-millisecond retrieval.
+  3. **Inverted File Indexes (IVF)** partition space into $C$ Voronoi cells using $k$-means. The parameter **`nprobe`** governs the recall vs. latency trade-off.
+  4. **Hierarchical Navigable Small World (HNSW)** organizes vectors into a multi-layered proximity graph, achieving $O(\log N)$ search time via greedy routing.
+  5. HNSW parameters include $M$ (connections per node, typically 16–64) and **`efSearch`** (candidate priority queue size during query execution).
+  6. **Product Quantization (PQ)** slices vectors into $m$ sub-spaces and quantizes each to 1-byte codebook centroid IDs, achieving up to **$32\times$ memory compression**.
+  7. **Asymmetric Distance Computation (ADC)** evaluates distances between unquantized queries and compressed vectors using fast table lookups instead of float multiplications.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'How does an Inverted File Index (IVF) reduce query latency during vector search?',
+    options: [
+      'By quantizing all 32-bit floating point numbers to 1-bit boolean flags',
+      'By partitioning vectors into Voronoi cells and searching only the vectors belonging to the top `nprobe` nearest centroids',
+      'By compiling vector search loops into Triton GPU kernels',
+      'By converting all vectors into English text and using BM25'
+    ],
+    answer: 1,
+    why: 'IVF clusters space into centroids. At query time, it only scans vectors assigned to the closest `nprobe` centroids, pruning 95%+ of the candidate vectors from distance calculations.'
+  },
+  {
+    q: 'You have an index of 1,000,000 vectors with 768 dimensions in FP32 (each float is 4 bytes). You apply Product Quantization with $m = 96$ sub-vectors, each quantized to an 8-bit centroid index (1 byte). What is the total memory in megabytes (MB = $10^6$ bytes) required to store the compressed vectors?',
+    numeric: true,
+    answer: 96,
+    tolerance: 2,
+    unit: 'MB',
+    why: 'Each compressed vector requires 96 sub-vectors * 1 byte = 96 bytes. For 1,000,000 vectors: 1,000,000 * 96 bytes = 96,000,000 bytes = 96 MB (a 32x reduction from 3,072 MB).'
+  },
+  {
+    q: 'In HNSW graph traversal, what is the purpose of the sparse upper layers (e.g. Layer 2 and Layer 1)?',
+    options: [
+      'To store cached query results from previous users',
+      'To serve as "express highways" that allow long-range geometric hops toward the query, avoiding local minima and achieving $O(\\log N)$ convergence',
+      'To store document metadata such as titles and authors',
+      'To run backpropagation on misclassified queries'
+    ],
+    answer: 1,
+    why: 'Upper layers contain exponentially fewer nodes with long-range edges, enabling the greedy search walk to cover large geometric distances in single hops before descending to local dense layers.'
+  },
+  {
+    q: 'What is the primary operational trade-off when using an uncompressed HNSW index (`IndexHNSWFlat`) over an exact flat index (`IndexFlatIP`)?',
+    options: [
+      'HNSW is slower but uses less memory',
+      'HNSW provides sub-millisecond query speed, but requires 30% to 50% more RAM to store graph connection pointers',
+      'HNSW can only run on NVIDIA GPUs',
+      'HNSW cannot support cosine similarity'
+    ],
+    answer: 1,
+    why: 'HNSW is dramatically faster (1.2 ms vs 60 ms), but storing graph edge pointers (up to M pointers per node across layers) adds significant memory overhead on top of the raw vector data.'
+  },
+  {
+    q: 'In Product Quantization using Asymmetric Distance Computation (ADC), how are distances evaluated between the query and compressed documents?',
+    options: [
+      'By decompressing every document back to FP32 before calculating dot products',
+      'By precomputing distances from query sub-vectors to all codebook centroids in a lookup table, then summing table entries for each document',
+      'By converting all vectors to TF-IDF posting lists',
+      'By running a cross-encoder transformer forward pass'
+    ],
+    answer: 1,
+    why: 'ADC precomputes distances from the query sub-vectors to codebook centroids into a table of size m * 256. Evaluating each document requires only m table lookups and additions, bypassing floating-point vector arithmetic.'
+  },
+  {
+    q: 'If an engineer notices that their IVF index is missing relevant documents located near cluster boundaries, which parameter should they increase at query time?',
+    options: [
+      'M (graph connections)',
+      'nprobe',
+      'codebook bits',
+      'document length b'
+    ],
+    answer: 1,
+    why: 'Increasing nprobe instructs the IVF search engine to inspect more centroid cells, widening the search radius and capturing boundary vectors at the expense of slightly higher latency.'
+  }
+]} />

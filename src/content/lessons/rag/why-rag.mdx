@@ -1,0 +1,320 @@
+---
+title: 'Why retrieval: finetuning for form, RAG for facts'
+summary: 'Why large language models fail at factual recall, why finetuning to inject knowledge is an expensive trap, and how separating parametric weights from non-parametric retrieval solves the knowledge cutoff.'
+objectives:
+  - Contrast parametric memory in model weights with non-parametric memory in external storage
+  - Explain why supervised finetuning fails to inject factual knowledge reliably using findings from Ovadia et al. (2023)
+  - Trace the end-to-end dataflow of the retriever-generator architecture
+  - Calculate the compute and financial cost difference between periodic retraining and retrieval at serving time
+  - Identify when a serving architecture demands finetuning, RAG, or both
+---
+import WhyRag from '@/components/viz/rag/WhyRag.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You deploy an open-weights model such as Llama-3.1-8B to power your company’s internal developer assistant. A software engineer types a question into the chat box: *"What is the timeout on our production payment gateway in the EU-West region, and which service handles the retry loop?"*
+
+The model answers instantly and persuasively: *"The payment gateway timeout is 5,000 milliseconds, and the RetryWorker in the BillingService automatically retries failed transactions three times with exponential backoff."*
+
+Every single token is syntactically flawless. The Python code snippet it provides compiles cleanly. But there is one fatal problem: your company's actual timeout is 1,200 milliseconds, and retries are managed by an asynchronous Kafka dead-letter queue called `PaymentDispatcher`. The model’s answer was an outright fabrication. It did not lie out of malice; it simply predicted high-probability tokens based on general public internet code seen during pretraining.
+
+The first instinct of almost every engineering team facing this failure is identical: *"Let's take our internal engineering wikis, API documentation, and Jira tickets, and finetune the model on them."* This lesson shows why that instinct is one of the most expensive dead ends in AI engineering, and why production systems decouple memory into two entirely different systems: **parametric weights** for form, and **non-parametric retrieval** for facts.
+
+## The two memories of a machine
+
+In earlier modules you learned how a transformer functions: an input sequence of tokens passes through stacked layers of multi-head attention and feed-forward networks (MLPs). The knowledge of that model is stored inside its floating-point parameters — the weights.
+
+We call this **parametric memory**.
+
+Parametric memory is fundamentally a lossy, fuzzy hash map. A 8-billion parameter model in 16-bit precision occupies roughly 16 gigabytes of memory. During pretraining, that model ingested trillions of tokens of text — tens of terabytes of human knowledge. Squeezing 15 terabytes of text into a 16 GB file means the model cannot store documents verbatim. Instead, it compresses statistical patterns, grammatical relationships, and abstract reasoning pathways into weight matrices.
+
+Because parametric memory is lossy:
+1. **It has a hard knowledge cutoff.** The model knows nothing about the world after the timestamp when its training data was collected. If a bug was patched this morning, the model cannot know it.
+2. **It confuses common associations with factual truth.** If 80% of open-source payment libraries use a 5,000 ms timeout, the model's highest logit for the next token will be 5,000, regardless of what your private internal repo uses.
+3. **Updating it is catastrophic.** To update a single fact in parametric weights, you must run backward passes, compute gradients, and update matrices. If you update weights on only new facts, the network suffers from *catastrophic forgetting* — degrading its general reasoning capabilities on unrelated tasks.
+
+To solve this, we introduce **non-parametric memory**: external storage such as a vector database, an inverted search index, or an SQL table. Non-parametric storage stores exact text strings unmodified. Appending a new document costs a single write operation ($O(1)$), requires zero GPU backpropagation, and can be inspected, audited, or deleted in milliseconds.
+
+The visual below demonstrates how these two memory types interact when handling a private query.
+
+<Scrolly>
+  <WhyRag client:visible slot="stage" />
+
+  <Step title="1. The Cutoff Problem">
+    A user query arrives asking for internal or recent facts. The **frozen LLM** has no access to private documentation or events past its pretraining cutoff. Left alone, it fabricates plausible-sounding nonsense.
+  </Step>
+
+  <Step title="2. Attempt: Finetuning">
+    The intuitive fix is to finetune the model on the private documents. But gradient descent across millions of tokens costs massive compute, risks catastrophic forgetting, and **still hallucinates** on rare facts.
+  </Step>
+
+  <Step title="3. The Non-Parametric Index">
+    Instead of burning GPU hours baking documents into weights, store them verbatim in an **external index**. Chunks of text live in memory or SSDs, updated instantly without touching the model weights.
+  </Step>
+
+  <Step title="4. Retrieve Relevant Chunks">
+    When the query arrives, a lightweight **retriever** scans the index in milliseconds. It identifies the two or three exact paragraphs relevant to the user’s question.
+  </Step>
+
+  <Step title="5. Augment the Prompt">
+    The system prepends the retrieved paragraphs directly into the prompt context window: *System prompt + Retrieved facts + User question*.
+  </Step>
+
+  <Step title="6. Grounded Generation">
+    The generator LLM runs a standard prefill over this prompt. Through self-attention, it attends directly to the retrieved facts, answering with 100% precision and citing its exact sources.
+  </Step>
+
+  <Step title="7. The Serving Trade-Off">
+    RAG trades extra prompt tokens and 10–50 ms of retrieval latency for **factual precision, instant document updates, and strict access control**.
+  </Step>
+</Scrolly>
+
+## Why finetuning fails for knowledge injection
+
+Why can't we simply train the model until it memorizes our private data?
+
+In late 2023, a research team from Johns Hopkins University and Microsoft published a landmark empirical study: *Fine-Tuning or Retrieval? Comparing Knowledge Injection in LLMs* (Ovadia et al., arXiv:2312.05934). The authors systematically tested whether supervised finetuning (SFT) or Retrieval-Augmented Generation (RAG) is superior for giving large language models access to unseen information.
+
+Their experimental setup compared models across multiple knowledge domains:
+- Medical and clinical datasets
+- Legal statutes and case law
+- Real-time recent events
+- Synthetic enterprise knowledge bases
+
+They subjected the models to intensive finetuning, testing full-parameter finetuning and parameter-efficient LoRA adaptations, varying the number of training epochs from 1 all the way to 50 passes over the target corpus.
+
+The findings were definitive:
+
+### 1. Accuracy on facts
+Even after aggressive finetuning, models achieved poor factual recall on newly injected facts compared to RAG. When tested on exact question-answering over the ingested corpus, RAG consistently outperformed finetuning by **30 to 50 percentage points** in factual accuracy.
+
+Why? Because gradient descent does not insert a discrete row into a key-value store. When you present an input-target pair $(x, y)$ during finetuning, backpropagation nudges millions of weight values across dozens of layers. The model learns a diffuse statistical association between terms, not an immutable statement of fact. If the user asks the question with different phrasing, synonyms, or unusual prompt formatting, the model frequently reverts to its pretraining priors and hallucinates.
+
+### 2. Resistance to hallucination
+When a question cannot be answered from the provided documents, a well-prompted RAG system can reliably state: *"I cannot find that information in the provided context."*
+
+A finetuned model, by contrast, has no clean mechanism to signal uncertainty. Because the facts are blended into the same weight matrices that generate grammar and style, the model generates fluent, grammatically sound answers whether it genuinely remembers the fact or is totally guessing.
+
+### 3. The rule of thumb: Form vs. Facts
+This leads directly to the core architectural maxim of modern AI systems engineering:
+
+<Callout type="mentor" title="The Golden Rule of Model Customization">
+  **Finetune for form, retrieve for facts.**
+  
+  Use **finetuning** when you need to teach the model *how to behave*: adopting a specific persona, speaking in a distinct corporate brand voice, adhering to a strict JSON schema, writing domain-specific SQL dialects, or executing multi-step chain-of-thought reasoning steps.
+  
+  Use **RAG** whenever the model needs to know *what is true*: product prices, inventory counts, bug fixes, internal documentation, legal contracts, user profiles, or any information that changes faster than your GPU training pipeline can run.
+</Callout>
+
+| Dimension | Supervised Finetuning (SFT / LoRA) | Retrieval-Augmented Generation (RAG) |
+|---|---|---|
+| **Primary purpose** | Teaching style, formatting, syntax & tone | Injecting factual truth & current data |
+| **Update latency** | Hours to days (GPU batch training job) | Milliseconds (O(1) write to index) |
+| **Compute cost to update** | Massive (${}6 \times P \times N$ FLOPs per epoch) | Trivial (single embedding forward pass) |
+| **Source attribution** | Impossible (cannot point to a specific weight) | Trivial (cites exact file name and chunk ID) |
+| **Access control & RBAC** | None (all weights accessible to all users) | Native (filter retrieved chunks by user permissions) |
+| **Inference cost** | Short prompt (fast prefill, low KV memory) | Longer prompt (+500–2,000 tokens per query) |
+
+## The arithmetic: Retraining costs vs. Serving costs
+
+Let us prove why finetuning for facts is financially and computationally unviable using the first-principles math from Module 02.
+
+Suppose your engineering organization has 10 million tokens of internal documentation (approximately 7.5 million words, or 15,000 pages of text). Your engineers update wiki pages, code comments, and architecture docs daily. You want your model to stay up to date.
+
+### Approach A: Daily Supervised Finetuning
+You decide to finetune Llama-3.1-8B ($P \approx 8 \times 10^9$ parameters) on your 10-million-token corpus ($N = 10^7$) every night.
+
+From Chinchilla scaling laws (Module 02), the compute required for one forward pass is roughly $2 P$ FLOPs per token. A backward pass requires roughly $4 P$ FLOPs per token. A single training epoch therefore requires:
+
+$$
+C_{\text{train}} \approx 6 P N\ \text{FLOPs}
+$$
+
+For an 8-billion parameter model on 10 million tokens:
+
+$$
+C_{\text{train}} = 6 \times (8 \times 10^9) \times (10 \times 10^6) = 4.8 \times 10^{17}\ \text{FLOPs}
+$$
+
+If you train for 3 epochs to ensure convergence, total compute is:
+
+$$
+3 \times 4.8 \times 10^{17} = 1.44 \times 10^{18}\ \text{FLOPs}
+$$
+
+An NVIDIA A100 GPU provides roughly 312 TFLOP/s ($3.12 \times 10^{14}$ FLOP/s) of BF16 tensor core compute. Operating at a realistic Model FLOPs Utilization (MFU) of 45%:
+
+$$
+\text{Effective throughput} = 0.45 \times 3.12 \times 10^{14} \approx 1.40 \times 10^{14}\ \text{FLOP/s}
+$$
+
+The time required on a single A100 GPU is:
+
+$$
+\text{Time} = \frac{1.44 \times 10^{18}\ \text{FLOPs}}{1.40 \times 10^{14}\ \text{FLOP/s}} \approx 10{,}285\ \text{seconds} \approx \mathbf{2.86\ \text{hours}}
+$$
+
+At an on-demand cloud rate of \$3.50 per hour per A100, each daily run costs approximately \$10. Over a year, that is **\$3,650** in raw compute — simply to keep a small 8B model aware of basic documentation changes. And if your documentation expands to 100 million tokens, the daily training time balloons to nearly 29 GPU hours per day, exceeding the hours in a day unless you scale to expensive multi-GPU clusters. Worse still, as shown by Ovadia et al., the model will still hallucinate on edge cases!
+
+### Approach B: RAG Ingestion and Inference
+Now consider RAG on that same 10-million-token corpus.
+
+**Ingestion:** You split your documents into chunks of 500 tokens and compute an embedding vector for each using a lightweight bi-encoder embedding model such as `all-MiniLM-L6-v2` ($P_{\text{embed}} \approx 2.2 \times 10^7$ parameters, 22 million).
+
+Generating embeddings is an inference-only forward pass ($2 P N$ FLOPs):
+
+$$
+C_{\text{embed}} = 2 \times (2.2 \times 10^7) \times (10 \times 10^6) = 4.4 \times 10^{14}\ \text{FLOPs}
+$$
+
+On a modest NVIDIA T4 GPU (65 TFLOP/s FP16, at 30% MFU $\approx 1.95 \times 10^{13}$ FLOP/s):
+
+$$
+\text{Time}_{\text{embed}} = \frac{4.4 \times 10^{14}}{1.95 \times 10^{13}} \approx \mathbf{22.6\ \text{seconds}}
+$$
+
+Embedding the entire corporate library takes **under 23 seconds** on a cheap \$0.35/hour GPU, costing less than **a quarter of one cent (\$0.002)**. When an engineer edits a single document tomorrow, re-embedding that single chunk takes 2 milliseconds.
+
+**Inference Serving Overhead:**
+At query time, the retriever fetches the top 4 chunks (each 250 tokens, totaling 1,000 context tokens) and prepends them to the user query.
+
+In Module 05, you learned that prefill processing is compute-bound, requiring $2 P$ FLOPs per prompt token:
+
+$$
+\text{Prefill FLOPs} = 2 \times (8 \times 10^9) \times 1{,}000 = 1.6 \times 10^{13}\ \text{FLOPs} = 16\ \text{TFLOPs}
+$$
+
+On an NVIDIA H100 GPU (running at an effective ~500 TFLOP/s BF16 during prefill):
+
+$$
+\text{Additional TTFT} = \frac{16 \times 10^{12}}{5 \times 10^{14}} = 0.032\ \text{seconds} = \mathbf{32\ \text{ms}}
+$$
+
+Adding 1,000 tokens of context adds just **32 milliseconds** to your Time to First Token (TTFT). For 32 ms of latency, you achieve 100% verified factual accuracy, instant real-time updates, and verifiable citations.
+
+## The end-to-end RAG architecture
+
+A production RAG system comprises two distinct subsystems: the **Offline Ingestion Pipeline** and the **Online Serving Pipeline**.
+
+```
+OFFLINE INGESTION:
+[Raw Documents] -> [Chunker] -> [Chunks (text)]
+                                      │
+                                      ▼
+                               [Embedding Model] -> [Vector Index + Metadata DB]
+
+ONLINE SERVING:
+[User Query q] ───────┬────────────────────────────────────────┐
+                      │                                        │
+                      ▼                                        ▼
+             [Embedding Model]                         [Prompt Assembler]
+                      │                                        ▲
+                      ▼                                        │
+             [Retriever (ANN/BM25)] ──> [Top-k Chunks] ────────┘
+                                                               │
+                                                               ▼
+                                                       [Generator LLM]
+                                                               │
+                                                               ▼
+                                                      [Cited Answer + Source IDs]
+```
+
+### 1. Ingestion Pipeline (Asynchronous)
+- **Document Loading & Cleaning:** Stripping HTML, parsing PDFs, standardizing Markdown.
+- **Chunking:** Partitioning continuous text into discrete chunks (e.g., 200–500 tokens). Chunks must preserve semantic coherence.
+- **Embedding:** Passing each chunk through an encoder model to produce a dense floating-point vector representing its semantic meaning.
+- **Indexing:** Storing the vectors in an Approximate Nearest Neighbor (ANN) index (such as FAISS or HNSW) alongside an inverted text index (such as BM25) and raw chunk text in a relational or object store.
+
+### 2. Serving Pipeline (Synchronous, Low Latency)
+- **Query Processing:** The user query $q$ is embedded into the same vector space.
+- **Retrieval:** The retriever computes similarities between $q$ and all indexed document chunks, returning the top-$k$ highest-scoring chunks.
+- **Reranking:** An optional cross-encoder scores the candidate chunks with full bidirectional attention, filtering out false positives.
+- **Prompt Augmentation:** The selected text chunks are formatted into a prompt template alongside strict instructions: *"Answer the query using ONLY the provided facts. If the facts do not contain the answer, reply that you do not know."*
+- **Generation:** The generator LLM runs prefill over the combined prompt and autoregressively generates the response, citing chunk IDs.
+
+<Callout type="pitfall" title="The Context Pollution Trap">
+  RAG is not free. Every retrieved chunk you add to the prompt consumes context window, increases prefill time, and consumes KV cache memory ($128\text{ KB}$ per token on an 8B model). 
+  
+  If you retrieve 20 chunks when only 2 are relevant, the generator suffers from *lost in the middle* degradation (Module B1), where the model misses key facts buried amidst irrelevant boilerplate. High retrieval precision is not just about finding the needle; it is about keeping the haystack out of the prompt.
+</Callout>
+
+<Callout type="real" title="Now read the paper">
+  **Fine-Tuning or Retrieval? Comparing Knowledge Injection in LLMs**
+  *Ovadia et al., 2023. arXiv:2312.05934*
+
+  - **Read:** Section 1 (Introduction), Section 3 (Methodology: Datasets and Evaluation Protocols), and Section 4.1 (Main Results comparing RAG vs Fine-Tuning across model scales).
+  - **Skip:** Section 5.3 (hyperparameter sweeps on specific learning rate schedules) unless you are actively training custom LoRA adapters.
+  - **What you will recognize:** The exact accuracy gap between parametric fine-tuning and non-parametric retrieval, and the phenomenon where fine-tuned models overconfidently fabricate answers when confronted with paraphrased queries.
+</Callout>
+
+<KeyNotes>
+  1. **Parametric memory** lives in model weights; it is lossy, fuzzy, has a hard knowledge cutoff, and costs heavy GPU compute to update.
+  2. **Non-parametric memory** lives in external storage; it is exact, auditable, supports granular access control, and updates in milliseconds at near-zero cost.
+  3. **Finetune for form, retrieve for facts.** SFT trains tone, syntax, style, and task behavior; RAG provides current and verifiable ground truth.
+  4. Ovadia et al. (2023) demonstrated that RAG outperforms supervised finetuning by **30 to 50 percentage points** on factual recall tasks across diverse domains.
+  5. Training compute scales as $C_{\text{train}} \approx 6 P N$ FLOPs per epoch. Finetuning an 8B model on 10M tokens for 3 epochs requires $1.44 \times 10^{18}$ FLOPs (~2.8 hours on an A100).
+  6. Embedding the same 10M tokens with a 22M bi-encoder requires only forward passes ($2 P N \approx 4.4 \times 10^{14}$ FLOPs), taking less than **23 seconds** on a T4 GPU.
+  7. RAG adds a minor latency cost at inference time: retrieval search time (~10–30 ms) plus the prefill FLOPs for the retrieved context tokens (~32 ms on H100 for 1,000 tokens).
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why does supervised finetuning struggle to reliably inject discrete new facts into a language model?',
+    options: [
+      'Because models can only learn new tokens during pretraining',
+      'Because gradient descent distributes updates diffusely across millions of weights, creating statistical associations rather than immutable factual records',
+      'Because finetuning automatically resets all attention heads to zero',
+      'Because loss functions do not penalize factual inaccuracies'
+    ],
+    answer: 1,
+    why: 'Backpropagation updates weight matrices across all layers. Facts are compressed diffusely across parameters rather than inserted into an addressable table, making recall fragile when queries are phrased differently from training samples.'
+  },
+  {
+    q: 'You want to finetune a 7B parameter model ($P = 7 \times 10^9$) on a 5-million-token ($N = 5 \times 10^6$) dataset for 2 epochs. What is the approximate total training FLOPs required ($6PN$ per epoch)?',
+    numeric: true,
+    answer: 4.2e17,
+    tolerance: 0.2e17,
+    unit: 'FLOPs',
+    why: 'One epoch requires 6 * P * N = 6 * (7e9) * (5e6) = 2.1e17 FLOPs. For 2 epochs, total FLOPs = 2 * 2.1e17 = 4.2e17 FLOPs.'
+  },
+  {
+    q: 'You use an embedding model with 30 million parameters ($P = 3 \times 10^7$) to embed the same 5-million-token dataset ($N = 5 \times 10^6$) for a RAG pipeline. How many FLOPs ($2PN$) does this forward pass require?',
+    numeric: true,
+    answer: 3e14,
+    tolerance: 0.2e14,
+    unit: 'FLOPs',
+    why: 'Forward pass FLOPs = 2 * P * N = 2 * (3e7) * (5e6) = 3e14 FLOPs. This is more than 1,000x fewer FLOPs than finetuning the 7B model!'
+  },
+  {
+    q: 'According to the findings of Ovadia et al. (2023), how did RAG compare to supervised finetuning on factual question answering?',
+    options: [
+      'Finetuning beat RAG by 20% when trained for 50 epochs',
+      'RAG consistently beat finetuning by 30 to 50 percentage points on factual accuracy',
+      'Both techniques performed identically once LoRA rank was increased to 128',
+      'Finetuning was better for recent facts, while RAG was better for general knowledge'
+    ],
+    answer: 1,
+    why: 'Ovadia et al. found that RAG consistently outperformed finetuning by 30-50 percentage points in factual accuracy, demonstrating that parametric storage is ill-suited for strict factual injection.'
+  },
+  {
+    q: 'An engineer asks: "Should we finetune our model to speak in pirate slang, or use RAG?" What is the correct architectural recommendation?',
+    options: [
+      'Use RAG, because pirate slang vocabulary changes dynamically every day',
+      'Finetune, because pirate slang is a matter of form, tone, and style, not external factual recall',
+      'Neither; slang cannot be learned by modern transformer architectures',
+      'Use both simultaneously with an inverted index of pirate dictionaries'
+    ],
+    answer: 1,
+    why: 'The golden rule is "Finetune for form, retrieve for facts." Slang, tone, persona, and stylistic formatting are aspects of form best instilled into the weights via finetuning.'
+  },
+  {
+    q: 'At inference time, what serving cost does RAG add to the LLM generation phase?',
+    options: [
+      'It requires retraining the model before generating tokens',
+      'It increases prefill FLOPs and KV cache memory due to the injected context tokens',
+      'It doubles the model parameter count during the decode phase',
+      'It eliminates the need for a causal attention mask'
+    ],
+    answer: 1,
+    why: 'Prepend chunks into the prompt increases prompt length, which linearly increases prefill FLOPs and allocates additional KV cache memory (e.g., 128 KB per token on Llama-3.1-8B).'
+  }
+]} />

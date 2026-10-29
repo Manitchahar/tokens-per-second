@@ -1,0 +1,161 @@
+---
+title: 'Module B3 · Retrieval & RAG'
+module: rag
+---
+
+## The golden rule of customization
+
+> **Finetune for form, retrieve for facts.**
+
+- **Finetuning (SFT / LoRA):** Teaches style, syntax, tone, output format (JSON/SQL), and reasoning patterns.
+- **RAG:** Provides current, verifiable, cited ground truth with zero weight updates.
+- **Ovadia et al. (2023):** RAG outperforms supervised finetuning by **30 to 50 percentage points** in factual recall across diverse domains.
+
+---
+
+## Compute & memory costs: Retraining vs RAG
+
+### Daily Finetuning ($P$ parameters, $N$ tokens, 3 epochs)
+$$
+C_{\text{train}} \approx 3 \times 6 P N\ \text{FLOPs}
+$$
+- For an 8B model on 10M tokens: $1.44 \times 10^{18}\ \text{FLOPs}$ (~2.86 hours on an A100 at 45% MFU, costing ~\$10/day or \$3,650/year).
+
+### RAG Embedding Ingestion ($P_{\text{embed}} = 22\text{M}$, $N = 10\text{M}$ tokens)
+$$
+C_{\text{embed}} = 2 P_{\text{embed}} N \approx 4.4 \times 10^{14}\ \text{FLOPs}
+$$
+- Takes **22.6 seconds** on a T4 GPU, costing **\$0.002** (fractions of a cent).
+
+### RAG Serving Overhead (1,000 retrieved context tokens on 8B model)
+$$
+\text{Additional Prefill FLOPs} = 2 \times (8 \times 10^9) \times 1{,}000 = 16\ \text{TFLOPs}
+$$
+- Adds **~32 ms** to TTFT on an NVIDIA H100 GPU.
+
+---
+
+## Vector geometry & exact k-NN scan
+
+### Cosine Similarity on Unit Hypersphere
+When vectors are pre-normalized to unit length ($\|u\|_2 = 1, \|v\|_2 = 1$):
+$$
+\cos(\theta) = \frac{u \cdot v}{\|u\|_2 \|v\|_2} = u \cdot v = \sum_{i=1}^d u_i v_i
+$$
+
+### Exact Linear Scan Cost ($N$ documents, dimension $d$)
+$$
+\text{Total MACs} = N \times d
+$$
+$$
+\text{Total FLOPs} = 2 \times N \times d
+$$
+- For $1\text{M}$ vectors at $d = 768$: **768M MACs** ($1.536\text{ GFLOPs}$).
+
+### Memory Footprint & Bandwidth Wall
+$$
+\text{Memory (bytes)} = N \times d \times \text{bytes\_per\_float}
+$$
+- $1\text{M} \times 768$ in FP32 (4 B): **3.072 GB** ($2.86\text{ GiB}$).
+- $1\text{M} \times 768$ in FP16 (2 B): **1.536 GB**.
+
+### Arithmetic Intensity
+$$
+\text{Intensity} = \frac{2 \times d\ \text{FLOPs}}{d \times 4\ \text{bytes}} = \mathbf{0.5\ \text{FLOP/byte}}\ \text{(FP32)} \quad \text{or} \quad \mathbf{1.0\ \text{FLOP/byte}}\ \text{(FP16)}
+$$
+- **Severely memory-bandwidth bound.**
+- Scan time on CPU (50 GB/s): **61.4 ms** per query.
+- Scan time on T4 GPU (320 GB/s): **9.6 ms** per query.
+
+---
+
+## Okapi BM25 sparse search
+
+$$
+\text{BM25}(D, Q) = \sum_{i=1}^{|Q|} \text{IDF}(q_i) \cdot \frac{f(q_i, D) \cdot (k_1 + 1)}{f(q_i, D) + k_1 \cdot \left(1 - b + b \cdot \frac{|D|}{\text{avgdl}}\right)}
+$$
+
+### RSJ Inverse Document Frequency (IDF)
+$$
+\text{IDF}(q_i) = \ln \left( \frac{N - n(q_i) + 0.5}{n(q_i) + 0.5} + 1 \right)
+$$
+
+### Key Parameters
+- **$k_1 \approx 1.2$:** Controls term frequency saturation. As $f \to \infty$, score ceiling is **$k_1 + 1 = 2.2$**.
+- **$b \approx 0.75$:** Controls document length normalization. $b=1$ full penalty, $b=0$ no penalty.
+- **Inverted Index:** Dictionary maps terms to posting lists `[(doc_id, term_frequency)]`. Lookup is $O(1)$.
+
+---
+
+## Reciprocal Rank Fusion (RRF)
+
+Fuses candidate lists from disparate retrievers without normalizing incompatible raw score scales:
+
+$$
+\text{RRF\_Score}(d) = \sum_{m \in M} \frac{1}{k + r_m(d)}
+$$
+
+- $r_m(d)$ is the 1-based rank position in retriever $m$.
+- Default smoothing constant: **$k = 60$**.
+- Rank 1 adds $\frac{1}{61} \approx 0.01639$; Rank 2 adds $\frac{1}{62} \approx 0.01613$.
+- Strongly rewards **cross-system consensus**: a document ranking #2 in both systems ($0.03226$) beats a document ranking #1 in only one system ($0.01639$).
+
+---
+
+## ANN indexes: IVF, HNSW & Product Quantization
+
+| Index Type | Search Time (1M docs) | RAM (1M docs) | Recall@10 | Core Mechanism |
+|---|---|---|---|---|
+| **IndexFlatIP** | ~60 ms | 3.07 GB | 100% | Exact linear scan ($N \times d$ MACs) |
+| **IndexIVFFlat** | ~3–5 ms | 3.07 GB | 95–98% | Voronoi cells ($C \approx 4\sqrt{N}$), search `nprobe` cells |
+| **IndexHNSWFlat** | ~1.2 ms | ~4.5 GB | 98–99.5% | Multi-layer skip graph, greedy routing, $O(\log N)$ |
+| **IndexIVFPQ** | ~0.8 ms | ~0.15 GB | 85–92% | Product Quantization ($32\times$ compression) + Asymmetric Distance (ADC) |
+
+### Product Quantization (PQ-96)
+- Slice $d = 768$ into $m = 96$ sub-vectors of dimension $8$.
+- Cluster each sub-space into $k^* = 256$ centroids ($2^8 = 1\text{ byte}$).
+- Compresses $3{,}072\text{ bytes} \to 96\text{ bytes}$ (**$32\times$ reduction**).
+- ADC evaluates distances via $96$ table lookups and additions rather than floating-point math.
+
+---
+
+## Chunking, context & reranking
+
+### Chunk Size Rules of Thumb
+- **Sweet Spot:** **250 to 500 tokens** with **10–20% sliding window overlap**.
+- **Anthropic Contextual Retrieval (2024):** Prepending 50–100 tokens of LLM-generated document summary to each chunk reduces retrieval failure by **35%** alone, and **49%** when combined with hybrid search.
+- **Query Rewriting:** Expands conversational follow-ups (*"What about in Europe?"*) into self-contained search queries (*"What is the payment gateway timeout in Europe?"*).
+
+### The Two-Stage Funnel
+1. **Stage 1 (High Recall):** Hybrid search (Bi-Encoder + BM25 with RRF) retrieves **top 100** candidates in ~3 ms.
+2. **Stage 2 (High Precision):** Cross-Encoder (`ms-marco-MiniLM-L-6-v2`) runs full cross-token self-attention across 100 pairs in ~15 ms, filtering down to **top 5** chunks.
+3. Saves ~23,750 prompt tokens and ~3.1 GB of KV cache memory compared to feeding all 100 chunks.
+
+---
+
+## Evaluation metrics
+
+### Set-Based Retrieval Metrics
+$$
+\text{Precision}@k = \frac{|\text{Ret}_k \cap \text{Rel}|}{k}, \qquad \text{Recall}@k = \frac{|\text{Ret}_k \cap \text{Rel}|}{|\text{Rel}|}
+$$
+
+### Mean Reciprocal Rank (MRR)
+$$
+\text{MRR} = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_{1, i}}
+$$
+
+### Normalized Discounted Cumulative Gain (NDCG@k)
+$$
+\text{DCG}@k = \sum_{i=1}^k \frac{2^{\text{rel}_i} - 1}{\log_2(i + 1)}
+$$
+$$
+\text{NDCG}@k = \frac{\text{DCG}@k}{\text{IDCG}@k}
+$$
+- Logarithmic discounts: $i=1 \to 1.0$, $i=2 \to 1.585$, $i=3 \to 2.0$, $i=4 \to 2.322$, $i=5 \to 2.585$.
+- Bounded strictly in $[0.0, 1.0]$.
+
+### The RAG Triad
+1. **Context Relevance:** Fraction of retrieved context relevant to query (Retriever quality).
+2. **Faithfulness:** Fraction of answer claims entailed by retrieved context (Generator groundedness).
+3. **Answer Relevance:** Degree to which answer addresses user question (Generator intent).

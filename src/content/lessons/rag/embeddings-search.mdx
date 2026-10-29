@@ -1,0 +1,364 @@
+---
+title: 'Embeddings & vector search'
+summary: 'How encoder models map human language to geometric space, why dot product equals cosine similarity on the unit hypersphere, and the exact memory and MAC costs of brute-force nearest-neighbour search.'
+objectives:
+  - Contrast bidirectional encoder representations with autoregressive causal decoders
+  - Explain how token pooling produces a fixed-size sentence embedding
+  - Compute exact memory footprint and MAC FLOPs for linear scan search across $N$ vectors
+  - Calculate memory bandwidth limits and arithmetic intensity for vector search on CPU and GPU
+  - Implement normalized cosine similarity and top-k retrieval in NumPy
+---
+import EmbeddingSearch from '@/components/viz/rag/EmbeddingSearch.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In 1957, the British linguist John Rupert Firth coined an adage that remains the foundation of modern natural language processing: *"You shall know a word by the company it keeps."*
+
+If you search an internal technical documentation database for the query *"out of memory kernel panic"*, traditional keyword search looks for documents containing those exact words. If an engineer documented the incident as *"CUDA OOM crash due to GPU VRAM allocation failure"*, keyword search finds zero matching terms and returns nothing. The user leaves empty-handed, even though the document holds the exact solution to their problem.
+
+To bridge the chasm between literal strings and semantic concepts, we convert text into **dense vector embeddings**. An embedding model maps a variable-length string of text into a single point in a high-dimensional vector space $\mathbb{R}^d$. Sentences with similar meanings land close to one another in this space, even if they share zero vocabulary in common.
+
+This lesson explores how embedding models construct these representations, the linear algebra that governs vector comparison, and the concrete physical hardware cost of searching a million vectors.
+
+## From tokens to points in space
+
+In Module 03, you explored the transformer architecture and saw how a token ID is mapped to a vector via an embedding matrix $W_E \in \mathbb{R}^{V \times d_{\text{model}}}$. In an autoregressive decoder (such as GPT-4 or Llama-3), attention is **causal**: each token can only attend to earlier tokens.
+
+Embedding models used for retrieval operate differently. They are typically **bidirectional encoders** (descended from BERT and RoBERTa) or modern decoder models run with bidirectional attention masks.
+
+When a sentence of $T$ tokens is passed into an encoder:
+1. Every token attends to every other token in the sequence simultaneously. The word *"bank"* in *"river bank"* gathers contextual information from *"river"*, shifting its representation away from financial institutions.
+2. The final transformer layer outputs $T$ contextual vectors, each of dimension $d$:
+   $$
+   H = [h_1, h_2, \dots, h_T] \in \mathbb{R}^{T \times d}
+   $$
+3. To represent the entire document as a single vector, we apply a **pooling operation**. The two standard approaches are:
+   - **CLS pooling:** Taking the vector corresponding to the special `[CLS]` token at index 0.
+   - **Mean pooling:** Averaging all token vectors across the sequence, ignoring pad tokens:
+     $$
+     v = \frac{1}{\sum_{i=1}^T m_i} \sum_{i=1}^T m_i \cdot h_i
+     $$
+     where $m_i \in \{0, 1\}$ is the attention mask indicator.
+
+Mean pooling produces a single dense vector $v \in \mathbb{R}^d$. Common embedding models output vectors with dimensions such as $d = 384$ (`all-MiniLM-L6-v2`), $d = 768$ (`bge-base-en-v1.5`, `BERT-base`), $d = 1024$ (`bge-large-en-v1.5`), or $d = 1536$ (`text-embedding-3-small`).
+
+<Scrolly>
+  <EmbeddingSearch client:visible slot="stage" />
+
+  <Step title="1. Text to Vector">
+    A text passage enters the bidirectional encoder. Self-attention mixes tokens across the sequence, and mean pooling compresses the output into a single dense vector $v \in \mathbb{R}^d$.
+  </Step>
+
+  <Step title="2. L2 Normalization">
+    Raw embeddings have varying geometric lengths. We normalize each vector to unit length ($\|v\|_2 = 1$). This projects every document onto the surface of a unit hypersphere.
+  </Step>
+
+  <Step title="3. Cosine Similarity & Angle">
+    On the unit hypersphere, vector similarity is simply the cosine of the angle $\theta$ between them: $\cos(\theta) = q \cdot d$. Identical vectors have $\theta = 0^\circ$ and $\cos(\theta) = 1.0$.
+  </Step>
+
+  <Step title="4. Linear Scan: N × d MACs">
+    To find the top-k nearest neighbors without an index, we perform a brute-force matrix-vector product between the query $q$ and all $N$ document vectors: exactly $N \times d$ multiply-accumulate operations.
+  </Step>
+
+  <Step title="5. Memory Footprint">
+    Memory scales linearly with corpus size. A collection of 1,000,000 document vectors of dimension 768 in FP32 precision requires **3.07 GB** of contiguous RAM.
+  </Step>
+
+  <Step title="6. Memory Bandwidth Bottleneck">
+    Every vector must be loaded from memory to compute a dot product. With an arithmetic intensity of only 0.5 FLOP/byte, the scan is completely memory-bandwidth bound.
+  </Step>
+
+  <Step title="7. The Need for ANN">
+    On a CPU at 50 GB/s bandwidth, scanning 1M vectors takes over 60 ms per query. At 10M vectors, latency exceeds half a second. Sub-millisecond retrieval requires approximate nearest neighbor indexing.
+  </Step>
+</Scrolly>
+
+## Vector geometry: Dot products and Cosine similarity
+
+How do we decide whether two vectors $u$ and $v$ are semantically similar?
+
+### 1. Euclidean Distance ($L_2$)
+The straight-line distance between two points in $\mathbb{R}^d$:
+
+$$
+\|u - v\|_2 = \sqrt{\sum_{i=1}^d (u_i - v_i)^2}
+$$
+
+Smaller distance means greater similarity. However, Euclidean distance is sensitive to vector magnitude: a long document and a short document discussing the same topic might have vectors pointing in the exact same direction, but the longer document may produce larger activation values, creating an artificially large Euclidean distance.
+
+### 2. Cosine Similarity
+Cosine similarity measures the angle $\theta$ between two vectors, completely ignoring their magnitudes:
+
+$$
+\cos(\theta) = \frac{u \cdot v}{\|u\|_2 \|v\|_2} = \frac{\sum_{i=1}^d u_i v_i}{\sqrt{\sum_{i=1}^d u_i^2} \sqrt{\sum_{i=1}^d v_i^2}}
+$$
+
+- If $u$ and $v$ point in the exact same direction, $\theta = 0^\circ \implies \cos(\theta) = 1.0$.
+- If $u$ and $v$ are orthogonal (unrelated concepts), $\theta = 90^\circ \implies \cos(\theta) = 0.0$.
+- If $u$ and $v$ point in opposite directions, $\theta = 180^\circ \implies \cos(\theta) = -1.0$.
+
+### 3. The Normalization Shortcut
+Computing square roots and divisions for millions of vectors during every search query is computationally wasteful.
+
+Notice what happens if we pre-normalize every vector to unit length ($L_2$ norm = 1) at ingestion time:
+
+$$
+\hat{u} = \frac{u}{\|u\|_2}, \qquad \hat{v} = \frac{v}{\|v\|_2} \implies \|\hat{u}\|_2 = 1, \quad \|\hat{v}\|_2 = 1
+$$
+
+Substituting unit vectors into the cosine formula:
+
+$$
+\cos(\theta) = \frac{\hat{u} \cdot \hat{v}}{1 \times 1} = \hat{u} \cdot \hat{v} = \sum_{i=1}^d \hat{u}_i \hat{v}_i
+$$
+
+<Callout type="math" title="Cosine Similarity Becomes a Dot Product">
+  When all vectors in your database are pre-normalized to unit length:
+  $$
+  \text{Cosine Similarity}(q, d) = q \cdot d
+  $$
+  Computing similarity requires no norms, no square roots, and no divisions at query time. It is a pure dot product: $d$ floating-point multiplications and $d-1$ additions.
+</Callout>
+
+Furthermore, the squared Euclidean distance between two unit vectors has a direct monotonic relationship to dot product:
+
+$$
+\|\hat{u} - \hat{v}\|_2^2 = \|\hat{u}\|^2 + \|\hat{v}\|^2 - 2(\hat{u} \cdot \hat{v}) = 1 + 1 - 2(\hat{u} \cdot \hat{v}) = 2(1 - \hat{u} \cdot \hat{v})
+$$
+
+Maximizing cosine similarity $\hat{u} \cdot \hat{v}$ is mathematically identical to minimizing Euclidean distance $\|\hat{u} - \hat{v}\|_2$.
+
+## The cost of exact k-NN: MACs, memory, and bandwidth
+
+Suppose you have indexed a corpus of $N$ documents, each represented by a unit-normalized vector of dimension $d$. When a user query arrives, it is embedded into query vector $q \in \mathbb{R}^d$.
+
+To find the exact top-$k$ nearest neighbors without any index (brute force linear scan):
+1. Multiply $q$ by the document matrix $D \in \mathbb{R}^{N \times d}$.
+2. This computes $N$ dot products: $s_i = q \cdot d_i$ for $i = 1, \dots, N$.
+3. Sort or run a min-heap to find the $k$ largest scores.
+
+Let us examine the exact arithmetic for this operation.
+
+### 1. Multiply-Accumulate Operations (MACs)
+One dot product of dimension $d$ requires multiplying corresponding elements and summing them:
+
+$$
+q \cdot d_i = q_1 d_{i,1} + q_2 d_{i,2} + \dots + q_d d_{i,d}
+$$
+
+This requires $d$ multiplications and $d-1$ additions. In hardware architecture, a combined multiply and add is executed as a single **Multiply-Accumulate (MAC)** or Fused Multiply-Add (FMA) instruction. Each MAC represents 2 floating-point operations (2 FLOPs).
+
+For $N$ document vectors:
+
+$$
+\text{Total MACs} = N \times d
+$$
+
+$$
+\text{Total FLOPs} = 2 \times N \times d
+$$
+
+<Callout type="math" title="Worked Example: 1 Million Vectors">
+  Suppose your corpus contains $N = 1{,}000{,}000$ chunks, embedded with a 768-dimensional model ($d = 768$):
+
+  $$
+  \text{MACs} = 10^6 \times 768 = 768{,}000{,}000\ \text{MACs} = \mathbf{768\ \text{M MACs}}
+  $$
+
+  $$
+  \text{FLOPs} = 2 \times 768 \times 10^6 = \mathbf{1.536\ \text{GFLOPs}}
+  $$
+
+  $1.536$ GFLOPs sounds like a tiny amount of compute for a modern processor. A standard server CPU can perform hundreds of GFLOP/s, and an NVIDIA T4 GPU can execute 65,000 GFLOP/s (65 TFLOP/s). Why, then, does a linear scan feel sluggish in production?
+</Callout>
+
+### 2. Memory Footprint
+Before a processor can compute a dot product with vector $d_i$, it must load the floating-point values of $d_i$ from system RAM into cache registers.
+
+In standard single-precision floating point (FP32), each number occupies 4 bytes:
+
+$$
+\text{Memory (bytes)} = N \times d \times 4
+$$
+
+For $1\text{M}$ vectors at $d = 768$:
+
+$$
+\text{Memory} = 1{,}000{,}000 \times 768 \times 4 = 3{,}072{,}000{,}000\ \text{bytes} \approx \mathbf{3.072\ \text{GB}}\ (2.86\ \text{GiB})
+$$
+
+If stored in half-precision (FP16 or BF16, 2 bytes per number):
+
+$$
+\text{Memory (FP16)} = 1{,}000{,}000 \times 768 \times 2 = 1{,}536{,}000{,}000\ \text{bytes} \approx \mathbf{1.536\ \text{GB}}
+$$
+
+### 3. The Memory Bandwidth Bottleneck
+Now calculate the **arithmetic intensity** of a linear scan.
+
+To compute the similarity between $q$ and $d_i$, we read $d \times 4$ bytes of data from memory, and perform $2 d$ FLOPs of arithmetic:
+
+$$
+\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes Moved}} = \frac{2 \times d}{4 \times d} = \mathbf{0.5\ \text{FLOPs per byte}}
+$$
+
+In FP16, the intensity is:
+
+$$
+\text{Arithmetic Intensity (FP16)} = \frac{2 \times d}{2 \times d} = \mathbf{1.0\ \text{FLOP per byte}}
+$$
+
+Recall the Roofline Model from Module 12. On an NVIDIA T4 GPU, the ridge point between memory-bound and compute-bound workloads is roughly 200 FLOP/byte. At $0.5$ FLOP/byte, brute-force vector search is **deep in the memory-bound regime**. The GPU tensor cores sit idle 99% of the time, waiting for bytes to trickle across the memory bus from HBM.
+
+On a standard dual-channel DDR5 server CPU with a memory bandwidth of $50\text{ GB/s}$:
+
+$$
+\text{Query Latency (CPU)} \approx \frac{3.072\text{ GB}}{50\text{ GB/s}} \approx \mathbf{61.4\ \text{ms}}
+$$
+
+On an NVIDIA T4 GPU with $320\text{ GB/s}$ bandwidth:
+
+$$
+\text{Query Latency (T4)} \approx \frac{3.072\text{ GB}}{320\text{ GB/s}} \approx \mathbf{9.6\ \text{ms}}
+$$
+
+A latency of 61 milliseconds on CPU for a single query might be acceptable if you have only one user. But if your database grows to 10 million documents:
+- Memory required: $30.72\text{ GB}$
+- Scan time on CPU: **614 milliseconds** per query
+- Scan time on T4: **96 milliseconds** per query
+
+At 50 queries per second, a 10M document linear scan would require hundreds of GPUs just to read memory over and over again. This physical memory wall is why production systems use **Approximate Nearest Neighbor (ANN)** indexes.
+
+## Exact search from scratch in Python
+
+The following minimal implementation demonstrates vector normalization, batch dot products, and top-$k$ selection using NumPy:
+
+```python
+import numpy as np
+
+def normalize(vectors: np.ndarray) -> np.ndarray:
+    """Normalize vectors along the last dimension to unit length (L2 norm = 1)."""
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    # Avoid division by zero for zero vectors
+    return vectors / np.maximum(norms, 1e-12)
+
+class ExactKNNIndex:
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.vectors = np.empty((0, dim), dtype=np.float32)
+        self.doc_ids = []
+
+    def add(self, doc_ids: list[str], embeddings: np.ndarray):
+        """Add normalized embeddings to index."""
+        normed = normalize(embeddings.astype(np.float32))
+        self.vectors = np.vstack([self.vectors, normed])
+        self.doc_ids.extend(doc_ids)
+
+    def search(self, query_embedding: np.ndarray, top_k: int = 5):
+        """Find the top-k highest cosine similarity documents."""
+        # 1. Normalize query vector [1, d]
+        q = normalize(query_embedding.reshape(1, -1).astype(np.float32))
+        
+        # 2. Linear scan: compute dot product against all N vectors [N]
+        # Memory traffic = N * d * 4 bytes
+        scores = np.dot(self.vectors, q.T).squeeze(-1)
+        
+        # 3. Partition top-k indices (faster than full argsort)
+        if len(scores) <= top_k:
+            top_indices = np.argsort(-scores)
+        else:
+            partitioned = np.argpartition(-scores, top_k)[:top_k]
+            top_indices = partitioned[np.argsort(-scores[partitioned])]
+            
+        return [(self.doc_ids[idx], float(scores[idx])) for idx in top_indices]
+```
+
+```python
+# Create index with dimension 768
+index = ExactKNNIndex(dim=768)
+
+# Add 10,000 synthetic document vectors
+N = 10_000
+synthetic_docs = np.random.randn(N, 768).astype(np.float32)
+doc_ids = [f"doc_{i}" for i in range(N)]
+index.add(doc_ids, synthetic_docs)
+
+# Search
+query = np.random.randn(768).astype(np.float32)
+results = index.search(query, top_k=3)
+for doc_id, score in results:
+    print(f"Match: {doc_id} | Cosine Similarity: {score:.4f}")
+```
+
+<Callout type="pitfall" title="Argpartition vs Argsort">
+  When finding top-$k$ elements in an array of $N$ scores, calling `np.argsort()` sorts all $N$ elements, taking $O(N \log N)$ time.
+  
+  For $N = 10{,}000{,}000$ and $k = 5$, sorting the entire array takes hundreds of milliseconds of CPU time. Use `np.argpartition(scores, -k)[-k:]` instead, which finds the top $k$ unsorted in $O(N)$ linear time, followed by sorting only those $k$ elements ($O(k \log k)$).
+</Callout>
+
+<KeyNotes>
+  1. **Bidirectional encoders** allow every token to attend to all other tokens; **mean pooling** averages contextual vectors to produce a single dense sentence embedding.
+  2. Standard embedding models use dimensions such as $d = 384$ (`all-MiniLM-L6-v2`), $d = 768$ (`bge-base`, `BERT`), or $d = 1536$ (`text-embedding-3-small`).
+  3. Pre-normalizing vectors to unit length ($\|v\|_2 = 1$) makes **cosine similarity equal to dot product**: $\cos(\theta) = q \cdot d$.
+  4. Exact nearest neighbor search over $N$ vectors requires $N \times d$ Multiply-Accumulate operations (**$N \times d$ MACs**), equal to $2 N d$ FLOPs.
+  5. Searching $1\text{M}$ vectors of dimension 768 requires **768M MACs** ($1.536\text{ GFLOPs}$) and **3.072 GB** of RAM in FP32 (or $1.536\text{ GB}$ in FP16).
+  6. Brute-force linear scan has an arithmetic intensity of only **0.5 FLOPs/byte** in FP32, making it completely bound by memory bandwidth.
+  7. On a server CPU at $50\text{ GB/s}$ bandwidth, scanning $1\text{M}$ vectors takes ~61 ms. At $10\text{M}$ vectors, it takes >600 ms, necessitating approximate index structures.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why does cosine similarity reduce to a simple dot product $u \cdot v$ when working with production vector databases?',
+    options: [
+      'Because all negative numbers are clamped to zero',
+      'Because vectors are pre-normalized to unit length ($L_2$ norm = 1) at ingestion time, making the denominator $1 \times 1 = 1$',
+      'Because high-dimensional spaces eliminate angles larger than 45 degrees',
+      'Because vector databases only store integer coordinates'
+    ],
+    answer: 1,
+    why: 'Cosine similarity is (u · v) / (||u|| * ||v||). When vectors are normalized to unit length, ||u|| = 1 and ||v|| = 1, so the expression simplifies directly to the dot product u · v.'
+  },
+  {
+    q: 'You store 2,000,000 document embeddings of dimension 1,024 in FP32 precision (4 bytes per number). How much RAM in gigabytes (GB = $10^9$ bytes) does this raw matrix require?',
+    numeric: true,
+    answer: 8.192,
+    tolerance: 0.1,
+    unit: 'GB',
+    why: 'Memory = N * d * bytes = 2,000,000 * 1,024 * 4 bytes = 8,192,000,000 bytes = 8.192 GB.'
+  },
+  {
+    q: 'How many Multiply-Accumulate operations (MACs) are required to execute a brute-force exact search of 1 query against 500,000 vectors of dimension 768?',
+    numeric: true,
+    answer: 384000000,
+    tolerance: 1000000,
+    unit: 'MACs',
+    why: 'Total MACs = N * d = 500,000 * 768 = 384,000,000 MACs (384M MACs). Each MAC is 1 multiplication + 1 addition (2 FLOPs).'
+  },
+  {
+    q: 'What is the arithmetic intensity of a linear scan over FP16 embedding vectors (where each float is 2 bytes and a dot product requires 2 FLOPs per dimension)?',
+    numeric: true,
+    answer: 1.0,
+    tolerance: 0.05,
+    unit: 'FLOP/byte',
+    why: 'Arithmetic intensity = FLOPs / bytes = (2 * d) / (2 * d) = 1.0 FLOP/byte. This is far below the GPU ridge point, making the operation severely memory-bandwidth bound.'
+  },
+  {
+    q: 'A vector search cluster holds 5 million document vectors (each 768 dimensions in FP32, totaling 15.36 GB). If your server memory bandwidth is 60 GB/s, what is the theoretical lower bound on query latency for an unindexed linear scan?',
+    numeric: true,
+    answer: 256,
+    tolerance: 5,
+    unit: 'ms',
+    why: 'Time = Bytes / Bandwidth = 15.36 GB / 60 GB/s = 0.256 seconds = 256 milliseconds.'
+  },
+  {
+    q: 'Why is `np.argpartition` preferred over `np.argsort` when retrieving the top-10 matches from an array of 1,000,000 similarity scores?',
+    options: [
+      'argpartition computes cosine similarity on the GPU automatically',
+      'argpartition has O(N) complexity to isolate the top-k elements, whereas argsort has O(N log N) complexity to sort all 1M elements',
+      'argsort cannot handle floating-point values',
+      'argpartition normalizes scores into probabilities'
+    ],
+    answer: 1,
+    why: 'argsort sorts the entire array of 1M elements in O(N log N) time. argpartition isolates the top k elements in linear O(N) time using quickselect, saving significant CPU overhead.'
+  }
+]} />

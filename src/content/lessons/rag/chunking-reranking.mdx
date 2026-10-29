@@ -1,0 +1,323 @@
+---
+title: 'Chunking, query rewriting & reranking'
+summary: 'How to slice documents without severing meaning, why Anthropic contextual retrieval cuts failure rates by nearly half, and how cross-encoder rerankers filter 100 noisy candidates down to 5 precision facts.'
+objectives:
+  - Analyze the trade-offs of chunk size, boundary detection, and sliding-window overlap
+  - Explain Anthropic contextual retrieval and why prepending document context reduces retrieval failures
+  - Implement a conversational query rewriting pipeline that converts ambiguous follow-ups into standalone queries
+  - Contrast the attention mechanisms and computational complexity of bi-encoders versus cross-encoders
+  - Design a two-stage retrieval funnel that balances high recall with strict generator context budgets
+---
+import ChunkingReranking from '@/components/viz/rag/ChunkingReranking.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You have set up an embedding index with HNSW and BM25 hybrid search. Your retrieval latency is a brisk 4 milliseconds. Yet, when users test your assistant, it routinely fails:
+- An engineer asks: *"What was the root cause of the payment outage?"* The system retrieves a chunk that reads: *"It was caused by an unexpected change in configuration."* But the document never mentions which service *"It"* refers to, because the service name was defined three paragraphs earlier.
+- A user asks in a multi-turn conversation: *"What is the latency of our search engine?"* The assistant answers: *"35 milliseconds."* The user asks a follow-up: *"And what about in Tokyo?"* The retriever searches literally for the string *"And what about in Tokyo?"* and returns travel expense reimbursement policies for Japanese business trips.
+
+These failures did not occur because vector math was wrong or the index was poorly tuned. They occurred at the seams where raw unstructured text meets retrieval pipelines: **chunking**, **query formulation**, and **candidate reranking**.
+
+This lesson explores how to preprocess documents and queries to maximize information density, and how the two-stage retrieval funnel turns high-recall candidate pools into high-precision LLM prompts.
+
+## The chunking dilemma: Granularity vs. Context
+
+A raw document — an SEC filing, a 50-page architecture spec, or an internal customer support wiki — cannot be embedded as a single monolithic block. Embedding models have strict context length limits (typically 512 tokens for models like `all-MiniLM-L6-v2` or 8,192 tokens for modern models). Furthermore, averaging hundreds of sentences into a single vector dilutes specific facts into a vague semantic soup.
+
+We must break documents into **chunks**. But choosing chunk size is a delicate balancing act:
+
+```
+TINY CHUNKS (50–100 tokens):
+[ "In July, it increased by 4.2%." ]
+  -> Pros: High semantic specificity; vector points tightly to the exact sentence.
+  -> Cons: Context amnesia. Pronoun antecedents ("it"), subject definitions, and conditions are lost.
+
+MASSIVE CHUNKS (1,000–2,000 tokens):
+[ "Q3 Financials... Revenue expanded... Infrastructure migrated... Security audit..." ]
+  -> Pros: Retains global context, full sentences, and surrounding qualifications.
+  -> Cons: Embedding dilution. Multiple distinct concepts average together, degrading cosine similarity.
+     Wastes generator context window and bloats KV cache memory ($128\text{ KB}$/token on Llama-8B).
+```
+
+### Sliding Window Overlap
+To prevent critical facts from being cut in half across a chunk boundary, standard chunkers use **overlap**:
+
+$$
+\text{Step Size} = \text{Chunk Size} - \text{Overlap}
+$$
+
+For example, with a chunk size of 500 tokens and an overlap of 100 tokens (20%), Chunk 1 covers tokens $0 \dots 499$, Chunk 2 covers tokens $400 \dots 899$, and Chunk 3 covers tokens $800 \dots 1299$.
+
+Overlap guarantees that any sentence shorter than 100 tokens appears completely intact inside at least one chunk. However, overlap does not solve the fundamental problem of **orphan facts**: a sentence that makes sense only in light of the document's opening header.
+
+<Scrolly>
+  <ChunkingReranking client:visible slot="stage" />
+
+  <Step title="1. Chunk Size Trade-Off">
+    Tiny chunks lose surrounding subject definitions; huge chunks dilute embedding vectors and consume precious generator context. The production sweet spot for dense embeddings is typically **250 to 500 tokens**.
+  </Step>
+
+  <Step title="2. Anthropic Contextual Retrieval">
+    To eliminate orphan chunks without inflating chunk size, Anthropic introduced **Contextual Retrieval**: prepending a short 50–100 token LLM-generated document summary to each chunk before embedding.
+  </Step>
+
+  <Step title="3. Multi-Turn Query Rewriting">
+    Conversational follow-ups like *"What about in Europe?"* lack explicit nouns. A fast rewriter model expands the chat history into a self-contained search query before querying the index.
+  </Step>
+
+  <Step title="4. Bi-Encoder vs Cross-Encoder">
+    Bi-encoders embed query and document independently into fixed vectors ($O(1)$ search with ANN). Cross-encoders concatenate them into a single sequence, running full $O(L^2)$ bidirectional attention across all token pairs.
+  </Step>
+
+  <Step title="5. The Two-Stage Funnel">
+    Cross-encoders are too computationally expensive to score 1,000,000 documents. Production uses a funnel: Bi-Encoder + BM25 retrieves **top 100** candidates; a Cross-Encoder reranks them down to the **top 5**.
+  </Step>
+
+  <Step title="6. Cross-Encoder Token Attention">
+    Cross-encoders excel at catching negation (*"not approved"* vs *"approved"*), entity qualifiers, and subtle semantic shifts that vector dot products smooth away.
+  </Step>
+
+  <Step title="7. The End-to-End Pipeline">
+    The complete pipeline pairs wide-net candidate retrieval with surgical reranking, feeding the generator LLM clean, high-density facts that eliminate hallucinations.
+  </Step>
+</Scrolly>
+
+## Contextual retrieval: Fixing chunk amnesia
+
+In September 2024, Anthropic published a breakthrough methodology called **Contextual Retrieval**.
+
+### The Problem
+Consider an SEC filing for ACME Corp. On page 42, a table has the following text:
+
+> *"The enterprise contract revenue grew by 18% quarter-over-quarter, driven primarily by European expansion."*
+
+When chunked into isolation, this chunk contains neither the company name (*"ACME Corp"*), nor the document year (*"2024"*), nor the specific filing type (*"Q3 10-Q"*). When an executive asks: *"By what percentage did ACME's European revenue grow in Q3 2024?"*, both BM25 and vector search miss this chunk because none of those key terms appear anywhere in the text!
+
+### The Solution
+At ingestion time, pass each chunk through a fast, cost-effective language model alongside the entire parent document. The model generates 50 to 100 tokens of explanatory context situated specifically for that chunk.
+
+We prepend this context header to the chunk before computing both the dense embedding and the BM25 inverted index posting list:
+
+```markdown
+[Context: This chunk is from ACME Corp's Q3 2024 10-Q SEC filing, discussing segment revenue growth in the enterprise software division.]
+The enterprise contract revenue grew by 18% quarter-over-quarter, driven primarily by European expansion.
+```
+
+### The Empirical Results
+Anthropic's rigorous benchmarks measured the retrieval failure rate across diverse enterprise knowledge bases:
+- Traditional dense vector retrieval failure rate: **5.7%**
+- Contextual Embeddings alone: reduced failures by **35%** (down to 3.7%)
+- Contextual Embeddings + Contextual BM25 (Hybrid): reduced failures by **49%** (down to **2.9%**)!
+
+Prepending contextual text cut retrieval errors virtually in half. Thanks to prompt caching (Module 10), passing a 50-page parent document repeatedly to generate headers costs fractions of a cent, because the parent document prefix is cached in GPU memory across all chunk prompts.
+
+## Query rewriting for conversational search
+
+In production, users rarely search with clean, self-contained keyword strings. They interact through continuous, multi-turn dialogues:
+
+```
+User (Turn 1): "What is the token limit for Llama-3.1-8B?"
+Assistant:     "The native context window for Llama-3.1-8B is 128,000 tokens."
+User (Turn 2): "How much KV cache does that cost per token in BF16?"
+Assistant:     "It costs 128 KB per token."
+User (Turn 3): "And what about the 70B model?"
+```
+
+If you send the Turn 3 message (*"And what about the 70B model?"*) directly to your retriever:
+- It contains no mention of *"KV cache"*, *"BF16"*, or *"memory per token"*.
+- The retriever returns generic articles about Llama-3.1-70B model architecture and benchmark scores.
+- The generator LLM receives irrelevant context and cannot answer the question.
+
+### The Query Rewriting Pipeline
+Before hitting the retriever, multi-turn conversations pass through a **Query Rewriter**.
+
+A lightweight model (such as `Qwen2.5-1.5B-Instruct` or a small speculative draft engine) runs a single forward pass with a dedicated instruction prompt:
+
+```python
+REWRITE_PROMPT = """You are a search query reformulation engine. Given the conversation history and a follow-up user query, generate a single, completely self-contained search query.
+Resolve all pronouns (it, they, that, this) and incorporate all necessary context from earlier turns. Do NOT answer the question. Output only the rewritten query.
+
+Conversation History:
+User: What is the token limit for Llama-3.1-8B?
+Assistant: The native context window for Llama-3.1-8B is 128,000 tokens.
+User: How much KV cache does that cost per token in BF16?
+Assistant: It costs 128 KB per token.
+
+Follow-up query: "And what about the 70B model?"
+
+Self-contained query:"""
+```
+
+The output produced by the rewriter:
+> *"What is the KV cache memory cost per token in BF16 for Llama-3.1-70B?"*
+
+This rewritten query is packed with rich semantic tokens. It hits both the BM25 index and the vector index with maximum specificity, retrieving the exact 320 KB/token table from Module 05.
+
+On an NVIDIA T4 GPU, running a 1.5B model to generate 15 tokens of rewritten query takes under **20 milliseconds** — a trivial price to pay for eliminating conversational retrieval breakdowns.
+
+## Cross-Encoder rerankers: The second stage
+
+Once candidate chunks are retrieved, how do we order them for the generator?
+
+In Lesson 2, you learned that **Bi-Encoders** (dual-tower models) encode query $q$ and document $d$ completely independently:
+
+$$
+u = \text{Encoder}(q), \qquad v = \text{Encoder}(d)
+$$
+
+$$
+\text{Similarity}(q, d) = u \cdot v
+$$
+
+Because $u$ and $v$ are computed in isolation, query tokens **never attend to document tokens**. The model must compress the entire semantic complexity of the document into a single vector before it ever sees the query! This architectural separation is what makes $O(1)$ ANN search possible, but it comes at a significant cost in fine-grained linguistic comprehension.
+
+Enter the **Cross-Encoder**.
+
+### The Cross-Encoder Architecture
+A Cross-Encoder does not produce individual vectors. Instead, it concatenates the query and the candidate document into a single sequence separated by a delimiter token:
+
+$$
+\text{Input} = [\text{CLS}] \circ q_1 \circ q_2 \dots \circ [\text{SEP}] \circ d_1 \circ d_2 \dots \circ [\text{SEP}]
+$$
+
+This combined sequence is passed through a full transformer encoder.
+
+```
+BI-ENCODER (Dual Tower):
+[Query Tokens]    ──> [Transformer A] ──> Vector u ──┐
+                                                     ├──> Dot Product (u · v)
+[Document Tokens] ──> [Transformer B] ──> Vector v ──┘
+* No cross-token attention. Fast ANN search.
+
+CROSS-ENCODER (Joint Attention):
+[CLS] Query Tokens [SEP] Document Tokens [SEP]
+            │               │
+            ▼               ▼
+┌──────────────────────────────────────────────┐
+│  Full Bidirectional Multi-Head Self-Attention │
+│  (Every query word attends to every doc word) │
+└──────────────────────────────────────────────┘
+                        │
+                        ▼
+            Classification Head -> Relevance Score ∈ [0, 1]
+```
+
+At every single layer of the Cross-Encoder, **every query token attends directly to every document token**:
+- The word *"not"* in the query attends directly to the verb in the document, detecting subtle negations that bi-encoders blur.
+- Exact numeric bounds (*"greater than \$10,000"*) are directly checked against document numbers.
+- Word order and syntactic hierarchy are preserved with full transformer precision.
+
+### The Computational Asymmetry
+Why don't we use Cross-Encoders for the entire retrieval process?
+
+Recall that transformer self-attention scales quadratically with sequence length: $O(L^2)$ FLOPs per layer.
+- If an average query is 30 tokens and a chunk is 250 tokens, sequence length is $L = 280$.
+- Scoring **one single document** with a Cross-Encoder requires a full transformer forward pass over 280 tokens.
+- To search a database of **1,000,000 documents**, you would need to run 1,000,000 transformer forward passes!
+- On an NVIDIA H100 GPU, that would take over **15 minutes per query**.
+
+### The Two-Stage Retrieval Funnel
+Production systems resolve this trade-off by combining both architectures into a **Two-Stage Funnel**:
+
+```
+[1,000,000 Corpus Chunks]
+           │
+           │  STAGE 1: Candidate Generation (Bi-Encoder + BM25)
+           │  * Cheap dot products and inverted index lookups
+           │  * Latency: ~3 ms
+           ▼
+    [Top 100 Chunks]
+           │
+           │  STAGE 2: Cross-Encoder Reranking (e.g. bge-reranker-large)
+           │  * Joint cross-attention across 100 pairs
+           │  * Latency: ~15 ms
+           ▼
+     [Top 5 Chunks]
+           │
+           ▼
+    [Generator LLM Context]
+```
+
+1. **Stage 1 (High Recall):** We cast a wide net. Hybrid search (Bi-Encoder + BM25 with RRF) retrieves the top $K_1 = 100$ candidate chunks from the 1,000,000-document database. This takes roughly **3 to 5 milliseconds**.
+2. **Stage 2 (High Precision):** A lightweight Cross-Encoder (such as `cross-encoder/ms-marco-MiniLM-L-6-v2` or `bge-reranker-base`) evaluates those 100 candidates in a single batched forward pass. This takes roughly **12 to 18 milliseconds** on a GPU.
+3. The candidates are sorted by their cross-encoder score, and only the pristine **top 5 chunks** are injected into the generator's prompt.
+
+Total retrieval time: $5\text{ ms} + 15\text{ ms} = \mathbf{20\ \text{ms}}$. The generator LLM receives a compact, noise-free prompt of ~1,250 tokens rather than a polluted 25,000-token haystack.
+
+<Callout type="real" title="Now read the paper / technical report">
+  **Introducing Contextual Retrieval**
+  *Anthropic Engineering Blog, September 2024.*
+
+  - **Read:** The sections on "Contextual Embeddings" and "Contextual BM25", noting how prompt caching makes offline context injection economically viable.
+  - **Examine:** The benchmark comparison chart showing the jump from standard RAG (5.7% failure) to Contextual Hybrid RAG (2.9% failure).
+  - **What you will recognize:** The exact mechanics of chunk amnesia and why lexical and semantic search are complementary rather than competing paradigms.
+</Callout>
+
+<KeyNotes>
+  1. **Chunk size involves a strict trade-off:** tiny chunks (&lt;100 tokens) cause context amnesia; huge chunks (&gt;1,000 tokens) dilute embeddings and bloat KV cache memory.
+  2. **Sliding window overlap** (typically 10–20%) ensures sentences bridging chunk boundaries are preserved intact.
+  3. **Anthropic Contextual Retrieval** prepends 50–100 tokens of document-level summary to each chunk before indexing, cutting retrieval failures by up to **49%** when paired with hybrid search.
+  4. **Query Rewriting** converts ambiguous multi-turn conversation follow-ups into explicit, standalone search queries before hitting the index.
+  5. **Bi-encoders** encode query and document independently ($O(1)$ ANN search, no cross-token attention); **cross-encoders** run full bidirectional self-attention across concatenated token pairs ($O(L^2)$ compute).
+  6. **The Two-Stage Funnel:** Stage 1 uses fast Hybrid search to retrieve the **top 100** candidates (~3 ms); Stage 2 uses a Cross-Encoder to rerank down to the **top 5** high-precision chunks (~15 ms).
+  7. Reranking keeps irrelevant noise out of the generator context, avoiding the *lost in the middle* phenomenon and saving substantial prefill FLOPs.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why are cross-encoders not used to search directly across a full database of 1,000,000 documents?',
+    options: [
+      'Cross-encoders cannot output numerical similarity scores',
+      'Cross-encoders require concatenating the query with each document and running full transformer self-attention over all token pairs, making a 1M-document scan computationally prohibitive in real time',
+      'Cross-encoders are only compatible with CPU architectures',
+      'Cross-encoders only work on single-character queries'
+    ],
+    answer: 1,
+    why: 'Cross-encoders run joint self-attention across query and document tokens (O(L^2) complexity). Running 1,000,000 full forward passes per query would take several minutes on an H100 GPU.'
+  },
+  {
+    q: 'According to empirical benchmarks by Anthropic (2024), what was the reduction in retrieval failure rate when combining Contextual Embeddings with Contextual BM25 compared to standard uncontextualized embeddings?',
+    numeric: true,
+    answer: 49,
+    tolerance: 2,
+    unit: '%',
+    why: 'Anthropic reported that retrieval failure rate dropped from 5.7% to 2.9%, representing an approximate 49% reduction in retrieval failures.'
+  },
+  {
+    q: 'A production RAG funnel retrieves 100 candidate chunks (each 250 tokens) from an initial hybrid search. The cross-encoder reranks them down to 5 chunks before passing them to Llama-3.1-8B (which requires 128 KB of KV cache per token). How much KV cache memory in megabytes (MB = $10^6$ bytes) is SAVED during the generation prefill by reranking down to 5 chunks instead of feeding all 100 chunks?',
+    numeric: true,
+    answer: 3113,
+    tolerance: 100,
+    unit: 'MB',
+    why: 'Tokens pruned = (100 − 5) × 250 = 23,750 tokens. Llama-3.1-8B stores 128 KB = 131,072 bytes of KV cache per token, so the saving is 23,750 × 131,072 = 3,112,960,000 bytes ≈ 3,113 MB.',
+    options: [
+      'It translates non-English languages into Latin',
+      'It expands conversational follow-ups containing pronouns and omitted subjects into self-contained search queries packed with explicit entities',
+      'It encrypts user queries to comply with GDPR',
+      'It compresses 100 tokens into 1 token'
+    ],
+    answer: 1,
+    why: 'Conversational follow-ups (e.g. "What about in 2024?") lack nouns and context. Query rewriting restores the missing context from dialogue history so the retriever can find the intended documents.'
+  },
+  {
+    q: 'What problem does sliding window chunk overlap (e.g. 50 tokens on 500-token chunks) specifically solve?',
+    options: [
+      'It prevents sentences that span chunk boundaries from being cut in half and losing their local meaning',
+      'It compresses the vector index size by 50%',
+      'It eliminates the need for an inverted index',
+      'It automatically corrects typographical spelling mistakes'
+    ],
+    answer: 0,
+    why: 'Overlap ensures that text crossing an arbitrary token boundary is preserved intact in at least one adjacent chunk, preventing fractured phrases.'
+  },
+  {
+    q: 'In a production two-stage retrieval pipeline, what is the typical recommended ratio of candidate chunks retrieved at Stage 1 versus chunks passed to the generator LLM at Stage 2?',
+    options: [
+      'Retrieve 5, pass 5',
+      'Retrieve 100 candidates, rerank down to 5',
+      'Retrieve 100,000 candidates, rerank down to 10,000',
+      'Retrieve 1 candidate, rerank down to 0'
+    ],
+    answer: 1,
+    why: 'The standard funnel casts a broad net at Stage 1 (top 100 candidates via fast Bi-Encoder + BM25 in ~3 ms) and filters down with a Cross-Encoder to the top 5 cleanest chunks for the generator prompt.'
+  }
+]} />
