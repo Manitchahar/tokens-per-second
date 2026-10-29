@@ -1,0 +1,349 @@
+---
+title: 'How a model learns: loss & gradient descent'
+summary: 'Nobody typed in Llama’s 8 billion weights. This lesson shows how they were found: one number that measures how wrong the model is, a slope that says which way is downhill, and a loop that takes hundreds of thousands of small steps.'
+objectives:
+  - Compute a squared-error loss and a cross-entropy loss by hand
+  - Take a gradient-descent step by hand and predict which learning rates will diverge
+  - Run backpropagation through a two-layer network with the chain rule, and check it numerically
+  - 'Explain mini-batches, SGD and Adam, and write the training loop: forward, loss, backward, update'
+  - Explain why training needs about 16 bytes per weight while inference needs 2
+---
+import LossDescent from '@/components/viz/transformers/LossDescent.tsx';
+import BackpropViz from '@/components/viz/transformers/BackpropViz.tsx';
+import OptimizerPaths from '@/components/viz/transformers/OptimizerPaths.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson ended on one sentence: **training moves the weights, inference reads them.** You now know what a weight is and where Llama-3.1-8B keeps its 8.03 billion of them. But nobody typed those numbers in. When training began they were random, and a model with random weights produces random garbage. Somewhere between that garbage and a model that writes code, 8.03 billion numbers were each set to a useful value.
+
+This lesson is how. It is the only lesson in the course about training, and it is here for three reasons. Every later idea about inference assumes you know what training left behind. Finetuning, RL rollouts and quantization-aware tricks all bring training back later in the course. And the arithmetic of training, its loss, its gradients and its 16 bytes per weight, is the clearest way to see why inference is so much cheaper per step.
+
+## The obvious way, and why it fails
+
+Suppose you have a model with random weights and a pile of text it should predict. The most obvious way to improve it: **pick one weight, nudge it up a little, run the model again, and keep the nudge if the answers got better.** Then do the next weight.
+
+That works. It is also hopeless. To learn which way to nudge every weight once, you need one extra run of the model per weight. For Llama-3.1-8B that is **8.03 billion forward passes for a single improvement**, and training needs hundreds of thousands of improvements.
+
+What we need is a way to get the right direction for **all 8.03 billion weights at once**, for about the cost of running the model a few times. That method exists, it is called backpropagation, and it needs two ideas first: a single number that measures "how wrong", and the slope of that number.
+
+## Loss: one number for "how wrong"
+
+Start with the smallest model there is: one weight, $w$, and the prediction $\hat y = w \cdot x$. You have three examples, and they happen to follow $y = 2x$:
+
+| input $x$ | true answer $y$ | model's guess at $w = 0.5$ | error $\hat y - y$ | squared |
+|---|---|---|---|---|
+| 1 | 2 | 0.5 | −1.5 | 2.25 |
+| 2 | 4 | 1.0 | −3.0 | 9.00 |
+| 3 | 6 | 1.5 | −4.5 | 20.25 |
+
+Average the squared errors and you have the **mean squared error**:
+
+$$
+L(w) = \frac{1}{3}\sum_{i=1}^{3}(w x_i - y_i)^2 = \frac{2.25 + 9 + 20.25}{3} = 10.5
+$$
+
+That number is the <Term t="loss">loss</Term>. It is zero only when every prediction is exactly right, and it grows the more wrong the model is. Squaring does two jobs: an error of −3 counts as badly as +3, and big errors count much more than small ones.
+
+<Callout type="intuition" title="Why it has to be one number">
+  "Better" only means something if you can compare. With one number you can always say whether a change helped: 10.5 went to 2.99, so it did. With two numbers that can move in opposite directions you cannot. That is why every training run, however complicated the model, boils everything down to a single scalar. The whole of training is the instruction **make this one number smaller**.
+</Callout>
+
+**For a language model the loss is different, but still one number.** The model outputs a probability for every token in its vocabulary (you will see exactly how in 03.9). The loss for one position is minus the natural log of the probability it gave to the token that really came next:
+
+$$
+L = -\ln p(\text{correct token})
+$$
+
+| probability on the right token | loss $-\ln p$ |
+|---|---|
+| 0.9 | 0.105 |
+| 0.5 | 0.693 |
+| 0.1 | 2.303 |
+| 0.01 | 4.605 |
+| 1 / 128,256 (a uniform guess) | 11.76 |
+
+This is called **cross-entropy**. A confident right answer costs almost nothing; a confident wrong one costs a lot. The last row is where a freshly initialised model with Llama-3's 128,256-token vocabulary starts: it knows nothing, spreads its bets evenly, and pays $\ln 128{,}256 = 11.76$ per token. Training averages this loss over millions of positions at a time and pushes it down. Module 3A takes cross-entropy apart properly; here all you need is that it is a single number, and that smaller is better.
+
+## Rolling downhill
+
+Back to the one-weight model. Every choice of $w$ gives a loss, so you can draw the loss as a curve over $w$, and on that curve the right weight is simply the lowest point. Scroll through it.
+
+<Scrolly>
+  <LossDescent client:visible slot="stage" />
+
+  <Step title="1. A model that is wrong">
+    Three examples that follow $y = 2x$, and a one-weight model $\hat y = w \cdot x$ starting at $w = 0.5$. Its line is far too flat. Each red bar is one error: the gap between the guess and the truth.
+  </Step>
+
+  <Step title="2. Loss: one number for how wrong">
+    Square the three errors (2.25, 9 and 20.25) and average them: **L = 10.5**. Whatever the model, this is the move that matters: collapse "how wrong" into one number that can only be compared, not argued with.
+  </Step>
+
+  <Step title="3. Every weight has a loss">
+    Try every possible $w$ and plot its loss. You get a bowl with its bottom at $w = 2$, where the line passes through all three points and the loss is zero. **Drag the weight yourself.** Finding the bottom by hand is easy for one knob. For 8.03 billion knobs it is impossible.
+  </Step>
+
+  <Step title="4. The slope points uphill">
+    The slope of the bowl under the ball is the **gradient**, written $dL/dw$. At $w = 0.5$ it is **−14**: the loss falls as $w$ grows. The slope always points uphill, so to go down you move the opposite way. Drag $w$ past 2 and watch the slope flip sign.
+  </Step>
+
+  <Step title="5. Take one step downhill">
+    The update rule is $w \leftarrow w - \eta \cdot dL/dw$, where $\eta$ (eta) is the **learning rate**. At $\eta = 0.05$ the step is $-0.05 \times (-14) = +0.7$, so $w$ goes from 0.5 to **1.2** and the loss falls from 10.5 to **2.99**.
+  </Step>
+
+  <Step title="6. Repeat until the bottom">
+    From the new spot the slope is smaller (−7.47), so the next step is smaller too. The ball slows as the bowl flattens, all by itself. **After 6 steps the loss is below 0.01.** Drag $\eta$ and watch the readout: the number of steps it takes depends entirely on the step size.
+  </Step>
+
+  <Step title="7. Too big a step: divergence">
+    At $\eta = 0.25$ each step overshoots the bottom by more than the distance it started from: $w$ goes 0.5 → 4.0 → −0.67 → 5.56. The loss **grows** 1.78× per step. This is divergence, and in a real training run it shows up as a loss that suddenly shoots up to infinity or NaN.
+  </Step>
+
+  <Step title="8. Too small a step: crawling">
+    At $\eta = 0.005$ nothing breaks, but after 8 steps the loss is still 4.9. It takes **73 steps** to get below 0.01, against 6 at $\eta = 0.05$. Too small wastes compute; too large blows up. Picking the learning rate is the first decision of every training run.
+  </Step>
+</Scrolly>
+
+## Then derive it properly: one weight, real numbers
+
+Expand the loss. Every error is $w x_i - 2x_i = (w - 2)x_i$, so
+
+$$
+L(w) = \frac{1}{3}\sum_i x_i^2 (w-2)^2 = \frac{1 + 4 + 9}{3}(w - 2)^2 = \frac{14}{3}(w-2)^2
+$$
+
+A parabola with its bottom at $w = 2$, exactly the bowl in the visual. Its slope is the derivative:
+
+$$
+\frac{dL}{dw} = \frac{28}{3}(w - 2) \approx 9.33\,(w - 2)
+$$
+
+At $w = 0.5$: ${}9.33 \times (-1.5) = -14$. Now apply <Term t="gradient-descent">gradient descent</Term> with a <Term t="learning-rate">learning rate</Term> $\eta = 0.05$, step by step:
+
+| step | $w$ | loss $L(w)$ | slope $dL/dw$ | update $-\eta \cdot$ slope |
+|---|---|---|---|---|
+| 0 | 0.500 | 10.50 | −14.00 | +0.700 |
+| 1 | 1.200 | 2.987 | −7.467 | +0.373 |
+| 2 | 1.573 | 0.850 | −3.982 | +0.199 |
+| 3 | 1.772 | 0.242 | −2.124 | +0.106 |
+| 4 | 1.879 | 0.069 | −1.133 | +0.057 |
+| 5 | 1.935 | 0.0196 | −0.604 | +0.030 |
+| 6 | 1.966 | 0.0056 | −0.322 | +0.016 |
+
+Nobody told the algorithm to slow down near the bottom. The steps shrink because the slope shrinks. That is the quiet elegance of gradient descent: **the slope is both the direction and, scaled by $\eta$, the step size.**
+
+### When does it blow up?
+
+Watch the distance to the bottom, $e = w - 2$. One update gives
+
+$$
+e_{\text{new}} = e - \eta \cdot \tfrac{28}{3} e = \left(1 - 9.33\,\eta\right) e
+$$
+
+So every step multiplies the distance by the same factor, ${}1 - 9.33\eta$. If that factor is between −1 and 1, the distance shrinks and training converges. If it is beyond −1, every step lands farther away on the other side. Solve $|1 - 9.33\eta| < 1$:
+
+$$
+0 < \eta < \frac{2}{9.33} = 0.214
+$$
+
+| learning rate $\eta$ | factor ${}1 - 9.33\eta$ | steps until $L < 0.01$ | what you see |
+|---|---|---|---|
+| 0.005 | 0.953 | 73 | a crawl |
+| 0.05 | 0.533 | 6 | smooth descent |
+| 0.107 (= 3/28) | ≈ 0 | 1 | lands on the bottom in one step |
+| 0.15 | −0.400 | 4 | bounces across, settles fast |
+| 0.20 | −0.867 | 25 | bounces back and forth for a long time |
+| 0.25 | −1.333 | never | divergence |
+
+<Callout type="math" title="The steepness of the bowl sets the speed limit">
+  The 9.33 is the **curvature** of the bowl: how fast the slope itself changes. The rule you just derived is general: gradient descent on a bowl of curvature $c$ is stable only for $\eta < 2/c$.
+
+  A real network has billions of directions, each with its own curvature, and one learning rate for all of them. The **steepest** direction caps $\eta$, because above ${}2/c_{\max}$ that direction diverges. The **flattest** direction then crawls at that small $\eta$ and decides how long training takes. That mismatch is exactly what the Adam optimizer, later in this lesson, is designed to fix.
+</Callout>
+
+## Many weights: the gradient is a vector
+
+With two weights $w_1, w_2$ the loss is a surface over a plane, a landscape with hills and valleys. The slope now has a direction: you ask how fast the loss changes if you nudge $w_1$ alone, and if you nudge $w_2$ alone. Those two numbers are the **partial derivatives**, and together they form the <Term t="gradient">gradient</Term>:
+
+$$
+\nabla L = \left[\frac{\partial L}{\partial w_1},\ \frac{\partial L}{\partial w_2}\right], \qquad \mathbf{w} \leftarrow \mathbf{w} - \eta\, \nabla L
+$$
+
+Nothing else changes. The gradient points straight uphill on the surface, and the update steps every weight at once, each by its own partial derivative. For Llama-3.1-8B, $\nabla L$ is a list of **8.03 billion numbers**, one per weight, the same shape as the model itself. The only question left is how to compute it without 8.03 billion extra forward passes.
+
+## Backpropagation: the chain rule as bookkeeping
+
+Take the smallest network with two layers. One input $x$, two weights, a ReLU in between:
+
+$$
+z = w_1 x, \qquad a = \mathrm{ReLU}(z), \qquad \hat y = w_2\, a, \qquad L = (\hat y - y)^2
+$$
+
+Use $x = 1.5$, $w_1 = 0.8$, $w_2 = 0.5$ and target $y = 2$. The **forward pass** is what 03.1 already taught: $z = 1.2$, $a = 1.2$ (ReLU leaves positives alone), $\hat y = 0.6$, and the loss is $(0.6 - 2)^2 = 1.96$.
+
+The **backward pass** answers: if I nudge a weight, how much does the loss move? Each operation in the chain only needs to know its own local slope, and the **chain rule** says the slopes along a path multiply:
+
+$$
+\frac{\partial L}{\partial w_1} = \frac{\partial L}{\partial \hat y} \cdot \frac{\partial \hat y}{\partial a} \cdot \frac{\partial a}{\partial z} \cdot \frac{\partial z}{\partial w_1}
+$$
+
+Step through it in the visual, then check every number below.
+
+<BackpropViz client:visible />
+
+| quantity | rule | value |
+|---|---|---|
+| $\partial L / \partial \hat y$ | ${}2(\hat y - y)$ | ${}2 \times (0.6 - 2) = -2.8$ |
+| $\partial L / \partial w_2$ | $\partial L/\partial \hat y \times a$ | $-2.8 \times 1.2 = -3.36$ |
+| $\partial L / \partial a$ | $\partial L/\partial \hat y \times w_2$ | $-2.8 \times 0.5 = -1.4$ |
+| $\partial L / \partial z$ | $\partial L/\partial a \times \mathrm{ReLU}'(z)$ | $-1.4 \times 1 = -1.4$ |
+| $\partial L / \partial w_1$ | $\partial L/\partial z \times x$ | $-1.4 \times 1.5 = -2.1$ |
+
+Both gradients are negative, so both weights should **increase**. With $\eta = 0.05$: $w_1 \leftarrow 0.8 + 0.105 = 0.905$ and $w_2 \leftarrow 0.5 + 0.168 = 0.668$. Run forward again: $\hat y = 0.668 \times (0.905 \times 1.5) = 0.907$, and the loss drops from 1.96 to **1.20**.
+
+Three things make this <Term t="backpropagation">backpropagation</Term> rather than just "the chain rule":
+
+- **It runs once, from the loss backwards.** $\partial L/\partial a$ was computed one time and then reused for everything to its left. In a real network, the gradient arriving at layer 16 is computed once and shared by every weight in layers 1–16. That sharing is the whole trick: **one backward sweep gives the gradient for every weight**.
+- **It needs the forward values.** $\partial L/\partial w_2$ needed $a = 1.2$, and $\partial L/\partial w_1$ needed $x = 1.5$. So the forward pass must **keep its intermediate results** (the "activations") in memory until the backward pass uses them. Inference throws them away immediately.
+- **The nonlinearity can block it.** Drag $x$ below zero in the visual: $z$ becomes negative, ReLU's slope is 0, and **no gradient reaches $w_1$**. A neuron stuck there stops learning. This is one reason current models prefer SiLU, which still passes a small, non-zero slope for most negative inputs instead of a flat zero.
+
+<Callout type="math" title="Why a training step costs about three forward passes">
+  For a matrix multiply $y = Wx$, the forward pass is one matmul. The backward pass needs two: one to send the gradient back to the input ($W^\top \cdot \partial L/\partial y$, so the layer below can continue) and one to get the weight's own gradient ($\partial L/\partial y \cdot x^\top$). Same shapes, same cost.
+
+  So per token: forward ≈ ${}2N$ FLOPs (Module 01), backward ≈ ${}4N$, total ≈ ${}6N$ for a model with $N$ parameters. **That 6 is the 6 in $C \approx 6ND$**, the training-compute formula Module 3B is built on. Inference pays only the ${}2N$.
+</Callout>
+
+### In code: by hand, checked, then automatic
+
+```python
+# The two-layer net, by hand
+x, y = 1.5, 2.0
+w1, w2 = 0.8, 0.5
+
+def loss(w1, w2):
+    a = max(0.0, w1 * x)           # z = w1·x, then ReLU
+    return (w2 * a - y) ** 2
+
+# forward
+z = w1 * x; a = max(0.0, z); y_hat = w2 * a
+# backward: multiply local slopes from the loss back
+dy_hat = 2 * (y_hat - y)           # -2.8
+dw2 = dy_hat * a                   # -3.36
+da = dy_hat * w2                   # -1.4
+dz = da * (1.0 if z > 0 else 0.0)  # -1.4
+dw1 = dz * x                       # -2.1
+
+# check against the slow way: nudge each weight and re-run (finite differences)
+h = 1e-5
+print(dw1, (loss(w1 + h, w2) - loss(w1 - h, w2)) / (2 * h))   # -2.1  -2.1
+print(dw2, (loss(w1, w2 + h) - loss(w1, w2 - h)) / (2 * h))   # -3.36 -3.36
+
+# PyTorch does the same bookkeeping automatically ("autograd")
+import torch
+W1 = torch.tensor(0.8, requires_grad=True)
+W2 = torch.tensor(0.5, requires_grad=True)
+L = (W2 * torch.relu(W1 * 1.5) - 2.0) ** 2
+L.backward()                      # one backward sweep
+print(W1.grad, W2.grad)           # tensor(-2.1000) tensor(-3.3600)
+```
+
+The finite-difference check is the "obvious way" from the start of the lesson, and it agrees. It needed two extra runs **per weight**; backward needed one sweep for all of them. With two weights that hardly matters. With 8.03 billion it is the difference between possible and impossible.
+
+## Mini-batches and SGD
+
+The loss you really want to minimise is the average over **all** your data. LLaMA-7B was trained on 1.0 trillion tokens. Computing the exact gradient would mean a forward and backward pass over a trillion tokens for **every single step**.
+
+So nobody does. Instead, each step draws a random **mini-batch**, computes the loss and gradient on just that sample, and steps. The mini-batch gradient is not the true gradient, but it points the right way **on average**, and it costs a tiny fraction of the work. This is **stochastic gradient descent** (SGD): "stochastic" because each step's direction is a little random.
+
+How random? A mini-batch averages $B$ noisy per-example gradients, and averaging $B$ independent samples shrinks the noise by $\sqrt{B}$:
+
+$$
+\text{noise in the step} \;\propto\; \frac{1}{\sqrt{B}}
+$$
+
+Going from 16 examples to 64 halves the noise; from 16 to 256 cuts it by 4. Bigger batches give straighter steps but cost more per step, so you get fewer steps for the same compute. Real LLM runs use enormous batches: LLaMA used **4 million tokens per step**, so its 1.0T tokens took about 1.0T ÷ 4M ≈ **250,000 steps**.
+
+<OptimizerPaths client:visible />
+
+<Callout type="pitfall" title="An epoch is not a step">
+  An **epoch** is one full pass over the dataset. A **step** is one mini-batch update. Small models trained on small datasets run many epochs. LLMs are the opposite: they see most of their text about **once**. LLaMA's 1.4T-token runs passed over their web text about 1.1 times and over Wikipedia and books a little over twice. So "trained for about one epoch" is normal for an LLM and does not mean it was trained briefly.
+</Callout>
+
+## The training loop
+
+Put the pieces together and every training run in the world, from the two-weight net above to Llama-3, is the same four lines in a loop:
+
+```python
+model = MyModel()                                     # random weights
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+
+for x, y in data_loader:          # one mini-batch per step
+    logits = model(x)             # 1. forward: run the model, keep the activations
+    loss = loss_fn(logits, y)     # 2. loss: one number for how wrong
+    loss.backward()               # 3. backward: a gradient for every weight
+    opt.step()                    # 4. update: move every weight a little downhill
+    opt.zero_grad()               # forget this step's gradients before the next one
+```
+
+That is genuinely all of it. The engineering of a real run, thousands of GPUs, mixed precision, checkpointing, data pipelines, exists to make that loop run fast and not crash for weeks. Two details deserve a sentence each:
+
+- **The learning rate is not constant.** Runs start with a **warm-up** (raise $\eta$ from near zero over the first steps, while the weights are still random and gradients are wild) and end with a **decay** (shrink $\eta$ so the ball settles into the bottom instead of rattling around it). LLaMA-7B warmed up over 2,000 steps to a peak of ${}3 \times 10^{-4}$, then followed a cosine curve down to 10% of that peak.
+- **The gradients are zeroed every step.** PyTorch adds new gradients to old ones by default, so forgetting `zero_grad()` silently sums gradients across steps. It is the first bug almost everyone writes.
+
+### Adam, in one paragraph
+
+Plain SGD uses one learning rate for every weight, and the math callout above showed why that hurts: the steepest direction caps the step and the flattest one crawls. <Term t="adam">Adam</Term> (Kingma & Ba, 2014) gives each weight its own step size. For every weight it keeps two running averages: $m$, the average gradient (a "momentum" that smooths out mini-batch noise, typically with $\beta_1 = 0.9$, roughly the last 10 steps), and $v$, the average **squared** gradient (how big this weight's gradients usually are, $\beta_2 = 0.999$ by default, 0.95 in LLaMA). The update is $\eta \cdot m / (\sqrt{v} + \epsilon)$: a weight with large, consistent gradients gets divided by a large $\sqrt{v}$ and takes careful steps, while a weight with tiny gradients gets divided by a tiny one and moves at a similar pace. In the visual above, that is why Adam's path does not zig-zag. **AdamW** is Adam with weight decay applied separately (a gentle pull of every weight toward zero), and it is what almost every LLM, LLaMA included, was trained with. The price: two extra numbers, $m$ and $v$, stored for **every** weight.
+
+## What training leaves behind, and why inference is lighter
+
+Count the bytes a training step needs per parameter, in the standard mixed-precision setup:
+
+| what | format | bytes per parameter |
+|---|---|---|
+| weights used in forward and backward | BF16 | 2 |
+| gradients | BF16 | 2 |
+| master copy of the weights (updates are tiny; BF16 would round them away) | FP32 | 4 |
+| Adam momentum $m$ | FP32 | 4 |
+| Adam variance $v$ | FP32 | 4 |
+| **total, before activations** | | **16** |
+
+For Llama-3.1-8B: ${}8.03 \times 10^9 \times 16 = 128.5$ GB, before storing a single activation for the backward pass. That does not fit on one 80 GB H100, which is why training even an 8B model is a multi-GPU job.
+
+Now inference. No gradients, no master weights, no optimizer state, and every activation is thrown away as soon as the next layer has read it:
+
+| | training (AdamW, mixed precision) | inference (BF16) |
+|---|---|---|
+| bytes per weight | 16 | 2 |
+| Llama-3.1-8B | 128.5 GB + activations | 16.1 GB + KV cache |
+| FLOPs per token | ≈ ${}6N$ | ≈ ${}2N$ |
+| activations | kept for the backward pass | discarded layer by layer |
+| weights | change every step | **read-only** |
+
+<Callout type="mentor" title="What to carry into the rest of the course">
+  Training produced exactly one thing that inference uses: **the final weights**. The optimizer state, the gradients, the learning-rate schedule and the activations all stayed behind. When you load a checkpoint with `from_pretrained`, you are loading the place where the ball stopped rolling.
+
+  That is why inference code runs under `torch.inference_mode()`: it tells PyTorch not to record the forward pass for a backward pass that will never come, which saves memory and time. And it is why everything from Module 05 onwards is about moving those frozen weights, plus the KV cache, through the GPU as fast as possible.
+</Callout>
+
+<Callout type="real" title="Where training comes back later">
+  You will meet this loop again three times. **Finetuning** (Part B) runs it on a small dataset starting from pretrained weights instead of random ones. **LoRA** (Module 26) freezes the big matrices and trains only tiny added ones, so the 16-bytes-per-weight bill applies to a few million numbers instead of billions. And **RL training** (Module 26) alternates this loop with huge bursts of generation, which is pure inference, so the techniques in this course end up speeding up training too.
+</Callout>
+
+<KeyNotes>
+  1. Training needs **one number** to minimise: the **loss**. Mean squared error for numbers; for a language model, cross-entropy, $-\ln p(\text{correct token})$, which starts near $\ln 128{,}256 = 11.76$ for a random Llama-3-sized model.
+  2. The **gradient** is the slope of the loss with respect to every weight: as many numbers as the model has parameters, pointing uphill. **Gradient descent** steps the other way: $w \leftarrow w - \eta \nabla L$.
+  3. For the one-weight bowl $L = \frac{14}{3}(w-2)^2$, starting at $w = 0.5$ with $\eta = 0.05$, the loss falls 10.5 → 2.99 → 0.85 and is below 0.01 after 6 steps. Steps shrink on their own because the slope shrinks.
+  4. A learning rate above ${}2/c$ (here ${}2/9.33 = 0.214$) diverges; a tiny one crawls (73 steps at 0.005). In a real network the steepest direction caps $\eta$ and the flattest one sets how long training takes.
+  5. **Backpropagation** is the chain rule run once, backwards from the loss, reusing each intermediate gradient. In the two-layer example $\partial L/\partial w_2 = -3.36$ and $\partial L/\partial w_1 = -2.1$, and one update cuts the loss from 1.96 to 1.20.
+  6. A training step costs about **3 forward passes** (backward ≈ 2× forward), so ≈ ${}6N$ FLOPs per token versus ≈ ${}2N$ for inference. That is the 6 in $C \approx 6ND$.
+  7. **SGD** estimates the gradient on a random mini-batch; the noise shrinks like ${}1/\sqrt{B}$. LLaMA used 4M-token batches, about 250,000 steps for 1.0T tokens. **AdamW** gives each weight its own step size from running averages of its gradient and squared gradient.
+  8. Training with AdamW in mixed precision needs about **16 bytes per weight** (128.5 GB for an 8B model, before activations); inference needs **2**. Training leaves behind only the final weights, and inference only ever reads them.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'With the data (1, 2), (2, 4), (3, 6) and the model ŷ = w·x, what is the mean squared error at w = 1?', numeric: true, answer: 4.667, tolerance: 0.1, why: 'Predictions 1, 2, 3 against 2, 4, 6 give errors −1, −2, −3. Squared: 1, 4, 9. Mean: 14 ÷ 3 = 4.67. Check with the formula: (14/3)(1 − 2)² = 4.67.' },
+  { q: 'At w = 0.5 the slope dL/dw is −14. With a learning rate of 0.05, what is w after one gradient-descent step?', numeric: true, answer: 1.2, tolerance: 0.01, why: 'w ← w − η·slope = 0.5 − 0.05 × (−14) = 0.5 + 0.7 = 1.2. The slope is negative, so the step increases w.' },
+  { q: 'For the bowl L = (14/3)(w − 2)², each step multiplies the distance to the bottom by (1 − 9.33η). Which learning rate diverges?', options: ['0.005', '0.05', '0.15', '0.25'], answer: 3, why: 'Training converges only if |1 − 9.33η| < 1, i.e. η < 0.214. At 0.25 the factor is −1.33: every step lands 1.33× farther from the bottom, on alternating sides. 0.15 gives −0.40, which bounces but still converges.' },
+  { q: 'A two-layer net has z = w1·x, a = ReLU(z), ŷ = w2·a, L = (ŷ − y)², with x = 1, w1 = 1, w2 = 1 and target y = 3. What is ∂L/∂w1?', numeric: true, answer: -4, tolerance: 0.05, why: 'Forward: z = 1, a = 1, ŷ = 1. Backward: ∂L/∂ŷ = 2(1 − 3) = −4; × w2 = 1 gives ∂L/∂a = −4; × ReLU′ = 1 (z > 0) gives ∂L/∂z = −4; × x = 1 gives ∂L/∂w1 = −4.' },
+  { q: 'Training Llama-3.1-8B (8.03 B parameters) with AdamW in mixed precision needs about 16 bytes per parameter before activations. How many GB is that?', numeric: true, answer: 128.5, tolerance: 3, unit: 'GB', why: '8.03e9 × (2 BF16 weights + 2 BF16 gradients + 4 FP32 master weights + 4 Adam m + 4 Adam v) = 8.03e9 × 16 = 128.5e9 bytes. Inference needs only the 2-byte weights: 16.1 GB.' },
+  { q: 'You raise the mini-batch from 16 to 256 examples. By what factor does the noise in each gradient step shrink?', numeric: true, answer: 4, tolerance: 0.1, why: 'Noise scales like 1/√B. √(256/16) = √16 = 4. Sixteen times the work per step buys four times less noise, which is why batch size is a trade-off rather than "bigger is always better".' },
+] } />

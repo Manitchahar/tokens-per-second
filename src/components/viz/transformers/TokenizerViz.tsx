@@ -159,7 +159,7 @@ export default function TokenizerViz() {
             })}
             <Label x={30} y={296} tone={3} size={9.5}>{`Llama-3.1 has 128,256 entries; Qwen2.5 has 151,936. Same idea, 5,500× more of them.`}</Label>
             <Label x={30} y={314} tone={3} size={9.5}>{'An ID is not a meaning. It is an index — into the embedding table, and into the output head.'}</Label>
-            <Label x={30} y={332} tone={3} size={9.5}>{'That is the last thing the model knows about your text until 03.3 turns it into a vector.'}</Label>
+            <Label x={30} y={332} tone={3} size={9.5}>{'That is the last thing the model knows about your text until 03.4 turns it into a vector.'}</Label>
           </g>
         )}
 

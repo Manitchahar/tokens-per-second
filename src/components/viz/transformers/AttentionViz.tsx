@@ -199,7 +199,7 @@ export default function AttentionViz() {
           {st === 7 && (
             <g>
               <Label x={24} y={290} tone={1} size={10.5} bold>{'project → score → scale → mask → softmax → mix'}</Label>
-              <Label x={24} y={306} tone={2} size={9}>{'32 heads per layer (03.5), 32 layers deep (03.6).'}</Label>
+              <Label x={24} y={306} tone={2} size={9}>{'32 heads per layer (03.6), 32 layers deep (03.7).'}</Label>
               <Label x={24} y={322} tone={3} size={9}>{`4 wide here, 128 real → ÷${SQRT_REAL.toFixed(1)}, not ÷${Math.sqrt(D_HEAD).toFixed(0)}`}</Label>
             </g>
           )}
@@ -224,7 +224,7 @@ export default function AttentionViz() {
             <Label x={24} y={316} tone={3} size={9}>{'q = Wq·x   [4096 × 4096]  ·  32 query heads'}</Label>
             <Label x={24} y={332} tone={3} size={9}>{'k = Wk·x   [4096 × 1024]  ·  only 8 key heads in Llama-3.1-8B'}</Label>
             <Label x={24} y={348} tone={3} size={9}>{'v = Wv·x   [4096 × 1024]  ·  and V is what gets passed on'}</Label>
-            <Label x={24} y={370} tone={2} size={9}>RoPE then rotates Q and K (03.3) — it never touches V.</Label>
+            <Label x={24} y={370} tone={2} size={9}>RoPE then rotates Q and K (03.4) — it never touches V.</Label>
           </g>
         )}
 
@@ -260,7 +260,7 @@ export default function AttentionViz() {
         {st === 7 && (
           <g>
             <Label x={24} y={296} tone={1} size={10.5} bold>{'project → score → scale → mask → softmax → mix'}</Label>
-            <Label x={24} y={322} tone={2} size={9.5}>{'32 heads per layer (03.5), 32 layers deep (03.6).'}</Label>
+            <Label x={24} y={322} tone={2} size={9.5}>{'32 heads per layer (03.6), 32 layers deep (03.7).'}</Label>
             <Label x={24} y={344} tone={3} size={9}>{`This head is ${D_HEAD} wide. A real one is 128, so the divisor is`}</Label>
             <Label x={24} y={360} tone={3} size={9}>{`1/√128 = 1/${SQRT_REAL.toFixed(3)} instead of 1/${Math.sqrt(D_HEAD).toFixed(1)}.`}</Label>
           </g>

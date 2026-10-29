@@ -11,7 +11,7 @@ objectives:
 import EmbeddingPos from '@/components/viz/transformers/EmbeddingPos.tsx';
 import Quiz from '@/components/learn/Quiz.tsx';
 
-In 03.2 your sentence became integers. Now it becomes vectors: one row of one enormous table, per token. Then — and this is the part that trips up most people — we have to give those vectors a sense of **place**, because a bag of vectors does not know which word came first.
+In 03.3 your sentence became integers. Now it becomes vectors: one row of one enormous table, per token. Then — and this is the part that trips up most people — we have to give those vectors a sense of **place**, because a bag of vectors does not know which word came first.
 
 That second half is where the elegant mathematics is. It is also where an inference engineer has to look carefully, because the position scheme a model uses has a hard reach limit built into it.
 
@@ -45,7 +45,7 @@ What *is* in a row? Nothing human-readable. Each of the 4,096 numbers is a learn
   <EmbeddingPos client:visible slot="stage" />
 
   <Step title="1. An ID means nothing by itself">
-    Five tokens from 03.2 arrive as five integers: 15339, 1917, 4734, 11203, 128009. Nothing in the number 15339 says "the". The model has no table of meanings it can consult — it has one table of vectors, and it must index into it.
+    Five tokens from 03.3 arrive as five integers: 15339, 1917, 4734, 11203, 128009. Nothing in the number 15339 says "the". The model has no table of meanings it can consult — it has one table of vectors, and it must index into it.
   </Step>
 
   <Step title="2. An embedding table turns an ID into a vector">

@@ -26,7 +26,7 @@ $$
 \end{aligned}
 $$
 
-Every symbol is now something you can compute. Attention was 03.4 and 03.5. The MLP is below. The norm and the two adds are the rest of this lesson.
+Every symbol is now something you can compute. Attention was 03.5 and 03.6. The MLP is below. The norm and the two adds are the rest of this lesson.
 
 Note the shape discipline: $\mathbf{x}$, $\mathbf{u}$ and $\mathbf{y}$ are all 4,096 numbers. **A block takes a 4,096-vector and returns a 4,096-vector.** Whatever it learned is written into the vector it was given.
 
@@ -46,7 +46,7 @@ Note the shape discipline: $\mathbf{x}$, $\mathbf{u}$ and $\mathbf{y}$ are all 4
 What does dividing by the RMS actually buy? It makes every sublayer receive an input with a **fixed scale**, no matter how large the stream has grown. Drag the slider in the visual: the incoming vector's RMS changes by a factor of 60, and the output is *bit-identical* every time. RMSNorm discards the magnitude entirely and keeps only the shape.
 
 <Callout type="intuition" title="Why the stream grows, and why that is fine">
-  Each sublayer's output is **added** to the stream, and nothing in the architecture ever rescales the sum. So after 32 blocks the stream's magnitude is roughly 30 times what it was at layer 1. That would overflow any fixed-precision format within a few layers if the numbers fed into a sublayer kept growing — a single dot product over 128 numbers that each grew 30× would produce a score 900× too large, and the softmax from 03.4 would be dead.
+  Each sublayer's output is **added** to the stream, and nothing in the architecture ever rescales the sum. So after 32 blocks the stream's magnitude is roughly 30 times what it was at layer 1. That would overflow any fixed-precision format within a few layers if the numbers fed into a sublayer kept growing — a single dot product over 128 numbers that each grew 30× would produce a score 900× too large, and the softmax from 03.5 would be dead.
 
   RMSNorm's division by the RMS puts the scale back to exactly 1 before every single sublayer. **The growth is harmless precisely because the norm removes it first.** This is the load-bearing reason a 32-layer model is numerically stable in BF16.
 </Callout>

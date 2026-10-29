@@ -11,7 +11,7 @@ objectives:
 import HeadsViz from '@/components/viz/transformers/HeadsViz.tsx';
 import Quiz from '@/components/learn/Quiz.tsx';
 
-03.4 ended with one attention head, 128 numbers wide. This lesson asks the obvious question: what if you did that several times at once? And then the question that separates people who understand transformers from people who have read about them: **why are the key and value heads allowed to be fewer than the query heads?**
+03.5 ended with one attention head, 128 numbers wide. This lesson asks the obvious question: what if you did that several times at once? And then the question that separates people who understand transformers from people who have read about them: **why are the key and value heads allowed to be fewer than the query heads?**
 
 That second question has a fourfold effect on how many users one GPU can serve. It is the highest-leverage piece of arithmetic in this module.
 
@@ -40,7 +40,7 @@ There is one non-obvious convention: **head_dim stays at 128 even as the model g
 | Qwen2.5-32B | 5,120 | 40 | **128** |
 | Llama-3.1-70B | 8,192 | 64 | **128** |
 
-So $\text{head\_dim} = d_{\text{model}} / n_{\text{heads}}$, and for most modern models that quotient is 128. Holding it constant means the RoPE frequency spectrum from 03.3 has the same shape in every model, and the softmax statistics inside each head stay comparable across widths.
+So $\text{head\_dim} = d_{\text{model}} / n_{\text{heads}}$, and for most modern models that quotient is 128. Holding it constant means the RoPE frequency spectrum from 03.4 has the same shape in every model, and the softmax statistics inside each head stay comparable across widths.
 
 ## Then K and V do not have to keep up
 

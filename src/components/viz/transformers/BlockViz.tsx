@@ -24,7 +24,7 @@ const CAPTIONS = [
   'Give every token one vector of 4,096 numbers and keep adding to it. For Llama-3.1-8B that is 1 + 2 × 32 = 65 separate contributions summed into a single running vector.',
   'Each sublayer reads a normalised copy of the stream, computes something, and adds it back. Normalising on the way *in* is called pre-norm, and it is why 32-layer models train at all.',
   'RMSNorm divides a vector by its root-mean-square, so the output always has RMS 1, then multiplies by a learned gain. Drag the slider: the shape of the output never changes, only the scale it removes.',
-  'The attention sublayer from 03.4 and 03.5 produces 4,096 numbers, and those numbers are added straight into the stream. Nothing is subtracted, nothing is overwritten.',
+  'The attention sublayer from 03.5 and 03.6 produces 4,096 numbers, and those numbers are added straight into the stream. Nothing is subtracted, nothing is overwritten.',
   'The same again for the MLP. Two sublayers, two writes, one vector — and after 32 layers the stream has been written to 65 times.',
   'The MLP is three matrices: expand 4,096 → 14,336, multiply two copies element by element, project back to 4,096. That is 176.16 M parameters — 80.8% of a layer.',
   'Each sublayer adds to the stream and nothing ever rescales the sum, so its magnitude grows with depth. RMSNorm divides it back to 1 before every sublayer, which is exactly why that growth is survivable.',
@@ -88,7 +88,7 @@ export default function BlockViz() {
           <Arrow x1={CXF} y1={92} x2={CXF} y2={106} kind="compute" width={1.2} />
 
           <rect x={FLOWX} y={108} width={FLOWW} height={26} rx={3} fill="var(--compute-dim)" stroke="var(--compute)" strokeWidth={1} className="v-cell" />
-          <text x={CXF} y={125} textAnchor="middle" className="v-label" style={{ fontSize: 10.5, fontWeight: 600 }}>Attention · 03.4 + 03.5</text>
+          <text x={CXF} y={125} textAnchor="middle" className="v-label" style={{ fontSize: 10.5, fontWeight: 600 }}>Attention · 03.5 + 03.6</text>
           <Arrow x1={CXF} y1={134} x2={CXF} y2={148} kind="compute" width={1.2} />
 
           <circle cx={CXF} cy={156} r={11} fill="var(--memory)" stroke="var(--memory)" strokeWidth={1} />
