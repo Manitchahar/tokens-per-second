@@ -135,6 +135,108 @@ Decide by asking three questions in order:
   "We run on Kubernetes because the org already operates it, so the marginal cost of KServe is a CRD rather than a cluster. We keep the router in front of the engines rather than relying on a Service, because routing on KV load is worth more than the operational simplicity we would buy. We revisit llm-d when placement becomes our bottleneck, not before."
 </Callout>
 
+## Many models behind one front door
+
+So far every replica served one model. Real fleets rarely look like that. A platform team might host forty fine-tuned 8B models, one per customer or task, plus two base models and a canary of the next version. Give each its own GPU and most of those GPUs sit idle, because traffic across models is lopsided: a few models take most of the requests and the long tail takes a trickle. The answer has three parts, and they live at layer 3 of the enterprise map below: a **router** that decides which model a request should get, **multiplexing** that decides which replica should serve it, and a **cache** on each replica that decides which models stay loaded.
+
+### Part 1: the model-selection router
+
+A request names a model, but not always the real one. A <Term t="model-selection-router">model-selection router</Term> is a small, pure function that turns *what the client asked for* into *what will actually run*, and it does three jobs:
+
+```python
+import hashlib
+
+ALIASES = {"chat": "llama-3.1-8b-instruct-v7", "chat-large": "llama-3.1-70b-instruct-v3"}
+ALLOWED = {                                    # per-tenant allow-lists
+    "acme":   {"llama-3.1-8b-instruct-v7", "acme-support-v2"},
+    "globex": {"llama-3.1-8b-instruct-v7", "llama-3.1-70b-instruct-v3"},
+}
+CANARY = {                                     # weighted splits for a stable name
+    "llama-3.1-8b-instruct-v7": [("llama-3.1-8b-instruct-v7", 0.95),
+                                 ("llama-3.1-8b-instruct-v8", 0.05)],
+}
+
+def select_model(tenant: str, user: str, requested: str) -> str:
+    name = ALIASES.get(requested, requested)           # 1. resolve the alias
+    if name not in ALLOWED.get(tenant, set()):          # 2. enforce the tenant's allow-list
+        raise PermissionError(f"{tenant} may not use {name}")
+    splits = CANARY.get(name)                           # 3. weighted canary split
+    if not splits:
+        return name
+    h = int(hashlib.sha256(f"{name}:{user}".encode()).hexdigest(), 16)
+    u, acc = (h % 10_000) / 10_000, 0.0                 # stable per user, uniform overall
+    for target, weight in splits:
+        acc += weight
+        if u < acc:
+            return target
+    return splits[-1][0]
+```
+
+Three details are deliberate. **Aliases** let clients ask for "chat" while you swap the model underneath. The **allow-list** is checked against the stable name before the canary, so a tenant permitted to use v7 is automatically permitted to receive its canary and nobody else's. And the split hashes the **user**, not a random number, so one user sees one version for a whole conversation instead of flipping between v7 and v8 every turn (Python's built-in `hash()` changes between processes, which is why this uses `hashlib`). At 2,000 requests a minute, a 5% split sends about **100 requests a minute** to v8: 1,000 within ten minutes, enough to compare its p95 TTFT and error rate with v7's before you ramp (Module 22).
+
+### Part 2: multiplexing many models onto few replicas
+
+Now the router has said "acme-support-v2". Which replica should run it? Ideally one that already has it loaded. **Ray Serve** has this built in as <Term t="model-multiplexing">**model multiplexing**</Term>: each replica keeps up to a fixed number of models in memory, and the router prefers replicas that already hold the requested one.
+
+```python
+from ray import serve
+
+@serve.deployment(ray_actor_options={"num_gpus": 1})
+class ManyModels:
+    @serve.multiplexed(max_num_models_per_replica=3)
+    async def get_model(self, model_id: str):
+        return await load_model(model_id)               # runs only on a miss on this replica
+
+    async def __call__(self, request):
+        model_id = serve.get_multiplexed_model_id()     # which model this request wants
+        model = await self.get_model(model_id)          # hit: already loaded; miss: load, evict LRU
+        return await model.generate(await request.json())
+
+app = ManyModels.bind()
+```
+
+The client (or the router in front) puts the model id in a request header, `serve_multiplexed_model_id` at the time of writing, and `serve.get_multiplexed_model_id()` reads it back inside the replica. When a replica already holds three models and a fourth is requested, it evicts its <Term t="lru-eviction">**least recently used**</Term> one. **The arithmetic decides whether this works.** Eight replicas × 3 slots = 24 resident models. If the 16 least popular of 40 models together draw 5% of requests and none of them is resident anywhere, then 1 request in 20 pays a cold load: 16 GB of weights at about 2 GB/s from local NVMe is about 8 s of TTFT. Your p50 is untouched and your p99 is a model load. Either add slots (smaller models, more memory, LoRA adapters instead of full models; see Multi-LoRA serving) or pin the tail to a dedicated replica where its cold starts are expected.
+
+### Part 3: build the per-replica LRU cache yourself
+
+The eviction rule inside each replica is worth writing once, because every multi-model server has one. An `OrderedDict` remembers insertion order, and two of its methods make LRU a few lines: `move_to_end(key)` marks a model as just used, and `popitem(last=False)` removes the one used longest ago.
+
+```python
+from collections import OrderedDict
+
+class ModelCache:
+    """Keep as many models resident as fit in capacity_gb; evict least recently used."""
+    def __init__(self, capacity_gb: float, sizes_gb: dict, load, unload):
+        self.capacity, self.sizes, self.load, self.unload = capacity_gb, sizes_gb, load, unload
+        self.models = OrderedDict()                      # model_id -> model, oldest first
+        self.used = 0.0
+
+    def get(self, model_id: str):
+        if model_id in self.models:                      # hit
+            self.models.move_to_end(model_id)            # now the most recently used
+            return self.models[model_id]
+        need = self.sizes[model_id]                      # miss: make room BEFORE loading
+        while self.models and self.used + need > self.capacity:
+            old_id, old = self.models.popitem(last=False)   # least recently used
+            self.unload(old)
+            self.used -= self.sizes[old_id]
+        self.models[model_id] = self.load(model_id)
+        self.used += need
+        return self.models[model_id]
+```
+
+Evict **before** you load: loading first would briefly need room for the newcomer and the model it is about to replace, which is exactly the out-of-memory you were trying to avoid. Trace it on an L40S with about 48 GB to spare and three 16 GB models' worth of room, for the request sequence A, B, C, A, D:
+
+| request | hit or miss | evicted | resident afterwards, oldest first | used |
+|---|---|---|---|---|
+| A | miss | — | A | 16 GB |
+| B | miss | — | A, B | 32 GB |
+| C | miss | — | A, B, C | 48 GB |
+| A | **hit** | — | B, C, **A** | 48 GB |
+| D | miss | **B** | C, A, D | 48 GB |
+
+The hit on A is what saved it: without `move_to_end`, A would have been the oldest and D would have evicted the model that was just in use.
+
 ## The rolling deploy, end to end
 
 Module 22 taught canaries and rollbacks for one server. On a fleet the same release is a multi-step dance, and the ordering matters more than it did with one pod.
@@ -242,6 +344,7 @@ print("last of the 30 admitted at t =", admitted[-1])   # 40
   6. llm-d's thesis is right — placement is a different problem for inference — but at the time of writing it is young.
   7. Under ~50 replicas on machines you own, vLLM's own production stack is often less work than adopting a cluster.
   8. Route in front of the engines with something KV-aware; a plain Service cannot see the thing that matters.
+  9. Many models share few GPUs in three steps: a model-selection router (aliases, per-tenant allow-lists, sticky weighted canary splits), multiplexing that sends a request to a replica already holding its model (Ray Serve: `@serve.multiplexed(max_num_models_per_replica=…)` and `serve.get_multiplexed_model_id()`), and a per-replica LRU cache (`OrderedDict` with `move_to_end` and `popitem(last=False)`, evicting before loading).
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -252,4 +355,6 @@ print("last of the 30 admitted at t =", admitted[-1])   # 40
   { q: 'Llama-3.1-8B weights in BF16 take about 16 GB. vLLM uses 90% of an 80 GB H100 (72 GB), and after the weights and about 3.2 GB of CUDA context and workspace, 52.7 GB is left for the KV pool. At 131,072 bytes of KV per token, how many KV tokens does that pool hold?', numeric: true, answer: 402, tolerance: 15, unit: 'thousand tokens', why: 'The pool is 72 − 16.06 − 3.2 = 52.7 GB = 52.7 × 10⁹ bytes. Dividing by 131,072 bytes per token gives about 402,000 tokens. That is 392 users at a 1,024-token context, or 48 at 8,250. The pool size is the first half of every capacity calculation in this module.' },
   { q: 'You deploy 4 replicas and roll a new model version. An H100 holds about 402,374 KV tokens; a warm replica holds 100,000 tokens while the new cold replica holds 0. What percentage of its pool is occupied on the warm replica?', numeric: true, answer: 25, tolerance: 1, unit: '%', why: '100,000 / 402,374 ≈ 0.2485 (about 25%), while the new replica sits at 0.00 (0%). Because a zero-load replica wins every comparison, a least-loaded router routes an outsized share of traffic to the cold replica unless it is pre-warmed or has its traffic capped.' },
   { q: 'A tenant’s token bucket refills at 60,000 tokens per minute and holds at most 20,000. The gateway reserves 2,000 tokens per request (prompt plus max_tokens). With the bucket full, 30 requests arrive at once and the client retries each rejected one as soon as it would fit. How many seconds after the burst is the last request admitted?', numeric: true, answer: 40, tolerance: 1, unit: 's', why: 'The refill rate is 60,000 / 60 = 1,000 tokens/s. The full bucket admits 20,000 / 2,000 = 10 requests at once. The other 20 need 20 × 2,000 = 40,000 tokens, which take 40,000 / 1,000 = 40 s to refill. A tenant that kept sending could spend b + rT = 20,000 + 60,000 = 80,000 tokens in its first minute, not 60,000.' },
+  { q: 'A replica’s LRU model cache holds three 16 GB models in 48 GB. Requests arrive for A, B, C, A, D. Which model does D evict?', options: ['A, because it was loaded first', 'B, because after the second request for A it is the least recently used', 'C, because it was loaded last', 'None, because there is room'], answer: 1, why: 'After A, B, C the order (oldest first) is A, B, C. The hit on A moves it to the end: B, C, A. D needs 16 GB with 48 GB used, so popitem(last=False) evicts B.' },
+  { q: 'A router sends a weighted 5% canary split of 2,000 requests per minute to the new version. How many requests does the canary receive in ten minutes?', numeric: true, answer: 1000, tolerance: 20, unit: 'requests', why: '2,000 × 0.05 = 100 requests per minute, so 1,000 in ten minutes: enough to compare p95 TTFT and error rates against the stable version before ramping.' },
 ] } />

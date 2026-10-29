@@ -140,6 +140,12 @@ spec:
 Use a **startupProbe**. A liveness probe during weight loading restarts the pod
 forever and never serves a request.
 
+## Many models behind one front door
+
+1. **Model-selection router** (pure function): alias → real name; check the tenant's allow-list on the stable name; weighted canary split hashed on the **user** (sticky across turns; `hashlib`, not `hash()`). 5% of 2,000 req/min = 100/min = 1,000 canary requests in 10 min.
+2. **Multiplexing** (Ray Serve): `@serve.multiplexed(max_num_models_per_replica=3)` on an async `get_model(model_id)`; `serve.get_multiplexed_model_id()` reads the id (header `serve_multiplexed_model_id`); router prefers replicas holding the model; each replica evicts its LRU model. 8 replicas × 3 = 24 resident; a 5% non-resident tail = 1 request in 20 pays a cold load (16 GB at ~2 GB/s ≈ 8 s) → p99 is a model load.
+3. **Per-replica LRU cache:** `OrderedDict`; hit → `move_to_end(id)`; miss → evict with `popitem(last=False)` until it fits, **then** load. A, B, C, A, D in 3 slots evicts B.
+
 ## The enterprise map: seven layers
 
 | # | Layer | What you tune |

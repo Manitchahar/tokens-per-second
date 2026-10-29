@@ -202,4 +202,19 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'One log entry per request: tenant, model and version, prompt and output token counts, the admission decision and the latency. Billing, quota enforcement and incident review all read it, so the tokens are counted once and feed all three. It holds counts and IDs, not raw prompts.',
     lesson: 'routing-autoscaling/orchestration',
   },
+  'model-multiplexing': {
+    term: 'Model multiplexing',
+    def: 'Serving many models from fewer replicas: each replica keeps a few models loaded, requests carry a model id, and the router prefers a replica that already holds the requested model. Ray Serve provides it with @serve.multiplexed(max_num_models_per_replica=…) and serve.get_multiplexed_model_id(); each replica evicts its least recently used model.',
+    lesson: 'routing-autoscaling/orchestration',
+  },
+  'model-selection-router': {
+    term: 'Model-selection router',
+    def: 'The function that turns the model a client asked for into the one that will run: resolve aliases, enforce the tenant’s allow-list, and apply weighted canary splits (hashed on the user so a conversation stays on one version).',
+    lesson: 'routing-autoscaling/orchestration',
+  },
+  'lru-eviction': {
+    term: 'LRU eviction',
+    def: 'Least recently used: when a cache is full, remove the entry that was used longest ago. For a model cache, an OrderedDict does it in two calls: move_to_end on every hit, popitem(last=False) to evict, and evict before loading so the newcomer never has to coexist with its victim.',
+    lesson: 'routing-autoscaling/orchestration',
+  },
 };
