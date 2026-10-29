@@ -33,7 +33,7 @@ export const terms: Record<string, GlossaryEntry> = {
   // ── 2 · multi-LoRA ──
   lora: {
     term: 'LoRA (low-rank adaptation)',
-    def: 'A way to specialise a model by training a thin pair of matrices added to its existing weights, leaving the base frozen: W′ = W₀ + (α/r)·BA, where α/r is a fixed scale. For an (out x in) matrix of rank r the adapter holds r(in + out) parameters instead of in*out — on Llama-3.1-8B at r=16 on all linear layers that is 32.5M parameters, 0.41% of the model.',
+    def: 'A way to specialise a model by training a thin pair of matrices added to its existing weights, leaving the base frozen. For an (out x in) matrix of rank r the adapter holds r(in + out) parameters instead of in*out — on Llama-3.1-8B at r=16 that is 32.5M parameters, 0.41% of the model.',
     lesson: 'specialized-workloads/multi-lora',
   },
   adapter: {
