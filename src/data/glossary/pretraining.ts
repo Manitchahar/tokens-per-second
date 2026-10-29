@@ -45,4 +45,29 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'When a benchmark’s test text was in a model’s training data, so the model has partly memorised the answers. An unusually low perplexity on the test set, compared with fresh text of the same style, is a warning sign.',
     lesson: 'pretraining/loss-perplexity',
   },
+  'masked-language-model': {
+    term: 'Masked language model (MLM)',
+    def: 'BERT’s training game: hide about 15% of the tokens (80% become [MASK], 10% a random token, 10% stay) and predict the originals using both sides of the context. Only the hidden positions are graded.',
+    lesson: 'pretraining/bert',
+  },
+  'encoder-only': {
+    term: 'Encoder (encoder-only transformer)',
+    def: 'A transformer stack with no causal mask: every token attends to every other, producing a contextual vector per input token. Great for reading tasks (classification, search embeddings), but it cannot generate text. BERT is one.',
+    lesson: 'pretraining/bert',
+  },
+  wordpiece: {
+    term: 'WordPiece',
+    def: 'BERT’s subword tokenizer, close to BPE, with a vocabulary of about 30,000. Pieces that continue a word are marked with ##, as in "play ##ing".',
+    lesson: 'pretraining/bert',
+  },
+  'cls-token': {
+    term: '[CLS] and [SEP]',
+    def: 'BERT’s special tokens. [CLS] sits at the front and its final vector summarises the input for classification heads; [SEP] ends each of the (up to two) text segments.',
+    lesson: 'pretraining/bert',
+  },
+  'next-sentence-prediction': {
+    term: 'Next-sentence prediction (NSP)',
+    def: 'BERT’s second pretraining task: decide from [CLS] whether segment B really followed segment A (50%) or is random text (50%). RoBERTa later showed it could be dropped without loss.',
+    lesson: 'pretraining/bert',
+  },
 };

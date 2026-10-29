@@ -1,0 +1,271 @@
+---
+title: 'Reading: BERT and the masked-word game'
+summary: 'A left-to-right model builds each word''s meaning from the words before it, but understanding a sentence needs both sides. You cannot simply let a next-word predictor look right: it would read its own answer. BERT''s fix is to hide the answer in the input instead. This lesson builds the masked-word game step by step, then reads the 2018 paper that made it famous.'
+objectives:
+  - Explain why a left-to-right model cannot build fully contextual word representations
+  - Show why removing the causal mask from a next-word model makes it cheat
+  - Apply BERT's masking rule (15%, then 80/10/10) to a sequence and count the predictions
+  - Describe BERT's input format, its sizes, its data and the next-sentence task
+  - Explain how one pretrained encoder is finetuned with a tiny head per task
+---
+import MaskedWordGame from '@/components/viz/pretraining/MaskedWordGame.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+It is mid-2018. A team at OpenAI has just shown that the recipe from lesson 1 works: pretrain a 12-layer transformer on thousands of books with next-token prediction, then finetune it on each task with a little labelled data. That model, usually called GPT-1, set new records on most of the language-understanding tasks it was tested on.
+
+But there is something odd about using a *next-word predictor* for *understanding*. The tasks people cared about most in 2018 were not about writing. They were about reading: is this review positive? Does sentence B follow logically from sentence A? Which phrase in this paragraph answers the question? In all of them the model is given the whole text at once. Nothing needs to be generated. And yet GPT-1 read every sentence the way it would write one: strictly left to right, each word blind to everything after it.
+
+This lesson is about the model that took the other road. It plays a different game — fill in the blank instead of finish the sentence — and the reason it has to play that game, rather than just reading both ways, is one of the neatest ideas in the field.
+
+## The wall: meaning lives on both sides
+
+Read this: *"The bank was steep and muddy."*
+
+You know it is a river bank. But at the moment you read "bank" you did not: "The bank was closed on Sunday" is a different bank. The words that decide it, "steep" and "muddy", come **after** the word they explain.
+
+Now recall the causal mask from *Attention from scratch* (Module 03). In a left-to-right model, the vector the model builds for "bank", at every layer, is made only from "The" and "bank". It is never updated after "steep" arrives, because "bank"'s row of the attention matrix cannot read later columns. Later tokens can look back at "bank", but "bank" itself stays ignorant forever.
+
+For writing, that is exactly right. For reading, it throws away half the evidence for every single word. A question-answering model needs the representation of each word in a paragraph to reflect the whole paragraph. In "I expected it to be bad, but it was wonderful", a left-to-right model's vector for "bad" is built before "wonderful" exists, so the word that flips the meaning arrives too late to change it.
+
+So the goal is clear: **a model where every token's representation is built from both sides.** The question is how to train one.
+
+### Obvious fix 1: just delete the causal mask
+
+Take the next-word model and let every token attend to every other token. Now "bank" can read "steep". Done?
+
+Run the training objective and watch what happens. The output at "bank" must predict the next token, "was". But "was" is right there in the input, one column to the right, and nothing stops "bank"'s row from reading it. **The model learns to copy its neighbour.** The loss collapses towards zero within a few steps, and the model has learned nothing about language except "the answer is one position over". In a deep model the leak is even harder to block: with several layers, information about a token can flow to its left neighbour through intermediate tokens, so even clever partial masks leak.
+
+This is the trap from lesson 1, now with a name: **you cannot give a model both-sided context and also ask it to predict a token that is in that context.**
+
+### Obvious fix 2: train two one-way models and glue them
+
+Another approach, used by a 2018 model called ELMo: train one model left-to-right and a separate one right-to-left, then concatenate their outputs for each word. Each direction is honest, and together they cover both sides.
+
+The catch is that the two directions never meet *inside* the network. The left-to-right half builds "bank" without ever seeing "muddy"; the right-to-left half builds it without "The". Each half stays one-sided through all its layers, and only the final outputs are stapled together. The BERT authors argued that a model in which every layer sees both sides at once is strictly more powerful, and their experiments (below) bear that out.
+
+## The idea: hide the answer, not the context
+
+Here is BERT's move. The problem with fix 1 was that the answer was in the input. So **take it out of the input.** Replace a few tokens with a special `[MASK]` token, let every position attend to every other position with no causal mask at all, and ask the model to predict the original tokens at the masked positions.
+
+*"The bank was `[MASK]` and muddy."* → predict "steep".
+
+The masked position can read "bank" on its left and "muddy" on its right. It cannot read "steep", because "steep" is not there. Nothing to copy, so the model has to actually understand the sentence. Psychologists had used exactly this kind of fill-in-the-blank exercise to measure reading comprehension since the 1950s; it is called a **cloze test**, and the BERT paper cites it. BERT calls its version a <Term t="masked-language-model">masked language model</Term> (MLM).
+
+The visual walks from the wall to the full recipe. In steps 5 and 6, drag the mask rate and re-roll which tokens get chosen.
+
+<Scrolly>
+  <MaskedWordGame client:visible slot="stage" />
+
+  <Step title="1. Left-to-right sees only half">
+    The causal mask of a GPT-style model: each row reads itself and the rows above. That keeps next-word training honest. The cost: the vector built for **"bank" is made from "the bank" and nothing else**, at every layer.
+  </Step>
+
+  <Step title="2. Meaning lives on both sides">
+    River bank or money bank? Only "steep" and "muddy" can say, and they sit in the hatched cells that "bank" may not read. Reading tasks — classifying, tagging, answering questions — all want **every token to know its whole context**.
+  </Step>
+
+  <Step title="3. Just remove the mask?">
+    Fill in the whole matrix and every row reads everything. But the row that must predict the next word can now read it directly: the red cells. **The model learns to copy one position over**, the loss collapses, and nothing about language is learned.
+  </Step>
+
+  <Step title="4. Hide the answer in the input">
+    BERT's fix: replace "steep" with `[MASK]`. Every token now reads both sides freely, and the `[MASK]` position predicts the hidden word. **The answer is not in the input, so there is nothing to copy.** That is the masked language model.
+  </Step>
+
+  <Step title="5. Pick 15% of the tokens">
+    In each sequence, BERT picks **15% of the real tokens at random** to predict; `[CLS]` and `[SEP]` are never chosen. Here that is 3 of 18. The loss is computed only at those positions. Drag the rate: at 15%, a 512-token sequence gives 76.8 predictions.
+  </Step>
+
+  <Step title="6. 80% [MASK], 10% random, 10% unchanged">
+    Each chosen token becomes `[MASK]` 80% of the time, a random token 10% of the time, and **stays unchanged** 10% of the time, but is still predicted. Since the model can never tell which inputs are genuine, it has to build a good representation of every token.
+  </Step>
+
+  <Step title="7. Two sentences: [CLS] A [SEP] B [SEP]">
+    Every input is two segments wrapped in special tokens, and each position's input vector is the sum of a **token, a segment and a position embedding**. The `[CLS]` output was also trained to say whether B really followed A. Later work showed that this second task was unnecessary.
+  </Step>
+
+  <Step title="8. One body, a small head per task">
+    Pretraining produces one 110M-parameter encoder. For each task you add a **tiny head** — about 1,500 new weights for sentiment or question answering — and finetune everything for a few epochs. One expensive model, many cheap adaptations.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### The masking rule, exactly
+
+For each training sequence:
+
+1. Choose **15%** of the token positions uniformly at random (never the special tokens).
+2. For each chosen position:
+   - with probability 0.8, replace the token with `[MASK]`;
+   - with probability 0.1, replace it with a random token from the vocabulary;
+   - with probability 0.1, leave it unchanged.
+3. Run the model on the corrupted sequence, with full bidirectional attention.
+4. Compute the cross-entropy loss (lesson 2) **only at the chosen positions**, against the original tokens.
+
+If $M$ is the set of chosen positions and $\tilde{x}$ is the corrupted sequence:
+
+$$
+\mathcal{L}_{\text{MLM}} = -\frac{1}{|M|} \sum_{i \in M} \ln p_\theta(x_i \mid \tilde{x})
+$$
+
+Notice what is on the right of the bar: the *whole* corrupted sequence $\tilde{x}$, both sides, not just $x_{<i}$.
+
+<Callout type="math" title="Worked: one 512-token sequence">
+  Chosen for prediction: ${}0.15 \times 512 = 76.8$ positions on average.
+
+  Of those: ${}0.8 \times 76.8 = 61.4$ become `[MASK]`, ${}0.1 \times 76.8 = 7.7$ become a random token, and ${}7.7$ are left unchanged.
+
+  Across all tokens, only ${}0.1 \times 0.15 = 1.5\%$ are randomly replaced. That is small enough that the model's grasp of the language is not damaged by the noise, which the paper points out explicitly.
+
+  And the other side of the ledger: ${}512 - 76.8 = 435.2$ positions, **85% of the sequence, produce no training signal at all** in this pass. They are context only. Lesson 5 shows why that matters.
+</Callout>
+
+**Why not always use `[MASK]`?** Because `[MASK]` exists only during pretraining. When BERT is finetuned and used, its inputs are ordinary text with no `[MASK]` anywhere. A model that had learned "only `[MASK]` positions need good predictions" would arrive at finetuning with representations tuned for a token it will never see again. The 10% random replacements teach it that a visible token might be wrong; the 10% unchanged ones teach it that a visible token might be right and still be tested. Either way it cannot relax about any position.
+
+In code, the whole recipe is a few lines:
+
+```python
+import torch
+
+def mask_tokens(ids, vocab_size, mask_id, special_ids, p=0.15):
+    labels = ids.clone()
+    can_pick = ~torch.isin(ids, torch.tensor(special_ids))
+    chosen = (torch.rand(ids.shape) < p) & can_pick
+    labels[~chosen] = -100                                   # -100 = "ignore" in F.cross_entropy
+
+    roll = torch.rand(ids.shape)
+    ids = ids.clone()
+    ids[chosen & (roll < 0.8)] = mask_id                     # 80%: [MASK]
+    rand = chosen & (roll >= 0.8) & (roll < 0.9)             # 10%: random token
+    ids[rand] = torch.randint(vocab_size, ids.shape)[rand]
+    return ids, labels                                       # remaining 10%: unchanged, still predicted
+```
+
+Hugging Face's `DataCollatorForLanguageModeling(mlm_probability=0.15)` implements the same 80/10/10 rule; the lab uses it.
+
+### The input: [CLS], [SEP] and three embeddings
+
+BERT's input is always one or two segments of text, packed like this:
+
+```
+[CLS]  the bank was steep  [SEP]  we climbed down  [SEP]
+  A     A    A    A    A     A     B     B      B     B
+```
+
+- **<Term t="cls-token">`[CLS]`</Term>** ("classification") is a token at the very front. Its final hidden vector is the summary that classification heads read.
+- **`[SEP]`** ("separator") ends each segment.
+- Each position's input vector is the **sum of three learned embeddings**: the token embedding, a segment embedding ($E_A$ or $E_B$, telling the model which segment it is in) and a position embedding from a learned table of 512 rows. That table is why BERT can never read more than 512 tokens.
+
+### Next-sentence prediction, and why it was dropped
+
+BERT's second pretraining task, <Term t="next-sentence-prediction">next-sentence prediction</Term>: for each pair, 50% of the time segment B is the sentence that really followed A in the source text (*IsNext*), and 50% of the time it is a random sentence from elsewhere (*NotNext*). A small classifier on the `[CLS]` output learns to tell which. The motivation was tasks like question answering and inference, which are about how two pieces of text relate.
+
+It turned out not to matter much. In 2019, RoBERTa (Liu et al.) retrained BERT more carefully — more data, bigger batches, longer — and removed next-sentence prediction entirely. Downstream results matched or slightly improved. The masked-word game was doing the real work. It is worth remembering as a lesson in reading papers: an ablation in the original paper can point one way, and a better-controlled experiment later can point the other.
+
+### The model: an encoder, in two sizes
+
+Architecturally BERT is the transformer you built in Module 03, with the causal mask removed. A transformer stack without a causal mask, whose job is to produce a contextual vector for every input token, is called an <Term t="encoder-only">encoder</Term>.
+
+| | Layers | Hidden size | Heads | MLP width | Parameters |
+|---|---|---|---|---|---|
+| BERT-Base | 12 | 768 | 12 | 3,072 | 110M |
+| BERT-Large | 24 | 1,024 | 16 | 4,096 | 340M |
+
+BERT-Base was deliberately made the same size as GPT-1, so the two could be compared fairly: same size, different game.
+
+<Callout type="math" title="Where 110M comes from">
+  Using the counting method from Module 03, for BERT-Base with a 30,522-token vocabulary:
+
+  - Embeddings: token ${}30{,}522 \times 768 = 23{,}440{,}896$; position ${}512 \times 768 = 393{,}216$; segment ${}2 \times 768 = 1{,}536$; one LayerNorm ${}1{,}536$. Total **23,837,184**.
+  - One layer: attention ${}4 \times (768^2 + 768) = 2{,}362{,}368$; MLP ${}768 \times 3{,}072 + 3{,}072 + 3{,}072 \times 768 + 768 = 4{,}722{,}432$; two LayerNorms ${}3{,}072$. Total **7,087,872**, and 12 layers make **85,054,464**.
+  - A small "pooler" layer on `[CLS]`: ${}768^2 + 768 = 590{,}592$.
+
+  $$
+  23{,}837{,}184 + 85{,}054{,}464 + 590{,}592 = 109{,}482{,}240 \approx 110\text{M}
+  $$
+
+  That is exactly the count you get from `bert-base-uncased` in the lab. Note that more than a fifth of BERT-Base is its embedding table.
+</Callout>
+
+### The data and the training run
+
+- **Text:** BooksCorpus (800 million words) and English Wikipedia (2,500 million words, text passages only, with lists, tables and headers removed). About 3.3 billion words. The authors stressed using whole documents rather than shuffled sentences, so the model could see long, coherent passages.
+- **Tokenizer:** <Term t="wordpiece">WordPiece</Term>, a subword method close to the BPE you met in *Tokens & tokenizers*, with a vocabulary of about 30,000 tokens (30,522 in the released files). The "uncased" models lower-case everything first. Words outside the vocabulary are split into pieces marked with `##`.
+- **Schedule:** batches of 256 sequences × 512 tokens, for 1,000,000 steps. The paper describes this as about 40 epochs over the 3.3-billion-word corpus. Check: ${}256 \times 512 = 131{,}072$ tokens per batch, and ${}10^{6} \times 131{,}072 = 1.31 \times 10^{11}$ tokens in total, which divided by 3.3 billion is about 40 passes. (To save compute, 90% of the steps actually used 128-token sequences, with the final 10% at 512 so the later position embeddings got trained.)
+- **Hardware:** BERT-Base trained on 4 Cloud TPUs (16 TPU chips) and BERT-Large on 16 Cloud TPUs (64 chips), each for 4 days.
+
+### Finetuning: one body, many heads
+
+After pretraining, BERT is adapted to a task by adding the smallest possible head and training *all* the weights on the task's labelled data:
+
+- **Classification** (sentiment, entailment): a single matrix $W \in \mathbb{R}^{K \times 768}$ on the `[CLS]` vector, then a softmax over $K$ classes. For two-class sentiment that is ${}768 \times 2 + 2 = 1{,}538$ new weights, against 110 million pretrained ones.
+- **Question answering** (SQuAD): two learned vectors, a start vector $S$ and an end vector $E$, each of 768 numbers. The probability that token $i$ starts the answer is a softmax over $S \cdot T_i$ across the paragraph, where $T_i$ is token $i$'s final vector; the same for the end. That is ${}2 \times 768 = 1{,}536$ new weights.
+- **Tagging** (named entities): a classifier applied to every token's vector.
+
+The paper finetuned for 2 to 4 epochs with learning rates between 2e-5 and 5e-5, and reports that every result could be reproduced in **at most an hour on a single Cloud TPU**, or a few hours on a GPU, compared with four days of pretraining on 16 or 64 chips. That ratio is the foundation-model idea from lesson 1, made concrete.
+
+### What it achieved
+
+BERT-Large set new state-of-the-art results on eleven language-understanding tasks. A few headline numbers from the paper:
+
+| Benchmark | BERT | Gain over previous best |
+|---|---|---|
+| GLUE (average of nine tasks) | 80.5 | +7.7 points |
+| MultiNLI accuracy | 86.7% | +4.6 points |
+| SQuAD 1.1 test F1 | 93.2 | +1.5 points |
+| SQuAD 2.0 test F1 | 83.1 | +5.1 points |
+
+The most instructive result is in the ablation (Table 5 of the paper), where BERT-Base is retrained with pieces removed and tested on, among others, SQuAD 1.1:
+
+| Pretraining | MNLI accuracy | SQuAD F1 |
+|---|---|---|
+| Masked LM + next-sentence (BERT-Base) | 84.4 | 88.5 |
+| Masked LM only | 83.9 | 87.9 |
+| Left-to-right LM only (like GPT-1) | 82.1 | **77.8** |
+
+Same size, same data, different game: switching from the masked-word game to the next-word game costs more than 10 F1 points on question answering. That is the "both sides" argument, measured.
+
+<Callout type="pitfall" title="What BERT cannot do">
+  **It cannot write.** BERT predicts masked tokens in a fixed-length input; it has no natural way to produce a continuation. You can fill `[MASK]` slots one at a time, but every new token changes every other token's representation, the order is arbitrary, and the results are poor. The lab shows this.
+
+  **It cannot read past 512 tokens**, because its position table has 512 rows.
+
+  **It needs a head and labelled data for every task.** That last limitation is precisely what lesson 4's GPT-2 attacks.
+</Callout>
+
+<Callout type="real" title="BERT from an inference engineer’s chair">
+  An encoder is a refreshingly simple workload. A request is one forward pass over the whole input — no generation loop, no growing KV cache, no decode phase. All tokens are processed in parallel, so it behaves like the prefill you will meet in Module 05: dense matrix multiplies, compute-bound once inputs are long enough. At roughly 2 FLOPs per parameter per token, BERT-Base costs about ${}2 \times 110\text{M} = 0.22$ GFLOP per token, so a 128-token sentence is about 28 GFLOP.
+
+  That simplicity is why BERT-style encoders are still everywhere in production: embedding text for search, reranking search results, and classifying, cheaply and at huge volume. Lesson 5 and Module B3 come back to them.
+</Callout>
+
+<Callout type="real" title="Now read the paper">
+  **Devlin, Chang, Lee and Toutanova (2018), "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"** — [arXiv:1810.04805](https://arxiv.org/abs/1810.04805).
+
+  **Read carefully:** Section 1 (the argument against one-directional models, which is this lesson's wall), Section 3 with Figures 1 and 2 (pretraining tasks, input representation and finetuning), Section 5.1 and Table 5 (the ablation above), and Appendix A.1–A.2 (the exact masking procedure and the training schedule).
+
+  **Skim:** Section 4's per-task setups; read the results tables, not the details of each benchmark. **Skip** Section 2 (related work) and Appendix B on first reading.
+
+  **You will now recognise:** the masked LM and its 80/10/10 rule, the cloze reference, `[CLS]`/`[SEP]` and segment embeddings, next-sentence prediction, the Base/Large sizes and why Base matches GPT-1, and the "one hour on a TPU" finetuning claim. You will also notice the paper calling the masked-word objective "MLM" and the left-to-right baseline "LTR" — the two jobs of this module's title.
+</Callout>
+
+<KeyNotes>
+  1. A left-to-right model builds each token's representation from earlier tokens only, so a word like "bank" never sees the words after it that decide its meaning.
+  2. Deleting the causal mask from a next-word model breaks it: each position can read the token it must predict and learns to copy.
+  3. BERT's **masked language model** hides the answer in the input instead: replace tokens with `[MASK]` and predict them with full bidirectional attention.
+  4. The rule: choose **15%** of tokens; of those, 80% → `[MASK]`, 10% → random token, 10% unchanged. Per 512 tokens: 76.8 predictions, and 85% of positions give no signal.
+  5. Inputs are `[CLS] A [SEP] B [SEP]`, embedded as token + segment + position (512 positions max). Next-sentence prediction was later shown to be unnecessary (RoBERTa).
+  6. BERT-Base: 12 layers, 768 wide, 12 heads, 110M parameters (109,482,240 counted). BERT-Large: 24 layers, 1,024 wide, 16 heads, 340M. WordPiece vocabulary of about 30,000.
+  7. Trained on BooksCorpus (800M words) + English Wikipedia (2,500M words) for 1M steps of 256 × 512 tokens, about 40 epochs, in 4 days on 16 or 64 TPU chips.
+  8. Finetuning adds a tiny head (≈1,500 weights) and trains for a few epochs, at most an hour on one TPU. An encoder serves as a single forward pass, with no generation and no KV cache.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'BERT chooses 15% of tokens for prediction. On average, how many positions are chosen in a 512-token sequence?', numeric: true, answer: 76.8, tolerance: 2, unit: 'positions', why: '0.15 × 512 = 76.8. The other 435.2 positions are context only and contribute nothing to the loss in that pass.' },
+  { q: 'Of those chosen positions, about how many are actually replaced by [MASK]?', numeric: true, answer: 61.4, tolerance: 1.5, unit: 'positions', why: '80% of 76.8 = 0.8 × 76.8 = 61.4. Another 7.7 become random tokens and 7.7 stay unchanged, but all 76.8 are predicted.' },
+  { q: 'Why can’t you build a bidirectional model by simply removing the causal mask from a next-word predictor?', options: ['Bidirectional attention is too slow to train', 'Each position could then read the very token it is asked to predict, so the model learns to copy and the loss collapses', 'The softmax would no longer sum to one', 'Positions would lose their position embeddings'], answer: 1, why: 'Next-word prediction is only honest if the answer is invisible. With no mask, the token at t + 1 is in plain view of position t. BERT instead hides the answer in the input.' },
+  { q: 'Why does BERT replace 10% of chosen tokens with a random token and leave 10% unchanged, instead of always using [MASK]?', options: ['To make training faster', 'Because [MASK] never appears in real inputs later, and the model must keep good representations for every token rather than only for [MASK] positions', 'To reduce the vocabulary size', 'Because the tokenizer cannot produce [MASK] for every word'], answer: 1, why: 'If only [MASK] positions were ever tested, the model could ignore the representations of ordinary tokens. Since any visible token might be a corrupted or a tested one, it must model them all.' },
+  { q: 'You finetune BERT-Base for 3-class sentiment with a linear head on the [CLS] vector (768 numbers), including one bias per class. How many new weights does the head add?', numeric: true, answer: 2307, tolerance: 50, unit: 'weights', why: '768 × 3 = 2,304 weights plus 3 biases = 2,307, compared with about 110 million pretrained weights that are also finetuned.' },
+  { q: 'What did RoBERTa (2019) find about next-sentence prediction?', options: ['It was essential: removing it destroyed accuracy', 'Removing it matched or slightly improved downstream results', 'It worked only for BERT-Large', 'It should replace the masked LM'], answer: 1, why: 'With a better-controlled setup (more data, bigger batches, longer training), dropping NSP did not hurt and sometimes helped. The masked-word game carried the learning.' },
+]} />
