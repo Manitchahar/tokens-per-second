@@ -31,29 +31,29 @@ That factor is not a rounding error, and it is not a detail. It is the differenc
   <Step title="2. Forward: 2 FLOPs per weight">
     The forward pass is the matrix multiply you already know: each weight multiplies one input and adds the result into one output. **One multiply plus one add is 2 FLOPs**, so the forward pass costs 2 × 12 = 24 FLOPs.
 
-    For a whole model this is the familiar $2N$ per token. If training stopped here, your guess would have been right.
+    For a whole model this is the familiar ${}2N$ per token. If training stopped here, your guess would have been right.
   </Step>
 
   <Step title="3. Backward, part 1: blame flows back">
     But training does not stop at the output. In Module 03 you saw how a model learns: compute the loss, then work out how much every number contributed to it. That second half is the <Term t="backward-pass">backward pass</Term>.
 
-    First, the error at each output has to be sent back to the inputs, so the layer before this one can learn too. It travels back along the **same 12 weights**, in the other direction, and each one does another multiply and add. That is another $2N$.
+    First, the error at each output has to be sent back to the inputs, so the layer before this one can learn too. It travels back along the **same 12 weights**, in the other direction, and each one does another multiply and add. That is another ${}2N$.
   </Step>
 
   <Step title="4. Backward, part 2: each weight’s gradient">
     Second, each weight needs its own gradient: how much the loss would change if *this* weight moved a little. For the weight joining input $i$ to output $j$ it is simply input $i$ times the error at output $j$.
 
-    One multiply, and (summed over the tokens of a batch) one add, per weight: **another $2N$**.
+    One multiply, and (summed over the tokens of a batch) one add, per weight: **another ${}2N$**.
   </Step>
 
   <Step title="5. 6 FLOPs per weight per token">
-    Add the three: $2N + 2N + 2N = 6N$ FLOPs to learn from one token, **three times** what it costs to run the model on that token. Our 12 weights cost 72 FLOPs.
+    Add the three: ${}2N + 2N + 2N = 6N$ FLOPs to learn from one token, **three times** what it costs to run the model on that token. Our 12 weights cost 72 FLOPs.
 
     The optimizer then nudges every weight, but it does that **once per batch**, and a batch holds millions of tokens. Spread over them, its cost per token rounds to zero.
   </Step>
 
   <Step title="6. Times every training token: C ≈ 6ND">
-    Nothing about a token changes the arithmetic: the first token of training and the last both pay $6N$. So a run over $D$ tokens costs
+    Nothing about a token changes the arithmetic: the first token of training and the last both pay ${}6N$. So a run over $D$ tokens costs
 
     $$C \approx 6ND$$
 
@@ -95,7 +95,7 @@ $$
 \frac{\partial L}{\partial X} = \delta\, W^{\top}, \qquad [b \times n] \times [n \times k] \to [b \times k]
 $$
 
-Same three sizes, multiplied in a different order: $2bnk$ FLOPs.
+Same three sizes, multiplied in a different order: ${}2bnk$ FLOPs.
 
 **3. Backward, gradient for the weights.** Each weight $W_{ij}$ connected input $i$ to output $j$. Nudge it, and output $j$ of every token moves by that token's input $i$. So its gradient is the sum, over the batch, of input $i$ times error $j$:
 
@@ -103,7 +103,7 @@ $$
 \frac{\partial L}{\partial W} = X^{\top}\delta, \qquad [k \times b] \times [b \times n] \to [k \times n]
 $$
 
-Again the same three sizes: $2kbn$ FLOPs.
+Again the same three sizes: ${}2kbn$ FLOPs.
 
 Add them up:
 
@@ -111,7 +111,7 @@ $$
 \text{FLOPs per training step for this matrix} = 2bkn + 2bkn + 2bkn = 6\,(kn)\,b = 6 \times \text{parameters} \times \text{tokens}
 $$
 
-That is the rule, with nothing approximate about it for a single matrix. A transformer is almost entirely such matrices (you counted them for Llama-3.1-8B in Module 01), and every token passes through every one of them, so summing over the model gives $6N$ per token, and over a whole run, $6ND$.
+That is the rule, with nothing approximate about it for a single matrix. A transformer is almost entirely such matrices (you counted them for Llama-3.1-8B in Module 01), and every token passes through every one of them, so summing over the model gives ${}6N$ per token, and over a whole run, ${}6ND$.
 
 <Callout type="intuition" title="Why the backward pass costs twice the forward">
   Every weight is used three times per token. Once to compute the answer, once to pass blame back to the layer below, and once to work out its own correction. The first use is the forward pass; the other two are the backward pass. Each use is one multiply and one add.
@@ -176,18 +176,18 @@ The rule counts the weight matrices. Three other things happen during training, 
 
 | Left out | Cost | Why it is usually small |
 |---|---|---|
-| Attention scores, $QK^{\top}$ and the weighted sum of $V$ | about $2\,n_{\text{layer}}\,n_{\text{ctx}}\,d_{\text{model}}$ per token forward, ×3 for training | grows with context, not parameters |
+| Attention scores, $QK^{\top}$ and the weighted sum of $V$ | about ${}2\,n_{\text{layer}}\,n_{\text{ctx}}\,d_{\text{model}}$ per token forward, ×3 for training | grows with context, not parameters |
 | Embedding lookup | a memory read, no multiplies | 0 FLOPs |
 | Optimizer step (Adam) | about a dozen FLOPs per parameter **per batch** | a batch holds millions of tokens |
 
-For GPT-3 the attention term is 2 × 96 layers × 2,048 tokens × 12,288 = 4.8 × 10⁹ FLOPs per token, against $2N$ = 3.5 × 10¹¹. That is **1.4%**. The optimizer is even smaller: GPT-3's batch held 3.2 million tokens, so a dozen FLOPs per parameter per batch is about 12 ÷ 3,200,000 ≈ 0.000004 FLOPs per parameter per token.
+For GPT-3 the attention term is 2 × 96 layers × 2,048 tokens × 12,288 = 4.8 × 10⁹ FLOPs per token, against ${}2N$ = 3.5 × 10¹¹. That is **1.4%**. The optimizer is even smaller: GPT-3's batch held 3.2 million tokens, so a dozen FLOPs per parameter per batch is about 12 ÷ 3,200,000 ≈ 0.000004 FLOPs per parameter per token.
 
 Attention does stop being small when the context is long compared to the model width: the ratio is roughly $n_{\text{ctx}} / (12\,d_{\text{model}})$ in Kaplan et al.'s accounting (for GPT-3, 2,048 ÷ (12 × 12,288) = 1.4%, the same number). A small model trained at 32K context can spend a large fraction of its compute on attention. For the big models in this module it is a percent or two, and we ignore it.
 
 <Callout type="pitfall" title="Two different “utilizations”">
-  Big training runs often save memory by **throwing away activations** during the forward pass and recomputing them during the backward pass (<Term t="activation-checkpointing">activation checkpointing</Term>). The GPU then really does a second forward pass: about $8N$ FLOPs per token instead of $6N$.
+  Big training runs often save memory by **throwing away activations** during the forward pass and recomputing them during the backward pass (<Term t="activation-checkpointing">activation checkpointing</Term>). The GPU then really does a second forward pass: about ${}8N$ FLOPs per token instead of ${}6N$.
 
-  That extra work is real, but it is not *useful*. So the standard metric, <Term t="mfu">**MFU**</Term> (model FLOPs utilization, which you met in Module 01), counts only the $6N$ the model needs, divided by the GPU's peak. A run that does recomputation can show 50% "hardware utilization" and 38% MFU at the same time. When you budget a training run, use $6ND$ and an MFU, never the hardware number.
+  That extra work is real, but it is not *useful*. So the standard metric, <Term t="mfu">**MFU**</Term> (model FLOPs utilization, which you met in Module 01), counts only the ${}6N$ the model needs, divided by the GPU's peak. A run that does recomputation can show 50% "hardware utilization" and 38% MFU at the same time. When you budget a training run, use ${}6ND$ and an MFU, never the hardware number.
 </Callout>
 
 ## From FLOPs to GPU-hours
@@ -252,7 +252,7 @@ You will not train a 405B model. You will, constantly, be asked questions that t
 
 - **"Should we finetune or pretrain?"** Finetuning a Llama-3.1-8B on 100 million tokens costs 6 × 8 × 10⁹ × 10⁸ = 4.8 × 10¹⁸ FLOPs, about 3.4 H100-hours at 40% MFU. Pretraining it cost 150,000 times more. That ratio is why almost nobody pretrains.
 - **"What did this open model really cost?"** Parameters × tokens × 6 is the first sentence of every honest answer.
-- **"Training versus serving."** A token trained costs $6N$; a token served costs $2N$. Serve three times as many tokens as you trained on and you have spent as much compute running the model as making it. Lesson 5 turns that into the most important design decision in this module.
+- **"Training versus serving."** A token trained costs ${}6N$; a token served costs ${}2N$. Serve three times as many tokens as you trained on and you have spent as much compute running the model as making it. Lesson 5 turns that into the most important design decision in this module.
 
 <KeyNotes>
   1. Training a model on one token costs about **6 FLOPs per parameter**: 2 for the forward pass and 4 for the backward pass.
@@ -261,8 +261,8 @@ You will not train a 405B model. You will, constantly, be asked questions that t
   4. GPT-3: 6 × 175 × 10⁹ × 300 × 10⁹ = **3.15 × 10²³ FLOPs**, matching the paper's 3.14 × 10²³.
   5. GPU-hours = $C$ ÷ (peak FLOP/s × MFU) ÷ 3,600. With an H100 at 989 TFLOP/s and 40% MFU, GPT-3 is about 221,000 GPU-hours.
   6. 6ND ignores attention scores (about 1–2% for large models at 2K context), embeddings (no FLOPs) and the optimizer (once per batch, so negligible per token).
-  7. MFU counts only the model's $6N$; recomputed activations make the hardware busier without making MFU higher.
-  8. Serving costs $2N$ per token, a third of training, which is why heavy traffic eventually costs more than the training run itself.
+  7. MFU counts only the model's ${}6N$; recomputed activations make the hardware busier without making MFU higher.
+  8. Serving costs ${}2N$ per token, a third of training, which is why heavy traffic eventually costs more than the training run itself.
 </KeyNotes>
 
 <Quiz client:visible questions={[

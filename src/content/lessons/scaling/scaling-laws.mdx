@@ -43,7 +43,7 @@ The quantity on the vertical axis is the one you met in 3A: the **test loss**, t
   </Step>
 
   <Step title="4. The slope is the exponent">
-    For parameters, Kaplan et al. measured $\alpha_N = 0.076$. The meaning is concrete: every 10× more parameters multiplies the loss by $10^{-0.076} = 0.839$, a 16% drop.
+    For parameters, Kaplan et al. measured $\alpha_N = 0.076$. The meaning is concrete: every 10× more parameters multiplies the loss by ${}10^{-0.076} = 0.839$, a 16% drop.
 
     And it is the **same 16% at every scale**: going from 10M to 100M buys the same fraction as going from 1B to 10B. That is what a straight line on log-log axes means.
   </Step>
@@ -105,15 +105,15 @@ Kaplan et al. trained transformer language models on WebText2 (the same web text
 
 | Resource | Law | Exponent | 10× more multiplies loss by | 2× more multiplies loss by |
 |---|---|---|---|---|
-| Parameters $N$ | $L = (8.8 \times 10^{13} / N)^{0.076}$ | $\alpha_N$ = 0.076 | $10^{-0.076}$ = 0.839 | $2^{-0.076}$ = 0.949 |
-| Data $D$ (tokens) | $L = (5.4 \times 10^{13} / D)^{0.095}$ | $\alpha_D$ = 0.095 | $10^{-0.095}$ = 0.804 | $2^{-0.095}$ = 0.936 |
-| Compute $C$ (PF-days) | $L = (3.1 \times 10^{8} / C)^{0.050}$ | $\alpha_C$ = 0.050 | $10^{-0.050}$ = 0.891 | $2^{-0.050}$ = 0.966 |
+| Parameters $N$ | $L = (8.8 \times 10^{13} / N)^{0.076}$ | $\alpha_N$ = 0.076 | ${}10^{-0.076}$ = 0.839 | ${}2^{-0.076}$ = 0.949 |
+| Data $D$ (tokens) | $L = (5.4 \times 10^{13} / D)^{0.095}$ | $\alpha_D$ = 0.095 | ${}10^{-0.095}$ = 0.804 | ${}2^{-0.095}$ = 0.936 |
+| Compute $C$ (PF-days) | $L = (3.1 \times 10^{8} / C)^{0.050}$ | $\alpha_C$ = 0.050 | ${}10^{-0.050}$ = 0.891 | ${}2^{-0.050}$ = 0.966 |
 
 Some details matter if you ever use these numbers:
 
 - $N$ counts <Term t="non-embedding-params">**non-embedding**</Term> parameters: the weights in the transformer blocks, leaving out the token and position tables. Kaplan et al. found the trends were much cleaner that way.
 - The loss is cross-entropy in nats on their WebText2 test set, with their tokenizer. Change the data or the tokenizer and the constants change. The *shape*, a straight line on log-log axes, is what transfers.
-- $C$ is the compute of the best model at each budget (the compute-efficient frontier), in PF-days. Compute was counted with the rule from lesson 1, $C \approx 6ND$ (they wrote it $6NBS$: batch size times number of steps is $D$).
+- $C$ is the compute of the best model at each budget (the compute-efficient frontier), in PF-days. Compute was counted with the rule from lesson 1, $C \approx 6ND$ (they wrote it ${}6NBS$: batch size times number of steps is $D$).
 
 <Callout type="math" title="Worked: what the exponents say">
   **Bigger model.** Go from a 1.5B-parameter model to 174B, a factor of 116. Loss is multiplied by
@@ -122,7 +122,7 @@ Some details matter if you ever use these numbers:
 
   so it falls by about 30%. The law predicts 2.30 nats at 1.5B and 2.30 × 0.697 = 1.61 nats at 174B.
 
-  **How steep the road is.** To *halve* the loss with parameters alone you need $2^{1/0.076} = 2^{13.2} \approx 9{,}100$ times more parameters. With compute alone, $2^{1/0.050} = 2^{20} \approx 1{,}000{,}000$ times more compute. Every step of improvement costs a multiple, not an increment.
+  **How steep the road is.** To *halve* the loss with parameters alone you need ${}2^{1/0.076} = 2^{13.2} \approx 9{,}100$ times more parameters. With compute alone, ${}2^{1/0.050} = 2^{20} \approx 1{,}000{,}000$ times more compute. Every step of improvement costs a multiple, not an increment.
 </Callout>
 
 That last line is the sobering half of the story. A power law with a small exponent means **progress is reliable but expensive**. Each 10× of compute buys the same 11%, forever (until the law breaks), and each 10× costs ten times more money than the last.
@@ -182,7 +182,7 @@ The paper is called "Scaling Laws for Neural Language Models", and the three str
 
 ## How to spend a budget, according to Kaplan
 
-That last finding led to the paper's most influential conclusion. If you have compute $C$ and can choose any $N$ and $D$ with $6ND = C$, what split gives the lowest loss? Kaplan et al. fitted it and found that the best model size grows almost as fast as the budget:
+That last finding led to the paper's most influential conclusion. If you have compute $C$ and can choose any $N$ and $D$ with ${}6ND = C$, what split gives the lowest loss? Kaplan et al. fitted it and found that the best model size grows almost as fast as the budget:
 
 $$
 N_{\text{opt}} \propto C^{0.73}, \qquad D_{\text{opt}} \propto C^{0.27}
@@ -191,9 +191,9 @@ $$
 The two exponents add to 1, as they must, because $N \times D$ has to grow in proportion to $C$.
 
 <Callout type="math" title="Worked: 10× and 100× more compute, Kaplan's way">
-  For 10× compute: parameters grow by $10^{0.73} = 5.4\times$, data by $10^{0.27} = 1.9\times$. Check: 5.4 × 1.9 = 10.
+  For 10× compute: parameters grow by ${}10^{0.73} = 5.4\times$, data by ${}10^{0.27} = 1.9\times$. Check: 5.4 × 1.9 = 10.
 
-  For 100× compute: parameters grow by $100^{0.73} = 28.8\times$, data by $100^{0.27} = 3.5\times$. Check: 28.8 × 3.5 ≈ 100.
+  For 100× compute: parameters grow by ${}100^{0.73} = 28.8\times$, data by ${}100^{0.27} = 3.5\times$. Check: 28.8 × 3.5 ≈ 100.
 
   So a lab that grew its budget 100-fold was told to build a model 29 times bigger and feed it less than 4 times more text.
 </Callout>

@@ -15,7 +15,7 @@ Here is a fact from lesson 1 that should have bothered you. Llama-3.1-8B was tra
 
 So was Meta wasting most of its compute, the way Gopher did?
 
-No. Chinchilla answered a precise question: **what is the cheapest model to *train* to a given quality?** That is the right question for a research run. It is the wrong question for a product. A product model is trained once and then generates tokens, for millions of people, for a year or more. Every one of those tokens costs a forward pass, $2N$ FLOPs, and it is the model's size, not its training length, that sets that price.
+No. Chinchilla answered a precise question: **what is the cheapest model to *train* to a given quality?** That is the right question for a research run. It is the wrong question for a product. A product model is trained once and then generates tokens, for millions of people, for a year or more. Every one of those tokens costs a forward pass, ${}2N$ FLOPs, and it is the model's size, not its training length, that sets that price.
 
 This lesson puts serving into the bill. The answer it gives is the reason the models you will spend this course serving are small.
 
@@ -27,11 +27,11 @@ This lesson puts serving into the bill. The answer it gives is the reason the mo
   <Step title="1. Chinchilla’s question: cheapest training for a target quality">
     Fix the quality you need, say Chinchilla's own: the loss of a 70B model trained on 1.4T tokens. Many model sizes can reach it. A bigger one needs fewer tokens, a smaller one more, and below a certain size no amount of data will do.
 
-    Plot the training compute, $6N \times D(N)$, for each size that can reach the target (amber). It is lowest near **20 tokens per parameter**, at about 72B. That point is Chinchilla's answer, and it ignores everything after training.
+    Plot the training compute, ${}6N \times D(N)$, for each size that can reach the target (amber). It is lowest near **20 tokens per parameter**, at about 72B. That point is Chinchilla's answer, and it ignores everything after training.
   </Step>
 
   <Step title="2. Every served token costs 2N">
-    Now the model goes into service. Every token it processes (prompt or output) costs a forward pass, about **$2N$ FLOPs** (Module 01). Serve $T$ tokens over its life and that is $2NT$ FLOPs.
+    Now the model goes into service. Every token it processes (prompt or output) costs a forward pass, about **${}2N$ FLOPs** (Module 01). Serve $T$ tokens over its life and that is ${}2NT$ FLOPs.
 
     On these log axes the serving cost is a straight line (green): proportional to model size. A model twice as big costs twice as much **forever**.
   </Step>
@@ -77,7 +77,7 @@ $$
 C_{\text{life}} = \underbrace{6\,N\,D}_{\text{training}} + \underbrace{2\,N\,T}_{\text{serving}}
 $$
 
-where $T$ is every token the model will ever process in production, prompt tokens and output tokens alike (prefill and decode both cost $2N$ FLOPs per token).
+where $T$ is every token the model will ever process in production, prompt tokens and output tokens alike (prefill and decode both cost ${}2N$ FLOPs per token).
 
 The first useful thing to read off it is the **break-even point**: the serving volume at which serving has cost as much as training.
 
@@ -191,7 +191,7 @@ The bottom row is worth a moment. Even Meta's biggest model, trained "only" at 3
 
   It is the paper that turns this lesson's argument into a formal optimization. **Read** the introduction and the section that adds inference FLOPs to the Chinchilla objective: its first figures are this lesson's visual, model size and tokens per parameter as a function of inference demand. **Skim** the part that converts FLOPs into dollars with different hardware utilization for training and inference, which is a preview of Module 25. **Read** the experiments on very long training (up to 10,000 tokens per parameter), because they show where the fitted law stops being trustworthy. **Skip** the appendix details of model configurations.
 
-  You will now recognise the lifetime objective $6ND + 2NT$, the leftward shift of the optimum with demand, and the caveat about extreme ratios. The LLaMA paper (Touvron et al., [arXiv:2302.13971](https://arxiv.org/abs/2302.13971)) Section 1 is a two-paragraph version of the same argument, and Module 04 reads it with you.
+  You will now recognise the lifetime objective ${}6ND + 2NT$, the leftward shift of the optimum with demand, and the caveat about extreme ratios. The LLaMA paper (Touvron et al., [arXiv:2302.13971](https://arxiv.org/abs/2302.13971)) Section 1 is a two-paragraph version of the same argument, and Module 04 reads it with you.
 </Callout>
 
 ## The limits of scale

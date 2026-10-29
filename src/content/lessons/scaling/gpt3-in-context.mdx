@@ -90,7 +90,7 @@ The paper trained **eight** sizes on the same data, so that every result could b
 
 *(From the paper's Table 2.1, as printed. Two rows do not quite multiply out: 24 × 128 ≠ 2,048 and 40 × 128 ≠ 5,140. Published tables have typos too; the habit of multiplying things out is how you catch them.)*
 
-You can rebuild the 175B from three numbers. In Module 03 you counted a transformer block: attention has four $d \times d$ matrices ($W_q, W_k, W_v, W_o$), and GPT-3's MLP expands to $4d$ and back, two matrices of $d \times 4d$. That is $4d^2 + 8d^2 = 12d^2$ per layer.
+You can rebuild the 175B from three numbers. In Module 03 you counted a transformer block: attention has four $d \times d$ matrices ($W_q, W_k, W_v, W_o$), and GPT-3's MLP expands to ${}4d$ and back, two matrices of $d \times 4d$. That is ${}4d^2 + 8d^2 = 12d^2$ per layer.
 
 <Callout type="math" title="Worked: where 175 billion comes from">
   $$
@@ -176,12 +176,12 @@ The paper is unusually frank about what did not work, and it is worth knowing be
 - **Long generations drift.** Over long passages the model repeats itself, loses coherence and contradicts earlier sentences.
 - **Is it learning, or recognizing?** The paper itself says it is unclear whether few-shot prompting teaches a genuinely new task at inference time or helps the model recognize one it already met during pretraining. Probably both, in different proportions for different tasks.
 - **Contamination.** A model trained on a crawl of the web may have seen the benchmark questions. The authors measured the overlap and found that a bug had let some through; retraining at this cost was not an option, so they analysed its effect instead (Section 4).
-- **Cost.** 3.14 × 10²³ FLOPs to train, 349 GB of weights to serve, and $2N$ = 349 GFLOPs for every token, prompt or output.
+- **Cost.** 3.14 × 10²³ FLOPs to train, 349 GB of weights to serve, and ${}2N$ = 349 GFLOPs for every token, prompt or output.
 
 That last line deserves an inference engineer's full attention, because few-shot prompting moved cost from training to serving.
 
 <Callout type="math" title="Worked: what a few-shot prompt costs at serving time">
-  A few-shot prompt with 32 examples of about 50 tokens each is 1,600 tokens. Prefill reads it once per query at $2N$ FLOPs per token:
+  A few-shot prompt with 32 examples of about 50 tokens each is 1,600 tokens. Prefill reads it once per query at ${}2N$ FLOPs per token:
 
   $$
   2 \times 175 \times 10^9 \times 1{,}600 = 5.6 \times 10^{14}\ \text{FLOPs per query}

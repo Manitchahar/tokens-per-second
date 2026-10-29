@@ -10,7 +10,7 @@ objectives:
 ---
 import BudgetLab from '@/components/viz/scaling/BudgetLab.tsx';
 
-Five lessons of formulas: $C \approx 6ND$, GPU-hours from MFU, power laws, IsoFLOP valleys, $N = \sqrt{C/120}$, and the lifetime bill $6ND + 2NT$. This lab makes you use all of them at once, the way someone planning a real training run would, and checks your arithmetic against a simulator.
+Five lessons of formulas: $C \approx 6ND$, GPU-hours from MFU, power laws, IsoFLOP valleys, $N = \sqrt{C/120}$, and the lifetime bill ${}6ND + 2NT$. This lab makes you use all of them at once, the way someone planning a real training run would, and checks your arithmetic against a simulator.
 
 No GPU needed: everything runs in your browser, and every number the simulator shows is one of this module's formulas, so you can (and should) reproduce each one by hand.
 
@@ -65,7 +65,7 @@ Everything is one of the module's formulas, chained:
 | Predicted loss | $L = E + A/N^{\alpha} + B/D^{\beta}$ | 3B.4 |
 | Bottom of the valley | $N_{\text{opt}} = G\,(C/6)^{\beta/(\alpha+\beta)}$; rule of thumb $\sqrt{C/120}$ | 3B.4 |
 | Compute efficiency | smallest budget whose compute-optimal model reaches your loss, divided by your budget | 3B.4 |
-| Serving FLOPs | $2N \times \text{tokens per day} \times \text{days}$ | 3B.5 |
+| Serving FLOPs | ${}2N \times \text{tokens per day} \times \text{days}$ | 3B.5 |
 | Serving GPU-hours | serving FLOPs ÷ (peak × 25%) ÷ 3600 | 3B.5 |
 | Dollars | GPU-hours × hourly rate (illustrative: A100 \$1.60, H100 \$2.50, H200 \$3.50, B200 \$5.50) | 3B.1 |
 

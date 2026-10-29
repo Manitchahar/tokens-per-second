@@ -1,7 +1,8 @@
 import type { GlossaryEntry } from '../glossary';
 
-// Terms Module 3B introduces. FLOPs, MFU, perplexity, open weights and decoder-only models
-// are defined elsewhere (glossary.ts, profiling.ts, pretraining) and are not repeated here.
+// Terms Module 3B introduces. FLOPs, MFU, perplexity, open weights, decoder-only models and
+// over-training are defined elsewhere (glossary.ts, profiling.ts, pretraining.ts, first-llm.ts)
+// and are not repeated here.
 
 export const terms: Record<string, GlossaryEntry> = {
   // ── 3B.1 · Counting training compute
@@ -27,6 +28,6 @@ export const terms: Record<string, GlossaryEntry> = {
   'irreducible-loss': { term: 'Irreducible loss', def: 'The part of the loss no model can remove, because text itself is not fully predictable. The constant E (about 1.69 nats) in the Chinchilla formula L = E + A/N^α + B/D^β.', lesson: 'scaling/chinchilla' },
 
   // ── 3B.5 · Over-training and the limits of scale
-  'over-training': { term: 'Over-training', def: 'Training a model on far more tokens than the compute-optimal ~20 per parameter, on purpose, so a smaller model reaches the target quality and is cheaper to serve for its whole life. LLaMA-1 7B: ~143 tokens/param; Llama 3 8B: ~1,875.', lesson: 'scaling/beyond-chinchilla' },
   'lifetime-compute': { term: 'Lifetime compute', def: 'Training plus serving: 6ND + 2NT, where T is every token the model will process in production. Serving overtakes training once T = 3D.', lesson: 'scaling/beyond-chinchilla' },
+  'tokens-per-parameter': { term: 'Tokens per parameter', def: 'Training tokens D divided by parameters N. About 20 is compute-optimal (Chinchilla); GPT-3 had 1.7, LLaMA-1 7B about 143, Llama 3 8B about 1,875, because heavily served models are over-trained on purpose.', lesson: 'scaling/chinchilla' },
 };

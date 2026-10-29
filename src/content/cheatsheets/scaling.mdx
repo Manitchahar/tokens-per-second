@@ -1,0 +1,132 @@
+---
+title: 'Module 3B · What Scale Buys'
+module: scaling
+---
+
+## Training compute: C ≈ 6ND
+
+Per training token, every weight does three multiply-adds:
+
+| Pass | Matrix multiply (layer $W$: `[k × n]`, batch $X$: `[b × k]`) | FLOPs |
+|---|---|---|
+| Forward | $Y = XW$ | ${}2bkn$ → **2N** per token |
+| Backward, input gradient | $\delta W^{\top}$ | ${}2bkn$ → **2N** |
+| Backward, weight gradient | $X^{\top}\delta$ | ${}2bkn$ → **2N** |
+
+$$
+C \approx 6ND \qquad \text{(training)} \qquad\qquad 2N \text{ per token} \qquad \text{(serving)}
+$$
+
+- Left out: attention scores ≈ ${}2\,n_{\text{layer}} n_{\text{ctx}} d_{\text{model}}$ per token forward (ratio to ${}2N$ ≈ $n_{\text{ctx}}/12d_{\text{model}}$; GPT-3: 1.4%), embeddings (0 FLOPs), optimizer (once per batch, ≈ 0 per token).
+- Activation checkpointing makes the hardware do ≈ 8N per token; **MFU still counts 6N**.
+
+## FLOPs → GPU-hours → dollars
+
+$$
+\text{GPU-hours} = \frac{C}{\text{peak FLOP/s} \times \text{MFU} \times 3600}, \qquad \text{\$} = \text{GPU-hours} \times \text{price}
+$$
+
+H100: 989 TFLOP/s dense BF16 · large runs sustain ≈ 35–50% MFU · illustrative \$2.50/GPU-hour.
+
+| Run | N | D | 6ND | H100-hours at 40% | ≈ \$ |
+|---|---|---|---|---|---|
+| GPT-3 | 175B | 300B | 3.15 × 10²³ (paper: 3.14) | 221k | \$0.55M |
+| Gopher | 280B | 300B | 5.0 × 10²³ (paper's count: 5.76) | | |
+| Chinchilla | 70B | 1.4T | 5.9 × 10²³ | 413k | \$1.0M |
+| Llama-3.1-8B | 8B | 15T | 7.2 × 10²³ | 506k | \$1.3M |
+| Llama-3.1-405B | 405B | 15.6T | 3.8 × 10²⁵ | 26.6M | \$67M |
+
+- GPT-3 on 1,024 H100s: 221,183 ÷ 1,024 ÷ 24 ≈ **9 days**.
+- Llama-3.1-405B reported 30.84M H100-hours → 10.7M ideal ÷ 30.84M ≈ **35% effective**.
+- 1 PF-day = 10¹⁵ FLOP/s × 86,400 s = **8.64 × 10¹⁹ FLOPs**. GPT-3 ≈ 3,640 PF-days.
+
+## GPT-3 (Brown et al. 2020)
+
+- 175B: 96 layers, $d_{\text{model}}$ 12,288, 96 heads × 128, context 2,048, vocab 50,257, batch 3.2M tokens, 300B tokens.
+- Parameters: ${}12\,n_{\text{layer}} d^2$ = 12 × 96 × 12,288² = 173.9B + 0.65B embeddings = **174.6B**.
+- Eight sizes: 125M, 350M, 760M, 1.3B, 2.7B, 6.7B, 13B, 175B.
+- Data mix (weight): Common Crawl 60% (410B tokens, seen ≈ 0.44×), WebText2 22%, Books1 8%, Books2 8%, Wikipedia 3%.
+- **Zero-shot** = description only · **one-shot** = + 1 example · **few-shot** = + K examples (10–100, as many as fit). **Weights frozen.**
+- Few-shot gain grows with size. 175B: LAMBADA 76.2 / 72.5 / 86.4% (zero / one / few; prior best 68.0) · TriviaQA 64.3 / 68.0 / 71.2% · SuperGLUE few-shot 71.8 (finetuned SOTA 89.0) · WiC 49.4% (chance 50).
+- Serving cost of few-shot: prefill ${}2N \times$ prompt tokens per query. 1,600 tokens on 175B = 5.6 × 10¹⁴ FLOPs ≈ 1 H100-second at 55%.
+- 174.6B × 2 bytes = 349 GB → at least **5** × 80 GB GPUs.
+
+## Power laws (Kaplan et al. 2020)
+
+$$
+L(X) = \left(\frac{X_c}{X}\right)^{\alpha} \;\Longleftrightarrow\; \log L = \alpha\log X_c - \alpha \log X
+$$
+
+A straight line on log-log axes, slope $-\alpha$.
+
+$k\times$ more of $X$ multiplies loss by $k^{-\alpha}$, at every scale.
+
+| | Law | ×10 | ×2 | to halve loss |
+|---|---|---|---|---|
+| Parameters (non-embedding) | $(8.8 \times 10^{13}/N)^{0.076}$ | × 0.839 | × 0.949 | × 9,100 |
+| Data (tokens) | $(5.4 \times 10^{13}/D)^{0.095}$ | × 0.804 | × 0.936 | × 1,500 |
+| Compute (PF-days, best model) | $(3.1 \times 10^{8}/C)^{0.050}$ | × 0.891 | × 0.966 | × 1,000,000 |
+
+- Fitted on 768 → 1.5B params, 22M → 23B tokens; trends over more than 7 orders of magnitude of compute.
+- Shape (depth vs width) barely matters; overfitting penalty depends on $N^{0.74}/D$ (8× model → ~5× data).
+- Kaplan allocation: $N \propto C^{0.73}$, $D \propto C^{0.27}$ → 10× compute = 5.4× N, 1.9× D. **Superseded.**
+- Extrapolation amplifies slope error; a pure power law has no floor, real loss does.
+
+## Chinchilla (Hoffmann et al. 2022)
+
+$$
+L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}
+$$
+
+Printed constants: $E$ = 1.69, $A$ = 406.4, $B$ = 410.7, $\alpha$ = 0.34, $\beta$ = 0.28.
+
+$E$ = irreducible loss · $A/N^{\alpha}$ = capacity penalty · $B/D^{\beta}$ = data penalty. 2024 refit (Besiroglu et al.): $E$ 1.82, $A$ 482, $B$ 2,085, $\alpha$ 0.35, $\beta$ 0.37.
+
+- **IsoFLOP**: fix $C$, $D = C/6N$, loss vs $N$ is a valley.
+- Bottom: $\alpha A/N^{\alpha} = \beta B/D^{\beta}$ → $N_{\text{opt}} = G\,(C/6)^{\beta/(\alpha+\beta)}$, $G = (\alpha A/\beta B)^{1/(\alpha+\beta)}$.
+- Three approaches: $N_{\text{opt}} \propto C^{0.50}$ (1), $C^{0.49}$ (2), $C^{0.46}$ (3). Kaplan: 0.73.
+
+$$
+D \approx 20N \;\Rightarrow\; C = 120N^2 \;\Rightarrow\; N_{\text{opt}} = \sqrt{C/120}
+$$
+
+| C (FLOPs) | $N_{\text{opt}}$ | $D_{\text{opt}}$ |
+|---|---|---|
+| 10²¹ | 2.9B | 58B |
+| 10²² | 9.1B | 183B |
+| 10²³ | 29B | 577B |
+| 5.76 × 10²³ | 69B | 1.4T |
+| 10²⁴ | 91B | 1.8T |
+| 10²⁵ | 289B | 5.8T |
+
+- Gopher (280B, 300B tokens) vs Chinchilla (70B, 1.4T), same compute: loss 1.993 vs 1.937 (fit); **MMLU 60.0% vs 67.5%**.
+- Gopher would need 5.9T tokens and 9.9 × 10²⁴ FLOPs (17× its budget) to be compute-optimal.
+- Valley floor is flat: printed fit's bottom at 5.76 × 10²³ is ~32B, 70B is only +0.007 nats; Gopher is +0.053. Refit's bottom: ~72B, 18 tokens/param.
+- Kaplan's error: fixed learning-rate schedule across run lengths (plus non-embedding counts at small scale).
+
+## Over-training and lifetime cost
+
+$$
+C_{\text{life}} = 6ND + 2NT, \qquad \text{break-even at } T = 3D
+$$
+
+- Fixed quality $L^*$: $D(N) = \left(B/(L^* - E - A/N^{\alpha})\right)^{1/\beta}$; below the size where $A/N^{\alpha} \ge L^* - E$, **unreachable**.
+- Chinchilla-quality target, refit: lifetime optimum 72B (T = 0) → 58B (10¹² served) → 35B (10¹³) → **21B on 12.7T, ~600 tok/param (10¹⁴)**, 61% less lifetime compute.
+- Real models: LLaMA-1 7B on 1T ≈ **143 tok/param** · Llama 3 8B on 15T ≈ **1,875** · Llama 3.1 405B ≈ 39. Chinchilla: 20.
+- FLOPs understate it: smaller models also mean fewer bytes per decode step, fewer GPUs, more KV room.
+- Fitted laws overstate gains at extreme ratios (Sardana et al.: still improving at 10,000 tok/param, but slower).
+
+## Limits
+
+- Text: ~**300T tokens** of quality public human text (90%: 100T–1,000T); fully used ~2026–2032 at current trends. Llama 3 used 15T (5%).
+- Repetition: up to ~**4 epochs** nearly as good as fresh data, then falls off.
+- Synthetic data: works when verifiable; recursive training on own outputs → **model collapse** (lost tails).
+- Power: 16,384 H100s × 700 W ≈ **11.5 MW** for GPUs alone; 100k GPUs ≈ 70 MW.
+- Returns: each 10× compute ≈ −11% loss, at 10× the cost of the last 10×.
+
+## Lab formulas
+
+- $C = \text{hours} \times 3600 \times \text{peak} \times \text{MFU}$ · 100k H100-hours at 40% = 1.42 × 10²³ → $N_{\text{opt}}$ ≈ 34B.
+- 1M hours at 40%: A100 → 61B, H100 → 109B, B200 → 164B ($N_{\text{opt}} \propto \sqrt{\text{speed}}$).
+- Serving GPU-hours ≈ ${}2NT$ ÷ (peak × utilization) ÷ 3600 (FLOP estimate; Module 25 does it properly).
+- 70B Chinchilla plan serving 10¹¹ tokens/day for 2 years: ~\$1.0M train + ~\$28.7M serve. Lifetime-optimal 20B on 15T: ~\$3.2M + ~\$8.4M ≈ \$11.6M.
