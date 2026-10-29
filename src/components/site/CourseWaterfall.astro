@@ -1,91 +1,123 @@
 ---
-// The entire course as one waterfall trace: each module is a track, each lesson a span placed at
-// its cumulative study time. Completed lessons fill in as the learner progresses.
+// The course as a branching map: Part 1 is the trunk everyone takes, then the course forks into
+// "Build with it" and "Make it fast". Each module is a row of lesson cells; cells fill in as the
+// learner finishes lessons (progress.ts paints anything carrying data-lesson-key).
 import { modules, flatLessons, parts, totalMinutes } from '../../data/course';
 import { url } from '../../site';
 
-interface Props { compact?: boolean }
-const { compact = false } = Astro.props;
-
 const W = 1000;
-const labelW = compact ? 0 : 210;
-const rowH = compact ? 9 : 12;
-const gap = compact ? 3 : 4;
-const partGap = compact ? 8 : 14;
-const top = 26;
-const scale = (W - labelW - 10) / totalMinutes;
+const cell = 11;
+const step = 14;
+const rowH = 18;
+const BUILD = 9;
 
-let t = 0;
-let y = top;
+const mins = (ms: typeof modules) => ms.reduce((s, m) => s + m.lessons.reduce((a, l) => a + l.minutes, 0), 0);
+const hrs = (n: number) => `${Math.round(n / 60)} h`;
+const code = (slug: string, l: string) => flatLessons.find((f) => f.module.slug === slug && f.slug === l)!.code;
+const short = (t: string, n: number) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
+
+type Row = { m: (typeof modules)[number]; x: number; y: number; labelW: number; maxChars: number };
+type Head = { x: number; y: number; text: string; sub?: string };
+
+const trunk = modules.filter((m) => m.part === 1);
+const build = modules.filter((m) => m.part === BUILD);
+const fast = modules.filter((m) => m.part !== 1 && m.part !== BUILD);
+
+const rows: Row[] = [];
+const heads: Head[] = [];
+const partHeads: Head[] = [];
+
+// Trunk: full width.
+let y = 22;
+heads.push({ x: 0, y, text: 'Everyone: the trunk', sub: `${trunk.length} modules · ${hrs(mins(trunk))}` });
+y += 18;
+for (const m of trunk) { rows.push({ m, x: 0, y, labelW: 230, maxChars: 30 }); y += rowH; }
+const trunkEnd = y + 4;
+
+// The fork.
+const colW = 490;
+const colB = 0;
+const colF = 510;
+const forkY = trunkEnd + 18;
+y = forkY + 26;
+heads.push({ x: colB, y, text: 'Branch: Build with it', sub: `${build.length} modules · ${hrs(mins(build))}` });
+heads.push({ x: colF, y, text: 'Branch: Make it fast', sub: `${fast.length} modules · ${hrs(mins(fast))}` });
+y += 18;
+
+let yb = y;
+for (const m of build) { rows.push({ m, x: colB, y: yb, labelW: 215, maxChars: 30 }); yb += rowH; }
+
+let yf = y;
 let lastPart = 0;
-const rows = modules.map((m) => {
-  if (m.part !== lastPart) { if (lastPart !== 0) y += partGap; lastPart = m.part; }
-  const start = t;
-  const spans = m.lessons.map((l) => {
-    const fl = flatLessons.find((f) => f.module.slug === m.slug && f.slug === l.slug)!;
-    const s = { x: labelW + t * scale, w: Math.max(1.5, l.minutes * scale - 1), key: `${m.slug}/${l.slug}`, kind: l.kind, title: `${fl.code} ${l.title}` };
-    t += l.minutes;
-    return s;
-  });
-  const row = { m, y, start, end: t, spans };
-  y += rowH + gap;
-  return row;
-});
-const H = y + 8;
-const hours = Math.ceil(totalMinutes / 60);
-const tickEvery = 5;
-const ticks = Array.from({ length: Math.floor(hours / tickEvery) + 1 }, (_, i) => i * tickEvery);
+for (const m of fast) {
+  if (m.part !== lastPart) {
+    const p = parts.find((q) => q.num === m.part)!;
+    if (lastPart !== 0) yf += 6;
+    partHeads.push({ x: colF, y: yf + 9, text: `Part ${p.label ?? p.num} · ${p.title}` });
+    yf += 16;
+    lastPart = m.part;
+  }
+  rows.push({ m, x: colF, y: yf, labelW: 215, maxChars: 30 });
+  yf += rowH;
+}
+const H = Math.max(yb, yf) + 8;
+const hours = Math.round(totalMinutes / 60);
+const trunkMid = 230 + 70;
 ---
-<figure class:list={['waterfall', { compact }]}>
-  <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`The whole course as a timeline: ${modules.length} modules, about ${hours} hours of study.`}>
-    <line x1={labelW} x2={W - 10} y1={14} y2={14} class="axis" />
-    {ticks.map((h) => (
+<figure class="coursemap">
+  <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`The course as a map: a shared trunk of ${trunk.length} modules, then two branches, Build with it and Make it fast. ${flatLessons.length} lessons, about ${hours} hours.`}>
+    <path d={`M ${trunkMid} ${trunkEnd} V ${forkY} M ${colB + 8} ${forkY + 12} V ${forkY} H ${colF + 8} V ${forkY + 12}`} class="fork" />
+    {heads.map((h) => (
       <g>
-        <line x1={labelW + h * 60 * scale} x2={labelW + h * 60 * scale} y1={14} y2={H - 4} class="grid" />
-        <text x={labelW + h * 60 * scale} y={9} text-anchor="middle" class="tick">{h}h</text>
+        <text x={h.x} y={h.y} class="head">{h.text}</text>
+        {h.sub && <text x={h.x + (h.text.length * 7.4) + 10} y={h.y} class="hsub">{h.sub}</text>}
       </g>
     ))}
-    {rows.map((r) => (
-      <a href={url(`learn/${r.m.slug}/`)} class="row">
-        <title>{r.m.num} {r.m.title}</title>
-        {!compact && <text x={labelW - 12} y={r.y + rowH / 2 + 4} text-anchor="end" class="rlabel"><tspan class="rnum">{r.m.num}</tspan> {r.m.title.length > 26 ? r.m.title.slice(0, 25) + '…' : r.m.title}</text>}
-        <rect x={labelW + r.start * scale - 3} y={r.y - 2} width={(r.end - r.start) * scale + 6} height={rowH + 4} class="hit" />
-        {r.spans.map((s) => (
-          <rect x={s.x} y={r.y} width={s.w} height={rowH} rx="1.5" class:list={['sp', s.kind]} data-lesson-key={s.key}><title>{s.title}</title></rect>
-        ))}
-      </a>
-    ))}
+    {partHeads.map((h) => <text x={h.x} y={h.y} class="phead">{h.text}</text>)}
+    {rows.map((r) => {
+      const n = r.m.lessons.length;
+      const cx = r.x + r.labelW;
+      return (
+        <a href={url(`learn/${r.m.slug}/`)} class="row">
+          <title>{r.m.num} {r.m.title}</title>
+          <rect x={r.x} y={r.y - 2} width={r.labelW + n * step + 54} height={rowH - 1} class="hit" />
+          <text x={r.x + 4} y={r.y + 10} class="rlabel"><tspan class="rnum">{r.m.num}</tspan> {short(r.m.title, r.maxChars)}</text>
+          {r.m.lessons.map((l, i) => (
+            <rect x={cx + i * step} y={r.y + 1} width={cell} height={cell} rx="2" class:list={['sp', l.kind]} data-lesson-key={`${r.m.slug}/${l.slug}`}><title>{code(r.m.slug, l.slug)} {l.title} · {l.minutes} min</title></rect>
+          ))}
+          <text x={cx + n * step + 6} y={r.y + 10} class="mh">{hrs(r.m.lessons.reduce((a, l) => a + l.minutes, 0))}</text>
+        </a>
+      );
+    })}
   </svg>
-  {!compact && (
-    <figcaption>
-      <span><i class="key k-lesson" /> lesson</span>
-      <span><i class="key k-lab" /> lab or project</span>
-      <span><i class="key k-done" /> done</span>
-      <span>{flatLessons.length} lessons · about {hours} hours · {parts.length} parts</span>
-    </figcaption>
-  )}
+  <figcaption>
+    <span><i class="key k-lesson" /> lesson</span>
+    <span><i class="key k-lab" /> lab or project</span>
+    <span><i class="key k-done" /> done</span>
+    <span>{flatLessons.length} lessons · about {hours} hours in all · take the trunk, then either branch or both</span>
+  </figcaption>
 </figure>
 
 <style>
-  .waterfall { margin: 0; overflow-x: auto; }
-  svg { width: 100%; min-width: 680px; height: auto; display: block; overflow: visible; }
-  .axis { stroke: var(--rule-2); }
-  .grid { stroke: var(--rule); stroke-dasharray: 2 4; }
-  .tick { font: 10px var(--font-mono); fill: var(--text-3); }
+  .coursemap { margin: 0; overflow-x: auto; }
+  svg { width: 100%; min-width: 760px; height: auto; display: block; overflow: visible; }
+  .head { font: 600 12px var(--font-sans); fill: var(--text); letter-spacing: 0.02em; }
+  .hsub { font: 11px var(--font-mono); fill: var(--text-3); }
+  .phead { font: 10px var(--font-mono); fill: var(--text-3); letter-spacing: 0.03em; }
+  .fork { fill: none; stroke: var(--rule-2); stroke-width: 1.2; }
   .rlabel { font: 11px var(--font-sans); fill: var(--text-2); }
   .rnum { font-family: var(--font-mono); fill: var(--text-3); }
-  .hit { fill: transparent; }
+  .mh { font: 10px var(--font-mono); fill: var(--text-3); }
+  .hit { fill: transparent; rx: 3; }
   .row:hover .hit { fill: var(--ground-3); }
   .row:hover .rlabel { fill: var(--text); }
   .sp { fill: transparent; stroke: var(--rule-2); stroke-width: 1; transition: fill 0.4s, stroke 0.4s; }
   .sp.lab, .sp.project { fill: url(#tps-hatch); }
   .sp:global(.is-done) { fill: var(--text-2); stroke: var(--text-2); }
   .sp:global(.is-flag) { fill: var(--compute); stroke: var(--compute); }
-  .compact .sp { stroke: var(--rule-2); }
-  figcaption { display: flex; flex-wrap: wrap; gap: 0.5rem 1.4rem; font-size: 0.75rem; color: var(--text-3); margin-top: 0.8rem; padding-left: 21%; }
+  figcaption { display: flex; flex-wrap: wrap; gap: 0.5rem 1.4rem; font-size: 0.75rem; color: var(--text-3); margin-top: 0.8rem; }
   figcaption span { display: inline-flex; align-items: center; gap: 0.4rem; }
-  .key { width: 16px; height: 8px; border-radius: 1.5px; border: 1px solid var(--rule-2); display: inline-block; }
+  .key { width: 10px; height: 10px; border-radius: 2px; border: 1px solid var(--rule-2); display: inline-block; }
   .key.k-lab { background: repeating-linear-gradient(135deg, var(--idle) 0 1.5px, transparent 1.5px 4px); }
   .key.k-done { background: var(--text-2); border-color: var(--text-2); }
-  @media (max-width: 700px) { figcaption { padding-left: 0; } .rlabel { font-size: 13px; } }
 </style>
