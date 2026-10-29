@@ -130,4 +130,19 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'A small, readable, correct version of a system built to be understood and extended rather than to be fast. Its job is to make the invariants visible; performance comes later.',
     lesson: 'mini-engine/read-vllm',
   },
+  'event-loop': {
+    term: 'Event loop (asyncio)',
+    def: 'The single thread an async web server uses to juggle many connections by never blocking. A blocking call inside it (such as a GPU forward pass) freezes every connection at once, which is why the engine loop runs in its own thread or process.',
+    lesson: 'mini-engine/api-metrics-engine',
+  },
+  'call-soon-threadsafe': {
+    term: 'loop.call_soon_threadsafe',
+    def: 'The asyncio method another thread uses to ask an event loop to run a callback, such as putting a token on an asyncio.Queue. asyncio objects are not thread-safe, so this is the correct bridge from a synchronous batching thread back to async request handlers.',
+    lesson: 'mini-engine/api-metrics-engine',
+  },
+  'batching-window': {
+    term: 'Batching window',
+    def: 'How long a worker waits for more requests after the first one arrives before running a batch. At arrival rate λ a window of w seconds collects about 1 + λw requests; the wait itself lands entirely in time to first token.',
+    lesson: 'mini-engine/api-metrics-engine',
+  },
 };

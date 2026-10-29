@@ -170,6 +170,19 @@ Llama-3.1-8B, `T = 4096`: `16.06e9 / (4096 × 131072) = 30`. Below ~30 sequences
 
 **`num_requests_waiting` is the leading indicator.** Throughput looks fine while it climbs; then latency explodes.
 
+## Process layout: keep the GPU loop off the event loop
+
+```
+web process (asyncio event loop)                 GPU side
+  handler ── submit(rid, prompt) ──► queue.Queue / mp task queue ──► batching thread / worker process
+  handler ◄─ await asyncio.Queue ◄── loop.call_soon_threadsafe(q.put_nowait, tok)   (thread)
+  handler ◄─ await Future ◄── pending[rid].set_result(...) ◄── mp result queue        (process)
+```
+
+- **Thread pattern:** engine loop in a thread; per-request `asyncio.Queue`; deliver with `loop.call_soon_threadsafe` (asyncio queues are not thread-safe). Still shares the GIL.
+- **Process pattern:** worker pinned with `CUDA_VISIBLE_DEVICES`, task queue in, result queue out, **request-id map** (`rid → Future`) in the web process. No GIL contention; a CUDA crash kills one worker. Send ids and strings, never tensors.
+- **Manual FIFO batching:** block for one request, keep taking until `max_batch` or the window `w` closes. Expected batch $\approx 1 + \lambda w$: 400 req/s × 10 ms → 5; 20 req/s → 1.2. The window is pure TTFT.
+
 ## Rules of thumb
 
 1. Read the weights once per step no matter the batch size — that is the floor on latency.

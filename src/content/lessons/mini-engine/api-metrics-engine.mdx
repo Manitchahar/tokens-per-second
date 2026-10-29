@@ -84,6 +84,115 @@ Two things make this correct rather than merely working:
   Returning a `StreamingResponse` whose generator does `text = "".join(all_tokens)` first and then yields the whole string. The response is technically streamed and the headers are correct, but TTFT is now equal to end-to-end latency. The symptom users report is "the model hangs then dumps everything at once", and the cause is in your API layer.
 </Callout>
 
+## Where the engine loop runs: threads, processes and the async bridge
+
+The endpoint above quietly assumes something hard: that an `async` web server and a synchronous GPU loop can live together. They cannot share a thread. The web framework (FastAPI on uvicorn, say) runs an <Term t="event-loop">**event loop**</Term>, one thread that juggles thousands of connections by never blocking. The engine loop is the opposite: a tight, blocking `while True` that runs a forward pass every few milliseconds. Call `engine.step()` from inside an `async def` and every HTTP connection freezes for the length of the step; make the engine `await` the network and the GPU idles. There are two standard ways to separate them, and serious servers use both.
+
+### Pattern 1: a batching thread, bridged with `asyncio.Queue` and `call_soon_threadsafe`
+
+Run the engine loop in its own thread. Requests go *in* through an ordinary thread-safe `queue.Queue`. Tokens come *out* through one `asyncio.Queue` per request, which the request's handler awaits. The catch: an `asyncio.Queue` belongs to the event loop and is **not thread-safe**, so the engine thread must never call `put_nowait` on it directly. It asks the loop to do it, with <Term t="call-soon-threadsafe">`loop.call_soon_threadsafe`</Term>:
+
+```python
+import asyncio, itertools, queue, threading
+
+class EngineThread:
+    def __init__(self, engine):
+        self.engine = engine
+        self.inbox = queue.Queue()                 # thread-safe: handlers -> engine thread
+        self.streams = {}                          # request id -> (asyncio.Queue, its event loop)
+        self.ids = itertools.count()
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def submit(self, prompt_ids):                  # called from an async handler
+        rid = next(self.ids)
+        q = asyncio.Queue()
+        self.streams[rid] = (q, asyncio.get_running_loop())
+        self.inbox.put((rid, prompt_ids))
+        return q
+
+    def run(self):                                 # the synchronous batching loop
+        while True:
+            if not self.engine.has_work():
+                self.engine.add_request(*self.inbox.get())        # sleep until a request arrives
+            while not self.inbox.empty():                         # admit arrivals, first in, first out
+                self.engine.add_request(*self.inbox.get_nowait())
+            for rid, token, done in self.engine.step():           # ONE forward pass for the batch
+                q, loop = self.streams[rid]
+                loop.call_soon_threadsafe(q.put_nowait, (token, done))  # hand over to the event loop
+                if done:
+                    del self.streams[rid]
+```
+
+```python
+@app.post("/v1/completions")
+async def completions(body: dict):
+    q = engine_thread.submit(tokenizer.encode(body["prompt"]))
+    async def events():
+        while True:
+            token, done = await q.get()            # wakes when the engine thread hands a token over
+            yield f"data: {json.dumps({'token': token})}\n\n"
+            if done:
+                break
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+The event loop never blocks on the GPU, and the GPU loop never waits on a socket. The cost is the GIL: the engine thread's Python (scheduling, sampling, bookkeeping) and the web server's Python (JSON, HTTP, detokenizing) still take turns on one interpreter lock, so under heavy traffic the web side adds jitter to the step time.
+
+### Pattern 2: a GPU worker process, connected by task and result queues
+
+The fix for the GIL is a second **process**. The web process does HTTP; a **worker process**, pinned to one GPU, owns the model and the loop. They talk through two `multiprocessing` queues, a **task queue** in and a **result queue** out, and the web process keeps a **request-id map** so each result finds the coroutine that is waiting for it:
+
+```python
+import multiprocessing as mp, os, queue, time
+
+def gpu_worker(task_q, result_q, gpu="0", max_batch=8, max_wait_s=0.010):
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu       # pin to one GPU before CUDA starts
+    model, tok = load_model()                      # loaded once, in this process only
+    while True:
+        batch = [task_q.get()]                     # block for the first request
+        deadline = time.monotonic() + max_wait_s
+        while len(batch) < max_batch:              # FIFO: fill the batch in arrival order
+            try:
+                batch.append(task_q.get(timeout=max(0.0, deadline - time.monotonic())))
+            except queue.Empty:
+                break                              # the window closed
+        rids, prompts = zip(*batch)
+        for rid, text in zip(rids, generate_batch(model, tok, list(prompts))):
+            result_q.put((rid, text))             # tagged, so the web side can route it
+
+# web process
+pending = {}                                       # request id -> asyncio.Future
+
+async def collect_results(result_q):              # one background task
+    loop = asyncio.get_running_loop()
+    while True:
+        rid, text = await loop.run_in_executor(None, result_q.get)  # block in a helper thread
+        pending.pop(rid).set_result(text)
+
+async def complete(task_q, prompt):
+    rid = uuid.uuid4().hex
+    fut = asyncio.get_running_loop().create_future()
+    pending[rid] = fut
+    task_q.put((rid, prompt))
+    return await fut
+```
+
+This is **manual FIFO batching**: wait for one request, keep taking more until the batch is full or a short window closes, run them together, route each answer home by its id. It is static batching (Module 07), because the whole batch finishes together, and it is how many first production servers start. Your Step 2 scheduler replaces the inner loop with continuous batching; the process split, the queues and the id map stay exactly the same, and they are what vLLM's V1 design does too, with the API server and the engine core in separate processes.
+
+**Sizing the <Term t="batching-window">batching window</Term>.** The window trades a little latency for bigger batches. With requests arriving at rate $\lambda$, a window of $w$ seconds collects on average ${}1 + \lambda w$ requests:
+
+| arrival rate | window | expected batch | what the window costs |
+|---|---|---|---|
+| 400 req/s | 10 ms | ${}1 + 400 \times 0.010 = 5$ | up to 10 ms of TTFT, bought 5× fewer weight reads per token |
+| 20 req/s | 10 ms | ${}1 + 20 \times 0.010 = 1.2$ | up to 10 ms of TTFT for almost nothing |
+
+Set the window from your arrival rate, cap it with `max_batch`, and remember that the window is pure queueing delay: it lands in TTFT and in nothing else.
+
+<Callout type="mentor" title="Why the split is worth an extra hop">
+  Crossing a process boundary pickles every message, so send token ids and short strings, never tensors. In return you get three things: the web server's Python can no longer steal GIL time from the GPU loop, a crashed CUDA kernel kills one worker instead of the whole API, and "one process per GPU" makes placement explicit, which is how you will scale to several GPUs on one machine (Module 18) and several machines (Module 23).
+</Callout>
+
 ## The detokenizer
 
 Incremental detokenization is a small, finicky problem. The rule that handles almost all of it:
@@ -264,6 +373,7 @@ Running this at batch size 1, then batch size 8, with and without prefix caching
   10. Diff against `transformers.generate()` at temperature 0, at batch 1 and batch 8, with and without prefix caching. It localises a bug to a stage in one run.
   11. Four panels are enough: saturation, memory pressure, latency distribution, throughput-with-goodput. Alert on the **waiting count**, not on p99 — it fires while you can still act.
   12. If p50 latency is fine and p99 is terrible, look for blocking code inside an `async def` first. A synchronous call stalls every request, not just one.
+  13. Keep the GPU loop off the event loop: a batching thread fed by a `queue.Queue` and answering through per-request `asyncio.Queue`s via `loop.call_soon_threadsafe`, or a worker process pinned to one GPU behind task and result queues with a request-id map. A batching window of $w$ seconds at arrival rate $\lambda$ collects about ${}1 + \lambda w$ requests.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -273,4 +383,6 @@ Running this at batch size 1, then batch size 8, with and without prefix caching
   { q: 'Which metric tells you that an engine is past capacity rather than merely busy?', options: ['num_requests_waiting', 'preemption_count', 'gpu_cache_usage_perc', 'num_requests_running'], answer: 1, why: 'A rising preemption count. It means allocation is failing and the scheduler is evicting live sequences — no scheduling policy fixes that; you need more KV memory, shorter contexts or a lower max_model_len.' },
   { q: 'Your engine matches transformers at batch size 1 but drifts after ~10 tokens at batch size 8. What is the most likely cause?', options: ['A bad chat template', 'Position ids or RoPE offsets computed from the batch index rather than each sequence’s true token count', 'A non-seeded sampler', 'An oversized max_num_seqs'], answer: 1, why: 'Everything correct at batch 1 points at how the batch is assembled. RoPE positions must come from each sequence’s own token count; deriving them from the row index only breaks once batched.' },
   { q: 'A client renders “naïve” with replacement characters. Where is the bug most likely?', options: ['In the GPU kernel', 'In the detokenizer: it is emitting a partial multi-byte UTF-8 sequence instead of buffering it', 'In the scheduler’s admission policy', 'In the KV block size'], answer: 1, why: 'A multi-byte character can span several tokens. The API layer must hold back an incomplete trailing UTF-8 sequence until the rest arrives, or the client receives bytes that are not yet a character.' },
+  { q: 'A GPU worker batches requests with a 10 ms window. Requests arrive at 400 per second. About how many requests does a batch collect?', numeric: true, answer: 5, tolerance: 0.3, unit: 'requests', why: 'The first request opens the window, and 400 × 0.010 = 4 more arrive on average before it closes: 1 + 4 = 5. At 20 requests per second the same window collects only 1.2, so it adds up to 10 ms of TTFT for almost no batching.' },
+  { q: 'An engine thread produces a token and must deliver it to an asyncio.Queue that a request handler is awaiting. What is the safe way?', options: ['Call q.put_nowait(token) from the engine thread', 'Call loop.call_soon_threadsafe(q.put_nowait, token), so the event loop performs the put on its own thread', 'Use asyncio.run(q.put(token)) inside the engine thread', 'Sleep briefly, then call q.put_nowait'], answer: 1, why: 'asyncio.Queue is not thread-safe and belongs to its event loop. call_soon_threadsafe schedules the put on the loop’s own thread and wakes it, so the awaiting handler resumes correctly.' },
 ]} />
