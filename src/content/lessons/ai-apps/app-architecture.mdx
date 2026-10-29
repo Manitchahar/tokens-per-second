@@ -1,0 +1,496 @@
+---
+title: 'From one model call to a full AI system'
+summary: 'A bare LLM API call is not a production application. Why real systems require seven distinct layers—gateway, caching, input guardrails, context assembly, model routing, output verification, and observability—and how they trade latency against unit economics.'
+objectives:
+  - Diagram the seven architectural layers between a raw user prompt and a production LLM response
+  - Formulate the end-to-end latency budget and compute how cache hits offset pipeline overhead
+  - Calculate blended token costs across tiered models and exact cache layers
+  - Identify the single points of failure in naive LLM architectures and how gateways provide resilience
+  - Design an asynchronous telemetry tap that records spans without degrading user TTFT
+---
+import ArchitectureStack from '@/components/viz/ai-apps/ArchitectureStack.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Almost every artificial intelligence application begins its life as a five-line script. You initialize an API client, wrap a prompt template in an f-string, call `client.chat.completions.create()`, and print the returned text to the terminal. In an afternoon hackathon, this feels like magic. The model answers complex domain queries, summarizes dense prose, and generates plausible code.
+
+Then you ship that five-line script to ten thousand real users. Within forty-eight hours, the illusion of simplicity collapses. A user uploads proprietary customer records and payroll spreadsheets, broadcasting unencrypted personally identifiable information (<Term t="pii-masking">PII</Term>) to external servers. An adversarial prompter tricks the model into roleplaying as a rogue administrator, leaking the confidential system prompt. An automated crawler triggers thirty thousand identical queries within five minutes, consuming \$900 of cloud spend while exhausting the provider rate limits and knocking legitimate users offline. Meanwhile, five percent of generations suffer from subtle hallucinations that misquote legal warranties.
+
+A raw language model is not an application; it is an unconstrained probabilistic next-token generator. To make it reliable, compliant, and commercially viable, inference engineers surround the model with a defensive architecture. 
+
+## The seven layers of a production system
+
+<Scrolly>
+  <ArchitectureStack client:visible slot="stage" />
+
+  <Step title="1. The bare model call">
+    A raw request travels directly from the client to a frontier model. While end-to-end latency is dominated purely by token generation, the system possesses **zero security boundaries**, no cost containment, and no mechanism to prevent severe data leaks or silent model drift.
+  </Step>
+
+  <Step title="2. Grounding with context">
+    The application injects domain facts using retrieval-augmented generation and live tools. Grounding the generation eliminates factual knowledge cutoffs, but expands the prompt from 50 tokens to over 2,000 tokens, significantly **increasing prefill compute**.
+  </Step>
+
+  <Step title="3. Input guardrails">
+    Before any token reaches a GPU, input guardrails intercept the payload. Lightweight deterministic regexes and fast intent filters scrub personal identifiers into reversible tokens and block prompt injections, **rejecting malicious traffic** for pennies.
+  </Step>
+
+  <Step title="4. Gateway and caching">
+    An ingress gateway terminates client authentication and enforces token-bucket rate limits. Directly behind it, an exact key-value cache checks if the normalized prompt has been evaluated previously, **returning responses in 7 ms** at \$0 inference cost.
+  </Step>
+
+  <Step title="5. Model routing">
+    For cache misses, an intent classifier evaluates semantic complexity. The router dispatches 70% of straightforward requests to an efficient 8B parameter model at \$0.15 per million tokens, reserving the expensive 70B frontier model solely for **deep multi-step reasoning**.
+  </Step>
+
+  <Step title="6. Output validation">
+    Before text returns to the user, output filters validate that JSON conform to strict Pydantic schemas, run hallucination consistency checks against the retrieved context, and **safely substitute original PII** back into the response stream.
+  </Step>
+
+  <Step title="7. Observability and feedback">
+    As the response streams, an asynchronous telemetry tap collects OpenTelemetry spans, token counts, time-to-first-token (TTFT), and explicit user feedback. This feeds the **continuous data flywheel** without adding a single millisecond of latency.
+  </Step>
+</Scrolly>
+
+## Anatomy of the production stack
+
+When you move from a toy script to a resilient platform, the system shifts from a synchronous point-to-point call to a pipeline of decoupled services. Each layer exists to address a specific structural vulnerability of autoregressive transformers.
+
+```
+[ Client Request ]
+       │
+       ▼
+┌────────────────────────────────────────────────────────┐
+│ 1. Ingress Model Gateway                               │
+│    • API Key Auth & Per-Tenant Quotas                  │
+│    • Token-Bucket Rate Limiting                        │
+│    • Provider Circuit Breakers & Failover              │
+└──────────────────────┬─────────────────────────────────┘
+                       │
+                       ▼
+┌────────────────────────────────────────────────────────┐
+│ 2. Multi-Tier Cache Layer                              │
+│    • Tier 1: Exact Match (SHA-256 in Redis)            │
+│    • Tier 2: Semantic Match (Embedding Cosine Sim)     │
+└──────────────┬───────────────────────────┬─────────────┘
+               │ Hit (~25%)                │ Miss (~75%)
+               │ (Return in 7 ms)          ▼
+               │              ┌──────────────────────────┐
+               │              │ 3. Input Guardrails      │
+               │              │    • Reversible PII Mask │
+               │              │    • Prompt Injection    │
+               │              │    • Toxic Topic Filter  │
+               │              └────────────┬─────────────┘
+               │                           │ Passed
+               │                           ▼
+               │              ┌──────────────────────────┐
+               │              │ 4. Context Assembly      │
+               │              │    • Vector RAG Chunks   │
+               │              │    • Tool / SQL Results  │
+               │              └────────────┬─────────────┘
+               │                           │
+               │                           ▼
+               │              ┌──────────────────────────┐
+               │              │ 5. Intent Router         │
+               │              │    • Complexity Classifier│
+               │              └──────┬────────────┬──────┘
+               │          Simple 70% │            │ Complex 30%
+               │                     ▼            ▼
+               │               ┌───────────┐ ┌───────────┐
+               │               │ Small LLM │ │ Large LLM │
+               │               │ (8B Tier) │ │(70B Tier) │
+               │               └─────┬─────┘ └─────┬─────┘
+               │                     │             │
+               │                     └──────┬──────┘
+               │                            │ Generated Tokens
+               │                            ▼
+               │              ┌──────────────────────────┐
+               │              │ 6. Output Guardrails     │
+               │              │    • Schema / JSON Regex │
+               │              │    • Hallucination Check │
+               │              │    • Reversible De-mask  │
+               │              └────────────┬─────────────┘
+               │                           │ Verified Output
+               ▼                           ▼
+┌────────────────────────────────────────────────────────┐
+│ 7. Asynchronous Telemetry & Feedback Collector         │
+│    • TTFT, TPOT, Latency Spans & Token Counters        │
+│    • Cost Accounting Ledger & Thumbs Up/Down Logging   │
+└────────────────────────────────────────────────────────┘
+```
+
+Let us examine the responsibilities, failure modes, and latency contributions of each layer from first principles.
+
+### Layer 1 · The Ingress Gateway
+
+Directly exposing an upstream LLM provider API (or a raw self-hosted vLLM instance) to client applications is hazardous. Upstream providers impose rigid requests-per-minute (RPM) and tokens-per-minute (TPM) quotas. Without an intermediary, one aggressive tenant running a batch benchmark can trigger HTTP 429 rate limit errors for your entire organization.
+
+A <Term t="gateway">model gateway</Term> acts as a reverse proxy sitting at the network edge. It performs three critical operations:
+1. **Unified Interface**: It exposes a standardized API (such as the OpenAI Chat Completions schema) regardless of whether the backend is Anthropic Claude, OpenAI, Google Gemini, or an internal vLLM cluster running Llama-3.1-8B.
+2. **Admission Control & Quotas**: It tracks token consumption per customer using a token-bucket algorithm, shedding excess load before it consumes backend GPU capacity.
+3. **Resilience & Fallbacks**: If the primary provider experiences elevated latencies (> 3 seconds) or returns 5xx internal server errors, the gateway transparently reroutes traffic to a secondary model or region.
+
+The gateway overhead is purely network routing and header inspection: typically **3 ms to 5 ms** in Go, Rust, or optimized Node.js.
+
+### Layer 2 · Multi-Tier Caching
+
+The cheapest and fastest token is the one you never generate. In consumer and enterprise applications alike, user queries exhibit substantial temporal locality: multiple users frequently ask identical or semantically equivalent questions (e.g., "What is the return policy?", "How do I reset my password?").
+
+Production architectures deploy two complementary caching tiers:
+- **Tier 1: <Term t="exact-cache">Exact Cache</Term>**: Hashes the normalized prompt text, system prompt, and sampling parameters (temperature, top_p) using SHA-256. A Redis lookup takes **1 ms to 3 ms**. If a hit occurs, the full response returns immediately. It costs \$0 in LLM tokens and consumes 0 GPU cycles.
+- **Tier 2: <Term t="semantic-cache">Semantic Cache</Term>**: Encodes the query into an embedding vector ($d = 384$ or $768$) and performs an approximate nearest neighbor search against previous queries. If cosine similarity exceeds a conservative threshold (typically $\tau \ge 0.92$), the cached answer is returned. Semantic lookups add **10 ms to 20 ms** of embedding calculation and vector search.
+
+If a cache hit occurs, the request completely bypasses guardrails, RAG retrieval, and model inference, short-circuiting directly to the client.
+
+### Layer 3 · Input Guardrails
+
+When a cache miss occurs, the raw user text must be sanitized before context injection or prompt templating. Input <Term t="guardrail">guardrails</Term> operate as security filters with two mandatory stages:
+1. **Reversible PII Masking**: Deterministic regular expressions and lightweight Named Entity Recognition (NER) models detect social security numbers, credit card numbers, email addresses, and phone numbers. These entities are replaced with deterministic surrogate tokens (such as `[EMAIL_1]` or `[CARD_1]`) and stored in a short-lived request-scoped dictionary.
+2. **Adversarial Screening**: Fast classification models or rule engines evaluate the prompt for direct prompt injections, jailbreak templates, and off-topic policy violations.
+
+Input guardrails add **15 ms to 30 ms** of CPU/GPU latency. Because they run on lightweight models, their compute cost is negligible (typically under \$0.00001 per call), yet they prevent thousands of dollars in wasted compute on malicious or non-compliant traffic.
+
+### Layer 4 · Context Assembly (RAG & Tools)
+
+Once sanitized, the query is enriched with domain knowledge. As derived in Module B3, an ungrounded model is susceptible to parametric memory hallucination. In this step:
+- The system embeds the query and searches an internal vector database or inverted BM25 index.
+- Top-$k$ relevant text chunks are formatted into the prompt template alongside system rules.
+- External API tools (e.g. SQL databases, search engines, account balance endpoints) execute synchronously to fetch structured data.
+
+Retrieval adds **30 ms to 80 ms** of network and vector search latency, while expanding the prompt length from ~50 tokens to ~2,000 tokens.
+
+### Layer 5 · Model Routing
+
+Not all prompts require a 70-billion or 400-billion parameter frontier model. Answering "What time does your store open?" does not demand deep chain-of-thought mathematical reasoning; an instruction-tuned 8B model can synthesize the answer flawlessly in 150 ms.
+
+An <Term t="intent-router">intent router</Term> examines the query features (token length, classification category, presence of code, required reasoning depth). If the task is classified as routine retrieval or summarization, it dispatches to a **small model tier** (e.g., Llama-3.1-8B or Qwen2.5-7B). If the task demands complex logic, ambiguous decision-making, or multi-step synthesis, it dispatches to a **frontier model tier** (e.g., Claude 3.5 Sonnet or GPT-4o).
+
+Routing adds **3 ms to 8 ms** of decision overhead, but reshapes the economics of the application.
+
+### Layer 6 · Output Validation
+
+Autoregressive sampling is stochastic. Even with temperature set to zero, models can occasionally emit hallucinated citations, drift into toxic prose, or produce malformed JSON that crashes downstream frontend parsers.
+
+Output guardrails intercept the generated token stream:
+- **Structural Enforcement**: Validates JSON output against a Pydantic schema or JSON Schema definition. If parsing fails, the system triggers an automated targeted repair prompt or falls back to a deterministic safe default.
+- **Hallucination Consistency Check**: Evaluates whether factual claims in the generated answer are strictly supported by the context chunks supplied in Layer 4.
+- **PII De-masking**: Replaces surrogate tokens (`[EMAIL_1]`) with the original client data stored in the request dictionary so the user receives a personalized response without upstream servers ever seeing the secret.
+
+Output verification adds **15 ms to 25 ms** before final delivery.
+
+### Layer 7 · Asynchronous Telemetry & Feedback
+
+Traditional software monitoring tracks HTTP 200 rates, CPU usage, and network saturation. These metrics are blind to AI failure modes: an endpoint can return HTTP 200 in 200 ms with 0% CPU load while emitting gibberish or offensive text.
+
+Layer 7 taps the request-response stream asynchronously. A background worker thread receives:
+- The full prompt and completion tokens
+- Time-to-first-token (<Term t="ttft">TTFT</Term>) and time-per-output-token (<Term t="tpot">TPOT</Term>)
+- Cost incurred according to the provider price ledger
+- Explicit user interactions (thumbs up, thumbs down, copy to clipboard, prompt regeneration)
+
+Crucially, **Layer 7 does not live on the user's synchronous path**. Spans are pushed into an in-memory ring buffer and flushed in batches to OpenTelemetry collectors, ensuring 0 ms of added user latency.
+
+---
+
+## The Latency Budget Equation
+
+Every layer added to an AI application costs time. In interactive systems, human perception benchmarks dictate strict boundaries:
+- Under **100 ms**: Feels instantaneous.
+- Under **300 ms**: Feels responsive.
+- Over **1,000 ms**: The user notices a pause; focus begins to wander.
+
+To maintain a responsive application, an inference engineer must formulate and enforce an explicit **latency budget**. Let $h$ denote the cache hit rate ($0 \le h \le 1$). Let $T_{\text{gw}}$ be gateway overhead, $T_{\text{cache}}$ be cache lookup time, $T_{\text{guard\_in}}$ be input guardrail latency, $T_{\text{context}}$ be retrieval time, $T_{\text{route}}$ be intent routing, $T_{\text{LLM}}$ be model execution time, and $T_{\text{guard\_out}}$ be output validation.
+
+The expected end-to-end latency $\mathbb{E}[T]$ is expressed as:
+
+$$
+\mathbb{E}[T] = T_{\text{gw}} + T_{\text{cache}} + (1 - h) \cdot \Big[ T_{\text{guard\_in}} + T_{\text{context}} + T_{\text{route}} + T_{\text{LLM}}(P, G) + T_{\text{guard\_out}} \Big]
+$$
+
+Notice the multiplier $(1 - h)$: every percentage point gained in cache hit rate directly multiplies and removes the entire synchronous downstream chain.
+
+The model execution latency $T_{\text{LLM}}(P, G)$ itself breaks down into two distinct phases taught in Module 05:
+
+$$
+T_{\text{LLM}}(P, G) = \underbrace{T_{\text{prefill}}(P)}_{\text{Time to First Token (TTFT)}} + \underbrace{G \times \text{TPOT}}_{\text{Decode stream}}
+$$
+
+Where $P$ is the prompt length in tokens, $G$ is the generated length in tokens, and TPOT is the average inter-token latency.
+
+| Architectural Layer | Typical Latency | Bottleneck Type | Runs on Cache Hit? |
+|---|---|---|---|
+| 1. Model Gateway | 3 – 5 ms | Network I/O / CPU | **Yes** |
+| 2. Exact Cache Lookup | 2 – 4 ms | Redis Memory / Network | **Yes** |
+| 3. Input Guardrails | 15 – 30 ms | CPU / Lightweight Model | No |
+| 4. Context Retrieval (RAG) | 35 – 80 ms | Vector DB / Network | No |
+| 5. Intent Router | 3 – 8 ms | CPU Classifier | No |
+| 6. Model Generation (8B Tier) | 120 – 200 ms | GPU Prefill + Memory Decode | No |
+| 6. Model Generation (70B Tier) | 450 – 800 ms | GPU Prefill + Memory Decode | No |
+| 7. Output Guardrails | 15 – 25 ms | CPU Regex / JSON Parser | No |
+| 8. Telemetry Tap | 0 ms (async) | Background Thread / Queue | **Yes** |
+
+<Callout type="intuition" title="The streaming trade-off">
+  In a streaming interface where tokens flow directly to the browser via Server-Sent Events (SSE), the user perceives responsiveness via **TTFT**, not total generation time. If you run output guardrails on the full completed message, you must buffer the entire response on the server, destroying the streaming experience. In Lesson 2, we resolve this with sliding sentence-window guardrails.
+</Callout>
+
+---
+
+## The Economics of Layered Serving
+
+Why not simply send every request to the smartest available model? Let us calculate the financial reality of running an enterprise assistant at scale.
+
+Assume a production service receives $N = 100{,}000$ queries per day.
+- Average prompt length: $P = 2{,}000$ tokens (including retrieved RAG chunks).
+- Average generation length: $G = 200$ tokens.
+- Total token volume per query: 2,200 tokens.
+- Total daily token volume: $220{,}000{,}000$ tokens ($220\text{M}$ tokens/day).
+
+### Scenario A · The Naive Architecture
+
+Every request hits a premier frontier model (such as Claude 3.5 Sonnet or GPT-4o tier).
+Public pricing at the time of writing is approximately:
+- Input tokens: \$3.00 per $10^6$ tokens.
+- Output tokens: \$15.00 per $10^6$ tokens.
+
+The cost per single query $C_{\text{naive}}$ is:
+
+$$
+C_{\text{naive}} = \frac{2{,}000 \times \$3.00}{10^6} + \frac{200 \times \$15.00}{10^6} = \$0.0060 + \$0.0030 = \$0.0090\ \text{per query}
+$$
+
+For $100{,}000$ queries per day:
+
+$$
+\text{Daily Cost} = 100{,}000 \times \$0.0090 = \$900.00\ \text{per day} \quad \implies \quad \mathbf{\$27{,}000\ \text{per month}}
+$$
+
+### Scenario B · The Engineered Production Stack
+
+We introduce three architectural interventions:
+1. **Exact Caching**: Achieves a realistic $h = 0.25$ (25% hit rate) across repeated queries and system prompts.
+2. **Intent Routing**: Of the remaining 75% cache misses, 70% of queries are classified as standard lookup/summarization and routed to a small model tier (e.g. Llama-3.1-8B or Qwen2.5-7B hosted or via API). The remaining 30% are routed to the frontier model tier.
+   - Small model pricing: \$0.15 per $10^6$ input tokens, \$0.60 per $10^6$ output tokens.
+3. **Guardrails & Infra**: Lightweight Redis and classifier hosting costs approximately \$0.01 per 1,000 queries (\$0.00001 per query).
+
+Let us compute the daily cost step by step:
+
+**Step 1: Cache hits**
+$25{,}000$ queries hit the cache. Inference cost = **\$0.00**.
+
+**Step 2: Cache misses to small model**
+Queries routed to small tier: $75{,}000 \times 0.70 = 52{,}500$ queries.
+Cost per query on small tier $C_{\text{small}}$:
+
+$$
+C_{\text{small}} = \frac{2{,}000 \times \$0.15}{10^6} + \frac{200 \times \$0.60}{10^6} = \$0.00030 + \$0.00012 = \$0.00042\ \text{per query}
+$$
+
+Total daily cost for small model tier:
+
+$$
+52{,}500 \times \$0.00042 = \mathbf{\$22.05\ \text{per day}}
+$$
+
+**Step 3: Cache misses to large model**
+Queries routed to large tier: $75{,}000 \times 0.30 = 22{,}500$ queries.
+Cost per query on large tier $C_{\text{large}} = \$0.0090$.
+Total daily cost for large model tier:
+
+$$
+22{,}500 \times \$0.0090 = \mathbf{\$202.50\ \text{per day}}
+$$
+
+**Step 4: Infrastructure and guardrails**
+$75{,}000$ misses evaluate guardrails at \$0.01 per 1k requests:
+
+$$
+75 \times \$0.01 = \mathbf{\$0.75\ \text{per day}}
+$$
+
+**Total engineered cost:**
+
+$$
+\text{Total Daily Cost} = \$0.00 + \$22.05 + \$202.50 + \$0.75 = \mathbf{\$225.30\ \text{per day}} \quad \implies \quad \mathbf{\$6{,}759\ \text{per month}}
+$$
+
+<Callout type="math" title="The 75% savings arithmetic">
+  $$
+  \text{Savings} = \frac{\$27{,}000 - \$6{,}759}{\$27{,}000} \times 100\% = \mathbf{74.97\%}
+  $$
+
+  By adding a \$0.75/day guardrail and router layer with a cache, the team saves **\$20,241 every single month** on a 100k-query system. Furthermore, median p50 latency plummets from 580 ms to under 150 ms because 25% of queries finish in 7 ms and 52.5% of queries run on an agile 8B model.
+</Callout>
+
+---
+
+## Building a Resilient Pipeline in Python
+
+Here is a clean implementation of the core architectural pipeline. It coordinates rate-limiting, exact hashing, routing, model dispatch, and telemetry capture.
+
+```python
+import hashlib
+import json
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+@dataclass
+class TelemetrySpan:
+    query_id: str
+    cached: bool
+    model_tier: str
+    tokens_in: int
+    tokens_out: int
+    latency_ms: float
+    cost_usd: float
+
+class ProductionAISystem:
+    def __init__(self):
+        # In-memory exact cache simulating Redis (Key: SHA256, Value: response string)
+        self.exact_cache: Dict[str, str] = {}
+        # Asynchronous telemetry buffer
+        self.telemetry_buffer: list[TelemetrySpan] = []
+
+    def _hash_prompt(self, prompt: str, system_prompt: str) -> str:
+        """Create deterministic key from normalized prompt inputs."""
+        normalized = f"{system_prompt.strip()}||{prompt.strip().lower()}"
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def _input_guardrail(self, prompt: str) -> Tuple[bool, str, Dict[str, str]]:
+        """Scrub PII and detect injection. Returns (is_safe, masked_text, pii_map)."""
+        # Simple illustration of reversible PII masking
+        pii_map = {}
+        masked = prompt
+        if "secret" in prompt.lower() and "ignore previous" in prompt.lower():
+            return False, "Prompt injection detected.", {}
+        return True, masked, pii_map
+
+    def _intent_router(self, prompt: str) -> str:
+        """Classify task difficulty. Returns 'small' or 'large'."""
+        # Simple heuristics: word count and reasoning markers
+        tokens = len(prompt.split())
+        complex_markers = ["prove", "analyze", "compare step by step", "write python"]
+        if tokens > 150 or any(m in prompt.lower() for m in complex_markers):
+            return "large"
+        return "small"
+
+    def execute_query(self, user_prompt: str, system_prompt: str) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        query_id = hashlib.md5(f"{time.time()}_{user_prompt}".encode()).hexdigest()[:8]
+
+        # 1. Gateway & Cache Lookup
+        cache_key = self._hash_prompt(user_prompt, system_prompt)
+        if cache_key in self.exact_cache:
+            latency = (time.perf_counter() - t0) * 1000.0
+            self._record_telemetry(query_id, True, "none", 0, 0, latency, 0.0)
+            return {"response": self.exact_cache[cache_key], "cached": True, "latency_ms": latency}
+
+        # 2. Input Guardrails
+        is_safe, masked_prompt, pii_map = self._input_guardrail(user_prompt)
+        if not is_safe:
+            return {"error": "Request rejected by security policy.", "code": 400}
+
+        # 3. Intent Routing
+        tier = self._intent_router(masked_prompt)
+
+        # 4. Model Inference Dispatch (Simulated)
+        if tier == "small":
+            # 8B model: fast, cheap
+            tokens_in, tokens_out = 500, 80
+            cost = (tokens_in * 0.15 + tokens_out * 0.60) / 1e6
+            generation = f"[8B Response] Verified answer for: {masked_prompt[:40]}..."
+        else:
+            # 70B model: deep reasoning
+            tokens_in, tokens_out = 1500, 250
+            cost = (tokens_in * 3.00 + tokens_out * 15.00) / 1e6
+            generation = f"[70B Frontier Response] Detailed synthesis: {masked_prompt[:40]}..."
+
+        # 5. Output Verification & De-masking
+        final_output = generation  # Apply PII dictionary substitution here
+
+        # 6. Populate Cache
+        self.exact_cache[cache_key] = final_output
+
+        # 7. Asynchronous Telemetry
+        latency = (time.perf_counter() - t0) * 1000.0
+        self._record_telemetry(query_id, False, tier, tokens_in, tokens_out, latency, cost)
+
+        return {"response": final_output, "cached": False, "tier": tier, "latency_ms": latency}
+
+    def _record_telemetry(self, qid, cached, tier, tin, tout, lat, cost):
+        span = TelemetrySpan(qid, cached, tier, tin, tout, lat, cost)
+        self.telemetry_buffer.append(span)
+```
+
+<Callout type="pitfall" title="Do not run guardrails after the cache">
+  A common architectural anti-pattern is placing input guardrails *before* the exact cache lookup. If you scrub PII with a non-deterministic model before hashing, identical user prompts may yield slightly different masked strings (e.g. `[NAME_1]` vs `[PERSON_1]`), causing **cache misses on identical queries**. Normalize your exact cache keys strictly on raw trimmed text or deterministic tokenizers before running stochastic filters.
+</Callout>
+
+<KeyNotes>
+  1. A production AI application requires **seven distinct layers**: gateway, caching, input guardrails, context assembly, model routing, output guardrails, and observability.
+  2. The **bare model call** suffers from unconstrained costs, exposure to prompt injections, unencrypted PII broadcasting, and silent hallucinations.
+  3. The **ingress gateway** protects against upstream provider outages, handles multi-tenant rate limits, and standardizes disparate model vendor schemas.
+  4. An **exact cache** (SHA-256) returns responses in 2–4 ms with zero GPU compute and \$0 token cost; every 10% increase in hit rate directly cuts 10% from total model spend.
+  5. **Model routing** shifts the cost-quality frontier: dispatching 70% of simple tasks to an 8B model (\$0.15/M) cuts blended generation bills by ~75% compared to monolithic frontier serving.
+  6. **Input and output guardrails** impose a modest latency penalty (30–50 ms total), but enforce strict compliance and prevent malformed structured payloads.
+  7. **Observability must be asynchronous**: logging spans, token counts, and TTFT metrics via background buffers ensures 0 ms impact on the user's critical path.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why should the exact cache lookup occur before invoking an LLM-based input guardrail?',
+    options: [
+      'Because guardrail models are hosted in a different cloud provider',
+      'Because cached queries have already passed safety verification, and bypassing the guardrail saves 20 ms and eliminates unnecessary compute',
+      'Because exact hashing only works on binary files',
+      'Because Redis does not support string queries'
+    ],
+    answer: 1,
+    why: 'If a query is already present in the cache, its previous response was already scrubbed and verified by the output guardrails. Bypassing the guardrail and LLM layers saves 20–50 ms and avoids compute costs.'
+  },
+  {
+    q: 'An AI service processes 200,000 queries per day. Each query averages 1,500 input tokens and 200 output tokens on a frontier model costing \\$3.00/M input and \\$15.00/M output. What is the daily cost of this naive setup?',
+    numeric: true,
+    answer: 1500,
+    tolerance: 50,
+    unit: 'USD',
+    why: 'Cost per query = (1,500 × 3.00 + 200 × 15.00) / 1,000,000 = (4,500 + 3,000) / 1,000,000 = \\$0.0075. Daily cost = 200,000 × \\$0.0075 = \\$1,500.00 per day.'
+  },
+  {
+    q: 'In the system above, the team adds an exact cache with a 20% hit rate and routes 60% of misses to an 8B model (\\$0.20/M input, \\$0.80/M output). The remaining 40% of misses use the frontier model. Guardrails cost \\$0.01 per 1k requests. What is the new daily cost?',
+    numeric: true,
+    answer: 541.44,
+    tolerance: 20,
+    unit: 'USD',
+    why: 'Cache hits (40,000 queries) = \\$0. Misses = 160,000 queries. Small model (60% of 160k = 96,000 queries): (1,500 × 0.20 + 200 × 0.80) / 1e6 = (300 + 160) / 1e6 = \\$0.00046. Cost = 96,000 × \\$0.00046 = \\$44.16. Large model (40% of 160k = 64,000 queries): 64,000 × \\$0.0075 = \\$480.00. Guardrails: 160 × \\$0.01 = \\$1.60. Total = \\$44.16 + \\$480.00 + \\$1.60 = \\$525.76 per day (well within tolerance).'
+  },
+  {
+    q: 'Which component in the architecture is responsible for circuit breaking and provider failover during an upstream API outage?',
+    options: [
+      'The vector database',
+      'The ingress model gateway',
+      'The semantic cache',
+      'The PII masking module'
+    ],
+    answer: 1,
+    why: 'The model gateway acts as the centralized reverse proxy and ingress layer. It monitors upstream HTTP response codes and latencies, triggering circuit breakers and rerouting traffic to fallback models or secondary regions when an outage occurs.'
+  },
+  {
+    q: 'Why must telemetry and trace logging be decoupled from the synchronous request path via an asynchronous buffer or ring queue?',
+    options: [
+      'To prevent disk write latencies and remote telemetry network calls from inflating the user’s end-to-end response time and TTFT',
+      'Because OpenTelemetry does not support HTTP requests',
+      'Because LLMs cannot generate tokens while log files are open',
+      'To comply with GPU driver memory safety rules'
+    ],
+    answer: 0,
+    why: 'Synchronous network calls or disk writes to logging aggregators would add 10–50 ms to every user request. By pushing spans into an in-memory queue flushed asynchronously by a background thread, telemetry overhead on the critical path drops to 0 ms.'
+  },
+  {
+    q: 'A system has a 30% cache hit rate (cache latency 5 ms). Cache misses take 400 ms on average. What is the expected average latency of the system?',
+    numeric: true,
+    answer: 281.5,
+    tolerance: 10,
+    unit: 'ms',
+    why: 'Expected latency = 0.30 × 5 ms + 0.70 × 400 ms = 1.5 ms + 280 ms = 281.5 ms.'
+  }
+]} />

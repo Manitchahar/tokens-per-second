@@ -1,0 +1,143 @@
+---
+title: 'Project: Ship an AI app end to end'
+summary: 'Assemble every layer of this module into a resilient, production-ready AI application: ingress gateway, rate-limiting, reversible PII masking, exact and semantic caching, grounded RAG generation, schema validation, telemetry, and preference pair capture.'
+objectives:
+  - Construct an end-to-end AI application integrating gateways, guardrails, caches, and RAG retrieval
+  - Deploy an open-weights generator in FP16 on an NVIDIA T4 GPU with strict JSON schema enforcement
+  - Verify multi-tier cache hits across exact (SHA-256) and semantic (embedding cosine similarity) lookups
+  - Implement reversible PII masking and adversarial prompt injection screening
+  - Export production interaction telemetry into cleaned (x, y_w, y_l) preference pairs for continuous alignment
+colab: b7-ai-app.ipynb
+---
+import ProjectAppSim from '@/components/viz/ai-apps/ProjectAppSim.tsx';
+
+Throughout this module, you have analyzed why a bare model call is fragile: it exposes raw customer PII to third-party providers, leaves endpoints vulnerable to prompt injections, runs with zero cost containment or rate-limiting, and fails semantically without warning.
+
+In this capstone project, you will build and defend a complete, production-grade AI application. You will connect every layer taught in this module—an ingress gateway with a token-bucket rate limiter, reversible PII pseudonymization, a two-tier cache (Redis SHA-256 and vector cosine similarity), an intent router, a grounded RAG generation engine using `Qwen2.5-0.5B-Instruct` in FP16 on a free Google Colab T4 GPU, structured output guardrails, asynchronous OpenTelemetry logging, and a feedback capture engine that serializes DPO preference pairs.
+
+Open the Colab notebook below to run the complete implementation on real GPU hardware.
+
+<Colab nb="b7-ai-app.ipynb" />
+
+---
+
+## Interactive Simulator: Test the Complete Application
+
+Before running the GPU notebook, test the interactive simulator below. Select different query scenarios—clean factual queries, duplicate questions, paraphrased variants, PII-laden prompts, and malicious injection attempts—to trace how the pipeline routes, caches, sanitizes, and verifies each request.
+
+<Wide>
+  <ProjectAppSim client:visible />
+</Wide>
+
+---
+
+## The Deliverable
+
+You will produce and defend a repository containing four core components:
+
+1. **`app.py`** — The complete application pipeline implementing rate-limiting, PII masking, caching, RAG retrieval, generation, and output verification.
+2. **`telemetry.jsonl`** — The asynchronous operational log recording prompt tokens, completion tokens, TTFT, TPOT, and micro-dollar costs for at least 20 test executions.
+3. **`dpo_pairs.jsonl`** — A serialized dataset of at least 5 clean preference tuples $(x, y_w, y_l)$ mined from user regenerations and inline text edits.
+4. **`ARCHITECTURE.md`** — A technical design document detailing your latency budget allocation, cache threshold tuning rationale, and failure recovery runbooks.
+
+---
+
+## Step-by-Step Implementation Guide
+
+### Task 1 · Ingress Gateway & Token-Bucket Rate Limiter
+
+Your gateway must protect upstream model resources by shedding excess load before invoking expensive retrieval or GPU inference.
+
+In `notebooks-src/b7-ai-app.py`, implement a thread-safe token-bucket rate limiter:
+- Parameterize capacity $C = 60$ tokens and refill rate $r = 1.0$ tokens/second.
+- If a tenant exhausts their bucket, return an immediate HTTP 429 response without invoking downstream layers.
+
+```python
+class TokenBucketRateLimiter:
+    def __init__(self, capacity: int = 60, refill_rate: float = 1.0):
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.refill_rate = refill_rate
+        self.last_time = time.time()
+
+    def allow_request(self) -> bool:
+        now = time.time()
+        elapsed = now - self.last_time
+        self.last_time = now
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+```
+
+### Task 2 · Reversible PII Pseudonymization
+
+Construct an input guardrail that detects structured identifiers (SSNs, emails, credit cards) and replaces them with surrogate tokens:
+- Store pairs in a request-scoped dictionary: `{"[SSN_1]": "000-12-3456"}`.
+- After generation, execute the reverse substitution so that the user receives an unmasked answer while upstream logs remain sanitized.
+
+### Task 3 · Two-Tier Multi-Modal Caching
+
+Implement a two-tier caching hierarchy:
+1. **Tier 1 (Exact)**: Hash the normalized prompt using SHA-256. If present, return in under 3 ms with \$0 token cost.
+2. **Tier 2 (Semantic)**: Encode cache misses into 384-dimensional dense vectors using `sentence-transformers/all-MiniLM-L6-v2`. If cosine similarity against a cached entry exceeds $\tau \ge 0.90$, return the cached response.
+
+<Callout type="pitfall" title="Do not set the semantic threshold below 0.90">
+  In your notebook experiments, verify that setting $\tau = 0.84$ triggers a false hit on opposing queries like *"How do I provision an instance?"* versus *"How do I terminate an instance?"*. Keep your threshold at $\tau \ge 0.90$ to maintain safe precision.
+</Callout>
+
+### Task 4 · Grounded Generation with Qwen2.5 on T4
+
+Load `Qwen/Qwen2.5-0.5B-Instruct` in `torch.float16` on your Colab T4 GPU:
+- Format the prompt using structural XML delimiters (`<system_instructions>`, `<untrusted_context>`, `<user_query>`) to enforce the **Instruction Hierarchy**.
+- Enforce structured JSON generation:
+
+```json
+{
+  "answer": "string",
+  "citations": ["doc_01"],
+  "confidence": 0.95
+}
+```
+
+- Measure exact prefill latency (TTFT) and decode stream latency (TPOT).
+
+### Task 5 · Output Verification & Hallucination Filter
+
+Before returning text to the client:
+- Parse the output JSON. If malformed, execute an automated fallback repair.
+- Verify that citations in the response match valid document IDs returned by RAG retrieval.
+- Execute de-masking to restore original customer PII.
+
+### Task 6 · Asynchronous Telemetry & DPO Export
+
+Log every transaction asynchronously to an in-memory buffer:
+- Record query hash, input tokens, output tokens, total latency, TTFT, TPOT, and cost.
+- Capture simulated user corrections (e.g. an inline text edit) and export the tuple $(x, y_w, y_l)$ to `dpo_pairs.jsonl`.
+
+---
+
+## Acceptance Criteria & Evaluation Rubric
+
+Your project submission will be evaluated against five rigorous engineering criteria:
+
+| Category | Weight | Criteria for Full Score |
+|---|---|---|
+| **Architectural Completeness** | 25% | All seven layers (Gateway, Rate Limiter, PII Mask, Cache, RAG, Output Rail, Telemetry) execute in proper sequence without coupling. |
+| **Safety & Guardrails** | 20% | Reversible PII masking prevents raw SSNs from entering model prompts; adversarial injection attempts trigger clean HTTP 400 rejections. |
+| **Caching & Latency** | 20% | Exact cache hits resolve in &lt; 5 ms; semantic cache resolves paraphrases at $\tau \ge 0.90$; TTFT and TPOT are logged independently. |
+| **Data Flywheel & DPO** | 15% | Captured user edits and regenerations correctly synthesize valid $(x, y_w, y_l)$ preference pairs exported to JSONL format. |
+| **Documentation & Defense** | 20% | `ARCHITECTURE.md` derives the latency budget mathematically, justifies the semantic threshold, and articulates failover runbooks. |
+
+---
+
+<KeyNotes>
+  1. A production AI application is an **integrated defensive system**, not a standalone model call.
+  2. The **gateway and rate limiter** protect backend resources against denial-of-service and tenant noisy-neighbor starvation.
+  3. **Reversible PII masking** satisfies compliance mandates by ensuring unencrypted identifiers never leave the application perimeter.
+  4. Multi-tier caching achieves **sub-5 ms latency on 20% to 30% of traffic**, saving thousands of dollars in monthly inference compute.
+  5. The **Instruction Hierarchy** and structural XML delimiters prevent untrusted retrieved text from executing unauthorized tool commands.
+  6. **Constrained JSON schemas and factuality validation** eliminate downstream parsing errors and catch ungrounded hallucinations.
+  7. Logging granular operational telemetry while capturing implicit feedback into **DPO preference pairs** transforms a static deployment into a compounding, self-improving platform.
+</KeyNotes>

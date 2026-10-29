@@ -1,0 +1,425 @@
+---
+title: 'Model gateways, routers & caches'
+summary: 'Architecting high-scale LLM ingress: unified gateways, rate-limiting token buckets, exact Redis caching, semantic vector cache thresholds, intent routing, and blended unit economics.'
+objectives:
+  - Consolidate disparate AI services behind a unified model gateway with tenant quotas and automated failover circuits
+  - Implement a two-tier caching architecture combining SHA-256 exact matching with embedding semantic caching
+  - Calculate the false-hit risk curve for semantic cache cosine similarity thresholds (τ)
+  - Derive the blended token price equation across tiered models and compute multi-tenant savings
+  - Leverage provider prompt prefix caching to slash prefill latency on static system prompts
+---
+import GatewayRouterCache from '@/components/viz/ai-apps/GatewayRouterCache.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In modern engineering teams, adopting language models often resembles an uncoordinated gold rush. The marketing team builds an automated copy generator using direct calls to OpenAI. The analytics team scripts an internal SQL assistant using Anthropic Claude. The search team experiments with a self-hosted vLLM deployment on an internal GPU cluster.
+
+Within three months, engineering leadership confronts an operational nightmare. Ten different microservices hold hardcoded API keys. When an upstream provider suffers a regional outage, four core customer-facing applications crash simultaneously because none implemented fallback logic. One buggy crawler enters an infinite loop, consuming the organization's entire tier-4 rate limit quota in twenty minutes and knocking all other services offline with HTTP 429 errors. Meanwhile, the finance team receives an un-auditable, six-figure cloud bill with zero visibility into which team or user generated which cost.
+
+Production inference engineering demands a single, hardened front door: a **model gateway**, paired with **intelligent multi-tier caching** and **intent-based model routing**.
+
+## Unifying ingress, caching, and model routing
+
+<Scrolly>
+  <GatewayRouterCache client:visible slot="stage" />
+
+  <Step title="1. The unrouted API dilemma">
+    Direct service-to-provider connections create severe operational vulnerabilities: fragmented API keys, uncoordinated rate-limit exhaustion, zero visibility into per-tenant costs, and **instant total downtime** during provider outages.
+  </Step>
+
+  <Step title="2. Unified model gateway & auth">
+    A <Term t="gateway">model gateway</Term> provides a centralized reverse proxy. It terminates client authentication, enforces per-tenant token-bucket rate limits, tracks cost ledgers, and manages **automated failover circuits** across cloud vendors.
+  </Step>
+
+  <Step title="3. Tier 1: Exact hash cache (Redis)">
+    Before touching any model or vector store, an <Term t="exact-cache">exact cache</Term> computes the SHA-256 hash of the normalized prompt string and parameters. Repeated queries return in **2 ms at \$0 cost**, completely bypassing the GPU.
+  </Step>
+
+  <Step title="4. Tier 2: Semantic vector cache & threshold">
+    For novel strings, a <Term t="semantic-cache">semantic cache</Term> computes an embedding vector and searches nearest neighbors. Setting the similarity threshold at $\tau \ge 0.92$ safely absorbs paraphrased queries, while avoiding the **false-hit danger zone** below 0.88.
+  </Step>
+
+  <Step title="5. Intent routing: Small vs Large">
+    When a cache miss occurs, an <Term t="intent-router">intent router</Term> evaluates task complexity. The system dispatches 70% of routine lookups to a fast, cheap 8B model (\$0.15/M tokens), reserving the 70B frontier model (\$3.00/M tokens) exclusively for **deep multi-step reasoning**.
+  </Step>
+
+  <Step title="6. Provider prompt prefix caching">
+    Prompts sent to upstream engines leverage provider-level prompt caching (Module 10). Reusing the static system prompt and few-shot examples against pre-computed KV blocks cuts prefill latency and input token pricing by **up to 80%**.
+  </Step>
+
+  <Step title="7. Blended pricing & failover circuit">
+    By combining a 25% cache hit rate with 70% small-tier routing, the system drops the blended cost per million tokens from \$4.50 down to **under \$1.00**, while circuit breakers ensure 99.99% availability during provider disruptions.
+  </Step>
+</Scrolly>
+
+---
+
+## The Model Gateway: Centralized Ingress
+
+A model gateway acts as an API reverse proxy sitting between your internal applications and the upstream model providers (both commercial APIs like OpenAI/Anthropic and self-hosted vLLM or Triton clusters).
+
+```
+[ Internal Client Apps ]
+  (Mobile, Web, Workers)
+            │
+            ▼
+┌────────────────────────────────────────────────────────┐
+│ MODEL GATEWAY REVERSE PROXY                            │
+├────────────────────────────────────────────────────────┤
+│ 1. Unified Schema (OpenAI ChatCompletions standard)    │
+│ 2. Virtual API Keys & RBAC per Department              │
+│ 3. Token-Bucket Rate Limiter (RPM & TPM per tenant)    │
+│ 4. Unified Cost & Usage Accounting Ledger              │
+│ 5. Health Probes & Circuit Breaker Failover            │
+└───────────┬────────────────────────────────┬───────────┘
+            │ Primary (99% traffic)          │ Fallback (Failover)
+            ▼                                ▼
+┌──────────────────────┐         ┌──────────────────────┐
+│ Upstream Provider A  │         │ Upstream Provider B  │
+│ (e.g. OpenAI / vLLM) │         │ (e.g. Claude / Groq) │
+└──────────────────────┘         └──────────────────────┘
+```
+
+The gateway standardizes four vital platform capabilities:
+
+### 1. Schema Normalization
+Different vendors use incompatible request schemas: OpenAI formats tool calls with `tool_calls: [{function: ...}]`, Anthropic uses XML-style content blocks, and Google Gemini uses `parts: [{text: ...}]`. The gateway accepts one canonical schema (usually the OpenAI Chat Completions standard) and translates requests and streaming responses on the fly. Upstream vendors become plug-and-play interchangeable backends.
+
+### 2. Multi-Tenant Token-Bucket Admission Control
+To prevent noisy-neighbor starvation, the gateway enforces token-bucket rate limiting on two distinct axes:
+- **Requests Per Minute (RPM)**: Governs concurrency and socket limits.
+- **Tokens Per Minute (TPM)**: Governs token volume.
+
+If a batch job or automated script exceeds its allocated quota, the gateway sheds load at the edge with HTTP 429 responses, safeguarding the shared upstream quota for critical user-facing traffic.
+
+### 3. Circuit Breakers and Transparent Failovers
+When an upstream provider experiences elevated latency or returns consecutive HTTP 5xx errors, a naive client repeatedly retries, exacerbating provider load.
+
+A gateway implements the **Circuit Breaker pattern**:
+- **Closed State**: Normal operation; all requests route to Primary Provider.
+- **Open State**: If the error rate over a sliding 60-second window exceeds 5%, the circuit trips *Open*. For the next 30 seconds, all requests bypass the failing provider and automatically failover to a configured Secondary Provider (e.g., swapping from GPT-4o to Claude 3.5 Sonnet, or falling back to a self-hosted Llama-3.1-70B instance).
+- **Half-Open State**: After the timeout, a small canary slice (5% of traffic) tests the Primary. If successful, the circuit resets to *Closed*.
+
+---
+
+## Multi-Tier Caching: Exact vs Semantic
+
+The most effective latency and cost optimization is returning a verified answer without performing autoregressive generation. Modern architectures combine two distinct caching tiers:
+
+### Tier 1 · Exact Hashing (Redis)
+
+Exact caching checks whether the identical prompt and generation configuration have been processed previously.
+
+To ensure consistency, prompt strings must be normalized before hashing:
+1. Strip leading and trailing whitespace.
+2. Normalize Unicode representations (e.g. NFC normalization).
+3. Include all sampling parameters that alter generation: `model`, `temperature`, `top_p`, `presence_penalty`, and `system_prompt`.
+
+```python
+import hashlib
+import json
+
+def generate_exact_cache_key(messages: list[dict], model: str, temperature: float) -> str:
+    """Generate a deterministic SHA-256 cache key from normalized prompt inputs."""
+    payload = {
+        "model": model.strip().lower(),
+        "temperature": round(temperature, 2),
+        "messages": [
+            {"role": m["role"].strip().lower(), "content": m["content"].strip()}
+            for m in messages
+        ]
+    }
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+```
+
+An exact cache lookup against an in-memory Redis cluster completes in **1 ms to 3 ms**. It carries **zero false-positive risk**: because the hash is deterministic, a hit guarantees that the user submitted the exact same query under the exact same parameters.
+
+### Tier 2 · Semantic Caching (Vector Search)
+
+In human language, identical questions are rarely phrased with identical character sequences. A user asking *"What is the baggage allowance for flight BA142?"* wants the same answer as *"How many bags can I take on BA142?"*. An exact cache yields a miss on both.
+
+A **semantic cache** overcomes this by matching queries in embedding space:
+1. When a query misses the exact cache, encode the user prompt into a dense vector embedding $\mathbf{u} \in \mathbb{R}^d$ using a small bi-encoder (such as `all-MiniLM-L6-v2`, $d = 384$).
+2. Query an Approximate Nearest Neighbor (ANN) vector index storing historical prompt embeddings and their validated responses.
+3. Compute the cosine similarity against the top neighbor $\mathbf{v}$:
+
+$$
+\text{sim}(\mathbf{u}, \mathbf{v}) = \frac{\mathbf{u} \cdot \mathbf{v}}{\|\mathbf{u}\|_2 \|\mathbf{v}\|_2}
+$$
+
+4. If $\text{sim}(\mathbf{u}, \mathbf{v}) \ge \tau$, return the cached response.
+
+```
+Incoming User Query: "How many bags can I take on BA142?"
+                     │
+                     ▼
+       Bi-Encoder (MiniLM, 12 ms)
+                     │
+                     ▼ Vector u (d = 384)
+┌────────────────────────────────────────────────────────┐
+│ Vector Database ANN Search (FAISS / HNSW, 4 ms)        │
+├────────────────────────────────────────────────────────┤
+│ Nearest: "What is baggage allowance for BA142?"        │
+│ Cosine Similarity: 0.942                               │
+└────────────────────┬───────────────────────────────────┘
+                     │
+     Is 0.942 ≥ τ (0.92)?
+      ┌──────────────┴──────────────┐
+  Yes │                             │ No
+      ▼                             ▼
+Cache Hit (Return Answer)       Cache Miss (Route to LLM)
+```
+
+### The False-Hit Danger Zone
+
+The central engineering challenge of semantic caching is selecting the similarity threshold $\tau$.
+
+```
+Cosine Similarity (τ)
+0.80 ──────────── 0.86 ──────────── 0.92 ──────────── 1.00
+      HIGH RISK         MODERATE          SAFE
+    [False Hits]      [Ambiguous]       [True Paraphrase]
+```
+
+- **$\tau \ge 0.92$ (The Safe Zone)**: The prompts are near-identical syntactic paraphrases with identical semantic intent (*"reset password"* vs *"how to change my password"*). False hit rate is typically under 0.5%.
+- **$0.85 \le \tau < 0.91$ (The Danger Zone)**: Queries share keywords and semantic domain, but express opposite or distinct intents.
+  - Query A: *"How do I start an AWS EC2 instance?"*
+  - Query B: *"How do I terminate an AWS EC2 instance?"*
+  - Because both queries heavily share cloud infrastructure terminology, their bi-encoder cosine similarity is often **0.87 to 0.89**. If your threshold is set to $\tau = 0.85$, the semantic cache returns instructions on starting an instance to a user trying to terminate one—a critical failure.
+- **$\tau < 0.85$ (Catastrophic Collision Zone)**: Massive semantic bleeding; unrelated queries in the same broad topic trigger false hits.
+
+<Callout type="pitfall" title="Never cache dynamic or context-dependent prompts">
+  Never enable semantic caching on prompts that contain temporal markers (*"What is the weather today?"*), session-specific data (*"What was my previous question?"*), or non-zero temperatures where randomized creative output was explicitly requested. Semantic caches should be keyed to (prompt, tenant_id, date_bucket) to prevent cross-user data leakage.
+</Callout>
+
+---
+
+## Provider Prompt Caching (Prefix Caching)
+
+What happens when a request misses both the exact and semantic caches and must be routed to an upstream engine?
+
+In modern LLM applications, prompts are often dominated by large, static preambles:
+- A 2,000-token system instruction specifying role, constraints, and JSON schemas.
+- A 1,500-token set of few-shot demonstration examples.
+- A 50-token dynamic user question.
+
+As established in Module 10 (Prefix Caching), computing attention over the 3,500 static tokens on every request wastes huge amounts of GPU prefill compute. Modern providers (such as Anthropic, OpenAI, and self-hosted vLLM instances with `--enable-prefix-caching`) automatically cache the KV tensors of identical prefix blocks.
+
+When a prompt matches an already-cached prefix:
+- **Prefill Latency**: Drops by 50% to 80% because the engine skips matrix multiplies for the cached tokens.
+- **Token Pricing**: Providers charge a discounted rate—typically **50% to 80% cheaper** than standard input tokens—for cached tokens.
+
+To exploit provider prompt caching, inference engineers structure prompts so that **static tokens always appear first**:
+
+$$\underbrace{[\text{System Prompt}] \quad [\text{Few-Shot Examples}]}_{\text{Static Cached Prefix (3,500 tokens)}} \quad \underbrace{[\text{Retrieved Chunks}] \quad [\text{User Question}]}_{\text{Dynamic Suffix (500 tokens)}}$$
+
+If you place a timestamp or user ID at the very top of the system prompt, you invalidate the prefix hash, destroying cache alignment for the entire sequence.
+
+---
+
+## Intent Routing and Blended Economics
+
+Not every request requires a 70-billion parameter frontier model. Answering *"What is the capital of France?"* does not require deep chain-of-thought mathematical reasoning; an 8B parameter model can answer accurately in 100 ms at a fraction of the cost.
+
+An **intent router** classifies incoming queries by complexity and routes each prompt to the cheapest model capable of completing the task.
+
+### The Blended Price Equation
+
+Let $h$ represent the combined cache hit rate ($0 \le h \le 1$). Let $p_{\text{small}}$ represent the proportion of cache misses routed to a small model tier, and $(1 - p_{\text{small}})$ represent the proportion routed to a large frontier model tier.
+
+Let $C_{\text{small}}$ be the total token cost per query on the small model, and $C_{\text{large}}$ be the total token cost per query on the large model.
+
+The expected blended cost per query $\mathbb{E}[C]$ is expressed as:
+
+$$
+\mathbb{E}[C] = (1 - h) \cdot \Big[ p_{\text{small}} \cdot C_{\text{small}} + (1 - p_{\text{small}}) \cdot C_{\text{large}} \Big]
+$$
+
+Let us work through a concrete production example.
+
+Suppose an enterprise customer service application processes $N = 1{,}000{,}000$ queries per month:
+- Average input length: $P = 1{,}500$ tokens.
+- Average output length: $G = 200$ tokens.
+- Small Model Tier (e.g. Llama-3.1-8B): \$0.15 per million input tokens, \$0.60 per million output tokens.
+- Large Model Tier (e.g. Llama-3.1-70B / Frontier): \$3.00 per million input tokens, \$15.00 per million output tokens.
+
+#### Cost Per Single Query on Each Model
+
+$$
+C_{\text{small}} = \frac{1{,}500 \times \$0.15}{10^6} + \frac{200 \times \$0.60}{10^6} = \$0.000225 + \$0.000120 = \mathbf{\$0.000345}
+$$
+
+$$
+C_{\text{large}} = \frac{1{,}500 \times \$3.00}{10^6} + \frac{200 \times \$15.00}{10^6} = \$0.004500 + \$0.003000 = \mathbf{\$0.007500}
+$$
+
+Notice that the frontier model is **21.7× more expensive** per query than the small model.
+
+#### Case 1 · Monolithic Frontier Model (No Cache, No Router)
+
+Every query hits the large frontier model:
+
+$$
+\text{Monthly Spend} = 1{,}000{,}000 \times \$0.0075 = \mathbf{\$7{,}500.00\ \text{per month}}
+$$
+
+#### Case 2 · Engineered Stack (Cache + Intent Router)
+
+We introduce:
+1. **Multi-tier Caching**: Achieves $h = 0.25$ (25% hit rate). Cache hits cost \$0.
+2. **Intent Router**: Of the remaining 75% misses ($750{,}000$ queries), the classifier routes $p_{\text{small}} = 0.70$ (70%) to the small model tier, and $30\%$ to the large model tier.
+
+Let us compute the costs:
+- Cache hits ($250{,}000$ queries): **\$0.00**
+- Small model queries ($750{,}000 \times 0.70 = 525{,}000$ queries):
+  $$525{,}000 \times \$0.000345 = \mathbf{\$181.13}$$
+- Large model queries ($750{,}000 \times 0.30 = 225{,}000$ queries):
+  $$225{,}000 \times \$0.007500 = \mathbf{\$1{,}687.50}$$
+
+**Total Monthly Spend:**
+
+$$
+\text{Total} = \$0.00 + \$181.13 + \$1{,}687.50 = \mathbf{\$1{,}868.63\ \text{per month}}
+$$
+
+<Callout type="math" title="Economic impact of the router">
+  $$\text{Net Monthly Savings} = \$7{,}500.00 - \$1{,}868.63 = \mathbf{\$5{,}631.37} \quad (75.08\%\ \text{reduction})$$
+
+  The application achieves identical quality on 100% of user queries because simple queries never required the reasoning depth of a 70B model, while complex reasoning queries still received full frontier compute.
+</Callout>
+
+---
+
+## Implementing a Smart Router with Redis and Embeddings
+
+Here is a functional implementation in Python demonstrating an exact SHA-256 cache, an in-memory cosine semantic cache, and an intent router:
+
+```python
+import hashlib
+import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
+
+class ProductionGatewayRouter:
+    def __init__(self, semantic_threshold: float = 0.92):
+        self.exact_cache: Dict[str, str] = {}
+        # Stores (embedding_vector, response_text) tuples
+        self.semantic_cache: List[Tuple[np.ndarray, str]] = []
+        self.semantic_threshold = semantic_threshold
+
+    def _hash_exact(self, prompt: str, model: str) -> str:
+        norm = f"{model.strip().lower()}::{prompt.strip().lower()}"
+        return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+    def _mock_embed(self, text: str) -> np.ndarray:
+        """Simulate a normalized 384-dimensional embedding."""
+        rng = np.random.default_rng(abs(hash(text)) % (2**32))
+        vec = rng.standard_normal(384)
+        return vec / np.linalg.norm(vec)
+
+    def route_query(self, user_prompt: str) -> Dict[str, Any]:
+        # 1. Check Exact Cache (1 ms)
+        exact_key = self._hash_exact(user_prompt, "auto")
+        if exact_key in self.exact_cache:
+            return {"response": self.exact_cache[exact_key], "source": "exact_cache", "cost": 0.0}
+
+        # 2. Check Semantic Cache (15 ms)
+        query_vec = self._mock_embed(user_prompt)
+        best_sim = -1.0
+        best_response = None
+        for cached_vec, cached_ans in self.semantic_cache:
+            sim = float(np.dot(query_vec, cached_vec))
+            if sim > best_sim:
+                best_sim = sim
+                best_response = cached_ans
+
+        if best_sim >= self.semantic_threshold and best_response is not None:
+            return {"response": best_response, "source": "semantic_cache", "similarity": round(best_sim, 3), "cost": 0.0}
+
+        # 3. Intent & Complexity Routing (5 ms)
+        # Classify complexity: word count, reasoning markers, or code blocks
+        is_complex = len(user_prompt.split()) > 100 or any(k in user_prompt.lower() for k in ["analyze", "derive", "code", "optimize"])
+        tier = "70B_large" if is_complex else "8B_small"
+
+        # 4. Model Generation (Simulated)
+        if tier == "8B_small":
+            response = f"[8B Response] Fast answer to: {user_prompt[:30]}"
+            cost = 0.000345
+        else:
+            response = f"[70B Frontier Response] In-depth reasoning for: {user_prompt[:30]}"
+            cost = 0.007500
+
+        # 5. Populate Caches
+        self.exact_cache[exact_key] = response
+        self.semantic_cache.append((query_vec, response))
+
+        return {"response": response, "source": tier, "cost": cost}
+```
+
+<KeyNotes>
+  1. A **model gateway** eliminates vendor lock-in by providing a unified API, multi-tenant rate limiting (RPM/TPM), centralized billing, and automated failover circuit breakers.
+  2. An **exact cache** (SHA-256 in Redis) answers identical queries in 1–3 ms at \$0 cost, with 0% risk of false hits.
+  3. A **semantic vector cache** matches paraphrased queries using embedding cosine similarity; setting $\tau \ge 0.92$ is essential to avoid the **false-hit danger zone** below 0.88.
+  4. Never apply semantic caching to dynamic, temporal, or session-dependent prompts without partitioning cache keys by tenant and time window.
+  5. **Provider prompt caching** (Prefix caching) slashes prefill latency and input token prices by up to 80% on long, static system prompts; keeping dynamic text at the end of the prompt is mandatory to preserve prefix alignment.
+  6. **Intent routing** directs ~70% of routine traffic to small models (\$0.15/M) and ~30% of complex tasks to frontier models (\$3.00/M), cutting blended token spend by ~75% without compromising answer quality.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why does setting a semantic cache similarity threshold too low (e.g. τ = 0.85) create severe production reliability risks?',
+    options: [
+      'Because Redis runs out of memory storing floating-point numbers',
+      'Because queries that share broad topic vocabulary but express opposite or distinct intents (e.g. "start instance" vs "terminate instance") have similarities around 0.87, triggering dangerous false hits',
+      'Because cosine similarity cannot mathematically exceed 0.85',
+      'Because bi-encoders only work for exact keyword matches'
+    ],
+    answer: 1,
+    why: 'In dense embedding spaces, queries from the same domain that share key noun phrases often achieve cosine similarities between 0.85 and 0.89 despite having completely opposing verbs or goals. A conservative threshold (τ ≥ 0.92) is required to prevent answering the wrong question.'
+  },
+  {
+    q: 'An AI service handles 500,000 queries per month. Average prompt is 1,000 tokens, average output is 200 tokens. The small model costs \\$0.20/M input and \\$0.80/M output. The large model costs \\$3.00/M input and \\$15.00/M output. If 100% of queries use the large model, what is the monthly cost?',
+    numeric: true,
+    answer: 3000,
+    tolerance: 50,
+    unit: 'USD',
+    why: 'Cost per query on large model = (1,000 × 3.00 + 200 × 15.00) / 1,000,000 = (3,000 + 3,000) / 1,000,000 = \\$0.006. Monthly cost = 500,000 × \\$0.006 = \\$3,000.00.'
+  },
+  {
+    q: 'In the system above, the team implements an exact cache with a 20% hit rate (\\$0 cost). Of the 400,000 misses, an intent router sends 75% to the small model and 25% to the large model. What is the new monthly cost?',
+    numeric: true,
+    answer: 708,
+    tolerance: 30,
+    unit: 'USD',
+    why: 'Cache hits = \\$0. Misses = 400,000 queries. Small model (75% of 400k = 300,000 queries): (1,000 × 0.20 + 200 × 0.80) / 1e6 = (200 + 160) / 1e6 = \\$0.00036. Cost = 300,000 × \\$0.00036 = \\$108.00. Large model (25% of 400k = 100,000 queries): 100,000 × \\$0.006 = \\$600.00. Total = \\$108.00 + \\$600.00 = \\$708.00.'
+  },
+  {
+    q: 'To maximize the hit rate of provider prompt caching (KV prefix caching), where must dynamic per-user variables (such as timestamps or user IDs) be placed in the prompt?',
+    options: [
+      'At the very beginning of the system prompt',
+      'Directly after the first sentence of the developer instructions',
+      'At the very end of the prompt (in the user message suffix), keeping the large system prompt and few-shot examples completely static at the prefix',
+      'In the HTTP headers only'
+    ],
+    answer: 2,
+    why: 'Prefix caching matches contiguous token blocks starting from token index 0. Any dynamic alteration at the beginning invalidates the hash for all subsequent tokens, causing a total cache miss. Static blocks must come first.'
+  },
+  {
+    q: 'What is the primary function of a Circuit Breaker in a production model gateway?',
+    options: [
+      'To prevent GPUs from drawing too much electrical current',
+      'To detect when an upstream provider has elevated error rates or latency, immediately rerouting traffic to a fallback model to prevent cascading application downtime',
+      'To terminate idle WebSocket connections after 5 seconds',
+      'To encrypt prompt embeddings on disk'
+    ],
+    answer: 1,
+    why: 'The Circuit Breaker tracks upstream error and latency metrics. When failures exceed a threshold, it trips open, preventing repeated doomed requests and seamlessly redirecting traffic to secondary providers or regions.'
+  },
+  {
+    q: 'A team achieves a 30% cache hit rate (h = 0.30). Of the misses, 80% route to a small tier (\\$0.0004/query) and 20% route to a large tier (\\$0.0080/query). What is the expected blended cost per query across all incoming traffic?',
+    numeric: true,
+    answer: 0.001344,
+    tolerance: 0.0001,
+    unit: 'USD',
+    why: 'Miss cost = 0.80 × 0.0004 + 0.20 × 0.0080 = 0.00032 + 0.00160 = \\$0.00192. Blended cost = (1 - 0.30) × 0.00192 = 0.70 × 0.00192 = \\$0.001344 per query.'
+  }
+]} />

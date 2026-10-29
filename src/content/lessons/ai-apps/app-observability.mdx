@@ -1,0 +1,342 @@
+---
+title: 'Observability for AI apps'
+summary: 'Why traditional APM dashboards fail for language models: distributed OpenTelemetry spans, TTFT and TPOT instrumentation, cost allocation, statistical sampling for LLM judges, semantic drift detection, and trace privacy.'
+objectives:
+  - Implement distributed OpenTelemetry tracing across guardrails, caches, retrieval, and streaming LLM spans
+  - Instrument real-time TTFT, TPOT, token counters, and micro-dollar cost ledgers
+  - Design an asynchronous LLM-as-a-judge evaluation pipeline using statistical sample sizing
+  - Calculate semantic embedding drift using the Population Stability Index (PSI) to detect distribution shifts
+  - Enforce data privacy and compliance by redacting sensitive telemetry before long-term trace persistence
+---
+import AppObservabilityTrace from '@/components/viz/ai-apps/AppObservabilityTrace.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+In standard web services, observability is a solved discipline. You deploy an Application Performance Monitoring (APM) agent to collect HTTP status codes, p99 request latency, CPU load, and database query durations. If your p99 latency stays under 300 ms and your HTTP error rate hovers at 0.01%, your system is considered completely healthy.
+
+When applied to generative artificial intelligence, this mental model fails catastrophically. An LLM endpoint can return an HTTP 200 status code in 250 ms, utilize only 10% of CPU memory, and cost less than a penny—while confidently telling a customer that your software is open-source and free, or leaking competitive pricing data. 
+
+Language models fail **semantically**, not structurally. They do not throw null pointer exceptions or segfault; they hallucinate, drift, violate brand voice, or lose grounding. To operate AI applications safely in production, inference engineers must build an observability architecture that measures both systems performance and semantic validity.
+
+## Distributed tracing and continuous telemetry
+
+<Scrolly>
+  <AppObservabilityTrace client:visible slot="stage" />
+
+  <Step title="1. Traditional metrics miss AI failures">
+    Traditional APM tools monitor socket health and HTTP status codes. Because models emit hallucinations and policy violations inside completely valid HTTP 200 payloads, **traditional monitoring is semantically blind**.
+  </Step>
+
+  <Step title="2. Distributed OpenTelemetry trace spans">
+    A production trace decomposes the request lifecycle into an explicit hierarchy: parent HTTP request, input guardrails, cache lookup, RAG vector retrieval, model prefill, streaming decode, and output schema validation.
+  </Step>
+
+  <Step title="3. Granular token & cost telemetry">
+    Per-span telemetry tracks prompt tokens, completion tokens, time-to-first-token (<Term t="ttft">TTFT</Term>), time-per-output-token (<Term t="tpot">TPOT</Term>), and micro-dollar costs, attributing expenses to individual customer tenants in real time.
+  </Step>
+
+  <Step title="4. Sampled LLM-as-a-judge scoring">
+    Evaluating 100% of live traffic with an <Term t="ai-judge">LLM-as-a-judge</Term> would double your infrastructure bill. By routing an asynchronous **5% statistical sample** to a judge model, we track faithfulness and relevance with rigorous confidence bounds.
+  </Step>
+
+  <Step title="5. Semantic embedding drift detection">
+    User behavior is not static. By projecting daily query embeddings into semantic clusters and computing the Population Stability Index (PSI), the system detects **concept and data drift** before retrieval accuracy degrades.
+  </Step>
+
+  <Step title="6. Privacy scrubbing & log redaction">
+    Raw logs must never store unencrypted PII. An asynchronous privacy worker sanitizes prompt payloads, strips confidential tokens, and sets strict 14-day retention windows for text while storing numerical metrics permanently.
+  </Step>
+
+  <Step title="7. The production telemetry dashboard">
+    A unified operational dashboard synthesizes latency percentiles, unit economics, drift indices, and automated judge quality scores into proactive alerting thresholds.
+  </Step>
+</Scrolly>
+
+---
+
+## Distributed Tracing with OpenTelemetry
+
+A single user interaction in an AI application touches multiple distributed services: gateways, caches, vector databases, local model runners, and external vendor endpoints. If a response takes 1,800 ms, where did the time go?
+
+OpenTelemetry (OTel) structures the request as a directed acyclic graph of **spans**:
+
+```
+[ POST /v1/chat/completions ] ───────────────────────── Duration: 412 ms
+  ├── [ input_guardrails ] ───────── Duration: 24 ms
+  ├── [ cache_lookup ] ───────────── Duration: 3 ms  (Result: Miss)
+  ├── [ rag_retrieval ] ──────────── Duration: 48 ms (Chunks: 4, Similarity: 0.88)
+  ├── [ llm_generation ] ─────────── Duration: 312 ms (Model: llama-3.1-70b)
+  │     ├── [ TTFT Marker ] ──────── Offset: 80 ms   (Prompt: 1,840 tokens)
+  │     └── [ Decode Stream ] ────── Duration: 232 ms (Tokens: 182 @ 1.27 ms/tok)
+  └── [ output_verification ] ────── Duration: 18 ms (Schema: Valid, De-mask: 2 entities)
+```
+
+### Essential Span Attributes
+
+For language model operations, standard network attributes (`http.status_code`, `net.peer.name`) must be augmented with AI-specific semantic conventions:
+
+| Span Name | Key Attributes | Why It Matters |
+|---|---|---|
+| `input_guardrail` | `guardrail.pii_entities_found`, `guardrail.blocked_flag` | Tracks attack frequency and PII volume |
+| `cache_lookup` | `cache.hit_type` (exact/semantic), `cache.latency_ms` | Monitors cache efficiency |
+| `rag_retrieval` | `rag.chunk_count`, `rag.top_score`, `rag.query_vector_norm` | Diagnoses retrieval degradation |
+| `llm_generation` | `llm.model_name`, `llm.prompt_tokens`, `llm.completion_tokens`, `llm.ttft_ms`, `llm.tpot_ms` | Core inference performance and cost accounting |
+| `output_rail` | `schema.is_valid`, `faithfulness.score` | Immediate semantic validation |
+
+```python
+from opentelemetry import trace
+import time
+
+tracer = trace.get_tracer("ai.production.system")
+
+def execute_traced_generation(prompt: str, retrieved_context: list[str]) -> str:
+    with tracer.start_as_current_span("llm_generation") as span:
+        span.set_attribute("llm.system", "vllm")
+        span.set_attribute("llm.model", "meta-llama/Llama-3.1-70B-Instruct")
+        
+        t0 = time.perf_counter()
+        # Simulated generator call yielding tokens
+        stream = mock_llm_stream(prompt, retrieved_context)
+        
+        first_token = True
+        tokens = []
+        for chunk in stream:
+            if first_token:
+                ttft = (time.perf_counter() - t0) * 1000.0
+                span.set_attribute("llm.ttft_ms", ttft)
+                first_token = False
+            tokens.append(chunk)
+            
+        total_time = (time.perf_counter() - t0) * 1000.0
+        prompt_tokens = len(prompt.split()) * 1.3
+        completion_tokens = len(tokens)
+        tpot = (total_time - ttft) / max(1, completion_tokens - 1)
+        
+        span.set_attribute("llm.prompt_tokens", int(prompt_tokens))
+        span.set_attribute("llm.completion_tokens", completion_tokens)
+        span.set_attribute("llm.tpot_ms", tpot)
+        span.set_attribute("llm.cost_usd", (prompt_tokens * 3.0 + completion_tokens * 15.0) / 1e6)
+        
+        return "".join(tokens)
+```
+
+---
+
+## Statistical Sampling for LLM-as-a-Judge
+
+Automated heuristic checks (regexes, BLEU, ROUGE) are too brittle to evaluate complex natural language reasoning. Today, teams deploy strong frontier models as automated evaluators—**LLM-as-a-judge**—to score live production traffic on qualitative rubrics:
+1. **Faithfulness**: Is every factual claim in the response directly entailed by the retrieved context?
+2. **Answer Relevance**: Did the model directly address the user's specific request without tangential filler?
+3. **Safety & Policy**: Did the response maintain appropriate brand tone and avoid restricted advice?
+
+### The Evaluation Cost Barrier
+
+Suppose your application processes $N = 100{,}000$ queries per day. A typical judge prompt contains the user query, retrieved context, generated answer, and evaluation rubric—averaging $P_{\text{eval}} = 1{,}500$ input tokens and $G_{\text{eval}} = 150$ output tokens.
+
+Using a frontier evaluator (at \$3.00/M input, \$15.00/M output), the cost to evaluate **one** query is:
+
+$$
+C_{\text{judge}} = \frac{1{,}500 \times \$3.00}{10^6} + \frac{150 \times \$15.00}{10^6} = \$0.00450 + \$0.00225 = \mathbf{\$0.00675\ \text{per evaluation}}
+$$
+
+If you evaluate 100% of production traffic:
+
+$$
+\text{Daily Cost} = 100{,}000 \times \$0.00675 = \mathbf{\$675.00\ \text{per day}} \quad \implies \quad \mathbf{\$20{,}250.00\ \text{per month}}
+$$
+
+Evaluating every transaction with a frontier judge can double or triple the total operational cost of the application.
+
+### The Sample Size Solution
+
+Fortunately, evaluating 100% of queries is statistically unnecessary. If your objective is to monitor daily quality trends, detect regression incidents, and establish quality SLOs, you can evaluate an asynchronous **random sample**.
+
+From classical sampling theory, for a population of size $N$ with proportion metric $p$ (e.g., faithfulness rate $\approx 0.95$), the required sample size $n$ to achieve a margin of error $E$ at confidence level $Z$ (for 95% confidence, $Z = 1.96$) is:
+
+$$
+n = \frac{Z^2 \cdot p(1 - p)}{E^2}
+$$
+
+For $p = 0.95$ and an acceptable margin of error $E = \pm 0.01$ ($\pm 1\%$):
+
+$$
+n = \frac{(1.96)^2 \cdot 0.95 \cdot (1 - 0.95)}{(0.01)^2} = \frac{3.8416 \cdot 0.0475}{0.0001} \approx \mathbf{1{,}825\ \text{evaluations per day}}
+$$
+
+Taking a modest **$2\%$ to $5\%$ sample** ($2{,}000$ to $5{,}000$ queries per day) yields a margin of error well under 1%, while slashing evaluation costs by 95%:
+
+$$
+\text{Sampled Daily Cost (2,000 queries)} = 2{,}000 \times \$0.00675 = \mathbf{\$13.50\ \text{per day}} \quad \implies \quad \mathbf{\$405.00\ \text{per month}}
+$$
+
+By spending \$13.50/day instead of \$675.00/day, the team maintains continuous, statistically sound visibility into model quality.
+
+---
+
+## Semantic Embedding Drift Detection
+
+Models in production do not exist in a vacuum. Over time, user query distributions undergo <Term t="drift">data and concept drift</Term>:
+- **Temporal Drift**: Users stop asking about summer apparel and start asking about winter jackets.
+- **Vocabulary Drift**: Slang, competitive product names, or new corporate acronyms enter queries.
+- **Adversarial Shifts**: Coordinated bot networks probe system boundaries with novel phrasing.
+
+When drift occurs, retrieval embeddings diverge from the indexed knowledge corpus, causing RAG recall to plummet and hallucinations to rise.
+
+```
+Embedding Space (t-SNE Projection)
+┌────────────────────────────────────────────────────────┐
+│                                                        │
+│       [Baseline Cluster Q]                             │
+│       (Launch Reference)                               │
+│              ● ● ●                                     │
+│            ●  ●  ●  ●                                  │
+│              ● ● ●                                     │
+│                                                        │
+│                                  [Current Cluster P]   │
+│                                  (Production Week 6)   │
+│                                         ▲ ▲ ▲          │
+│                                       ▲   ▲   ▲        │
+│                                         ▲ ▲ ▲          │
+└────────────────────────────────────────────────────────┘
+```
+
+### The Population Stability Index (PSI)
+
+To quantify drift mathematically without manually reading thousands of queries, inference engineers compute the **Population Stability Index (PSI)** over query embedding clusters.
+
+1. At model launch, partition the reference query embedding space into $B$ discrete Voronoi clusters (using $k$-means, e.g. $B = 20$). Compute the baseline proportion of queries in each bin: $Q_b$.
+2. For each rolling 7-day production window, assign new query embeddings to the nearest baseline cluster. Compute the observed production proportion: $P_b$.
+3. Compute the PSI across all bins:
+
+$$
+\text{PSI} = \sum_{b=1}^{B} (P_b - Q_b) \times \ln\left(\frac{P_b}{Q_b}\right)
+$$
+
+The mathematical structure of $(P_b - Q_b) \times \ln(P_b / Q_b)$ guarantees that each term is non-negative:
+- If $P_b > Q_b$, then $\ln(P_b / Q_b) > 0$, yielding a positive term.
+- If $P_b < Q_b$, then $\ln(P_b / Q_b) < 0$, and multiplying by a negative number yields a positive term.
+
+| PSI Metric Range | Statistical Interpretation | Recommended Operational Action |
+|---|---|---|
+| **$\text{PSI} < 0.10$** | Insignificant change | System is stable; no intervention required |
+| **$0.10 \le \text{PSI} < 0.25$** | Moderate distribution shift | Investigate emerging query clusters; review retrieval recall |
+| **$\text{PSI} \ge 0.25$** | Significant semantic drift | Alert on-call; re-index RAG knowledge base; update few-shot examples |
+
+<Callout type="math" title="Worked numeric example: Two-cluster drift calculation">
+  Suppose the prompt distribution is divided into two topics: Technical Support ($b=1$) and Billing ($b=2$).
+  - Baseline distribution: $Q_1 = 0.70$, $Q_2 = 0.30$.
+  - After a pricing change, production distribution shifts to: $P_1 = 0.40$, $P_2 = 0.60$.
+
+  $$
+  \text{Term}_1 = (0.40 - 0.70) \times \ln\left(\frac{0.40}{0.70}\right) = (-0.30) \times (-0.5596) = +0.1679
+  $$
+
+  $$
+  \text{Term}_2 = (0.60 - 0.30) \times \ln\left(\frac{0.60}{0.30}\right) = (+0.30) \times (+0.6931) = +0.2079
+  $$
+
+  $$
+  \text{PSI} = 0.1679 + 0.2079 = \mathbf{0.3758}
+  $$
+
+  Because $0.3758 > 0.25$, the pipeline triggers an automated drift incident: user queries have shifted heavily toward billing, requiring updated knowledge chunks.
+</Callout>
+
+---
+
+## Telemetry Privacy and Log Governance
+
+Logging full raw prompts and completions in plaintext creates an enterprise compliance emergency. If an end user pastes proprietary code or financial details, writing that unencrypted string into an Elasticsearch or Datadog cluster violates GDPR Article 17 (Right to Erasure) and SOC2 compliance.
+
+A production observability pipeline enforces **data segregation**:
+
+```
+Live Request (Sync)
+       │
+       ▼
+[ Async Ring Buffer ]
+       │
+       ├─────────────────────────────────┐
+       ▼                                 ▼
+┌───────────────────────────┐ ┌───────────────────────────┐
+│ Metric / Metadata Store   │ │ Ephemeral Payload Store   │
+│ (Prometheus / TimescaleDB)│ │ (Encrypted S3 Object)     │
+├───────────────────────────┤ ├───────────────────────────┤
+│ • Trace ID, Tenant ID     │ │ • Scrubbed Prompt / Reply │
+│ • TTFT, TPOT, Latency     │ │ • PII Re-masked           │
+│ • Token counts, Cost ($)  │ │ • Hard TTL: 14 Days       │
+│ • Retained: 365 Days      │ │ • Auto-Delete Policy      │
+└───────────────────────────┘ └───────────────────────────┘
+```
+
+1. **Decouple Metrics from Content**: Operational indicators (token counts, TTFT, cost, duration) contain no sensitive user information and are stored in time-series databases indefinitely for financial auditing.
+2. **Scrubbing Before Storage**: Raw conversational text passes through an asynchronous privacy filter that scrubs remaining PII entities.
+3. **Automated Ephemeral Retention**: Customer text payloads are stored in encrypted object buckets with a strict Time-to-Live (TTL)—typically 14 to 30 days—after which the data is permanently purged.
+
+<KeyNotes>
+  1. Traditional APM metrics are **semantically blind**; an AI endpoint can return HTTP 200 in 200 ms while generating offensive text or hallucinations.
+  2. **OpenTelemetry distributed traces** decompose AI requests into explicit spans (guardrails, cache, retrieval, generation), recording TTFT and TPOT separately.
+  3. Every generation span must record **token accounting and micro-dollar costs**, attributing expenditures to individual tenant IDs in real time.
+  4. Evaluating 100% of production queries with frontier LLM judges is cost-prohibitive; a **2% to 5% asynchronous sample** maintains statistical significance (margin of error &lt; 1%) while reducing eval spend by 95%.
+  5. The **Population Stability Index (PSI)** measures semantic embedding drift across query clusters; $\text{PSI} \ge 0.25$ indicates significant drift requiring RAG re-indexing.
+  6. **Telemetry privacy** requires separating metadata from payload text and enforcing strict 14-to-30-day auto-purge lifecycles on stored conversational transcripts.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why are traditional APM metrics (HTTP status codes, CPU load) insufficient for monitoring production AI applications?',
+    options: [
+      'Because GPUs do not support the TCP/IP networking stack',
+      'Because LLMs fail semantically (hallucinations, drift, toxic outputs) within completely valid HTTP 200 responses that consume normal CPU and memory',
+      'Because OpenTelemetry cannot run in Python',
+      'Because vector databases only emit UDP traffic'
+    ],
+    answer: 1,
+    why: 'Unlike conventional software that crashes with HTTP 500 errors or high memory alerts, language models typically generate syntactically valid HTTP 200 responses even when the generated text contains factual hallucinations or policy violations.'
+  },
+  {
+    q: 'An AI platform processes 200,000 queries per day. The team wants to run an LLM-as-a-judge on a 4% sample. Each judge evaluation costs \\$0.006. What is the total monthly cost of this evaluation strategy (30 days)?',
+    numeric: true,
+    answer: 1440,
+    tolerance: 50,
+    unit: 'USD',
+    why: 'Daily evaluated queries = 200,000 × 0.04 = 8,000 queries/day. Daily cost = 8,000 × \\$0.006 = \\$48.00. Monthly cost = \\$48.00 × 30 = \\$1,440.00.'
+  },
+  {
+    q: 'In a baseline reference corpus, Cluster A represents 60% of queries (Q₁ = 0.60) and Cluster B represents 40% (Q₂ = 0.40). In a new production week, traffic shifts to P₁ = 0.50 and P₂ = 0.50. What is the Population Stability Index (PSI)?',
+    numeric: true,
+    answer: 0.0405,
+    tolerance: 0.005,
+    unit: 'PSI',
+    why: 'Term 1 = (0.50 - 0.60) × ln(0.50 / 0.60) = (-0.10) × ln(0.8333) = (-0.10) × (-0.1823) = 0.01823. Term 2 = (0.50 - 0.40) × ln(0.50 / 0.40) = (+0.10) × ln(1.25) = (+0.10) × (+0.2231) = 0.02231. PSI = 0.01823 + 0.02231 = 0.04054 (well under 0.10, indicating stable distribution).'
+  },
+  {
+    q: 'What does a Population Stability Index (PSI) value of 0.32 between reference and production query embeddings indicate?',
+    options: [
+      'The model weights have become corrupted in GPU memory',
+      'Significant semantic drift has occurred in user query distributions, indicating user behavior or terminology has shifted and RAG retrieval accuracy may be compromised',
+      'The cache hit rate has increased by 32%',
+      'The system is 100% compliant with GDPR regulations'
+    ],
+    answer: 1,
+    why: 'By industry convention, PSI ≥ 0.25 indicates significant population drift. When user prompt embeddings shift significantly from the baseline distribution, retrieval indexes and system prompts often require recalibration.'
+  },
+  {
+    q: 'To comply with enterprise data governance (such as GDPR and HIPAA), how should an observability architecture handle user prompts and completions?',
+    options: [
+      'Store all prompt texts permanently in unencrypted plaintext on local web servers',
+      'Decouple non-sensitive operational metrics (tokens, latency, costs) for long-term retention while scrubbing PII from text payloads and applying ephemeral retention policies (e.g. 14–30 day auto-delete)',
+      'Never log token counts or response times',
+      'Disable OpenTelemetry entirely'
+    ],
+    answer: 1,
+    why: 'Compliance frameworks mandate data minimization and right-to-erasure. Operational telemetry (latencies, token counters, costs) is retained permanently, while conversational text is sanitized and purged automatically after an ephemeral debugging window.'
+  },
+  {
+    q: 'An inference request logs TTFT = 90 ms and generates 150 output tokens over a total streaming span of 450 ms. What is the average Time Per Output Token (TPOT)?',
+    numeric: true,
+    answer: 2.42,
+    tolerance: 0.1,
+    unit: 'ms',
+    why: 'Total streaming decode time = 450 ms - 90 ms = 360 ms. The remaining 149 tokens take 360 ms. TPOT = 360 ms / 149 tokens ≈ 2.416 ms/token.'
+  }
+]} />

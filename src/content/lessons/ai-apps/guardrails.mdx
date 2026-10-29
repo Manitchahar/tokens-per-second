@@ -1,0 +1,387 @@
+---
+title: 'Guardrails: input & output'
+summary: 'Protecting language models with deterministic and semantic verification layers: reversible PII pseudonymization, input topic filters, output schema validation, the streaming buffering dilemma, and handling false refusals.'
+objectives:
+  - Implement a reversible PII masking map that sanitizes prompts before model ingestion and re-injects values post-generation
+  - Design deterministic and probabilistic output guardrails to guarantee JSON schema compliance and factuality
+  - Quantify the latency budget of input versus output guardrail chains
+  - Resolve the streaming dilemma by computing chunk buffer delays across sentence boundaries
+  - Analyze the trade-off between False Refusal Rate (FRR) and False Acceptance Rate (FAR) in enterprise deployments
+---
+import GuardrailsFlow from '@/components/viz/ai-apps/GuardrailsFlow.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+When software engineers first interact with large language models, their natural instinct is to control them using prompt engineering. They write elaborate system instructions: *"You are an enterprise HR assistant. You must never disclose employee social security numbers. You must always reply with valid JSON. Under no circumstances should you answer questions about politics or competitors."*
+
+Then production reality hits. A user enters: *"Please translate the following customer record to Spanish: 'SSN: 000-12-3456, Salary: \$120,000'"*. The model, faithfully obeying its translation role, emits the unredacted social security number in fluent Spanish. Another user sends a prompt with trailing whitespace, causing the model to emit a Markdown block instead of pure JSON, crashing the backend parser. A third user crafts an adversarial hypothetical scenario that induces the model to debate corporate litigation.
+
+Prompt instructions are soft suggestions embedded in the model's stochastic attention mechanism; they are not security boundaries. A <Term t="guardrail">guardrail</Term> is an external, deterministic, or specialized probabilistic verification layer that intercepts inputs before they reach the model and inspects outputs before they reach the user.
+
+## The bidirectional guardrail pipeline
+
+<Scrolly>
+  <GuardrailsFlow client:visible slot="stage" />
+
+  <Step title="1. The unprotected pipeline">
+    In an unprotected system, the client interacts directly with the model. Raw credentials flow into provider logs, prompt injections bypass alignment, and malformed completions trigger uncaught exceptions in downstream services.
+  </Step>
+
+  <Step title="2. Input: Reversible PII masking">
+    Lightweight deterministic regular expressions and Named Entity Recognition (NER) scan the prompt. Sensitive entities like credit card numbers or names are stored in a request-scoped memory map and replaced with surrogate tokens (`[SSN_1]`).
+  </Step>
+
+  <Step title="3. Input: Topic & injection screen">
+    A fast classifier (DeBERTa or specialized small model) checks the sanitized prompt for adversarial jailbreak syntax and forbidden topics in **under 20 ms**. Unsafe requests are rejected immediately, saving downstream GPU cycles.
+  </Step>
+
+  <Step title="4. Model generation with surrogates">
+    The LLM performs prefill and decode over the masked prompt. Because surrogate tokens preserve syntactic grammar and relational structure, the model produces coherent reasoning without ever observing the actual private data.
+  </Step>
+
+  <Step title="5. Output: Format & schema checks">
+    As tokens generate, an output guardrail validates syntax. For structured workflows, it enforces strict JSON Schema conformance, triggering an automatic micro-repair or fallback if parsing fails.
+  </Step>
+
+  <Step title="6. Output: Factuality & de-masking">
+    A lightweight verification model cross-checks the response against the retrieved source context to flag unsupported hallucinations. Finally, the de-masking layer replaces `[SSN_1]` with the original secret before returning to the user.
+  </Step>
+
+  <Step title="7. The streaming dilemma: chunk buffers">
+    Output guardrails face a fundamental tension with token streaming. Holding the entire response destroys time-to-first-token (<Term t="ttft">TTFT</Term>); streaming raw tokens risks emitting hazardous text. We resolve this by **buffering across sentence boundaries** (15–25 tokens).
+  </Step>
+</Scrolly>
+
+---
+
+## Input Guardrails: Sanitization Before the GPU
+
+Input guardrails protect two distinct assets: customer privacy and the model's compute budget. Every millisecond or dollar spent processing a prompt that should have been rejected is pure waste.
+
+```
+Raw User Text
+      │
+      ▼
+┌────────────────────────────────────────────────────────┐
+│ 1. Regex & Pattern Scrubbing (0.5 ms)                  │
+│    • Social Security Numbers: \d{3}-\d{2}-\d{4}        │
+│    • Credit Cards: 16-digit Luhn algorithm             │
+│    • Email Addresses & IP Addresses                    │
+└──────────────────────┬─────────────────────────────────┘
+                       │
+                       ▼
+┌────────────────────────────────────────────────────────┐
+│ 2. Statistical NER (10 – 15 ms)                        │
+│    • Personal Names, Organizations, Addresses          │
+│    • Reversible Pseudonymization Map                   │
+└──────────────────────┬─────────────────────────────────┘
+                       │ Sanitized Text + PII Map
+                       ▼
+┌────────────────────────────────────────────────────────┐
+│ 3. Adversarial & Policy Classifier (12 – 18 ms)        │
+│    • DeBERTa-v3-small or SetFit classifier             │
+│    • Jailbreak & Injection Embedding Distance          │
+└──────────────┬───────────────────────────┬─────────────┘
+               │ Safe                      │ Unsafe
+               ▼                           ▼
+       [ Send to LLM ]              [ HTTP 400 Refusal ]
+```
+
+### 1. Reversible PII Masking (Pseudonymization)
+
+Under regulations such as GDPR, HIPAA, and CCPA, sending unencrypted personally identifiable information (<Term t="pii-masking">PII</Term>) to third-party inference APIs creates severe compliance liabilities. Yet, applications frequently require the model to reason about specific customer context (e.g. drafting an email to Jane Doe about policy number 987654).
+
+The solution is **reversible pseudonymization**:
+1. Scan the prompt using high-precision regular expressions (for structured identifiers like SSNs, credit cards, and phone numbers) and a fast Named Entity Recognition (NER) model (such as a quantized spaCy or GLiNER model) for person names and physical locations.
+2. For each detected entity $e_i$, generate a unique surrogate token $s_i = \text{type}_k + \text{"\_"} + i$.
+3. Store the tuple $(s_i, e_i)$ in a request-scoped dictionary.
+4. Replace occurrences of $e_i$ in the prompt with $s_i$.
+
+```python
+import re
+from typing import Dict, Tuple
+
+class ReversiblePiiMasker:
+    def __init__(self):
+        self.ssn_pattern = re.compile(r'\b\d{3}-\d{2}-\d{4}\b')
+        self.email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
+
+    def mask(self, text: str) -> Tuple[str, Dict[str, str]]:
+        pii_map: Dict[str, str] = {}
+        reverse_map: Dict[str, str] = {}
+
+        def replace_match(match: re.Match, pii_type: str) -> str:
+            val = match.group(0)
+            if val not in pii_map:
+                token = f"[{pii_type}_{len(pii_map) + 1}]"
+                pii_map[val] = token
+                reverse_map[token] = val
+            return pii_map[val]
+
+        # Apply regex substitutions
+        masked = self.ssn_pattern.sub(lambda m: replace_match(m, "SSN"), text)
+        masked = self.email_pattern.sub(lambda m: replace_match(m, "EMAIL"), masked)
+        return masked, reverse_map
+
+    def unmask(self, text: str, reverse_map: Dict[str, str]) -> str:
+        out = text
+        for token, original in reverse_map.items():
+            out = out.replace(token, original)
+        return out
+```
+
+Because modern language models represent tokens via subword pieces (Module 01), a token like `[SSN_1]` behaves syntactically like a distinct noun. The model can output *"We have verified that [SSN_1] is linked to [EMAIL_1]"*, and the unmasking step restores the exact raw data before delivery.
+
+### 2. Fast Topic & Injection Screening
+
+Do not use an expensive frontier model (like GPT-4 or Claude) to evaluate whether a prompt is safe. Running a 70B parameter model to guardrail an 8B model inverts the system's economic and latency profile.
+
+Instead, production guardrails employ a tiered classification hierarchy:
+- **Level 1 (Sub-millisecond)**: Deterministic blocklists, regexes for known jailbreak preambles (*"DAN mode"*, *"Ignore all previous instructions"*), and Levenshtein distance checks.
+- **Level 2 (10–18 ms)**: A distilled bi-encoder (such as `deberta-v3-small` or a fine-tuned MiniLM) that scores prompt similarity against known adversarial clusters and prohibited topic taxonomies.
+
+---
+
+## Output Guardrails: Format, Toxicity, and Factuality
+
+Once the language model finishes generation, output guardrails verify that the generated text adheres to contract requirements.
+
+### 1. Structural and Schema Enforcement
+
+When an application feeds downstream microservices, malformed output causes immediate system crashes. If an LLM generates:
+
+```
+Here is the requested user profile:
+{ "name": "Alice", "age": 30, }
+```
+
+The trailing comma renders this invalid JSON, causing `json.loads()` to raise a `JSONDecodeError`.
+
+Output format guardrails utilize three layers of defense:
+1. **Constrained Decoding (Grammar Masking)**: As taught in Module 26, the serving engine (e.g. vLLM or llama.cpp) restricts sampling logits at every decode step to only valid next tokens according to a Context-Free Grammar (CFG) or JSON Schema. This guarantees 100% syntactic validity at zero post-processing latency, though it slightly increases inter-token latency (ITL).
+2. **Deterministic Schema Parsing**: In APIs that do not support CFG constrained decoding, output guardrails run Pydantic or JSON schema parsers over the completed text.
+3. **Automated One-Shot Repair**: If schema validation fails, the system executes an automated micro-retry. It passes the malformed text and the exact validation error back to a fast model: *"Fix this invalid JSON to match the schema: [error description]"*.
+
+### 2. Factuality and Hallucination Verification
+
+In Retrieval-Augmented Generation (RAG), a model may inject ungrounded assertions not present in the context chunks. Factuality checkers evaluate the **Faithfulness** metric:
+
+$$
+\text{Faithfulness} = \frac{|\text{Supported Claims in Generation}|}{|\text{Total Atomic Claims in Generation}|}
+$$
+
+A lightweight NLI (Natural Language Inference) model breaks the generation into atomic propositions and checks whether the retrieved context entails each proposition. If $\text{Faithfulness} < 0.85$, the response is withheld and replaced with a polite refusal (*"I could not verify that information in the provided documentation"*).
+
+---
+
+## The Latency Budget and the Streaming Dilemma
+
+Guardrails do not come for free. In interactive applications, every additional millisecond added to the critical path directly degrades user satisfaction.
+
+### Allocating the Latency Budget
+
+Consider an interactive customer support assistant with a strict Service-Level Objective (<Term t="slo">SLO</Term>): **p95 TTFT must remain below 400 ms**.
+
+The serving engine alone requires:
+- Network propagation: 30 ms
+- Gateway routing: 5 ms
+- RAG vector search: 50 ms
+- Model prefill (2,000 prompt tokens on an H100): 120 ms
+- Total baseline TTFT = $30 + 5 + 50 + 120 = 205$ ms.
+
+This leaves an available latency margin for input guardrails of:
+
+$$
+T_{\text{margin}} = 400\ \text{ms} - 205\ \text{ms} = 195\ \text{ms}
+$$
+
+If your input guardrail chain consists of:
+- Regex PII masking: 1.5 ms
+- Statistical NER: 14 ms
+- Bi-encoder injection classifier: 16 ms
+- Total input guardrails = $1.5 + 14 + 16 = 31.5$ ms.
+
+Because $31.5\ \text{ms} \ll 195\ \text{ms}$, the budget is comfortably preserved, maintaining p95 TTFT at approximately $236.5$ ms.
+
+### The Streaming Dilemma: Buffering vs Latency
+
+In modern interfaces, tokens stream to the user in real time via Server-Sent Events (<Term t="sse">SSE</Term>). Here lies a fundamental dilemma:
+
+> **The Streaming Paradox:** If you wait until the model finishes generating the entire 200-token response to check for toxicity or hallucinations, you destroy the streaming experience. The user stares at a blank screen for 5 seconds. Conversely, if you stream tokens instantly as they pop out of the model, you may stream an offensive phrase or leak a credit card number before your output guardrail has a chance to intervene.
+
+Let us quantify this arithmetic. Suppose a generation produces $N = 200$ tokens with an inter-token latency $\text{TPOT} = 25$ ms.
+- If you buffer the **entire completion**:
+  $$
+  T_{\text{wait}} = N \times \text{TPOT} = 200 \times 25\ \text{ms} = 5{,}000\ \text{ms} = \mathbf{5.0\ \text{seconds}}
+  $$
+  The user feels a catastrophic 5-second freeze before the first character appears.
+- If you use **Sentence-Level Chunk Buffering**:
+  Instead of buffering 200 tokens, the stream buffers tokens into an internal FIFO queue until it encounters a sentence boundary delimiter (`.`, `!`, `?`, `\n`). An average English sentence contains approximately $S \approx 18$ tokens.
+  The added latency before emitting the first verified sentence is:
+  $$
+  T_{\text{chunk}} = S \times \text{TPOT} = 18 \times 25\ \text{ms} = \mathbf{450\ \text{ms}}
+  $$
+
+```
+Model Decode Stream (25 ms/tok)
+    │  [tok_1] [tok_2] ... [tok_18: "."]
+    ▼
+┌──────────────────────────────────────────────┐
+│ Sentence Sliding Window Buffer (18 tokens)   │
+├──────────────────────────────────────────────┤
+│ 1. Regex PII de-masking ([SSN_1] -> real)   │
+│ 2. Incremental toxicity/leak scan (< 5 ms)   │
+└──────────────────────┬───────────────────────┘
+                       │ Verified Sentence
+                       ▼
+            Emit SSE to Client (450 ms TTFT)
+```
+
+By buffering at sentence boundaries, the perceived TTFT is only 450 ms above prefill, while the system retains the ability to cancel the stream and redact the sentence if an output violation is detected.
+
+---
+
+## The False Refusal Trade-off (FRR vs FAR)
+
+Every classification guardrail operates under uncertainty, characterized by two competing error rates:
+- **False Acceptance Rate (FAR)**: The probability that a malicious or non-compliant prompt slips through the guardrail undetected (a false negative).
+- **False Refusal Rate (FRR)**: The probability that a completely benign, legitimate user query is erroneously blocked (a false positive).
+
+$$\text{Precision} = \frac{\text{True Positives}}{\text{True Positives} + \text{False Positives}}$$
+
+$$\text{Recall} = \frac{\text{True Positives}}{\text{True Positives} + \text{False Negatives}}$$
+
+In consumer applications, setting classifier confidence thresholds too aggressively causes the dreaded **false refusal crisis**: the model refuses to answer historical queries about World War II because the word "bomb" or "war" triggered a crude safety threshold.
+
+<Callout type="pitfall" title="False refusals destroy user trust faster than latency">
+  When an assistant refuses a benign question with *"I cannot assist with that request"*, user retention drops sharply. In enterprise benchmarks, reducing the False Refusal Rate from 4% to 0.5% typically yields greater customer satisfaction improvements than shaving 100 ms off TTFT. Always tune classifier operating thresholds on a golden set of domain-specific edge cases.
+</Callout>
+
+| Classification Strategy | Typical FAR | Typical FRR | Latency Cost | Best Used For |
+|---|---|---|---|---|
+| Rigid Keyword Blocklist | High (bypassed easily) | Extremely High (false triggers) | &lt; 0.1 ms | Trivial spam and blatant profanity |
+| Regex + NER Map | Very Low (deterministic) | Low (if well-scoped) | 10 – 15 ms | Structured PII (SSN, emails, credit cards) |
+| Small Cross-Encoder | Low (5 – 8%) | Moderate (2 – 4%) | 15 – 25 ms | Subtle prompt injection & policy screening |
+| LLM-as-a-Judge | Very Low (&lt; 2%) | Low (1 – 2%) | 400 – 1,200 ms | Asynchronous offline auditing (not on sync path) |
+
+---
+
+## Implementing an End-to-End Guardrailed Runner
+
+Here is a complete, production-ready implementation of an input-output guardrailed runner featuring reversible PII mapping, schema validation, and structured error recovery:
+
+```python
+import json
+import re
+from typing import Any, Dict, Optional, Tuple
+
+class GuardrailPipeline:
+    def __init__(self):
+        self.ssn_regex = re.compile(r'\b\d{3}-\d{2}-\d{4}\b')
+        self.blocked_keywords = ["drop database", "ignore previous instructions", "sudo rm"]
+
+    def process_request(self, raw_prompt: str, model_caller) -> Dict[str, Any]:
+        # 1. Input Guardrail: Blocklist / Injection Scan
+        for bad in self.blocked_keywords:
+            if bad in raw_prompt.lower():
+                return {"status": "refused", "error": f"Policy violation: detected prohibited pattern '{bad}'."}
+
+        # 2. Input Guardrail: Reversible PII Masking
+        pii_map = {}
+        def _mask_ssn(m: re.Match) -> str:
+            ssn = m.group(0)
+            token = f"[SSN_{len(pii_map)+1}]"
+            pii_map[token] = ssn
+            return token
+
+        sanitized_prompt = self.ssn_regex.sub(_mask_ssn, raw_prompt)
+
+        # 3. Model Generation (calling mock or real LLM)
+        # Model is instructed to return JSON: {"summary": str, "verified": bool}
+        raw_completion = model_caller(sanitized_prompt)
+
+        # 4. Output Guardrail: JSON Schema Verification
+        try:
+            parsed = json.loads(raw_completion)
+            if not isinstance(parsed.get("verified"), bool):
+                raise ValueError("Missing 'verified' boolean field.")
+        except (json.JSONDecodeError, ValueError) as err:
+            # Fallback repair attempt
+            parsed = {"summary": "Safe fallback output.", "verified": False, "repaired": True}
+
+        # 5. Output Guardrail: De-masking original PII
+        if "summary" in parsed:
+            for token, real_val in pii_map.items():
+                parsed["summary"] = parsed["summary"].replace(token, real_val)
+
+        return {"status": "success", "data": parsed}
+```
+
+<KeyNotes>
+  1. System prompts are **soft guidelines, not security barriers**; robust applications enforce rules using external deterministic and probabilistic guardrail layers.
+  2. **Reversible PII pseudonymization** replaces sensitive identifiers (SSNs, cards) with surrogate tokens (`[SSN_1]`) before model ingestion and re-injects them post-generation, ensuring compliance.
+  3. **Input guardrails** screen for adversarial jailbreaks and policy violations in 15–30 ms, saving GPU compute by rejecting malicious requests early.
+  4. **Output format enforcement** combines constrained decoding (CFG grammars) with schema parsers and automated one-shot JSON repairs.
+  5. The **streaming dilemma** is resolved by **sentence-level chunk buffering** (15–25 tokens), preventing hazardous output emission while keeping perceived TTFT under 500 ms.
+  6. The **False Refusal Rate (FRR)** is as critical as the False Acceptance Rate (FAR); over-aggressive safety filters destroy user retention by blocking legitimate domain queries.
+  7. High-overhead LLM judges should be reserved for **asynchronous offline auditing**, never deployed on the synchronous user-facing request path.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why is reversible PII masking preferred over irreversible redaction (e.g., replacing names with "[REDACTED]") in transactional workflows?',
+    options: [
+      'Because [REDACTED] requires twice as many GPU FLOPs to process during prefill',
+      'Because reversible masking preserves entity relationships and allows re-injecting the original value into the final customer-facing output without exposing it to upstream providers',
+      'Because OpenAI APIs reject prompts containing the string [REDACTED]',
+      'Because regex engines cannot perform irreversible redactions'
+    ],
+    answer: 1,
+    why: 'Reversible masking assigns unique surrogate tokens ([PERSON_1], [SSN_1]), allowing the model to reason about relationships between entities while keeping the original private values safely stored in a local session map for re-insertion.'
+  },
+  {
+    q: 'An inference pipeline has a baseline TTFT of 180 ms. The engineering team adds an input guardrail chain: regex PII masking (2 ms), statistical NER (14 ms), and a bi-encoder safety classifier (18 ms). What is the new TTFT before token decode begins?',
+    numeric: true,
+    answer: 214,
+    tolerance: 5,
+    unit: 'ms',
+    why: 'Total TTFT = 180 ms (baseline) + 2 ms (regex) + 14 ms (NER) + 18 ms (classifier) = 214 ms.'
+  },
+  {
+    q: 'A streaming system produces tokens with TPOT = 20 ms. If the output guardrail requires buffering 25 tokens to reach the first complete sentence boundary, how much latency does this buffer add before the first token reaches the user?',
+    numeric: true,
+    answer: 500,
+    tolerance: 10,
+    unit: 'ms',
+    why: 'Buffer delay = 25 tokens × 20 ms/token = 500 ms.'
+  },
+  {
+    q: 'What is the primary operational danger of tuning a safety classifier threshold to achieve an extremely low False Acceptance Rate (FAR ≈ 0%)?',
+    options: [
+      'The GPU runs out of VRAM due to tensor core overflow',
+      'The False Refusal Rate (FRR) spikes, causing benign user prompts to be incorrectly blocked and destroying user retention',
+      'The exact cache hit rate drops to zero',
+      'The model begins outputting raw CUDA assembly code'
+    ],
+    answer: 1,
+    why: 'In classification, pushing FAR toward zero forces decision boundaries wider, inevitably misclassifying benign boundary prompts as malicious. A high FRR frustrates legitimate users and degrades application utility.'
+  },
+  {
+    q: 'Why should constrained decoding (CFG grammars) be preferred over post-hoc JSON regex parsers for critical API integrations?',
+    options: [
+      'Because grammars reduce weight loading time on disk',
+      'Because constrained decoding masks invalid tokens at each sampling step, mathematically guaranteeing valid syntax and eliminating retry latency',
+      'Because JSON parsers cannot run in Python',
+      'Because grammars allow models to skip the attention layer'
+    ],
+    answer: 1,
+    why: 'Constrained decoding modifies logit probabilities at runtime to forbid tokens that would violate the syntax tree, guaranteeing that every generated token strictly adheres to the schema without needing post-hoc repairs.'
+  },
+  {
+    q: 'A customer support bot evaluates 50,000 queries per day. 1,000 queries contain real policy violations. The guardrail correctly catches 950 of them, but also incorrectly blocks 1,470 benign queries. What is the False Refusal Rate (FRR) expressed as a percentage of benign queries?',
+    numeric: true,
+    answer: 3.0,
+    tolerance: 0.2,
+    unit: '%',
+    why: 'Total queries = 50,000. Malicious queries = 1,000. Benign queries = 50,000 - 1,000 = 49,000. False refusals (benign blocked) = 1,470. FRR = 1,470 / 49,000 = 0.03 = 3.0%.'
+  }
+]} />

