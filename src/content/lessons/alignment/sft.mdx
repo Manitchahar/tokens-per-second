@@ -1,0 +1,195 @@
+---
+title: 'Supervised finetuning: teaching by example'
+summary: 'The first and simplest fix: show the model thousands of examples of the conversations you want, and keep training with the same next-token loss. Why the loss must skip the prompt, where the model learns to stop, and why a thousand excellent examples can beat many thousands of ordinary ones.'
+objectives:
+  - Describe a demonstration dataset and how a chat template turns each pair into one training sequence
+  - Compute an SFT loss with and without prompt masking, and explain why masking is the default
+  - Write the label-masking code that implements loss masking in PyTorch
+  - State what LIMA found about data quantity versus quality, and the superficial alignment hypothesis
+  - Explain what supervised finetuning cannot fix, and why that motivates preference data
+---
+import LossMask from '@/components/viz/alignment/LossMask.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+The last lesson ended with a diagnosis. A base model imitates the documents it was trained on, and on the web a question is often followed by another question. The cure suggests itself: **give it new documents**. Write down conversations in which a user asks something and an assistant answers it well, then keep training the model on them until that kind of document is what it produces whenever it sees the chat format.
+
+That is supervised finetuning, and it is almost embarrassingly simple: the same network, the same next-token loss, the same optimizer as pretraining, aimed at a few thousand hand-made examples instead of a few hundred billion scraped tokens. Simple, but three details decide whether it works: **which tokens go into the loss**, **where the model learns to stop**, and **how much data, of what kind**. Get any of them wrong and you get a model that writes user questions, never stops talking, or answers confidently in the style of whoever wrote your data.
+
+## Show, don't tell
+
+You cannot easily write down a rule for "be a helpful assistant". You can, however, show what it looks like, thousands of times. A <Term t="demonstration">demonstration</Term> is a pair: a prompt, and the response a skilled person would want the model to give. Training on demonstrations is called <Term t="sft">supervised finetuning</Term> (SFT). "Supervised" because every example comes with the right answer attached, written by a person, unlike the self-supervised labels of pretraining (Module 3A), which came free from the text itself.
+
+The InstructGPT team (Ouyang et al., 2022) hired a team of about 40 contractors to write theirs. Their SFT training set held **12,725 prompts**: 11,295 written by the labelers themselves to get things started, and 1,430 drawn from early users of the OpenAI API. Each came with a demonstration answer. The prompts were deliberately varied: mostly open-ended generation, plus questions, brainstorming, rewriting, summarising and classification.
+
+Now watch what happens to one demonstration on its way into the loss.
+
+<Scrolly>
+  <LossMask client:visible slot="stage" />
+
+  <Step title="1. A demonstration">
+    A prompt and an ideal response. No rules, no scores, no explanation of what "helpful" means. **Just an example of it.** SFT is thousands of these.
+  </Step>
+
+  <Step title="2. One sequence, with a template">
+    The **chat template** wraps the pair in special tokens that mark whose turn it is, and the result is one token sequence. To the model it is simply another document, of a kind it has rarely seen before.
+  </Step>
+
+  <Step title="3. Next-token loss on every token">
+    Train it exactly like pretraining: at each position, the loss is $-\log p$ of the true next token. The bars under the tokens are those losses. Averaged over all 18 predicted positions: **1.44 nats**.
+  </Step>
+
+  <Step title="4. Most of it is the user's words">
+    Look where the tall bars are. **88% of the summed loss comes from guessing what the user typed.** Minimising that teaches the model to write user questions, and it barely touches the response, which is the whole point of the exercise.
+  </Step>
+
+  <Step title="5. Mask the prompt">
+    Set the prompt's labels to **−100** and the loss skips those positions. Only the 5 response tokens are learned, with mean **0.64 nats**. The prompt still goes through the forward pass, because the response attends to it.
+  </Step>
+
+  <Step title="6. The stop is a target too">
+    The response ends with `<|im_end|>`, and that token is in the loss like any other. **This is where the model learns to stop.** Leave it out of the labels and the finetuned model rambles exactly like the base model did.
+  </Step>
+
+  <Step title="7. A batch: only amber cells learn">
+    In a padded batch, prompt and padding positions are computed but never targets. Here **36 of 120 positions** carry a loss. The average is taken over those 36, not over all 120.
+  </Step>
+
+  <Step title="8. How many demonstrations?">
+    InstructGPT used **12,725**, Llama 2-Chat **27,540**, LIMA just **1,000**. Next to GPT-3's 300 billion pretraining tokens, all three are rounding errors, and the smallest one works remarkably well.
+  </Step>
+</Scrolly>
+
+## Then derive it properly
+
+### The SFT loss, precisely
+
+Write the templated sequence as tokens $x_1, \ldots, x_T$, and let $R$ be the set of positions that belong to the response (including its end-of-turn token). Pretraining averages the loss over every position. SFT averages only over $R$:
+
+$$
+\mathcal{L}_{\text{SFT}}(\theta) = -\frac{1}{|R|} \sum_{t \in R} \log p_\theta(x_t \mid x_{<t}) .
+$$
+
+Two things did not change. Every prediction still sees the full prefix $x_{<t}$, prompt included, so the model learns to answer *this* prompt. And it is still cross-entropy, the loss from *How a model learns: loss & gradient descent* (Module 03): push up the probability of the token the demonstrator actually wrote.
+
+<Callout type="math" title="Worked: masking changes what is minimised">
+  Take the 19 tokens in the visual. The first token has nothing before it, so 18 positions are predicted: 13 in the prompt (template plus the user's six words) and 5 in the response.
+
+  | | Positions | Summed loss (nats) | Mean |
+  |---|---|---|---|
+  | prompt | 13 | 22.71 | 1.75 |
+  | response | 5 | 3.20 | 0.64 |
+  | **all** | **18** | **25.91** | **1.44** |
+
+  Without masking the model minimises 25.91 ÷ 18 = 1.44 nats, and the prompt's share of that sum is 22.71 ÷ 25.91 = **87.6%**. The biggest single term is "Name" at 6.1 nats: the model being asked to guess, from nothing, how a user will open their message.
+
+  With masking it minimises 3.20 ÷ 5 = **0.64 nats**, every bit of which is about answering. Same data, same model; a different question is being asked of the gradient.
+</Callout>
+
+In code the mask is one line, because PyTorch's cross-entropy skips any position whose label equals `-100` (its `ignore_index`):
+
+```python
+import torch.nn.functional as F
+
+def build_example(tok, prompt, response):
+    msgs = [{"role": "user", "content": prompt}]
+    # the prompt part ends with the assistant header, exactly what inference will send
+    prompt_ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
+    full_ids = tok.apply_chat_template(msgs + [{"role": "assistant", "content": response}])
+    assert full_ids[:len(prompt_ids)] == prompt_ids, "template is not prefix-stable"
+    labels = list(full_ids)
+    labels[:len(prompt_ids)] = [-100] * len(prompt_ids)   # mask the prompt
+    return full_ids, labels
+
+def sft_loss(model, input_ids, labels):
+    logits = model(input_ids).logits                     # [B, T, V]
+    # position t predicts token t+1, so shift by one
+    return F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)),
+                           labels[:, 1:].reshape(-1), ignore_index=-100)
+```
+
+Hugging Face models do the shift for you if you pass `labels=` to the forward call; the shift is shown here because forgetting it is the classic off-by-one of every hand-written training loop. The `assert` catches a subtler trap: some templates render the prompt slightly differently on its own than as part of a full conversation, and then your mask lands a few tokens off.
+
+### Why masking is the default
+
+Three reasons, in order of how often they bite.
+
+1. **The job is answering, not asking.** Every gradient step spent learning to predict user messages is a step not spent on responses, and a model that has learned to write user turns will happily write one after its own answer, playing both sides of the conversation.
+2. **Long prompts drown the signal.** Retrieval and document tasks (Module B3) have prompts of thousands of tokens and answers of a hundred. With a 3,000-token prompt and a 100-token answer, the prompt is 3,000 ÷ 3,100 = **96.8%** of the positions. Unmasked, the model mostly learns to predict your documents.
+3. **Prompts are not curated.** Demonstrations are written carefully; prompts are often collected from users, with typos, odd formats and adversarial attempts. You do not want to imitate those.
+
+Meta's Llama 2 paper (Touvron et al., 2023) describes exactly this: during SFT it zeroed out the loss on user-prompt tokens and backpropagated only on answer tokens. At the time of writing, finetuning libraries expose the choice under names like "completion-only" or "assistant-only" loss, and the defaults differ between libraries and versions. Check which one your recipe uses. Some recent studies report that keeping a little prompt loss helps when responses are very short, but masking is the safe default.
+
+<Callout type="pitfall" title="The model that never stops">
+  The most common SFT bug in the wild: the tokenizer has no padding token, so the script sets `pad_token = eos_token`, then masks every position equal to `pad_token_id` with −100. That also masks the *real* end-of-turn token at the end of every response. The finetuned model never sees a reason to stop, and at inference it runs to `max_new_tokens` on every request. Training loss looks perfect; serving cost explodes. Check your labels: the last response token must not be −100.
+</Callout>
+
+### Where SFT teaches stopping
+
+Lesson 3C.1 showed that a base model does not know when it is done. SFT fixes this almost as a side effect: every demonstration ends with the end-of-turn token, the token is in $R$, and so after a complete answer the model learns to put its probability there. At inference your engine stops when it samples that token, which is why every API takes a list of stop tokens (*Load, tokenize, generate & stream*, Module 04).
+
+The template also decides how many tokens of overhead each turn costs. In Qwen2.5's format, `<|im_start|>assistant↵` is three tokens before the first word of every reply. Small per turn, but it is real prefill work on every request you will ever serve, and it is part of the model: [Chat templates & system prompts](/learn/prompting/chat-templates/) (Module B1) is the full story.
+
+### How many demonstrations: the LIMA question
+
+InstructGPT needed a team of 40 people. Llama 2's authors reported that third-party instruction datasets lacked the diversity and quality they wanted, collected their own, and stopped after 27,540 annotations because more did not seem necessary. So how much data does SFT actually need?
+
+LIMA (Zhou et al., 2023) pushed the question to an extreme. The authors took LLaMA-65B, a base model, and finetuned it on **1,000** carefully chosen prompt-response pairs, with no reinforcement learning and no preference data at all. Most examples were gathered from community Q&A sites and Reddit, filtered hard for quality and variety, and the rest written by the authors. In a controlled human study, LIMA's answers were rated equivalent to or better than GPT-4's in **43%** of cases, Bard's in **58%** and DaVinci003's in **65%**, the last of which had been trained with human feedback.
+
+Their explanation is the <Term t="superficial-alignment">superficial alignment hypothesis</Term>: almost all of a model's knowledge and ability is learned in pretraining, and alignment mostly teaches it *which format and style to use* when talking to a person. If that is right, you need enough examples to show the format convincingly across many kinds of request, and not much more.
+
+Their ablations, run on a 7B model, support the idea:
+
+- **Variety matters.** 2,000 examples from Stack Exchange, with its huge range of topics, beat 2,000 from wikiHow, where every prompt has the same "how to" shape.
+- **Quality matters.** Filtered Stack Exchange answers beat unfiltered ones by about half a point on a six-point helpfulness scale.
+- **Quantity alone matters less.** Adding many more examples from a single source helped far less than improving their quality or variety.
+
+<Callout type="mentor" title="Read the result carefully">
+  LIMA does not say "1,000 examples is enough for anything". It says that for a strong base model and general chat, a small, excellent, varied set teaches the format. It was evaluated on chat helpfulness, not on, say, tool calling or a narrow domain, and LIMA itself still lost to GPT-4 most of the time. What carries over to your work is the ordering of priorities: **variety and quality first, quantity last**. Module B6 turns that into a practical data pipeline.
+</Callout>
+
+### Training details that matter
+
+SFT runs are short. LIMA trained for about 15 epochs at a learning rate around ${}10^{-5}$; InstructGPT's SFT models trained for 16 epochs. The InstructGPT paper reports something worth remembering: validation loss on the demonstrations started rising after the first epoch, a classic overfitting signal, yet more epochs kept improving the reward-model score and human preference ratings. **In SFT, loss on held-out demonstrations is a poor guide to quality.** You judge the model by evaluating what it generates (Module B2), not by its loss curve.
+
+Whether you update every weight or a small low-rank adapter is a separate decision with a large effect on memory, covered in Module B5 (LoRA). The loss and the masking are identical either way.
+
+### What SFT cannot fix
+
+SFT gets you most of the way to an assistant. It also leaves four problems on the table, and they shape the rest of this module.
+
+1. **It can only imitate.** The model learns to write like the demonstrators, at best. Its ceiling is their skill, their patience and their consistency.
+2. **Writing ideal answers is slow and inconsistent.** A good long answer can take a labeler many minutes, and two skilled people will write two different "ideal" answers. The data says "this", never "this is better than that".
+3. **It never sees its own mistakes.** Every training prefix was written by a person (this is called *teacher forcing*). At inference the model conditions on its own output, including its own errors, which it was never trained to recover from. Lesson 3C.6 shows how one early wrong token can commit a whole answer.
+4. **It teaches confident answering, whether or not the model knows.** Every demonstration answers. If some demonstrations require facts the base model never learned, SFT teaches it to produce fluent answers anyway, which is a recipe for hallucination (lesson 3C.6).
+
+Problem 2 holds the key to the next step. If writing the best answer is hard, *comparing* two answers is easy. That is the subject of lesson 3C.3.
+
+<Callout type="real" title="Now read the paper">
+  **LIMA: Less Is More for Alignment** (Zhou et al., 2023), [arXiv 2305.11206](https://arxiv.org/abs/2305.11206).
+
+  - **Read:** the introduction, which states the superficial alignment hypothesis; Section 2, on how the 1,000 examples were chosen (this is the practical part); the human-evaluation results in Section 4; and Section 5, the ablations on diversity, quality and quantity.
+  - **Skim:** the multi-turn dialogue experiment and the discussion.
+  - **Skip:** the appendix of individual example outputs, unless you are curious about style.
+
+  You will now recognise the standard supervised loss they train with, why they add a special end-of-turn token, and why their quantity ablation is the most quoted figure in the paper.
+</Callout>
+
+<KeyNotes>
+  1. **Supervised finetuning** trains the pretrained model on demonstrations, prompts paired with ideal responses written by people, using the same next-token cross-entropy as pretraining.
+  2. The **chat template** turns each pair into one token sequence with special tokens marking the turns; the model must be served with the same template it was trained on.
+  3. **Loss masking**: set prompt labels to −100 so the loss averages only over response tokens, $-\frac{1}{|R|}\sum_{t\in R}\log p(x_t\mid x_{<t})$. In the worked example the prompt was 87.6% of the unmasked loss; masked, the mean is 3.20 ÷ 5 = 0.64 nats.
+  4. Masked positions still go through the forward pass, because the response attends to them; they just never act as targets. In a padded batch the mean is taken over the learned positions only.
+  5. The **end-of-turn token is a target**. That is where the model learns to stop; masking it by accident (the pad = eos bug) produces a model that never stops.
+  6. InstructGPT used **12,725** SFT prompts, Llama 2-Chat **27,540** annotations, LIMA **1,000**. LIMA's ablations: variety and quality beat quantity.
+  7. The **superficial alignment hypothesis**: knowledge comes from pretraining; SFT mainly teaches the format and style of answering.
+  8. SFT can only imitate, never sees its own mistakes, and teaches confident answering even without knowledge. Comparing answers is easier than writing ideal ones, which leads to preference data.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A templated example has 20 predicted prompt positions with summed loss 30 nats and 5 response positions with summed loss 4 nats. What is the SFT loss with prompt masking, in nats?', numeric: true, answer: 0.8, tolerance: 0.02, unit: 'nats', why: 'Masking keeps only the response positions: 4 ÷ 5 = 0.8 nats. Without masking it would be (30 + 4) ÷ 25 = 1.36 nats, and 30 ÷ 34 = 88% of the summed loss would come from the prompt.' },
+  { q: 'A RAG-style example has a 3,000-token prompt and a 120-token answer. Without masking, what percentage of the predicted positions belong to the prompt?', numeric: true, answer: 96.2, tolerance: 0.3, unit: '%', why: '3,000 ÷ (3,000 + 120) = 3,000 ÷ 3,120 = 0.962 = 96.2%. Unmasked, the model would mostly be learning to predict the retrieved documents.' },
+  { q: 'A padded batch has 4 sequences of 512 positions. The response lengths are 100, 50, 200 and 30 tokens. What percentage of positions carry a loss after masking?', numeric: true, answer: 18.6, tolerance: 0.3, unit: '%', why: 'Learned positions = 100 + 50 + 200 + 30 = 380. Total positions = 4 × 512 = 2,048. 380 ÷ 2,048 = 0.186 = 18.6%. All 2,048 still go through the forward pass.' },
+  { q: 'What does setting a label to −100 do in PyTorch’s cross-entropy?', options: ['It assigns that token a very low probability', 'It makes cross-entropy skip that position: no loss and no gradient from it, and it is left out of the average', 'It removes the token from the forward pass entirely', 'It marks the token as the end of the sequence'], answer: 1, why: '−100 is the default ignore_index. The token is still in the input, so later tokens can attend to it, but that position contributes nothing to the loss or its mean.' },
+  { q: 'After SFT, a model answers well but never stops generating. Which training bug is the most likely cause?', options: ['The learning rate was too low', 'The pad token was set to the EOS token and every pad-token position was masked, which also masked the real end-of-turn token', 'Too many epochs', 'The prompt was masked'], answer: 1, why: 'If the end-of-turn token is never a target, nothing teaches the model to put probability on it after an answer. Masking the prompt is correct; masking the stop token is the bug.' },
+  { q: 'What did LIMA’s results and ablations suggest?', options: ['SFT needs at least 50,000 examples', 'A small, carefully curated, varied set can teach a strong base model the format of helpful answers; variety and quality matter more than sheer quantity', 'Reinforcement learning is required for any useful assistant', 'Finetuning adds most of a model’s knowledge'], answer: 1, why: 'LIMA finetuned LLaMA-65B on 1,000 examples with no RL and was rated equivalent or better than GPT-4 in 43% of comparisons. Its 7B ablations showed diverse and filtered data beating more of the same.' },
+]} />
