@@ -1,0 +1,355 @@
+---
+title: 'Formatting instruction data'
+summary: 'Why a single misplaced space destroys your model. Chat template standards, byte-level token boundaries, turning expensive few-shot prompts into fast finetuning weights, and the math of loss masking.'
+objectives:
+  - Formulate instruction datasets in Alpaca, ShareGPT, and ChatML/Llama-3 formats
+  - Enforce byte-for-byte equivalence between training and inference templates
+  - Diagnose tokenization bugs caused by whitespace variations and unregistered special tokens
+  - Convert multi-shot in-context prompts into zero-shot finetuned weights to slash TTFT and KV cache
+  - Implement loss masking with target labels set to -100 to prevent prompt memorization
+---
+import InstructionFormatViz from '@/components/viz/datasets/InstructionFormatViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+You can spend \$50,000 collecting pristine human demonstrations, run data deduplication, and tune your hyperparameters perfectly—and still produce a model that outputs garbage in production.
+
+When an inference engineer investigates why a finetuned model repeats the user prompt, stutters endlessly, or refuses to stop generating until it hits the context limit, nine times out of ten the culprit is not the learning rate or the rank of the LoRA adapter. It is a **one-byte formatting mismatch** between the data used in training and the string sent to the inference engine.
+
+In this lesson, we will dissect how instruction data is tokenized, why chat templates are mandatory, how to convert few-shot prompts into permanent model weights, and why <Term t="loss-masking">loss masking</Term> is the dividing line between an intelligent conversationalist and an expensive parrot.
+
+## The Formats: Alpaca, ShareGPT, and ChatML
+
+Before modern chat templates standardized the ecosystem, datasets were formatted as raw string interpolations. Understanding this evolution explains why legacy datasets break modern tokenizers.
+
+### 1. Legacy Alpaca Format (Single-turn)
+Created for the Stanford Alpaca project in 2023, this format uses plain string markers:
+
+```text
+Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Extract the hardware specifications from the following log.
+
+### Input:
+Node-01: NVIDIA H100 SXM5 80GB HBM3.
+
+### Response:
+GPU: NVIDIA H100 SXM5, VRAM: 80GB, Memory Type: HBM3.
+```
+
+While simple, the Alpaca format suffers from severe limitations:
+- It supports only single-turn interactions. There is no clean way to represent a back-and-forth dialogue.
+- The boundary markers (`### Instruction:`) are made of common ASCII characters. The model treats them as standard text rather than atomic control signals.
+- If a user prompt happens to contain the characters `### Response:`, the model can be tricked into thinking its turn has begun prematurely.
+
+### 2. ShareGPT / OpenAI Messages Format (Multi-turn JSON)
+To represent multi-turn conversations, the open-source community adopted the ShareGPT JSON schema, which mirrors the standard OpenAI messages list:
+
+```json
+{
+  "conversations": [
+    {"from": "system", "value": "You are a low-latency inference routing assistant."},
+    {"from": "human", "value": "What is the peak memory bandwidth of an A100 GPU?"},
+    {"from": "gpt", "value": "The NVIDIA A100 SXM4 features 2.039 TB/s of HBM2e memory bandwidth."},
+    {"from": "human", "value": "And what about the PCIe version?"},
+    {"from": "gpt", "value": "The NVIDIA A100 PCIe version features 1.935 TB/s of HBM2e memory bandwidth."}
+  ]
+}
+```
+
+This JSON representation is format-agnostic. It stores the semantic conversation turns cleanly, leaving the serialization into raw strings to the tokenizer.
+
+### 3. Modern Chat Templates: ChatML and Llama-3
+Today, models use reserved, out-of-vocabulary control tokens.
+
+In **ChatML** (popularized by OpenAI and adopted by Qwen and Mistral):
+```text
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+What is 12 * 12?<|im_end|>
+<|im_start|>assistant
+144<|im_end|>
+```
+
+In **Llama-3**:
+```text
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+What is 12 * 12?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+144<|eot_id|>
+```
+
+These delimiters are not parsed as ordinary words. They correspond to dedicated token IDs in the model's vocabulary (for example, token ID 128006 for `<|start_header_id|>` in Llama-3).
+
+<Scrolly>
+  <InstructionFormatViz client:visible slot="stage" />
+
+  <Step title="1. Tokens: special ID vs text">
+    Boundary markers must map to **single reserved token IDs**. If `<|im_start|>` is treated as plain text, Byte-Pair Encoding (BPE) splits it into 6 separate tokens (`<`, `|`, `im`, `_`, `start`, `|>`). The model never learns an atomic concept of a turn boundary.
+  </Step>
+
+  <Step title="2. Anatomy of a chat turn">
+    A complete training sequence concatenates the system prompt, user turn, and assistant response into a single linear sequence. The entire sequence is processed in **one parallel forward pass** during training.
+  </Step>
+
+  <Step title="3. Loss masking: target = -100">
+    During training, cross-entropy loss must be **masked on all prompt tokens** (system and user) by setting their label target to `-100`. Gradients backpropagate only through the assistant's response tokens.
+  </Step>
+
+  <Step title="4. The whitespace trap">
+    In modern BPE tokenizers, **spaces are fused into tokens**. The string `"assistant\n"` produces token ID 77091, but `"assistant \n"` (with an accidental trailing space) produces an entirely different token sequence, breaking prefix caching and leading to generation errors.
+  </Step>
+
+  <Step title="5. The missing EOS trap">
+    If the training target does not include the explicit **end-of-turn token** (`<|im_end|>` or `<|eot_id|>`), the model never learns when to stop. During inference, it will babble indefinitely until hitting `max_tokens`, wasting GPU VRAM and compute.
+  </Step>
+
+  <Step title="6. Exact inference alignment">
+    At inference time, your serving framework calls `apply_chat_template(..., add_generation_prompt=True)`. This must generate the **exact byte-for-byte prefix** that the model saw during training right up to the assistant's first token.
+  </Step>
+</Scrolly>
+
+## The Golden Rule: Training Template Equals Inference Template
+
+In Module B1 (*Prompt Engineering*), you learned how `apply_chat_template` constructs the string that enters the tokenizer before inference.
+
+The golden rule of instruction data engineering is:
+
+> The prompt prefix fed to the model during training must match the prompt prefix generated at inference time down to the exact byte, the exact newline, and the exact token ID.
+
+Consider what happens if there is even a minor discrepancy:
+
+```python
+# TRAINING DATA STRING:
+"<|im_start|>system\nYou are an assistant.<|im_end|>\n<|im_start|>user\nHelp me.<|im_end|>\n<|im_start|>assistant\nCertainly!"
+
+# INFERENCE PROMPT STRING (WRONG):
+"<|im_start|>system\nYou are an assistant.<|im_end|>\n<|im_start|>user\nHelp me.<|im_end|>\n<|im_start|>assistant:\n"
+```
+
+Notice the tiny colon `:` added after `assistant` in the inference prompt.
+
+To a human reader, `assistant\n` and `assistant:\n` convey the exact same meaning. But to a transformer's attention layers:
+1. The token sequence ends with token ID 1058 (`:`) instead of token ID 198 (`\n`).
+2. The model was never trained on token 1058 following the assistant header.
+3. The positional embeddings and key vectors for the prefix diverge.
+4. Instead of answering the question, the model might emit another newline, repeat the prompt, or adopt an entirely different stylistic distribution.
+
+Furthermore, in Module 10 (*Prefix Caching*), you learned that engines like vLLM and SGLang hash the token IDs of prompt prefixes to reuse KV cache blocks. If your production prompt diverges by a single whitespace character, your prefix cache hit rate drops to zero, forcing full prefill recomputation.
+
+## Whitespace and Special-Token Traps
+
+Tokenizers are brittle state machines. Here are the three most common traps that sabotage instruction datasets:
+
+### Trap 1: The Trailing Whitespace Disaster
+In BPE tokenizers (such as Tiktoken or HuggingFace Tokenizers), spaces are prepended to the subsequent word token rather than existing as standalone tokens.
+
+For example, in the Llama-3 vocabulary:
+- `"Hello"` (at the start of a string) is token ID 9906.
+- `" Hello"` (with a leading space) is token ID 18328.
+
+If your dataset formatting code does this:
+
+```python
+# BUG: String concatenation adds an accidental trailing space
+prompt = template.format(user_query=query) + " "
+```
+
+The model will be evaluated on a sequence ending in token 220 (the standalone space token). But during training, the target response began with a leading space fused into the first word! Consequently, the model sees two consecutive spaces, disrupting its next-token probability distribution.
+
+### Trap 2: String Formatting vs Native Special Tokens
+When writing Python scripts to convert JSON to text, developers often use f-strings:
+
+```python
+# DANGEROUS:
+formatted_text = f"<|im_start|>user\n{user_input}<|im_end|>\n<|im_start|>assistant\n{response}<|im_end|>"
+```
+
+If the tokenizer does not have `<|im_start|>` registered in its `special_tokens_map`, it will treat that marker as literal text! It will look up the token ID for `<`, then `|`, then `im`, then `_`, then `start`, then `|>`.
+
+Always format instruction datasets using the official tokenizer API:
+
+```python
+formatted_prompt = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=False
+)
+```
+
+The tokenizer's Jinja template handles the exact token IDs, newlines, and special token encodings configured by the model's creators.
+
+### Trap 3: The Missing End-of-Turn (EOS) Token
+Every assistant response must end with an end-of-turn token (e.g., `<|im_end|>` or `<|eot_id|>`).
+
+If your training script strips trailing whitespace or slices strings using `text.strip()`, you might accidentally lop off the trailing EOS token. If the model is never trained to predict the EOS token at the conclusion of an answer, its probability of emitting EOS remains near zero. When deployed to vLLM, the decode loop will keep generating until reaching `max_tokens`. A 30-token summary turns into 2,048 tokens of repetitive hallucinations, inflating your serving latency by 68×!
+
+## Turning Few-Shot Prompts into Training Data
+
+In Module B1 (*Prompt Engineering*), you learned how to use few-shot prompting: prepending 5 to 10 input-output demonstrations to the user's prompt so the model learns the desired extraction schema in-context.
+
+While few-shot prompting works without training, it carries massive serving penalties:
+
+<Callout type="math" title="Worked Numeric Example: Serving Cost of Few-Shot vs Finetuning">
+  Suppose you have an entity extraction task.
+  - Each few-shot prompt includes 8 demonstrations of 250 tokens each = ${}2{,}000$ prompt tokens.
+  - The actual user document is 500 tokens.
+  - Total prompt context length $T = 2{,}500$ tokens.
+  - Output length $N_{\text{out}} = 50$ tokens.
+
+  1. **Prefill Compute Cost per Request**:
+  From Module 05, prefill FLOPs for an 8B parameter model ($P = 8 \times 10^9$):
+  $$
+  \text{FLOPs} = 2 P T = 2 \times (8 \times 10^9) \times 2{,}500 = 40 \times 10^{12}\ \text{FLOPs} = 40\ \text{TFLOPs}
+  $$
+
+  2. **KV Cache Memory Allocation**:
+  For Llama-3.1-8B in BF16, the KV cache costs 128 KB per token.
+  $$
+  \text{KV Cache per user} = 2{,}550 \times 128\ \text{KB} = 326.4\ \text{MB}
+  $$
+  On a 16 GB GPU (with 14 GB free after weights), you can hold at most:
+  $$
+  \frac{14{,}000\ \text{MB}}{326.4\ \text{MB}} \approx \mathbf{42\ \text{concurrent requests}}
+  $$
+
+  3. **The Finetuned Alternative**:
+  Now convert those 8 demonstrations into a 500-sample finetuning dataset. The model learns the extraction schema directly into its weights.
+  - The user prompt now needs zero demonstrations: $T = 500$ tokens.
+  - Prefill FLOPs drop from 40 TFLOPs to ${}2 \times (8 \times 10^9) \times 500 = \mathbf{8\ \text{TFLOPs}}$ (**5× reduction in prefill compute**).
+  - KV cache drops from 326.4 MB to ${}550 \times 128\ \text{KB} = \mathbf{70.4\ \text{MB}}$ (**4.6× reduction in memory**).
+  - Maximum concurrent requests jump from 42 to $\frac{14{,}000}{70.4} \approx \mathbf{198\ \text{concurrent requests}}$!
+</Callout>
+
+By baking in-context demonstrations into the model's weights through instruction tuning, you permanently recover your context window, reduce Time to First Token (TTFT), and slash memory bandwidth demand.
+
+## Loss Masking: Why Target Labels Must Be -100
+
+When training an autoregressive transformer, the input is a tensor of token IDs $X = [x_1, x_2, \dots, x_T]$ and the target is the same tensor shifted by one position $Y = [x_2, x_3, \dots, x_{T+1}]$.
+
+In a standard language modeling objective, the cross-entropy loss is computed across all positions:
+
+$$
+\mathcal{L}_{\text{unmasked}} = -\frac{1}{T} \sum_{t=1}^{T} \log P(x_{t+1} \mid x_1, \dots, x_t)
+$$
+
+Now consider what happens when you train on an instruction turn where $x_1, \dots, x_p$ are prompt tokens (system message and user query), and $x_{p+1}, \dots, x_T$ are response tokens.
+
+If you compute loss over the entire sequence without masking:
+1. The model is penalized for failing to predict the *user's* words.
+2. The user's query could be anything: an informal greeting, an error log, or a question phrased in dozens of arbitrary ways.
+3. Because the user's phrasing is largely unpredictable, the gradient updates force the model to memorize the specific questions in the training set rather than learning how to synthesize answers.
+4. The gradients from the prompt tokens dilute the gradients from the response tokens.
+
+To solve this, PyTorch's `torch.nn.CrossEntropyLoss` includes the parameter `ignore_index=-100`.
+
+When computing loss masking:
+- For all tokens belonging to the system prompt, user turn, and boundary headers, set the target label to `-100`.
+- For all tokens generated by the assistant, keep the target label equal to the actual token ID.
+
+$$
+\mathcal{L}_{\text{masked}} = -\frac{1}{N_{\text{response}}} \sum_{t=p}^{T-1} \log P(x_{t+1} \mid x_1, \dots, x_t)
+$$
+
+where $N_{\text{response}} = T - p$ is the count of assistant response tokens.
+
+```python
+import torch
+import torch.nn as nn
+
+# Sequence: [System, User prompt (tokens 0..4), Assistant response (tokens 5..8)]
+input_ids = torch.tensor([[151644, 8948, 151645, 151644, 872, 18420, 151645, 151644, 77091, 18924, 151645]])
+labels = input_ids.clone()
+
+# Mask prompt tokens up to the start of the assistant's generation
+prompt_len = 9
+labels[:, :prompt_len] = -100
+
+print("Input IDs:", input_ids)
+print("Labels:   ", labels)
+# Labels: [-100, -100, -100, -100, -100, -100, -100, -100, -100, 18924, 151645]
+
+# CrossEntropyLoss automatically ignores any target == -100
+loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+```
+
+Notice that the prompt tokens are still passed through the model's forward pass! Their key and value representations are computed and attended to by the assistant tokens. But during backpropagation, their loss contribution is strictly zero. The model learns exclusively how to respond given the context.
+
+<Callout type="pitfall" title="The -100 Off-by-One Offset">
+  A notorious bug in custom SFT trainers is masking one token too few or one token too many.
+  
+  Remember that causal language modeling predicts the *next* token: `logits[t]` predicts `labels[t]`. If you set `labels[p] = -100` where $p$ is the assistant header, ensure that the first actual word of the response is not masked. Verify your masking logic by decoding `[tok for tok in labels[0] if tok != -100]` and confirming it produces the exact assistant response text plus the EOS token.
+</Callout>
+
+<KeyNotes>
+  1. **Strict template parity**: The prompt prefix during training must match the inference prompt generated by `apply_chat_template` down to the exact byte and special token.
+  2. **Special tokens are atomic**: Always ensure control markers like `<|im_start|>` are recognized as unique single tokens in the tokenizer vocabulary, not sliced into multiple ASCII characters.
+  3. **Spaces are part of tokens**: BPE tokenizers fuse whitespace into subsequent tokens. An unintended trailing space changes the token ID and destroys prefix caching.
+  4. **Always include EOS**: Assistant targets must conclude with the tokenizer's end-of-turn token, or the model will babble indefinitely at serving time until hitting `max_tokens`.
+  5. **Bake few-shot into weights**: Replacing an 8-shot in-context prompt with a finetuned model slashes prompt prefill FLOPs by 5× and frees up to 80% of your KV cache memory.
+  6. **Loss masking is mandatory**: Set target labels for system and user tokens to `-100`. Gradients must update weights exclusively based on assistant response tokens.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why should the prompt tokens (system and user messages) have their training labels set to -100?',
+    options: [
+      'To reduce the memory required by the model weights on the GPU.',
+      'Because CrossEntropyLoss ignores index -100, ensuring gradients update the model based only on its responses rather than memorizing user questions.',
+      'To prevent the tokenizer from decoding the user prompt.',
+      'Because -100 is the ASCII representation of a newline character.'
+    ],
+    answer: 1,
+    why: 'Setting target labels to -100 instructs PyTorch CrossEntropyLoss to ignore those positions, focusing gradient updates strictly on the assistant response tokens.'
+  },
+  {
+    q: 'An in-context prompt uses 1,500 tokens of few-shot demonstrations and 300 tokens for the user query (1,800 prompt tokens total). If finetuning eliminates the need for demonstrations, reducing prompt length to 300 tokens, what is the ratio of prefill FLOPs required (few-shot vs finetuned)?',
+    numeric: true,
+    answer: 6,
+    tolerance: 0.1,
+    unit: 'x',
+    why: 'Prefill FLOPs scale linearly with prompt token count: 2 * P * T. The ratio is 1,800 / 300 = 6x reduction in prefill compute.'
+  },
+  {
+    q: 'For Llama-3.1-8B in BF16 (128 KB per token), how much KV cache memory is saved per user request when replacing a 2,000-token few-shot prompt with a 400-token zero-shot prompt?',
+    numeric: true,
+    answer: 204.8,
+    tolerance: 2,
+    unit: 'MB',
+    why: 'Tokens saved = 2,000 - 400 = 1,600 tokens. Memory saved = 1,600 * 128 KB = 204,800 KB = 204.8 MB per user.'
+  },
+  {
+    q: 'What occurs during inference if an instruction dataset was trained without appending the end-of-turn (EOS) token to the assistant response targets?',
+    options: [
+      'The model crashes with a CUDA out-of-memory error on step 1.',
+      'The model never predicts the stop condition and continues generating until it hits the max_tokens limit.',
+      'The tokenizer fails to load the weights into vLLM.',
+      'The model outputs only numerical tokens.'
+    ],
+    answer: 1,
+    why: 'Without loss on the EOS token, the model never learns when a turn concludes, resulting in endless babbling and hallucinations until the max token ceiling is reached.'
+  },
+  {
+    q: 'Why does adding an accidental trailing space at the end of a chat template (e.g. "assistant \\n" vs "assistant\\n") degrade serving performance?',
+    options: [
+      'It increases the GPU temperature.',
+      'BPE tokenizers treat whitespace-fused characters as completely different token IDs, causing cache misses in prefix caching and confusing next-token prediction.',
+      'It causes the attention matrix to become asymmetric.',
+      'It permanently corrupts the model weights.'
+    ],
+    answer: 1,
+    why: 'In BPE tokenizers, spaces fuse into tokens. A trailing space produces a completely different token ID, causing prefix cache misses and generating unexpected token distributions.'
+  },
+  {
+    q: 'A batch has a prompt of 600 tokens and an assistant response of 200 tokens (800 tokens total). What percentage of the sequence tokens have active loss gradients when loss masking is applied?',
+    numeric: true,
+    answer: 25,
+    tolerance: 1,
+    unit: '%',
+    why: 'Only the 200 assistant tokens have active loss; the 600 prompt tokens have label -100. The active percentage is 200 / 800 = 25%.'
+  }
+]} />

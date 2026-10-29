@@ -1,0 +1,327 @@
+---
+title: 'Quality, coverage & quantity'
+summary: 'Why 1,000 pristine examples beat 50,000 web scrapes. The superficial alignment hypothesis, how to choose domain mixes that unlock reasoning, and the pilot playbook for building dataset scaling curves.'
+objectives:
+  - Formulate the trade-offs between dataset quality, domain coverage, and raw sample quantity
+  - Explain the Superficial Alignment Hypothesis and cite findings from the LIMA paper
+  - Calculate labeling and token generation budgets across data scaling regimens
+  - Design a balanced domain recipe using code and math to improve generalized reasoning
+  - Construct a 50-to-100 sample pilot study to empirically measure finetuning feasibility
+---
+import QualityCoverageQuantityViz from '@/components/viz/datasets/QualityCoverageQuantityViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every newcomer to post-training falls into the exact same trap: they assume that because pretraining required 15 trillion tokens across thousands of GPUs, teaching a model to follow instructions must also require hundreds of thousands of examples. They scrape thousands of messy forum threads, dump unverified user tickets into a folder, kick off a finetuning run, and wonder why the resulting model hallucinates, speaks in fragmented sentences, and refuses standard queries.
+
+The truth is counter-intuitive. In instruction tuning, **quality and coverage utterly dominate raw quantity**. A model trained on 1,000 meticulously crafted, diverse examples can decisively outperform the same base model trained on 50,000 noisy, scraped dialogs.
+
+This lesson unpacks the mechanics behind that reality. We will explore the theoretical foundation known as the <Term t="superficial-alignment">Superficial Alignment Hypothesis</Term>, study the arithmetic of data scaling curves, understand why coding and mathematical reasoning data elevate general intelligence, and establish a pragmatic pilot protocol for every new project.
+
+## The Triad: Quality, Coverage, and Quantity
+
+When assembling a finetuning dataset, you are balancing three competing forces:
+
+1. **Quality**: The grammatical precision, logical validity, clarity, and formatting consistency of the target responses. A high-quality response contains no extraneous boilerplate, directly answers the prompt, avoids sycophancy, and demonstrates the exact persona and length desired.
+2. **Coverage**: The breadth and diversity of distinct task types, difficulty levels, vocabularies, edge cases, and reasoning modalities represented across the dataset.
+3. **Quantity**: The raw count of instruction-response pairs ($N$) or total tokens ($T$).
+
+If you hold your budget fixed, increasing quantity almost always degrades quality, because human annotation and expert review cannot scale infinitely without introducing noise.
+
+<Scrolly>
+  <QualityCoverageQuantityViz client:visible slot="stage" />
+
+  <Step title="1. Quantity alone fails">
+    Training on **50,000 noisy, web-scraped instructions** yields hallucinations and formatting drift. When gradient updates backpropagate through inconsistent, conflicting, or poorly phrased responses, the model learns the noise rather than the intended task structure.
+  </Step>
+
+  <Step title="2. LIMA: 1,000 curated gems">
+    In 2023, the LIMA study demonstrated that **1,000 hand-crafted examples** applied to a base 65B model matched or outperformed GPT-4 and Bard on human preference evaluations. Almost all world knowledge is already inside the pretrained weights; instruction tuning merely unlocks the conversational surface.
+  </Step>
+
+  <Step title="3. Logarithmic scaling curves">
+    Model performance scales with **$\log(N)$**. Increasing a dataset from 100 to 1,000 examples provides substantial improvements. Moving from 1,000 to 10,000 yields diminishing returns unless those new samples introduce genuinely novel coverage.
+  </Step>
+
+  <Step title="4. Domain mix: math & code">
+    A balanced dataset does not consist entirely of general conversation. Incorporating **20% math and 25% code** reinforces logical state tracking, step-by-step discipline, and syntax rigor that directly transfers to non-math reasoning tasks.
+  </Step>
+
+  <Step title="5. Teaching behaviors: CoT & tools">
+    Finetuning is primarily about **teaching behaviors rather than facts**. A few hundred examples of Chain-of-Thought (CoT) derivations and structured tool calls (`<tool_call>...`) teach the model to reason before answering and reliably interact with external APIs.
+  </Step>
+
+  <Step title="6. The pilot playbook: 50–100 rows">
+    Never begin an engineering project by paying for 10,000 annotations. Always build a **pristine 50 to 100 sample pilot**. Finetune a checkpoint, evaluate failure modes, verify that the loss drops cleanly, and plot your initial scaling point before scaling up.
+  </Step>
+</Scrolly>
+
+## The Superficial Alignment Hypothesis
+
+To understand why dataset quantity is so readily trumped by quality, we must revisit what happens during pretraining versus post-training.
+
+Recall from *3A Pretraining* that during self-supervised pretraining, the model processes trillions of tokens ($D \approx 10^{13}$) and expends vast computational energy ($C \approx 6ND \text{ FLOPs}$). Through next-token prediction over the global corpus of human knowledge, the model learns:
+
+- Linguistic representations and grammar across hundreds of natural and programming languages.
+- World knowledge, historical events, scientific laws, and commonsense physical reasoning.
+- Deep associative pathways connecting concepts, contexts, and queries.
+
+However, an unaligned base model is simply a document completer. If you give it the prompt `"What is the capital of France?"`, it might predict `" What is the capital of Germany? What is the capital of Italy?"` because it assumes it is completing a geography worksheet.
+
+In May 2023, Zhou et al. published **LIMA: Less Is More for Alignment** (arXiv:2305.11206). They formulated the **Superficial Alignment Hypothesis**:
+
+> A model's knowledge and abilities are acquired almost entirely during pretraining, whereas alignment teaches it which sub-distribution of formats, personas, and styles to use when interacting with users.
+
+The authors took LLaMA-65B (a base model with zero instruction tuning) and finetuned it on **only 1,000 manually curated, high-quality instruction-response pairs**. They used no reinforcement learning from human feedback (RLHF) and no reward models. The dataset contained:
+
+- 750 top-quality questions and answers curated from community forums (Stack Exchange, wikiHow).
+- 200 tasks manually authored by the authors to ensure broad task coverage.
+- 50 safety and refusal examples.
+
+When evaluated in double-blind human preference tests, LIMA (65B) was preferred or tied against:
+
+- **Alpaca-65B** (trained on 52,000 synthetic examples) in **65%** of comparisons.
+- **Bard** in **58%** of comparisons.
+- **DaVinci003** in **65%** of comparisons.
+- **GPT-4** in **43%** of comparisons (a tie or win in nearly half the trials despite GPT-4 being vastly larger and RLHF-aligned).
+
+<Callout type="intuition" title="The Actor and the Script">
+  Think of the pretrained base model as a brilliant classical actor who knows thousands of historical facts, speaks twenty languages, and can mimic any accent. Pretraining gave the actor talent and memory.
+
+  Instruction tuning does not send the actor to medical school or teach them French. Instruction tuning is simply handing the actor a script that says: *"You are an assistant. When the director asks a question, answer concisely, politely, and never repeat the prompt."*
+
+  To teach that script, you do not need 50,000 rehearsals. You need 1,000 flawless rehearsals. If 10,000 of your rehearsals feature slurred speech and chaotic shouting, the actor learns bad habits.
+</Callout>
+
+## The Math of Data Scaling Curves
+
+Why do teams continue to collect more data if 1,000 examples suffice? Because the superficial alignment hypothesis applies when the underlying capability already exists in the base model. When you want to teach a specific domain style, reduce variance across edge cases, or ensure robust out-of-distribution behavior, data quantity does matter—but only under a logarithmic scaling law.
+
+Let $N$ be the number of training examples, and let $E(N)$ be the task error rate. Empirically, error follows a power law:
+
+$$
+E(N) = E_\infty + \frac{\alpha}{N^\beta}
+$$
+
+where $E_\infty$ is the asymptotic irreducible error (the limit of the base model's capacity), $\alpha$ is a scaling constant, and $\beta$ is the data efficiency exponent (typically between 0.2 and 0.5).
+
+Expressed in terms of accuracy or benchmark performance $S(N)$:
+
+$$
+S(N) = S_0 + k \log_{10}(N)
+$$
+
+Let us examine the arithmetic of this logarithmic relationship.
+
+<Callout type="math" title="Worked Numeric Example: Annotation ROI">
+  Suppose you begin with a base model that achieves $S(100) = 45\%$ accuracy on your internal evaluation suite when finetuned on a pilot set of $N_1 = 100$ gold examples ($k \approx 15$).
+
+  1. Scaling to $N_2 = 1{,}000$ examples:
+  $$
+  S(1{,}000) = 45\% + 15 \log_{10}\left(\frac{1{,}000}{100}\right) = 45\% + 15(1) = 60\%
+  $$
+  You gained **15 percentage points** for ${}900$ additional examples. The gain per 100 examples was $\frac{15}{9} \approx 1.67\%$.
+
+  2. Scaling from ${}1{,}000$ to $N_3 = 10{,}000$ examples:
+  $$
+  S(10{,}000) = 60\% + 15 \log_{10}\left(\frac{10{,}000}{1{,}000}\right) = 60\% + 15(1) = 75\%
+  $$
+  You gained another **15 percentage points**, but it required ${}9{,}000$ new examples. The gain per 100 examples dropped to $\frac{15}{90} \approx 0.167\%$—a tenfold drop in data efficiency.
+
+  3. Now compute the financial cost:
+  If professional human annotation costs \$1.50 per validated prompt-response pair:
+  - Moving from 100 to 1,000 examples: 900 additional examples × \$1.50 = **\$1,350**.
+  - Moving from 1,000 to 10,000 examples: 9,000 additional examples × \$1.50 = **\$13,500**.
+  - Moving from 10,000 to 100,000 examples: 90,000 additional examples × \$1.50 = **\$135,000** for the same 15% increment.
+</Callout>
+
+This arithmetic governs every production dataset budget. If your budget is limited, you cannot afford to spend \$135,000 on redundant data. You must prioritize data that maximizes the exponent $\beta$ by expanding domain coverage.
+
+## Domain Mix: Why Code and Math Power General Reasoning
+
+One of the most consequential discoveries in modern LLM training is that **data domains are not isolated silos**.
+
+In naive intuition, you might expect that training a model on Python code only improves its ability to write Python code, and training on high school calculus only improves its performance on math benchmarks. In reality, empirical studies across Llama, Qwen, and DeepSeek demonstrate that incorporating code and math dramatically improves general reasoning, instruction following, and logical deduction on purely text-based tasks.
+
+Why does this cross-domain transfer happen?
+
+1. **State Tracking**: Code execution requires tracing variables across loops, conditionals, and scope boundaries. When an LLM learns to generate code, its attention heads learn to maintain pointers to state variables across hundreds of tokens.
+2. **Deterministic Syntax and Parsing**: Natural language tolerates ambiguity, colloquialisms, and dangling modifiers. Code does not; a missing parenthesis or indentation error causes a syntax error. Finetuning on code penalizes sloppy token emissions and forces strict adherence to formal structures.
+3. **Step-by-Step Chain of Logic**: A mathematical derivation requires that step $t$ follows inexorably from step $t-1$. Training on mathematical solutions teaches the model that jumping to conclusions produces incorrect outputs.
+
+| Domain | Recommended Proportion | Primary Capability Imparted |
+|---|---|---|
+| **Coding & Algorithms** | 20% – 25% | Strict syntax, variable state tracking, indentation, debugging discipline |
+| **Math & Symbolic Logic** | 15% – 20% | Step-by-step sequential deduction, error minimization, constraint satisfaction |
+| **General Instruction Following** | 35% – 40% | Core task versatility: extraction, summarization, creative drafting, transformation |
+| **Multi-turn Dialog & Context** | 10% – 15% | Conversation history tracking, resolving co-references, acknowledging user corrections |
+| **Safety, Refusal & Guardrails** | 5% – 10% | Knowing when to decline impossible, malicious, or unanswerable queries |
+
+When designing a production SFT mix, never train exclusively on your end-task domain (such as legal contract extraction or medical summaries). If 100% of your dataset is single-turn medical summaries, the model will suffer from **catastrophic forgetting**: it will lose its general conversational ability, hallucinate wildly when asked a basic logic question, and lose formatting agility. Keep at least 30% to 40% of the dataset grounded in general reasoning, coding, and multi-turn dialogue.
+
+## Data That Teaches Behaviors: CoT, Tool Calling, and Multi-turn
+
+When curating your instruction examples, you must distinguish between **factual data** and **behavioral data**.
+
+- **Factual data** attempts to teach the model new facts (e.g., *"The Q3 2026 revenue of Acme Corp was \$412 million"*). This is inefficient to teach via SFT. Pretraining or Retrieval-Augmented Generation (Module B3) is where facts belong.
+- **Behavioral data** teaches the model *how to operate*.
+
+Three behaviors are critical for modern inference applications:
+
+### 1. Chain-of-Thought (CoT)
+A prompt asking for an immediate answer often produces hallucinations because the model is forced to predict the final conclusion in its very next tokens, without dedicating compute to intermediate reasoning steps.
+
+A behavioral CoT example explicitly formats the thinking process:
+
+```text
+User: Does a 16 GB GPU have enough VRAM to load Llama-3.1-8B in FP16?
+Assistant: Let us calculate the memory required for the model weights:
+1. An 8B parameter model has approximately 8.03 billion parameters.
+2. In FP16 precision, each parameter requires 2 bytes of storage.
+3. Weight memory = 8.03 * 10^9 parameters * 2 bytes = 16.06 GB.
+4. Additionally, the serving engine requires memory for the CUDA context (~0.5 GB) and the KV cache for incoming requests.
+Because 16.06 GB exceeds the card's total physical capacity of 16.00 GB before even allocating the KV cache, the model cannot be loaded in FP16 on a 16 GB card without quantization (such as INT8 or INT4).
+```
+
+Including even 500 CoT examples teaches the model to automatically decompose complex questions before outputting a conclusion.
+
+### 2. Structured Tool Calling
+In Module B4 (Agents), the model must interact with external environments by emitting machine-readable payloads. If your dataset contains raw, unstructured text, the model will output conversational chatter when an API payload is needed.
+
+A behavioral tool-use example trains exact JSON schema adherence:
+
+```text
+User: Check the current memory utilization of GPU 0 on server cluster-a.
+Assistant: <tool_call>
+{"name": "get_gpu_metrics", "arguments": {"node": "cluster-a", "gpu_id": 0, "metric": "memory_used"}}
+</tool_call>
+```
+
+### 3. Multi-turn Conversational Repair
+In single-turn datasets, the assistant always receives a pristine prompt and gives a pristine answer. Real-world users, however, give ambiguous instructions, provide corrections, or change their minds:
+
+```text
+Turn 1:
+User: Summarize our cluster SLA.
+Assistant: The cluster guarantees 99.9% uptime with p95 TTFT under 400 ms.
+
+Turn 2:
+User: Wait, I meant the European datacenter, not the US one.
+Assistant: Understood. For the European datacenter (eu-west-1), the SLA guarantees 99.95% uptime with p95 TTFT under 350 ms.
+```
+
+If your dataset does not include multi-turn dialogs with corrective feedback, the model will struggle whenever a user pushes back or asks for revisions.
+
+## The Pilot Playbook: Starting with 50–100 Samples
+
+Before embarking on any data engineering effort, execute this five-step pilot playbook:
+
+```
+Step 1: Define Target Format & Hard Criteria
+   │
+   ▼
+Step 2: Author 50–100 Diverse Gold Rows (Hand-Crafted)
+   │
+   ▼
+Step 3: Run Baseline SFT (LoRA on 8B model, 3 epochs)
+   │
+   ▼
+Step 4: Audit Checkpoint on 20 Held-Out Edge Cases
+   │
+   ├── Did format match 100%? If no: fix templates (Lesson 2).
+   ├── Did the model adopt the persona?
+   └── Did accuracy beat zero-shot?
+   │
+   ▼
+Step 5: Plot Initial Scaling Point on (log N, Score) Graph
+```
+
+1. **Write the Style Guide**: Detail exact rules. Are headers capitalized? How are code blocks fenced? Is the tone direct or conversational? What is the maximum acceptable response length?
+2. **Hand-Author 50 to 100 Gold Rows**: Do not use synthetic generation yet. Have domain experts manually author 50 to 100 examples covering all primary use cases and critical edge cases.
+3. **Train a Baseline LoRA Adapter**: As you will practice in Module B5, train a low-rank adapter on a small model (e.g., Llama-3.1-8B or Qwen2.5-7B) for 3 epochs.
+4. **Inspect Failures**: Evaluate the adapter against 20 difficult, held-out validation prompts.
+   - If the model failed to follow the output schema, your dataset contains inconsistent formatting.
+   - If the model repeats itself, your responses are too short or lack proper EOS termination.
+   - If the model gets the facts wrong, verify whether the facts exist in the pretrained base or if you need RAG.
+5. **Establish the Scaling Curve**: Record your accuracy $S(100)$. Now add 100 synthetic or curated rows ($N=200$) and retrain. If the score increases to $S(200)$, calculate the slope $k$. You now have an empirical model of your project's data return on investment.
+
+<Callout type="pitfall" title="The Perils of Premature Scaling">
+  If you scale a flawed pilot of 100 rows to 10,000 rows before evaluating, every subtle formatting bug, hallucinated assumption, and stylistic defect in your initial template is magnified 100-fold. Fix the recipe when the batch is small.
+</Callout>
+
+<Callout type="real" title="Now read the paper">
+  Read the seminal paper on dataset curation:
+  **LIMA: Less Is More for Alignment** (Zhou et al., May 2023, arXiv: [2305.11206](https://arxiv.org/abs/2305.11206)).
+
+  - **Read**: Section 1 (Introduction), Section 2 (Data Curation — pay attention to how they selected the 1,000 prompts), and Section 4 (Human Evaluation results).
+  - **Skip**: Section 5 on multi-turn ablation if you are short on time.
+  - **What you will recognize**: You will recognize the Superficial Alignment Hypothesis, the exact composition of the 1,000 prompts, and why human judges preferred LIMA over models trained on 50,000 examples.
+</Callout>
+
+<KeyNotes>
+  1. **Superficial Alignment Hypothesis**: Pretraining learns world knowledge and linguistic representations; alignment and SFT primarily teach formatting, style, and conversational persona.
+  2. **Quality beats quantity**: 1,000 meticulously curated, diverse instruction examples can match or outperform 50,000 noisy, unvetted web-scraped examples.
+  3. **Logarithmic returns**: Finetuning gains scale with $\log_{10}(N)$. Once core format and coverage are learned, each additional percentage point of accuracy requires exponentially more examples.
+  4. **Cross-domain transfer**: Including 20% to 25% code and 15% to 20% math in your instruction mix significantly enhances general step-by-step reasoning and syntax discipline on non-math tasks.
+  5. **Teach behaviors, not static facts**: Prioritize Chain-of-Thought (CoT) reasoning, structured tool use, and multi-turn conversational repair over memorizing rapidly outdated factual tables.
+  6. **Always pilot with 50 to 100 rows**: Validate formatting, loss curves, and failure modes on a small, hand-crafted gold set before investing in large-scale annotation pipelines.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'What is the core premise of the Superficial Alignment Hypothesis presented in the LIMA paper?',
+    options: [
+      'Models require at least 1 million instruction examples to learn new facts.',
+      'A model’s knowledge is acquired almost entirely during pretraining, while alignment mostly teaches which format and style to use.',
+      'Reinforcement learning from human feedback is strictly required for instruction following.',
+      'Smaller models outperform larger models when trained on large quantities of web data.'
+    ],
+    answer: 1,
+    why: 'The LIMA paper showed that 1,000 curated examples were sufficient because pretraining had already imparted the underlying knowledge; SFT merely surfaced it in an assistant format.'
+  },
+  {
+    q: 'A team achieves 50% accuracy on a classification task with 100 curated examples. Their scaling curve follows S(N) = 50 + 20 * log10(N / 100). How many total examples N are needed to reach 70% accuracy?',
+    numeric: true,
+    answer: 1000,
+    tolerance: 10,
+    unit: 'examples',
+    why: 'We solve: 70 = 50 + 20 * log10(N / 100) => 20 = 20 * log10(N / 100) => 1 = log10(N / 100) => N / 100 = 10^1 = 10 => N = 1,000 examples.'
+  },
+  {
+    q: 'If manual data curation and verification costs \$1.50 per example, how much does it cost to expand a dataset from 1,000 to 10,000 examples?',
+    numeric: true,
+    answer: 13500,
+    tolerance: 100,
+    unit: 'dollars',
+    why: 'The number of additional examples needed is 10,000 - 1,000 = 9,000 examples. At \$1.50 per example, the total cost is 9,000 * 1.50 = \$13,500.'
+  },
+  {
+    q: 'Why does adding code and mathematical data to an instruction tuning dataset improve performance on non-math reasoning tasks?',
+    options: [
+      'It expands the tokenizer vocabulary size.',
+      'It teaches the attention mechanism variable state tracking, strict syntax compliance, and sequential step-by-step logic.',
+      'It reduces the total memory consumed by the KV cache.',
+      'It allows the model to bypass the need for a system prompt.'
+    ],
+    answer: 1,
+    why: 'Code and math enforce rigorous state tracking, deterministic syntax parsing, and sequential logical dependency, which generalize to reasoning across all domains.'
+  },
+  {
+    q: 'In the LIMA paper (Zhou et al., 2023), how many instruction-response pairs were used to finetune LLaMA-65B?',
+    numeric: true,
+    answer: 1000,
+    tolerance: 50,
+    unit: 'pairs',
+    why: 'LIMA was trained on exactly 1,000 carefully curated examples (750 from forums, 200 authored by the team, and 50 safety/refusal examples).'
+  },
+  {
+    q: 'What should be the very first step when initiating a new domain-specific finetuning project?',
+    options: [
+      'Scrape 100,000 forum posts and immediately initiate full-parameter training.',
+      'Author a 50 to 100 sample pristine gold pilot to evaluate formatting and establish a baseline scaling point.',
+      'Purchase an 8x H100 cluster for a month.',
+      'Deploy an unaligned base model directly into user-facing production.'
+    ],
+    answer: 1,
+    why: 'Starting with a 50 to 100 sample gold pilot allows engineers to detect formatting bugs, establish baseline feasibility, and measure initial scaling slope before committing major budget.'
+  }
+]} />

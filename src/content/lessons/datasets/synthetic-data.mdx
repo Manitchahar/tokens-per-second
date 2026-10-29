@@ -1,0 +1,339 @@
+---
+title: 'Synthetic data & distillation'
+summary: 'How to bypass human annotation bottlenecks using language models to teach language models. The Self-Instruct pipeline, Alpaca scaling, reverse instructions, and the legal constraints of teacher distillation.'
+objectives:
+  - Formulate the economic and velocity differences between human annotation and synthetic generation
+  - Trace the five stages of the Self-Instruct pipeline from 175 human seed tasks
+  - Apply ROUGE-L similarity filtering to preserve dataset diversity and prevent generation loops
+  - Implement reverse instruction backtranslation to generate prompt-response pairs from authentic reference texts
+  - Compare hard-label versus soft-label teacher-student distillation architectures
+  - Navigate commercial terms of service and model licensing restrictions on synthetic data
+---
+import SyntheticDistillationViz from '@/components/viz/datasets/SyntheticDistillationViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Every engineering team that decides to finetune a model faces an immediate crisis: where do the prompt-response pairs come from?
+
+If you rely exclusively on manual human labeling, progress is agonizingly slow. Expert software engineers, physicians, or lawyers cost anywhere from \$50 to \$250 per hour. Even general crowdsourced contractors cost \$1.50 to \$3.00 per validated instruction pair. Annotating 50,000 instruction pairs by hand requires over \$100,000 and months of coordination, vendor management, and review cycles.
+
+In late 2022 and early 2023, a radical alternative emerged: **using large language models to generate instruction data for smaller models**.
+
+By replacing human writers with automated generation loops, teams generate 50,000 instruction-following examples overnight for under \$500 in cloud API credits. This lesson deconstructs how synthetic data pipelines function, how to maintain semantic diversity using <Term t="seed-tasks">seed tasks</Term> and ROUGE filtering, how <Term t="reverse-instruction">reverse instruction</Term> prevents hallucinations, and how teacher-student distillation enables sub-8B models to match frontier capabilities.
+
+## The Economics of Synthetic Generation
+
+To understand the industry-wide shift toward synthetic data, consider the comparison between human annotation and programmatic token synthesis:
+
+1. **Unit Cost**: Generating an instruction-response pair using a state-of-the-art API costs approximately 1,000 total tokens (roughly 250 input tokens for the generation prompt and 750 output tokens for the response). At prevailing rates of \$0.50 per million input tokens and \$1.50 per million output tokens, each pair costs approximately:
+$$
+\text{Cost per pair} = (250 \times 0.50 \times 10^{-6}) + (750 \times 1.50 \times 10^{-6}) = 0.000125 + 0.001125 = \mathbf{0.00125\ \text{dollars}}
+$$
+Even at older 2023 pricing (such as `text-davinci-003` at \$0.02 per 1,000 tokens), a pair cost around \$0.01. Compared to \$2.50 for a crowdsourced human worker, synthetic generation is **200× to 2,000× cheaper**.
+
+2. **Throughput**: A human annotator produces roughly 50 high-quality reasoning examples per day. A single GPU inference server or API worker pool running batch inference can generate 50,000 pairs in under three hours.
+
+3. **Format Compliance**: Humans frequently omit closing JSON braces, add unauthorized conversational chatter, or misunderstand system prompts. A teacher model can be prompted with rigid few-shot examples or constrained decoding to output strict, schema-compliant JSON every single time.
+
+<Scrolly>
+  <SyntheticDistillationViz client:visible slot="stage" />
+
+  <Step title="1. The human annotation wall">
+    Human annotation costs **\$1 to \$50 per complex sample** and takes months to assemble. Label fatigue leads to inconsistent formatting and noisy responses that degrade SFT quality.
+  </Step>
+
+  <Step title="2. Self-Instruct: from 175 seeds">
+    In December 2022, Wang et al. introduced **Self-Instruct**. Bootstrapping from just **175 human-authored seed tasks**, the pipeline iteratively prompted a model with 8 randomly sampled tasks (6 human seeds, 2 previously generated) to author novel instructions.
+  </Step>
+
+  <Step title="3. Diversity pruning via ROUGE">
+    Without filtering, synthetic generation collapses into repetitive variations. Self-Instruct computes the **ROUGE-L overlap** between any proposed instruction and the existing pool. If similarity exceeds **0.7**, the instruction is discarded.
+  </Step>
+
+  <Step title="4. Alpaca: 52K pairs under \$500">
+    In March 2023, Stanford released **Alpaca**, applying Self-Instruct to OpenAI's `text-davinci-003`. They generated **52,000 instruction-following pairs for \$500**, finetuning a base LLaMA-7B model into a responsive conversational assistant.
+  </Step>
+
+  <Step title="5. Reverse instructions (Backtranslation)">
+    Instead of asking an LLM to invent both the prompt and the answer, **reverse instruction** starts with authentic reference text (technical documentation, unit tests, code) and asks the model: *"What question does this text answer?"* The authentic text becomes the target response, eliminating factual hallucinations.
+  </Step>
+
+  <Step title="6. Teacher-to-student distillation">
+    Frontier teacher models (such as Llama-3.1-405B or Qwen2.5-72B) generate rich step-by-step reasoning traces. A compact **8B student model** trains on these outputs, achieving 85% of the teacher's capability while running **12× faster** at 90% lower serving cost.
+  </Step>
+</Scrolly>
+
+## The Self-Instruct Pipeline (Wang et al., 2022)
+
+The foundational blueprint for modern synthetic dataset generation is **Self-Instruct: Aligning Language Models with Self-Generated Instructions** (arXiv:2212.10560).
+
+The authors demonstrated that a language model can iteratively improve its own instruction-following capabilities through a five-stage automated pipeline:
+
+```
+┌────────────────────────────────────────────────────────┐
+│ 1. Seed Task Pool (175 human-authored tasks)           │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ 2. Task Generation Prompt (Sample 6 seeds + 2 gen)     │
+│    "Propose a new, diverse instruction..."             │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ 3. Heuristic & Diversity Filter                        │
+│    - ROUGE-L similarity > 0.7 against pool? Prune!     │
+│    - Length < 3 or > 150 words? Prune!                 │
+│    - Blacklisted keywords or imperative check          │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ 4. Input Generation (Conditional)                      │
+│    Does task need input context? (Passage, code snippet)│
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ 5. Output Generation (Teacher Model Completes Response)│
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+                   Add to Dataset Pool
+```
+
+### Stage 1: The Seed Pool
+The pipeline begins with **175 human-authored seed tasks**. These tasks are deliberately diverse: creative writing, code debugging, entity extraction, mathematical reasoning, translation, classification, and planning. Each seed contains an instruction, an optional input context, and a gold response.
+
+### Stage 2: In-Context Instruction Generation
+To generate new instructions, the script randomly samples 8 tasks from the growing pool: 6 from the original human seeds (to keep the distribution anchored in reality) and 2 from previously generated tasks (to encourage exploration).
+
+These 8 tasks are formatted into a prompt:
+
+```text
+Come up with a series of tasks and instructions. Here are 8 examples:
+
+Task 1: Instruction: Write a Python script to parse an Apache log file.
+...
+Task 8: Instruction: Summarize the key trade-offs between GQA and MHA.
+
+Task 9: Instruction:
+```
+
+The language model continues the pattern, generating a candidate instruction.
+
+### Stage 3: Diversity Filtering with ROUGE-L
+Left unconstrained, LLMs exhibit strong mode attraction: they propose instructions that closely resemble the in-context demonstrations (e.g., repeating variations of *"Write a poem about..."*).
+
+To enforce novelty, the candidate instruction is compared against all existing instructions in the dataset using the **ROUGE-L metric** (Longest Common Subsequence).
+
+Let $I_{\text{cand}}$ be the candidate instruction and $I_{\text{pool}}$ be an existing instruction:
+
+$$
+\text{ROUGE-L}(I_{\text{cand}}, I_{\text{pool}}) = \frac{(1 + \beta^2) R_{\text{LCS}} P_{\text{LCS}}}{R_{\text{LCS}} + \beta^2 P_{\text{LCS}}}
+$$
+
+where $P_{\text{LCS}} = \frac{\text{LCS}(I_{\text{cand}}, I_{\text{pool}})}{|I_{\text{cand}}|}$ and $R_{\text{LCS}} = \frac{\text{LCS}(I_{\text{cand}}, I_{\text{pool}})}{|I_{\text{pool}}|}$.
+
+If the maximum ROUGE-L similarity between the candidate and any instruction in the pool exceeds **0.7**, the candidate is **immediately discarded**.
+
+Additional heuristic filters prune invalid candidates:
+- Instructions with fewer than 3 words or more than 150 words.
+- Instructions containing blacklisted tokens or common conversational filler (*"Sure, here is a task:"*).
+- Instructions that do not begin with an imperative verb (*"Draft"*, *"Calculate"*, *"Identify"*, *"Transform"*).
+
+### Stage 4: Input Generation
+Many instructions require contextual data. For instance, *"Extract the error code"* is meaningless without an accompanying log string.
+
+The pipeline prompts the model with a few-shot classifier:
+- **Input-free task**: *"Write a 4-line poem about latency."* (Input = `""`)
+- **Input-dependent task**: *"Translate this sentence to French."* (Input = `"Memory bandwidth is the bottleneck."`)
+
+If input-dependent, the model generates realistic input text.
+
+### Stage 5: Output Generation
+Finally, the complete instruction and input are fed into the teacher model to generate the authoritative response. In 2022, Self-Instruct used `text-davinci-003`; today, teams use open frontier models like Llama-3.1-70B or Qwen2.5-72B.
+
+## Reverse Instructions: The Backtranslation Breakthrough
+
+While Self-Instruct works well for general instruction-following, it has a significant vulnerability: **the teacher model can hallucinate the target response**.
+
+If you prompt an LLM to invent an instruction about an obscure internal API or recent hardware spec, it might invent a plausible-sounding function signature that does not actually exist.
+
+To solve this, researchers developed **Reverse Instruction** (also called Backtranslation):
+
+```text
+Step 1: Gather Real Ground-Truth Text
+[Clean Textbook Page / Verified CUDA Kernel / Production RFC]
+                         │
+                         ▼
+Step 2: Reverse Prompting (Teacher LLM)
+"Read the following technical text. Write the exact question or
+instruction that a software engineer would ask that is answered
+completely and accurately by this text."
+                         │
+                         ▼
+Step 3: Pair Synthesized Query with Real Target
+Instruction: [Synthesized Question]
+Response:    [Original Authentic Ground-Truth Text]
+```
+
+Why is reverse instruction so powerful for enterprise and systems engineering?
+1. **Zero Hallucination in Answers**: The target response was written by human domain experts (e.g., PyTorch documentation, NVIDIA CUDA guides). The model never invents fake APIs or incorrect numbers.
+2. **Domain Specificity**: You can point a reverse instruction pipeline at your internal engineering runbooks or API repositories, automatically creating 5,000 highly targeted SFT pairs without human authoring.
+3. **High Difficulty**: Because real documentation contains complex architectural trade-offs and nuances, the backtranslated questions naturally reflect realistic, high-complexity user requests.
+
+## Teacher-to-Student Distillation
+
+In Module 04 (*First LLM*) and Module 05 (*KV Cache*), you observed that running a 70B parameter model requires multiple GPUs and expends 140 GFLOPs per generated token. Deploying 70B models for high-throughput, low-latency applications is prohibitively expensive.
+
+**Distillation** bridges this gap: you use a massive teacher model ($T$) to train a compact student model ($S$).
+
+There are two primary paradigms of model distillation:
+
+### 1. Hard-Label (Sequence-Level) Distillation
+The simplest and most common approach in modern LLM engineering. The teacher generates complete text responses (token strings) to a set of prompts. The student model is trained on these pairs using standard supervised finetuning (SFT) with cross-entropy loss:
+
+$$
+\mathcal{L}_{\text{hard}}(\theta_S) = -\sum_{t=1}^{N} \log P_S(y_t \mid y_{<t}, x)
+$$
+
+where $y$ is the teacher's emitted text sequence.
+
+Sequence-level distillation has two enormous advantages:
+- It requires no access to the teacher's internal weights or logit matrices—only its text output. You can distill from any open model or API endpoint.
+- It can incorporate Chain-of-Thought (CoT) traces. By having the teacher output its step-by-step reasoning before the answer, the student learns the latent reasoning process, not just the final classification.
+
+### 2. Soft-Label (Logit-Level) Distillation
+If you have local access to the teacher's model weights (e.g., running both teacher and student in PyTorch), you can minimize the **Kullback-Leibler (KL) divergence** between the full probability distributions of the teacher and the student:
+
+$$
+\mathcal{L}_{\text{soft}}(\theta_S) = (1 - \alpha) \mathcal{L}_{\text{CE}}(y, P_S) + \alpha T_{\text{temp}}^2 D_{\text{KL}}\left(\sigma\left(\frac{z_T}{T_{\text{temp}}}\right) \;\middle\|\; \sigma\left(\frac{z_S}{T_{\text{temp}}}\right)\right)
+$$
+
+where $z_T$ and $z_S$ are the raw unnormalized logits of the teacher and student, $T_{\text{temp}}$ is the distillation temperature (which softens the distribution to expose the teacher's "dark knowledge"), and $\alpha$ balances cross-entropy against KL divergence.
+
+Soft distillation conveys the teacher's relative confidence across all tokens in the vocabulary (e.g., showing that the second-choice word was a close synonym while the thousandth-choice word was nonsense). However, it requires identical tokenizer vocabularies and massive GPU VRAM to hold both models in memory simultaneously during training. For this reason, 95% of practical dataset pipelines use **hard-label sequence distillation**.
+
+<Callout type="math" title="Worked Numeric Example: Cost-Performance Trade-off in Distillation">
+  Consider serving an entity extraction service processing 10 million requests per month.
+  - Average prompt length: 400 tokens.
+  - Average generation length: 100 tokens.
+  - Monthly tokens = 10M × (400 in + 100 out) = 4B input tokens + 1B output tokens.
+
+  1. **Option A: Serve Frontier Teacher Directly (Llama-3.1-70B on 4x A100 GPUs)**
+  At \$2.50 per card hour, a 4x A100 node costs \$10.00/hr = \$7,300/month.
+  To sustain peak traffic of 50 req/s, you need 3 nodes = **\$21,900 per month**.
+
+  2. **Option B: Distill into Student (Llama-3.1-8B on 1x T4 or L4 GPU)**
+  - Synthetic data generation: Generate 30,000 instruction pairs from the 70B teacher.
+    - 30,000 × (200 in + 300 out) = 6M input + 9M output tokens.
+    - Generation cost on 70B API at \$0.80/M tokens = **\$12.00**.
+  - LoRA finetuning compute: 3 hours on 1x A100 = **\$7.50**.
+  - Total one-time distillation cost = **\$19.50**.
+  - Production serving: An 8B model on a single L4 GPU (\$0.70/hr = \$511/month) serves 50 req/s.
+  - Annual savings: (\$21,900 − \$511) × 12 = **\$256,668 per year**!
+</Callout>
+
+## The Legal and Licensing Minefield
+
+Before firing up a synthetic generation script, every engineer must verify the legal and licensing terms governing the teacher model's outputs:
+
+### 1. Proprietary Commercial API Restrictions
+Most commercial API providers explicitly prohibit using their outputs to train competing models. For example, Section 2(c) of the OpenAI Business Terms states:
+
+> *"You may not... use output from the Services to develop models that compete with OpenAI."*
+
+If you generate synthetic data using GPT-4 to train an internal customer-service bot for your company's website, industry consensus generally views that as non-competing application development. But if you train a general-purpose foundational LLM or an API-accessible coding assistant, you risk terms violations and account termination.
+
+### 2. Meta Llama License Restrictions
+The Meta Llama 3 Community License allows wide commercial use, but includes specific synthetic data clauses:
+
+> *"You will not use the Llama Materials or any output or results of the Llama Materials to improve any other large language model (other than Llama 3 or its derivatives). You may use Llama 3 outputs to improve Llama 3 derivative models."*
+
+Under this license, you are legally permitted to use Llama-3.1-405B to generate synthetic data to train Llama-3.1-8B (since the student is a Llama 3 derivative). However, using Llama-3.1-405B to train a Mistral or Qwen checkpoint breaches the license terms.
+
+### 3. Truly Permissive Open Models
+If you require unencumbered commercial flexibility, generate synthetic data using models released under permissive open-source licenses:
+- **Apache 2.0**: Models like Mistral-7B-v0.1, Qwen2.5 (under Apache 2.0 / permissive open terms), and Falcon.
+- **MIT License**: Fully unconstrained for commercial and derivative training.
+
+Always document the model ID, generation date, tokenizer settings, and license terms in your dataset card.
+
+<Callout type="real" title="Now read the paper">
+  Read the seminal paper on automated instruction synthesis:
+  **Self-Instruct: Aligning Language Models with Self-Generated Instructions** (Wang et al., Dec 2022, arXiv: [2212.10560](https://arxiv.org/abs/2212.10560)).
+
+  - **Read**: Section 1 (Introduction), Section 2 (Self-Instruct Method — study the 5-step loop), and Section 3 (Dataset Analysis).
+  - **Skip**: Section 4.2 detailing older human benchmark comparisons unless interested in historical Davinci-001 benchmarks.
+  - **What you will recognize**: You will recognize the 175 seed task protocol, the ROUGE-L 0.7 pruning threshold, and the verb-noun task structure that forms the foundation of all modern synthetic pipelines.
+</Callout>
+
+<KeyNotes>
+  1. **The synthetic economic edge**: Generating instruction pairs with LLMs is 200× to 2,000× cheaper and orders of magnitude faster than human annotation.
+  2. **The Self-Instruct pipeline**: Bootstraps from 175 human seed tasks, sampling 8 tasks in-context to prompt a model to author diverse new instructions.
+  3. **ROUGE-L similarity threshold**: Discarding instructions with ROUGE-L similarity &gt; 0.7 against the existing pool prevents semantic mode collapse and enforces prompt variety.
+  4. **Reverse instruction (Backtranslation)**: Pairing authentic reference texts (code, docs) with synthesized questions eliminates factual hallucination in target responses.
+  5. **Hard vs soft distillation**: Hard-label distillation trains students on teacher text outputs via SFT; soft-label distillation minimizes KL divergence over full token logit distributions.
+  6. **Check the license**: OpenAI prohibits using outputs to develop competing models; Llama 3 permits distillation only into other Llama 3 derivatives; use Apache 2.0 models for unrestricted commercial freedom.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'In the Self-Instruct pipeline (Wang et al., 2022), why is a ROUGE-L similarity threshold of 0.7 enforced against the existing task pool?',
+    options: [
+      'To verify that the generated instruction has correct Python syntax.',
+      'To prevent the dataset from collapsing into repetitive, near-identical prompt phrasings.',
+      'To measure the GPU memory consumed by the tokenizer.',
+      'To ensure all generated tasks are exactly 100 tokens long.'
+    ],
+    answer: 1,
+    why: 'Without ROUGE-L diversity filtering, LLMs repeatedly generate superficial variations of existing prompts. Pruning candidates with > 0.7 similarity ensures broad task coverage.'
+  },
+  {
+    q: 'How many human-authored seed tasks were used in the original Self-Instruct paper to bootstrap the generation process?',
+    numeric: true,
+    answer: 175,
+    tolerance: 5,
+    unit: 'tasks',
+    why: 'Wang et al. (2022) hand-authored exactly 175 seed tasks across diverse reasoning and formatting domains to prime the generation prompt.'
+  },
+  {
+    q: 'An engineer generates 40,000 instruction-response pairs using a frontier model API. Each pair consumes 300 input tokens (\$0.50 per 1M) and 700 output tokens (\$1.50 per 1M). What is the total API cost to generate the entire dataset?',
+    numeric: true,
+    answer: 48,
+    tolerance: 2,
+    unit: 'dollars',
+    why: 'Cost per pair = (300 * 0.50 / 1e6) + (700 * 1.50 / 1e6) = \$0.00015 + \$0.00105 = \$0.00120 per pair. Total cost = 40,000 * 0.00120 = \$48.00.'
+  },
+  {
+    q: 'What is the primary advantage of Reverse Instruction (backtranslation) over standard Self-Instruct prompt generation?',
+    options: [
+      'It produces fewer tokens per second.',
+      'It grounds the target responses in authentic, verified human reference texts (code, documentation), preventing factual hallucinations in the answers.',
+      'It bypasses the need for a tokenizer.',
+      'It guarantees 100% KV cache hit rates.'
+    ],
+    answer: 1,
+    why: 'Reverse instruction takes verified ground-truth text as the target answer and uses the LLM only to generate the question, ensuring the answer is factually correct.'
+  },
+  {
+    q: 'Under the Meta Llama 3 Community License, can you use outputs from Llama-3.1-405B to finetune a Mistral-7B model?',
+    options: [
+      'Yes, open weights allow unrestricted derivative training on any model architecture.',
+      'No, the Llama 3 license explicitly restricts using Llama outputs to improve models other than Llama 3 or its derivatives.',
+      'Yes, as long as the dataset contains fewer than 1,000 examples.',
+      'Only if the training is performed on NVIDIA GPUs.'
+    ],
+    answer: 1,
+    why: 'The Meta Llama 3 Community License explicitly states that outputs may only be used to improve Llama 3 or its derivative models, prohibiting distillation into competing architectures.'
+  },
+  {
+    q: 'In March 2023, the Stanford Alpaca project generated 52,000 instruction-following examples from OpenAI’s text-davinci-003. Approximately how much did this generation cost in API credits?',
+    numeric: true,
+    answer: 500,
+    tolerance: 50,
+    unit: 'dollars',
+    why: 'Stanford Alpaca famously demonstrated that 52,000 instruction pairs could be generated from OpenAI API endpoints for less than \$500.'
+  }
+]} />

@@ -1,0 +1,464 @@
+---
+title: 'Deduplication & cleaning at scale'
+summary: 'Why repeated data destroys generalization. Exact hashing, MinHash signatures, Locality-Sensitive Hashing (LSH) on k-gram shingles, and the end-to-end data cleaning pipeline.'
+objectives:
+  - Explain how data duplication causes severe model memorization and hurts downstream generalization
+  - Identify the blind spots of exact cryptographic hashing (SHA-256) on near-duplicate text
+  - Formulate document overlap using k-shingles and Jaccard similarity
+  - Prove the MinHash collision theorem and estimate Jaccard similarity in O(m) time
+  - Derive the Locality-Sensitive Hashing (LSH) S-curve and calculate false positive and false negative rates
+  - Implement heuristic text cleaners for boilerplate removal, PII redaction, and language filtering
+---
+import DedupCleaningViz from '@/components/viz/datasets/DedupCleaningViz.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+If you scrape 100,000 pages from the public internet or download an open-source instruction dump, you might believe you have 100,000 distinct examples of human problem solving.
+
+In reality, web text is choked with duplicates. Between boilerplate privacy policies, syndicated news articles, reposted GitHub issues, and repetitive cookie banners, **between 30% and 50% of the documents in raw web crawls are near-identical copies of one another**.
+
+Training a language model on duplicated data is catastrophic. It causes the model to memorize phrases verbatim, degrades test-set perplexity, contaminates your evaluation benchmarks, and wastes tens of thousands of dollars in GPU compute.
+
+In this lesson, we study why repetition breaks neural generalization, why exact hashing fails to catch real-world duplicates, how <Term t="shingling">shingling</Term> and <Term t="minhash">MinHash</Term> reduce text to compact signatures, and how <Term t="lsh">Locality-Sensitive Hashing (LSH)</Term> turns an impossible $O(N^2)$ all-pairs comparison into a sub-quadratic candidate search. Finally, we implement <Term t="pii-redaction">PII redaction</Term> and boilerplate filtering to build an end-to-end cleaning pipeline.
+
+## Why Repeated Data Hurts: Memorization Scaling Laws
+
+In May 2022, Hernandez et al. published **Scaling Laws and Interpretability of Learning from Repeated Data** (arXiv:2205.10487). They uncovered a startling scaling property:
+
+> The capacity of a language model to memorize a sequence scales super-linearly with the number of times that sequence is repeated during training. A sequence repeated 10 times can be memorized up to 100 times more intensely than a sequence seen once.
+
+When a model encounters the same document multiple times:
+1. **Gradient Concentration**: The optimizer repeatedly pushes the model weights along the exact same gradient trajectory, over-indexing on idiosyncratic phrasing rather than underlying concepts.
+2. **Effective Data Shrinkage**: An epoch over a dataset with 50% duplication has an *effective dataset size* ($D_{\text{eff}}$) far smaller than its token count. You spend 100 hours of H100 GPU compute, but receive the statistical benefit of only 50 hours.
+3. **Evaluation Contamination**: If a test prompt or benchmark question appears in the training crawl (a ubiquitous problem with benchmarks like GSM8k and HumanEval), the model achieves deceptively high scores through pure memorization. When deployed to real users, its performance plummets.
+
+In 2021, Lee et al. published **Deduplicating Training Data Makes Language Models Better** (arXiv:2107.06499). By removing duplicate sequences from standard datasets like C4 and GitHub, the authors demonstrated:
+- Up to **10× reduction** in verbatim memorization.
+- Improved validation perplexity while using **fewer total training steps**.
+- Drastic reduction in generation loops (where models emit repeating sequences like *"and the church of the church of the church"*).
+
+<Scrolly>
+  <DedupCleaningViz client:visible slot="stage" />
+
+  <Step title="1. Repeated data hurts: memorization">
+    Duplicated documents cause models to **memorize tokens exponentially faster**. Repeating an instruction 10 times can increase memorization 100-fold, degrading downstream generalization and wasting GPU compute.
+  </Step>
+
+  <Step title="2. Exact hashing: SHA-256 limits">
+    Exact cryptographic hashing (SHA-256) groups identical strings in **$O(N)$ time**. However, if two documents differ by even a single space, comma, or timestamp, their hashes diverge completely due to the avalanche effect.
+  </Step>
+
+  <Step title="3. Shingling: text into k-grams">
+    To detect fuzzy near-duplicates, we break text into **overlapping shingles of length $k$** (e.g. 5-word sequences). The similarity between two documents is measured by their Jaccard similarity: $J(A, B) = \frac{|A \cap B|}{|A \cup B|}$.
+  </Step>
+
+  <Step title="4. MinHash: permutation signatures">
+    Computing shingle intersections across all pairs is computationally intractable. **MinHash** compresses each document into a signature of $m$ integer hash minima. The probability that two signatures match at index $i$ is exactly equal to their Jaccard similarity.
+  </Step>
+
+  <Step title="5. LSH banding: sub-quadratic search">
+    **Locality-Sensitive Hashing (LSH)** groups $m$ hashes into $b$ bands of $r$ rows. Documents that match identically across all rows in at least one band are flagged as candidate pairs, producing a sharp S-curve threshold without $O(N^2)$ checks.
+  </Step>
+
+  <Step title="6. The complete cleaning pipeline">
+    A production cleaning pipeline layers **exact SHA-256 dedup, MinHash LSH fuzzy dedup, regex PII redaction, and boilerplate stripping**, reducing dataset volume by 30% to 50% while improving model reasoning.
+  </Step>
+</Scrolly>
+
+## Exact Deduplication: The Limits of SHA-256
+
+The fastest way to clean a dataset is exact string deduplication.
+
+You normalize each document (strip leading/trailing whitespace, convert multiple consecutive spaces to a single space, and optionally lowercase the text), compute a cryptographic hash (such as MD5 or SHA-256), and store the hashes in a hash set or Bloom filter:
+
+```python
+import hashlib
+
+def exact_dedup(documents: list[str]) -> list[str]:
+    seen_hashes = set()
+    unique_docs = []
+    
+    for doc in documents:
+        # Normalization: collapse whitespace
+        normalized = " ".join(doc.strip().split())
+        doc_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        
+        if doc_hash not in seen_hashes:
+            seen_hashes.add(doc_hash)
+            unique_docs.append(doc)
+            
+    return unique_docs
+```
+
+Exact deduplication runs in **$O(N)$ linear time** and consumes minimal memory (a 64-bit integer hash per document). It catches identical instruction-response pairs, syndicated blog articles, and repeated bot comments.
+
+### Why Exact Hashing Fails
+Cryptographic hash functions are engineered to exhibit the **avalanche effect**: altering a single character or punctuation mark changes roughly 50% of the output hash bits.
+
+Consider two documents:
+- **Doc A**: `"FlashAttention reduces memory traffic on NVIDIA GPUs."`
+- **Doc B**: `"FlashAttention reduces memory traffic on NVIDIA GPUs!"`
+
+To human readers and neural networks, these two sentences are semantically identical. But their SHA-256 digests are completely unrelated:
+- `sha256(Doc A)` = `e8b3f17a...`
+- `sha256(Doc B)` = `3c94d0e1...`
+
+Because their hashes do not collide, exact deduplication keeps both documents. In web crawls, minor alterations (different page titles, varying timestamps, altered author signatures, differing indentation) allow millions of near-duplicate documents to slip through undetected. We need **fuzzy deduplication**.
+
+## Fuzzy Deduplication: Shingling and Jaccard Similarity
+
+To compare documents that are *almost* identical, we represent text as a mathematical set using **shingles** (overlapping $k$-grams).
+
+### 1. Constructing $k$-Shingles
+Let document $D$ be a sequence of words. A $k$-shingle is any contiguous subsequence of length $k$.
+
+For example, with $k = 3$ words:
+```text
+Document: "FlashAttention reduces memory traffic on GPUs"
+
+Shingles:
+{
+  ("FlashAttention", "reduces", "memory"),
+  ("reduces", "memory", "traffic"),
+  ("memory", "traffic", "on"),
+  ("traffic", "on", "GPUs")
+}
+```
+
+If we choose $k$ too small (e.g. $k = 1$, single words), almost all documents share common words like *"the"* and *"is"*, destroying discriminatory power. If we choose $k$ too large (e.g. $k = 50$), a single typo breaks many shingles. In practice, **$k = 5$ words** (or $k = 9$ characters) is standard for natural language deduplication.
+
+### 2. Jaccard Similarity
+Let $A$ and $B$ be the sets of shingles extracted from Document 1 and Document 2. The **Jaccard Similarity** $J(A, B)$ is defined as:
+
+$$
+J(A, B) = \frac{|A \cap B|}{|A \cup B|} = \frac{|A \cap B|}{|A| + |B| - |A \cap B|}
+$$
+
+$J(A, B)$ is bounded between 0 (the sets share zero shingles) and 1 (the sets are identical).
+
+If Document A has 100 shingles, and Document B differs by a single substituted word, they will still share roughly 95 shingles, yielding:
+$$
+J(A, B) = \frac{95}{105} \approx 0.905
+$$
+Near-duplicates exhibit high Jaccard similarity ($J \ge 0.70$ or 0.80).
+
+### The $O(N^2)$ Catastrophe
+The mathematical definition of Jaccard similarity is simple, but computationally devastating at scale.
+
+Suppose your dataset contains $N = 1{,}000{,}000$ documents ($10^6$). To find all duplicate pairs by computing exact Jaccard similarity, you must compare every document against every other document:
+
+$$
+\text{Total comparisons} = \frac{N(N - 1)}{2} = \frac{10^6 \times (10^6 - 1)}{2} \approx 5 \times 10^{11}\ \text{comparisons}
+$$
+
+If each set intersection takes 1 microsecond, computing all-pairs Jaccard similarity would take **500,000 seconds = 5.8 days** of continuous CPU execution. At $N = 10{,}000{,}000$ (Common Crawl scale), it requires $5 \times 10^{13}$ operations—over **1.5 years**.
+
+We need an algorithm that estimates Jaccard similarity without storing large shingle sets, and finds candidate pairs without checking all pairs.
+
+## MinHash: Dimensionality Reduction for Sets
+
+In 1997, Andrei Broder introduced **MinHash**. MinHash achieves two breakthroughs:
+1. It compresses a document's shingle set (which may contain thousands of words) into a tiny signature of $m$ integers (e.g. $m = 128$).
+2. It estimates Jaccard similarity in $O(m)$ time.
+
+### The MinHash Theorem
+Let $U$ be the universe of all possible shingles. Let $\pi$ be a random permutation of the universe $U$ (or an independent hash function $h: U \to [0, 2^{64}-1]$).
+
+The MinHash of a set $A$ under hash function $h$ is the minimum hash value obtained over all elements in $A$:
+
+$$
+h_{\min}(A) = \min_{x \in A} h(x)
+$$
+
+The fundamental theorem of MinHash states:
+
+$$
+P\left(h_{\min}(A) = h_{\min}(B)\right) = J(A, B) = \frac{|A \cap B|}{|A \cup B|}
+$$
+
+<Callout type="math" title="First-Principles Proof of the MinHash Theorem">
+  Consider the combined set of shingles $A \cup B$.
+  
+  When we apply an ideal, uniform hash function $h$ to every element in $A \cup B$, exactly one element $x^* \in A \cup B$ will map to the smallest integer value.
+  
+  Because $h$ is uniform, every element in $A \cup B$ has an equal probability of achieving that minimum hash value:
+  $$
+  P(x^* = x) = \frac{1}{|A \cup B|}
+  $$
+  Now, when does $h_{\min}(A) = h_{\min}(B)$?
+  
+  This event occurs **if and only if** the element $x^*$ that achieves the minimum value across $A \cup B$ happens to lie in the intersection $A \cap B$:
+  - If $x^* \in A \cap B$, then $x^* \in A$ and $x^* \in B$, so $h_{\min}(A) = h(x^*) = h_{\min}(B)$.
+  - If $x^* \in A \setminus B$, then $h_{\min}(A) = h(x^*)$, but $h_{\min}(B)$ must be some other (larger) element, so $h_{\min}(A) \ne h_{\min}(B)$.
+  - If $x^* \in B \setminus A$, then similarly $h_{\min}(A) \ne h_{\min}(B)$.
+  
+  Therefore, the probability that $h_{\min}(A) = h_{\min}(B)$ is simply the number of elements in the intersection divided by the total number of elements in the union:
+  $$
+  P\left(h_{\min}(A) = h_{\min}(B)\right) = \frac{|A \cap B|}{|A \cup B|} = J(A, B) \quad \blacksquare
+  $$
+</Callout>
+
+### Constructing the MinHash Signature
+Instead of one hash function, choose $m$ independent hash functions $h_1, h_2, \dots, h_m$ (typically $m = 128$).
+
+For each document $A$, compute its **MinHash signature vector** of length $m$:
+
+$$
+\text{sig}(A) = \left[ h_{\min, 1}(A), h_{\min, 2}(A), \dots, h_{\min, m}(A) \right]
+$$
+
+To estimate the Jaccard similarity between Document A and Document B, simply count what fraction of the $m$ signature slots are identical:
+
+$$
+\hat{J}(A, B) = \frac{1}{m} \sum_{i=1}^{m} \mathbb{I}\left( \text{sig}_i(A) == \text{sig}_i(B) \right)
+$$
+
+The standard error of this estimate is $\frac{1}{\sqrt{m}}$. With $m = 128$ hashes:
+
+$$
+\text{Standard Error} = \frac{1}{\sqrt{128}} \approx 0.088\ (8.8\%)
+$$
+
+With $m = 256$ hashes, the error drops to $\frac{1}{\sqrt{256}} = 0.0625$ (6.25%).
+
+## Locality-Sensitive Hashing (LSH): Sub-Quadratic Search
+
+MinHash compressed documents into 128-element integer vectors, making each pair comparison fast. But comparing all $N(N-1)/2$ pairs is still $O(N^2)$.
+
+To eliminate the $O(N^2)$ bottleneck, we use **Locality-Sensitive Hashing (LSH)** with **banding**.
+
+```
+MinHash Signature (m = 128 integers):
+┌──────────────────────────────────────────────┐
+│ Band 1  (rows 1..8)   ───► Hash to Bucket    │
+├──────────────────────────────────────────────┤
+│ Band 2  (rows 9..16)  ───► Hash to Bucket    │
+├──────────────────────────────────────────────┤
+│ ...                                          │
+├──────────────────────────────────────────────┤
+│ Band 16 (rows 121..128) ─► Hash to Bucket    │
+└──────────────────────────────────────────────┘
+```
+
+### The Banding Algorithm
+1. Take the MinHash signature of length $m$.
+2. Divide the $m$ integers into $b$ bands, each consisting of $r$ rows, such that:
+   $$
+   m = b \times r
+   $$
+   (For example, $m = 128$ hashes divided into $b = 16$ bands of $r = 8$ rows each).
+3. For each band $j \in \{1, \dots, b\}$, take the $r$ integer values and hash them into a hash table bucket.
+4. **The Candidate Rule**: If Document A and Document B land in the **same bucket for at least one band**, they are declared a **candidate duplicate pair**.
+5. Only candidate pairs have their full Jaccard similarity evaluated!
+
+### The S-Curve Mathematics
+Let two documents have true Jaccard similarity $s \in [0, 1]$.
+
+What is the probability $P_{\text{candidate}}(s)$ that they become a candidate pair under LSH?
+
+1. The probability that all $r$ rows match in a specific band is:
+   $$
+   P(\text{band match}) = s^r
+   $$
+2. The probability that the band does *not* match is:
+   $$
+   P(\text{band mismatch}) = 1 - s^r
+   $$
+3. The probability that the two documents fail to match in *all* $b$ independent bands is:
+   $$
+   P(\text{all } b \text{ bands mismatch}) = (1 - s^r)^b
+   $$
+4. Therefore, the probability that the documents match in **at least one band** (becoming a candidate pair) is:
+   $$
+   P_{\text{candidate}}(s) = 1 - (1 - s^r)^b
+   $$
+
+This function produces a steep, sigmoidal **S-curve**.
+
+The inflection point (the threshold similarity $t$ where $P_{\text{candidate}} = 0.5$) is approximately:
+
+$$
+t \approx \left(\frac{1}{b}\right)^{1/r}
+$$
+
+<Callout type="math" title="Worked Numeric Example: Tuning LSH Bands and Rows">
+  Suppose we configure $m = 128$ hashes with $b = 16$ bands and $r = 8$ rows ($16 \times 8 = 128$).
+  
+  1. **Calculate the theoretical similarity threshold $t$**:
+  $$
+  t \approx \left(\frac{1}{16}\right)^{1/8} = (0.0625)^{0.125} \approx \mathbf{0.707}
+  $$
+  Any document pair with Jaccard similarity $s > 0.71$ is very likely to be flagged as a candidate; any pair with $s < 0.70$ is likely to be ignored.
+
+  2. **High Similarity Pair ($s = 0.85$, near duplicates)**:
+  $$
+  s^r = 0.85^8 \approx 0.2725
+  $$
+  $$
+  P_{\text{candidate}} = 1 - (1 - 0.2725)^{16} = 1 - (0.7275)^{16} = 1 - 0.0059 = \mathbf{0.9941}\ (99.41\%)
+  $$
+  Over 99.4% of near-duplicate documents are caught!
+
+  3. **Low Similarity Pair ($s = 0.30$, unrelated documents)**:
+  $$
+  s^r = 0.30^8 \approx 0.0000656
+  $$
+  $$
+  P_{\text{candidate}} = 1 - (1 - 0.0000656)^{16} \approx 1 - (1 - 16 \times 0.0000656) = \mathbf{0.00105}\ (0.105\%)
+  $$
+  Only 1 out of every 1,000 unrelated pairs is falsely flagged for verification.
+</Callout>
+
+By tuning $b$ and $r$, you control the threshold $t$. If you want to detect even mild similarities ($s \approx 0.5$), increase $b$ (e.g. $b = 32, r = 4 \implies t \approx 0.42$). If you want to catch only near-identical documents ($s \ge 0.85$), increase $r$ (e.g. $b = 8, r = 16 \implies t \approx 0.88$).
+
+## The End-to-End Cleaning Pipeline
+
+Deduplication is the centerpiece of data engineering, but a production pipeline integrates several additional cleaning stages:
+
+```
+Raw Text Stream (Crawl / Scraped Dumps / User Prompts)
+                        │
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│ 1. Boilerplate & Format Sanitization                   │
+│    - Strip HTML / Markdown tags (trafilatura, regex)   │
+│    - Remove cookie notices & navigation bars           │
+│    - Normalize Unicode (NFKC) & collapse whitespace    │
+└───────────────────────┬────────────────────────────────┘
+                        │
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│ 2. PII Redaction & Secret Masking                      │
+│    - Regex / Presidio for emails, phone numbers, IPs   │
+│    - Mask AWS keys, SSH private keys, OpenAI tokens    │
+└───────────────────────┬────────────────────────────────┘
+                        │
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│ 3. Quality & Perplexity Filtering                      │
+│    - FastText Language ID: Drop non-target languages   │
+│    - KenLM / Perplexity: Drop low-entropy loops and    │
+│      high-entropy gibberish / SEO keyword stuffing     │
+└───────────────────────┬────────────────────────────────┘
+                        │
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│ 4. Exact Deduplication (SHA-256)                       │
+│    - Fast O(N) hash set eliminates exact duplicates    │
+└───────────────────────┬────────────────────────────────┘
+                        │
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│ 5. Fuzzy Near-Deduplication (MinHash + LSH)            │
+│    - Shingle size k = 5, m = 128, b = 16, r = 8        │
+│    - Connected components graph to keep 1 cluster rep  │
+└───────────────────────┬────────────────────────────────┘
+                        │
+                        ▼
+Cleaned, Deduplicated Instruction Dataset
+```
+
+### 1. PII Redaction (Personally Identifiable Information)
+Models trained on raw web data can memorize and regurgitate private telephone numbers, residential addresses, and API credentials.
+
+A production cleaner applies regex masking or Microsoft Presidio:
+
+```python
+import re
+
+def redact_pii(text: str) -> str:
+    # Redact email addresses
+    text = re.sub(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "<EMAIL>", text)
+    # Redact IPv4 addresses
+    text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<IP_ADDRESS>", text)
+    # Redact API keys / tokens (generic hex or base64 patterns)
+    text = re.sub(r"\b(sk-[a-zA-Z0-9]{32,}|ghp_[a-zA-Z0-9]{36})\b", "<API_KEY>", text)
+    return text
+```
+
+### 2. Quality Classifier (FastText & KenLM)
+Low-quality web pages often contain machine-translated SEO spam (*"buy cheap shoes discount buy shoes online"*).
+
+Train a lightweight **KenLM n-gram language model** on clean Wikipedia text. Compute the perplexity of each candidate document:
+- **Low perplexity**: Clean, grammatical text.
+- **Excessively high perplexity**: Machine-translated gibberish, broken code syntax, or random characters.
+- **Excessively low perplexity**: Repetitive templated strings or spam.
+
+Discard documents in the top and bottom 5% of the perplexity distribution.
+
+<Callout type="real" title="Now read the paper">
+  Read the two core papers establishing modern LLM deduplication:
+  1. **Scaling Laws and Interpretability of Learning from Repeated Data** (Hernandez et al., May 2022, arXiv: [2205.10487](https://arxiv.org/abs/2205.10487)).
+     - **Read**: Section 1 (Introduction) and Section 3 (Memorization Scaling Laws).
+     - **What you will recognize**: You will recognize the super-linear memorization exponent and why duplicated tokens hurt out-of-distribution loss.
+  2. **Deduplicating Training Data Makes Language Models Better** (Lee et al., July 2021, arXiv: [2107.06499](https://arxiv.org/abs/2107.06499)).
+     - **Read**: Section 2 (Dataset Deduplication at Scale with MinHash) and Section 4 (Results on Memorization).
+</Callout>
+
+<KeyNotes>
+  1. **Repeated data hurts generalization**: Hernandez et al. (2022) showed that sequences repeated 10× are memorized up to 100× more strongly, degrading test accuracy and wasting GPU FLOPs.
+  2. **Exact hashing is brittle**: SHA-256 is $O(N)$ and catches identical copies, but a single character or whitespace change prevents hash collisions due to the avalanche effect.
+  3. **Shingling**: Converting documents into overlapping sets of $k$-word shingles allows measuring overlap via Jaccard similarity: $J(A, B) = \frac{|A \cap B|}{|A \cup B|}$.
+  4. **The MinHash theorem**: $P(h_{\min}(A) = h_{\min}(B)) = J(A, B)$. Comparing $m$ hash minima estimates Jaccard similarity in $O(m)$ time without computing large set intersections.
+  5. **LSH banding breaks the $O(N^2)$ wall**: Partitioning $m$ hashes into $b$ bands of $r$ rows creates an S-curve candidate search with threshold $t \approx (1/b)^{1/r}$, finding duplicate pairs in sub-quadratic time.
+  6. **End-to-end cleaning**: Complete pipelines combine boilerplate removal, regex PII redaction, FastText language filtering, exact SHA-256 dedup, and MinHash LSH fuzzy dedup.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  {
+    q: 'Why does exact cryptographic hashing (SHA-256) fail to remove near-duplicate documents from web scrapes?',
+    options: [
+      'SHA-256 runs in O(N^2) time.',
+      'Due to the avalanche effect, altering even a single punctuation mark or space character changes roughly 50% of the hash bits, preventing a hash collision.',
+      'SHA-256 only works on ASCII text.',
+      'It cannot process documents longer than 512 tokens.'
+    ],
+    answer: 1,
+    why: 'Cryptographic hashes are explicitly designed so that small changes produce radically different hashes (the avalanche effect), meaning near-duplicates never collide in a hash table.'
+  },
+  {
+    q: 'An LSH configuration uses m = 128 hash functions split into b = 16 bands with r = 8 rows per band. What is the approximate Jaccard similarity threshold t where two documents have a 50% probability of becoming candidates?',
+    numeric: true,
+    answer: 0.707,
+    tolerance: 0.02,
+    unit: 'similarity',
+    why: 't ≈ (1 / b)^(1 / r) = (1 / 16)^(1 / 8) = (0.0625)^0.125 ≈ 0.707.'
+  },
+  {
+    q: 'Under an LSH configuration with b = 16 bands and r = 8 rows, what is the probability that two near-duplicate documents with Jaccard similarity s = 0.80 will be flagged as candidate pairs? (Use P = 1 - (1 - s^r)^b)',
+    numeric: true,
+    answer: 0.946,
+    tolerance: 0.02,
+    unit: 'probability',
+    why: 's^r = 0.80^8 ≈ 0.16777. Then 1 - s^r = 0.83223. Then (0.83223)^16 ≈ 0.0543. P = 1 - 0.0543 = 0.9457 (or ~94.6%).'
+  },
+  {
+    q: 'According to Hernandez et al. (2022), how does the memorization rate of an LLM scale with repeated training sequences?',
+    options: [
+      'Memorization decreases logarithmically.',
+      'Memorization scales super-linearly: a sequence repeated 10 times can be memorized up to 100 times more intensely.',
+      'Memorization is strictly linear with epoch count.',
+      'Memorization only occurs if the model has more than 70 billion parameters.'
+    ],
+    answer: 1,
+    why: 'Hernandez et al. proved that memorization scales super-linearly with data repetition, causing repeated data to be memorized up to 100x more intensely.'
+  },
+  {
+    q: 'What is the standard error of a MinHash Jaccard similarity estimate that uses m = 256 hash functions? (Formula: 1 / sqrt(m))',
+    numeric: true,
+    answer: 0.0625,
+    tolerance: 0.005,
+    unit: 'error',
+    why: 'Standard error = 1 / sqrt(256) = 1 / 16 = 0.0625 (or 6.25%).'
+  },
+  {
+    q: 'Why should PII (Personally Identifiable Information) like API keys and private emails be redacted from instruction tuning datasets?',
+    options: [
+      'Because tokenizers cannot encode email symbols like "@".',
+      'Because language models memorize duplicated training sequences and risk regurgitating sensitive credentials and private data to end users.',
+      'To prevent the GPU from thermal throttling.',
+      'Because PII makes the KV cache 10x larger.'
+    ],
+    answer: 1,
+    why: 'LLMs can memorize and regurgitate training data. Redacting PII prevents privacy violations, credential leakage, and compliance breaches.'
+  }
+]} />

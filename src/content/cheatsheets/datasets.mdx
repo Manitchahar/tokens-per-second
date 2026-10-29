@@ -1,0 +1,156 @@
+---
+title: 'Module B6 · Dataset Engineering'
+module: datasets
+---
+
+## Core Formulas & Mathematical Limits
+
+### 1. Data Scaling & Return on Investment
+Finetuning performance scales logarithmically with the number of high-quality samples $N$:
+
+$$
+S(N) = S_0 + k \log_{10}(N) \qquad E(N) = E_\infty + \frac{\alpha}{N^\beta}
+$$
+
+- $S(N)$: Task accuracy or benchmark score.
+- $E(N)$: Generalization error rate ($\beta \in [0.2, 0.5]$).
+- **Logarithmic diminishing returns**: Moving from 100 to 1,000 samples yields the same accuracy delta as moving from 1,000 to 10,000 samples, but requires 10× more annotation capital.
+- **LIMA Principle**: 1,000 hand-curated, diverse instruction pairs on a strong pretrained base match or exceed models trained on 50,000 noisy scraped samples.
+
+### 2. Loss Masking in Autoregressive SFT
+Cross-entropy loss must be computed exclusively over response tokens ($t \ge p$), with prompt positions masked via target label $-100$:
+
+$$
+\mathcal{L}_{\text{masked}} = -\frac{1}{N_{\text{response}}} \sum_{t=p}^{T-1} \log P(x_{t+1} \mid x_1, \dots, x_t)
+$$
+
+- $p$: Index of the first assistant response token.
+- $N_{\text{response}} = T - p$: Count of active response tokens.
+- **Prompt memorization danger**: Unmasked training forces gradient updates on user questions, destroying conversational generalization.
+
+### 3. Model Collapse Variance Decay
+When model generation $k+1$ is trained recursively on finite discrete samples ($M$) from generation $k$ without ground-truth anchor data:
+
+$$
+\mathbb{E}[\sigma_k^2] = \sigma_0^2 \left(1 - \frac{1}{M}\right)^k \qquad \lim_{k \to \infty} \mathbb{E}[\sigma_k^2] = 0
+$$
+
+- **Early Collapse**: Erasure of distribution tails (rare facts, edge cases, minority domains, specialized vocabulary).
+- **Late Collapse**: Degradation of primary distribution modes into repetitive, low-perplexity gibberish.
+- **The Anchor Rule**: Maintain 20% to 50% authentic human text in every training recipe: $D_{\text{train}} = \lambda D_{\text{human}} + (1 - \lambda) D_{\text{synthetic}}$.
+
+### 4. Shingling & Jaccard Similarity
+Representing documents as sets of contiguous $k$-word shingles:
+
+$$
+J(A, B) = \frac{|A \cap B|}{|A \cup B|} = \frac{|A \cap B|}{|A| + |B| - |A \cap B|}
+$$
+
+- Standard shingle length: $k = 5$ words for natural language documents.
+- All-pairs exact comparison is $O(N^2)$ ($\approx 5 \times 10^{11}$ checks for ${}10^6$ documents).
+
+### 5. MinHash Collision Theorem
+For any uniform random hash permutation $h$:
+
+$$
+P\left(h_{\min}(A) = h_{\min}(B)\right) = J(A, B) \qquad \hat{J}(A, B) = \frac{1}{m} \sum_{i=1}^{m} \mathbb{I}\left( \text{sig}_i(A) == \text{sig}_i(B) \right)
+$$
+
+- $m$: Number of independent hash permutations (typically $m = 128$).
+- Standard error of MinHash Jaccard estimate: $\text{SE} = \frac{1}{\sqrt{m}}$ (8.8% at $m = 128$; 6.25% at $m = 256$).
+
+### 6. Locality-Sensitive Hashing (LSH) Banding S-Curve
+Partitioning $m$ MinHash values into $b$ bands of $r$ rows ($m = b \times r$):
+
+$$
+P_{\text{candidate}}(s) = 1 - (1 - s^r)^b \qquad t \approx \left(\frac{1}{b}\right)^{1/r}
+$$
+
+- $s$: True Jaccard similarity between two documents ($s \in [0, 1]$).
+- $t$: Inflection point similarity threshold ($P = 0.5$).
+- Standard configuration: $m = 128, b = 16, r = 8 \implies t \approx (1/16)^{1/8} \approx \mathbf{0.707}$.
+
+---
+
+## Production Rules of Thumb & Numbers
+
+| Dimension | Recommended Specification | Serving / Training Impact |
+|---|---|---|
+| **Pilot Set Size** | 50 to 100 gold rows | Test format compliance & establish baseline scaling slope before spending capital |
+| **LIMA SFT Core** | 1,000 to 2,000 curated rows | Maximum data efficiency; surfaces pretrained capabilities without noise |
+| **Domain Recipe Mix** | 25% code, 20% math, 35% general, 10% dialog, 10% safety | Code/math enforce state tracking and strict syntax that boost general reasoning |
+| **Synthetic Unit Cost** | \$0.001 to \$0.01 per pair | 200× to 2,000× cheaper than human annotation (\$1.50 to \$50.00/pair) |
+| **ROUGE-L Filter** | Discard if ROUGE-L &gt; 0.70 | Prevents mode collapse in Self-Instruct task generation |
+| **Human Anchor Share** | 20% to 50% authentic human data | Preserves fat tails and prevents recursive model collapse |
+| **zlib Filter Bounds** | Keep if $C_{\text{ratio}} \in [0.25, 0.75]$ | Discards repetitive autoregressive loops (&lt; 0.20) and high-entropy noise (&gt; 0.85) |
+| **MinHash Setup** | $k=5$ words, $m=128$, $b=16$, $r=8$ | $t \approx 0.707$; catches 99.4% of near-duplicates ($s=0.85$) in sub-quadratic time |
+| **Token Prefill Savings** | 5× to 6× FLOP reduction | Replacing 1,500-token few-shot prompts with finetuned zero-shot model |
+| **KV Cache Savings** | 80% memory reduction | Frees 204.8 MB per user on Llama-3.1-8B (128 KB/token); boosts concurrency 4.6× |
+
+---
+
+## The Three Traps That Destroy Instruction Models
+
+### 1. Template Discrepancy (Training $\ne$ Inference)
+- **Failure**: A single missing newline or added colon (`"assistant\n"` vs `"assistant:\n"`) creates different token IDs at serving time.
+- **Consequence**: Prefix cache miss rate hits 100%; model outputs conversational filler or echoes the user prompt.
+- **Rule**: Always format training data using the exact tokenizer call used in serving: `tokenizer.apply_chat_template(messages, tokenize=False)`.
+
+### 2. The Missing EOS Token
+- **Failure**: Omitting the end-of-turn token (`<|im_end|>` or `<|eot_id|>`) from the training target.
+- **Consequence**: The model never predicts the stop condition. Inference servers (vLLM, SGLang) generate until hitting `max_tokens` (e.g. 2,048 tokens), blowing serving latency by 68×.
+- **Rule**: Always ensure the assistant response target terminates with `tokenizer.eos_token`.
+
+### 3. Unmasked Prompt Tokens
+- **Failure**: Computing cross-entropy loss over the entire sequence without setting prompt labels to `-100`.
+- **Consequence**: Gradients penalize the model for failing to predict the user's arbitrary words, causing prompt memorization rather than learning how to reason.
+- **Rule**: In PyTorch, set `labels[:prompt_len] = -100` so `CrossEntropyLoss` ignores prompt positions.
+
+---
+
+## The End-to-End Dataset Pipeline
+
+```
+Raw Instruction / Text Corpus (Web Crawl / Scrapes / API Generations)
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Boilerplate & PII Sanitization                           │
+│    - Regex redact emails: [a-zA-Z0-9_.+-]+@[...] -> <EMAIL> │
+│    - Regex redact IPv4:   \b(?:\d{1,3}\.){3}\d{1,3}\b       │
+│    - Strip HTML / Markdown tags and collapse whitespace     │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Exact Deduplication (SHA-256)                            │
+│    - O(N) hash set eliminates identical duplicate strings   │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Fuzzy Near-Deduplication (MinHash + LSH)                 │
+│    - 5-gram word shingles, m = 128 hashes, b = 16, r = 8    │
+│    - Discard near-duplicate clusters (Jaccard s >= 0.70)    │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Quality & Execution Filtering                            │
+│    - Filter length bounds [15 .. 2048 tokens]               │
+│    - Reject repeating loops (zlib compression ratio < 0.25) │
+│    - Execute sandboxed unit tests for code (pytest / mypy)  │
+│    - LLM-as-a-judge rubric verification (Score 6/6 only)    │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Chat-Template Formatting & Loss Masking                  │
+│    - Format turns into ChatML or Llama-3 headers            │
+│    - Append terminal EOS token to assistant target          │
+│    - Set labels = -100 on all system and user prompt tokens │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+Pristine JSONL Dataset -> Feed directly into SFTTrainer (Module B5)
+```
