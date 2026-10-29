@@ -33,14 +33,14 @@ export interface Cost {
 export function cost(backend: Backend, phase: Phase, T: number, cfg: Cfg, splits: number): Cost {
   const { heads: nq, kvHeads: nkv, headDim: d, bytes: b, gpuBw, gpuFlops } = cfg;
   const BR = 64, BC = 64;
+  const outB = heads(phase, nq, d, b);
   const kvB = 2 * nkv * d * b * T;
   const qkFlop = 2 * nq * d * T;
 
   if (phase === 'prefill') {
     const sTile = BR * BC * b;
     const peakEager = 2 * nq * T * T * b;              // S and P, all heads
-    // one program's on-chip footprint: Q, K, V and score tiles, FP32 output accumulator, m and l
-    const peakFused = BR * d * b + 2 * BC * d * b + BR * BC * b + BR * d * 4 + 2 * BR * 4;
+    const peakFused = BR * d * b + 2 * BC * d * b + 3 * BR * d * 4 + outB;
     const tri = T / BR;                                // triangular tile count
     const trafficEager = 4 * nq * T * T * b + 3 * nq * T * d * b;
     const trafficFused = 3 * nq * T * d * b;           // only Q, K, V, O
@@ -59,7 +59,7 @@ export function cost(backend: Backend, phase: Phase, T: number, cfg: Cfg, splits
   const kvRead = kvB;
   const flops = 4 * nq * d * T;
   const gather = backend === 'paged' ? 1.01 : 1.0;
-  const peakFused = BR * d * b + 2 * BC * d * b + BR * BC * b + BR * d * 4 + 2 * BR * 4;
+  const peakFused = BR * d * b + 2 * BC * d * b + 3 * BR * d * 4 + outB;
   const tMem = (kvRead * gather) / gpuBw;
   const tComp = flops / gpuFlops;
   if (backend === 'eager') {
@@ -72,6 +72,9 @@ export function cost(backend: Backend, phase: Phase, T: number, cfg: Cfg, splits
   return { peak: peakFused, traffic: kvRead * gather, flops, ms: t * 1e3, bound: 'memory' };
 }
 
+function heads(phase: Phase, nq: number, d: number, b: number) {
+  return phase === 'prefill' ? nq * 1024 * d * b : nq * d * b;
+}
 
 const BACKENDS: { id: Backend; label: string; blurb: string }[] = [
   { id: 'eager', label: 'Eager', blurb: 'materialises S and P' },
@@ -94,7 +97,7 @@ const STEPS = [
 const CAPTIONS = [
   'One layer, one phase, one model. The only thing that changes is which attention kernel runs. Everything on screen is computed from the bandwidth and FLOP/s of the GPU you pick and the head configuration of the model.',
   'At 4,096 tokens, eager attention holds both the T x T score matrix and its normalised copy for 32 heads. That is over 2 GB of extra memory for one layer — a crash on a smaller card, and pure waste on a big one.',
-  'FlashAttention never writes that tensor. Its peak extra memory is one program’s tiles and running state: about 89 KB, independent of context. The traffic term drops by the same factor.',
+  'FlashAttention never writes that tensor. Its peak extra memory is Q plus one tile plus three state vectors: about 45 KB, independent of context. The traffic term drops by the same factor.',
   'The causal mask means a triangular number of tiles is real work. That roughly halves the FLOPs for free — the same saving whether or not the kernel is fused.',
   'Switch the phase to decode and the picture inverts. There is one query row, no intermediate to fuse, and the cost is a single linear read of the KV cache.',
   'At decode, the bound is bandwidth, and the only lever is getting more SMs working. FlashDecoding splits the sequence into chunks; the savings here come purely from that parallelism.',
