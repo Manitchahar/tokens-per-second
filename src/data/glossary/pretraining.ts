@@ -80,4 +80,14 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'GPT-2’s training set: pages linked from Reddit posts with at least 3 karma, deduplicated and cleaned, with Wikipedia removed. Slightly over 8 million documents, about 40 GB of text.',
     lesson: 'pretraining/gpt2',
   },
+  'encoder-decoder': {
+    term: 'Encoder–decoder',
+    def: 'A transformer with two stacks: an encoder reads the input with full attention, and a decoder writes the output causally while cross-attending to the encoder. The original 2017 Transformer, T5 and Whisper use it.',
+    lesson: 'pretraining/encoder-vs-decoder',
+  },
+  'cross-attention': {
+    term: 'Cross-attention',
+    def: 'Attention whose queries come from one sequence and whose keys and values come from another. In an encoder–decoder, each output token uses it to read the whole encoded input.',
+    lesson: 'pretraining/encoder-vs-decoder',
+  },
 };
