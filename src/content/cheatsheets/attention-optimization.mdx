@@ -74,9 +74,13 @@ O /= l                                     # once, at the end
 
 | $B_r$ / $B_c$ | Tile bytes | Peak extra, one program |
 |---|---|---|
-| 32 | 4 KB | ~74 KB |
-| **64** | **8 KB** | **~147 KB** |
-| 128 | 32 KB | ~295 KB (occupancy cost) |
+| 32 | 2 KB | ~42 KB |
+| **64** | **8 KB** | **~89 KB** |
+| 128 | 32 KB | ~193 KB (occupancy cost) |
+
+Peak = Q tile $B_r d \cdot 2$ + K, V tiles $2 B_c d \cdot 2$ + score tile $B_r B_c \cdot 2$ + FP32 accumulator $B_r d \cdot 4$ + $m, \ell$ ($d = 128$, BF16 inputs).
+
+**Loop order:** query tile outside, K/V tiles inside, normalise once at the end = **FlashAttention-2**. FlashAttention-1's Algorithm 1 loops K/V outside and Q inside, rewriting $O_i, \ell_i, m_i$ in HBM each step.
 
 $$
 \text{peak} \approx B_r d \cdot 2 + 2 B_c d \cdot 2 + 3 B_r d \cdot 4
@@ -165,7 +169,7 @@ $$
 | H100 ridge point | ~295 FLOP/byte |
 | Decode intensity, Llama-3.1-8B | 4 FLOP/byte (**74× below ridge**) |
 | KV read, 8,192 tok, 32 layers | 1.07 GB → 320 µs on an H100 |
-| Fused peak, $B_r = B_c = 64$ | ~147 KB, independent of $T$ |
+| Fused peak, $B_r = B_c = 64$ | ~89 KB per program, independent of $T$ |
 | Paged gather overhead | ~1% of a decode step |
 | Eager peak, 8,192 tok, 1 layer | 8.59 GB (**8× the whole KV cache**) |
 | Causal FLOP saving | ~50% |
