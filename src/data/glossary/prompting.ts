@@ -64,4 +64,14 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'A model trained (typically with reinforcement learning on verifiable answers) to write a long chain of thought before answering, such as OpenAI o1 or DeepSeek-R1. Often thousands of output tokens per answer; prompt it zero-shot and set a thinking budget.',
     lesson: 'prompting/chain-of-thought',
   },
+  'needle-in-a-haystack': {
+    term: 'Needle in a haystack',
+    def: 'A long-context test: hide one out-of-place sentence at a chosen depth of filler text of a chosen length, ask for it back, and plot recall over depth and length. Useful, but it checks one literal fact with no distractors, so passing it is necessary rather than sufficient.',
+    lesson: 'prompting/context-position',
+  },
+  'effective-context-length': {
+    term: 'Effective context length',
+    def: 'The prompt length up to which a model still performs acceptably on a given task, as opposed to the advertised window it can hold. Harder long-context benchmarks often find it far below the advertised number; measure it on your own task.',
+    lesson: 'prompting/context-position',
+  },
 };

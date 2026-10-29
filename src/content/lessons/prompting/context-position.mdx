@@ -1,0 +1,143 @@
+---
+title: 'Long prompts: lost in the middle'
+summary: 'A model can hold a long prompt without using all of it. Where a fact sits changes whether the model finds it: the start and the end are read well, the middle badly. See the U-shaped curve, what needle-in-a-haystack tests do and do not prove, and the free placement rules that recover the lost accuracy.'
+objectives:
+  - Describe the U-shaped relation between a fact's position in the prompt and answer accuracy
+  - Explain why a large context window does not guarantee the model uses all of it, and what effective context length means
+  - Read a needle-in-a-haystack heatmap and name what the test leaves out
+  - Place instructions, documents and questions in a prompt to recover accuracy at no extra cost
+  - Compute the prefill time and KV memory a long prompt costs
+---
+import NeedlePosition from '@/components/viz/prompting/NeedlePosition.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+Your first retrieval-augmented prototype (Module B3 builds one properly) fetches 20 passages from your documentation, pastes them into the prompt, and asks the question at the end. A user asks about the refund window. The model answers wrongly. You open the logs: the passage that states the refund window, word for word, is right there, passage number 9. The whole prompt is 2,700 tokens. The model's context window is 128,000.
+
+Nothing is broken. The engine read every token, the KV cache holds every key and value, and attention can, in principle, reach position 9 as easily as position 1. But in practice **where a fact sits in the prompt changes whether the model uses it**. This lesson measures that effect, explains the tests people run for it, and turns it into a short list of placement rules that cost nothing.
+
+## Drag the answer around
+
+<Scrolly>
+  <NeedlePosition client:visible slot="stage" />
+
+  <Step title="1. A long prompt with the answer in it">
+    The prompt is an instruction, 20 retrieved documents and the question. Exactly one document (green) contains the answer; the others are plausible but unhelpful. With the right document **first**, the model answers correctly about 76% of the time. (The curve in this visual is illustrative, shaped after the published results.)
+  </Step>
+
+  <Step title="2. Drag the answer into the middle">
+    Drag the green document along the prompt (or use the slider). Accuracy falls as it moves toward the middle and recovers partly near the end, next to the question. That is a **U-shaped curve**, and it is the whole phenomenon called <Term t="lost-in-the-middle">lost in the middle</Term>. Same tokens, same model, same cost, different answer.
+  </Step>
+
+  <Step title="3. Worse than no documents at all">
+    The red dashed line is the model answering with **no documents**, from memory alone: 56%. Over the middle of the prompt the curve dips below it. The right document, placed badly, made the model worse than giving it nothing, because the 19 distractors around it are still read.
+  </Step>
+
+  <Step title="4. More documents, deeper valley">
+    Switch between 10, 20 and 30 documents. The valley deepens as the prompt grows, while each extra document adds 130 tokens of prefill. Note the sizes: 1,400 to 4,000 tokens, **far below any modern context window**. This is not a long-context problem only.
+  </Step>
+
+  <Step title="5. Needle in a haystack">
+    The popular stress test: hide one sentence (the needle) at every depth of filler text of every length, then ask for it back. Each cell is one test. Short contexts are solid; in this toy heatmap, at 64K and 128K tokens the middle depths fail.
+  </Step>
+
+  <Step title="6. The window you are sold and the window you get">
+    A model's **advertised** window is what it can hold. Its <Term t="effective-context-length">effective context length</Term> is how far its accuracy holds up on real tasks, and it is often much shorter. Passing the single-needle test does not close that gap.
+  </Step>
+
+  <Step title="7. Put it where the model looks">
+    You control the order. Random order averages the whole U: 57.6%. Putting the retriever's most relevant document first uses its ranking: **69.3%**, about 12 points more from the same documents and the same tokens.
+  </Step>
+</Scrolly>
+
+## What the experiment showed
+
+The effect was mapped carefully by Liu et al. (2023), and their setup is worth knowing because you can rerun it on your own model.
+
+**Multi-document question answering.** Take a question from a real question-answering dataset. Retrieve $k$ passages: exactly one contains the answer, the other $k - 1$ are relevant-looking passages that do not. Put the answer passage at position 1, then 2, then 3, and so on, and measure accuracy at each position. They used $k$ = 10, 20 and 30.
+
+**Key-value retrieval.** A synthetic control with no meaning at all: a JSON object of 75 to 300 pairs of random identifiers, and the question "what is the value for this key?". Pure lookup, the easiest possible use of a context.
+
+Across several 2023 models, open and closed, the findings were:
+
+1. **A U-shaped curve.** Accuracy was highest with the relevant information at the very beginning, next highest at the very end, and lowest in the middle. The beginning effect is called **primacy**, the end effect **recency**.
+2. **The middle could be worse than nothing.** For GPT-3.5-Turbo with 20 documents, accuracy with the answer passage in the middle fell below its accuracy with *no* documents at all (closed-book). That is step 3 of the visual.
+3. **Longer windows did not help.** Extended-context versions of a model, given a prompt that fit both versions, produced nearly the same curve. Room to hold more is not skill at using more.
+4. **Even pure lookup showed it.** Several models were near perfect on the key-value task at some positions and failed at others.
+5. **Putting the question first as well as last** made the key-value lookup nearly perfect, but barely changed the question-answering task.
+6. **More retrieved documents gave diminishing returns.** In an open-domain experiment, going well beyond 20 retrieved passages improved accuracy only marginally, even as the chance that the answer was *somewhere* in the prompt kept rising.
+
+Why does this happen? The honest answer is that it is still studied, but two contributing pressures are widely discussed. In the text models are trained on, the important material (titles, summaries, the instruction, the question) tends to sit at the start or the end. And attention itself develops strong habits: models put a large share of attention on the first tokens of a sequence, and nearby tokens are easier to attend to than distant ones. A passage in the middle of a long prompt is neither first nor near. Module 20 discusses the same effect from the serving side, as the one long-context problem no amount of memory fixes.
+
+<Callout type="intuition" title="Read it as attention budget, not memory">
+  The KV cache stores every token perfectly; nothing in the middle is lost in the storage sense. What is limited is how the model *distributes attention* when it computes the answer. Twenty passages compete for it, the first and the last get a head start, and a passage in the middle must win against nineteen neighbours from a worse position. Fewer neighbours, or a better position, both help.
+</Callout>
+
+## Needle in a haystack, and what it misses
+
+The most widely shown long-context test is the **<Term t="needle-in-a-haystack">needle in a haystack</Term>**, popularised in 2023 by a public test of commercial models. Take a long filler text, insert one out-of-place sentence (the needle) at a chosen depth, and ask a question only that sentence answers. Repeat for every combination of context length and depth, and colour a grid by whether the needle came back. Step 5 of the visual is a toy version of that heatmap.
+
+The test is useful: a model that fails it has a real problem. But a green grid proves much less than it appears to:
+
+- **One literal fact.** The question usually shares words with the needle, so finding it is closer to string matching than to understanding.
+- **No distractors.** Real prompts contain many passages that look relevant; the filler in a haystack test usually does not.
+- **No reasoning across facts.** Real tasks combine several facts spread through the context, count things, or follow a chain of references.
+- **It is a known target.** A test that everyone reports is a test that models are tuned to pass.
+
+Harder benchmarks add exactly those things. RULER (Hsieh et al., 2024) used multiple needles, variable tracking across the context, aggregation and question answering, at increasing lengths. Most models were near perfect on the plain needle test, yet performance dropped sharply as length grew on the harder tasks, and only about half of the models that claimed 32K tokens or more held up at 32K. That gap between the window a model accepts and the length at which it still works is its **effective context length**, and it depends on the task. The only number you can trust is the one you measure on your own task at your own lengths, which is what Module B2's evaluation pipeline is for.
+
+## What a long prompt costs
+
+Placement is free. Length is not. Every token you add to a prompt costs prefill compute and KV-cache memory, whether or not the model ends up using it. For Llama-3.1-8B on an H100 at 55% of 989 TFLOP/s, the per-token part of prefill is ${}2N$ FLOPs, about 29.5 µs per token:
+
+| Prompt | Tokens | Prefill (linear part) | KV cache (128 KB per token) |
+|---|---|---|---|
+| 10 documents | 60 + 10 × 130 + 40 = 1,400 | 1,400 × 29.5 µs ≈ 41 ms | 0.18 GB |
+| 20 documents | 2,700 | 80 ms | 0.35 GB |
+| 30 documents | 4,000 | 118 ms | 0.52 GB |
+| a full 128K window | 128,000 | ≈ 3.8 s | 16.8 GB |
+
+The KV figure comes from Module 05: Llama-3.1-8B stores ${}2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes per token (keys and values, 32 layers, 8 KV heads of 128 numbers, 2 bytes each). For the last row, ${}128{,}000 \times 131{,}072 \approx 16.8$ GB for **one** request, and the attention part of prefill, which grows with the square of the length, roughly doubles the 3.8 seconds at this size (Module 20 has the full arithmetic). That is a lot to pay for a prompt whose middle the model reads poorly.
+
+<Callout type="pitfall" title="Three ways prompts drift into the middle">
+  1. **Shuffled or unranked retrieval.** Many pipelines concatenate passages in whatever order the index returned them, or deduplicate in a way that scrambles the ranking. Your best passage can land anywhere.
+  2. **Instructions before a long document, question nowhere near them.** "Answer using the policy below", then 6,000 tokens of policy, then the question, puts the instruction at the far start and the question at the far end, with the facts in between. Restate the instruction next to the question.
+  3. **Long agent or chat loops.** As tool outputs and turns pile up, the original task statement ends up thousands of tokens back. Agents that periodically restate their goal near the end of the context (Module B4) are working around exactly this.
+</Callout>
+
+## Put it where the model looks
+
+Here are the placement rules, cheapest first. None of them adds tokens of any note.
+
+1. **Instructions at the start, the question at the end.** The system prompt opens the context (lesson B1.1); the question and a one-line restatement of the key instruction go after the long material, right before the model starts answering. At the time of writing, several model providers' long-context guidance recommends exactly this layout: long documents near the top, the query last.
+2. **Rank before you paste.** Put the most relevant passage first. In the toy model this alone moves expected accuracy from 57.6% (random order) to 69.3%. If your retriever's second-best passage is often the right one, putting the best passages at *both* ends is a reasonable variant; measure which ordering wins for your model.
+3. **Retrieve fewer, better passages.** Each extra passage is another distractor and another 130 tokens. A reranker (Module B3) that keeps the best 5 of 50 usually beats pasting all 50.
+4. **Quote, then answer.** Ask the model to first copy the passages relevant to the question, then answer from those quotes. This is a two-step chain (lesson B1.3) whose first step moves the needed facts to the end of the context, right next to where the answer is written. It costs some output tokens and often recovers much of the lost accuracy.
+5. **Give every passage an identity.** Number or title each passage and ask for citations. You cannot fix what you cannot trace, and a cited passage ID tells you whether a wrong answer was a retrieval miss or a reading miss.
+6. **Test positions on purpose.** Put the answer at the start, middle and end of the context in your evaluation set and check that your accuracy is flat. If it is not, your production accuracy depends on luck.
+
+<Callout type="real" title="Now read the paper">
+  **Liu et al., "Lost in the Middle: How Language Models Use Long Contexts" (2023), [arXiv 2307.03172](https://arxiv.org/abs/2307.03172).**
+
+  Read the introduction and its first figure (you have now dragged that curve yourself), the multi-document question-answering experiments, and the key-value retrieval task. Then read the section that asks *why*, which covers model architecture, putting the query before and after the data, and instruction tuning, and the short open-domain case study on retrieving more documents. Skim the tables of per-model numbers. You will recognise step 3's "worse than no documents" and placement rule 1.
+
+  For the testing side, read the abstract and the task list of Hsieh et al., "RULER: What's the Real Context Size of Your Long-Context Language Models?" (2024), [arXiv 2404.06654](https://arxiv.org/abs/2404.06654).
+</Callout>
+
+<KeyNotes>
+  1. A model can hold a long prompt without using all of it: answer accuracy depends on where the relevant fact sits, and the curve is **U-shaped**, best at the start (primacy), good at the end (recency), worst in the middle.
+  2. Liu et al. (2023) found this on multi-document QA and even on pure key-value lookup. For GPT-3.5-Turbo with 20 documents the middle fell below answering with no documents at all.
+  3. It appears at 1,400 to 4,000 tokens, far below modern windows, and extended-window versions of a model did not use the same context better.
+  4. **Needle-in-a-haystack** tests one literal fact with no distractors; passing it is necessary, not sufficient. Harder tests such as RULER find an **effective context length** often far below the advertised one; about half the models claiming 32K or more held up at 32K.
+  5. Long prompts cost real resources whether used or not: about 29.5 µs of prefill per token on an 8B model on an H100, and 128 KB of KV cache per token; a full 128K prompt is about 16.8 GB of KV and seconds of prefill.
+  6. Placement is free: instructions first, the question (and a restated key instruction) last, retrieved passages ranked with the best first. In the toy model ranking lifts expected accuracy from 57.6% to 69.3%.
+  7. Retrieve fewer, better passages; ask the model to quote the relevant passages before answering; label passages and ask for citations; and test answer positions explicitly in your evaluation set.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A prompt has a 60-token instruction, 30 retrieved passages of 130 tokens each, and a 40-token question. How many prompt tokens is that?', numeric: true, answer: 4000, tolerance: 0, unit: 'tokens', why: '60 + 30 × 130 + 40 = 60 + 3,900 + 40 = 4,000 tokens.' },
+  { q: 'Using about 2N FLOPs per token, how many milliseconds does prefilling those 4,000 tokens take on Llama-3.1-8B (8.03B parameters) on an H100 at 55% of 989 TFLOP/s?', numeric: true, answer: 118, tolerance: 4, unit: 'ms', why: '2 × 8.03e9 × 4,000 = 6.42e13 FLOP; 0.55 × 989e12 = 5.44e14 FLOP/s; 6.42e13 / 5.44e14 = 0.118 s = 118 ms.' },
+  { q: 'Llama-3.1-8B stores 131,072 bytes of KV cache per token. How many GB does one 128,000-token prompt occupy?', numeric: true, answer: 16.8, tolerance: 0.3, unit: 'GB', why: '128,000 × 131,072 = 16,777,216,000 bytes ≈ 16.8 GB, for a single request.' },
+  { q: 'What did Liu et al. (2023) find about the position of the relevant document among 20 retrieved documents?', options: ['Accuracy rises steadily the later the document appears', 'Accuracy is U-shaped: best at the beginning, good at the end, worst in the middle, and the middle can fall below answering with no documents', 'Position has no effect once the prompt fits in the window', 'Only the last document is ever used'], answer: 1, why: 'The curve shows primacy and recency with a dip in the middle; for GPT-3.5-Turbo the dip went below closed-book accuracy.' },
+  { q: 'A model card shows a perfect needle-in-a-haystack heatmap up to 128K tokens. What does that NOT tell you?', options: ['That the model can hold 128K tokens', 'That it can find one literal sentence at any depth', 'How well it handles many relevant-looking distractors, or combines several facts spread across the context, at those lengths', 'Anything about its tokenizer'], answer: 2, why: 'The single-needle test checks retrieval of one literal fact without distractors. Harder suites such as RULER add multiple needles, tracing and aggregation, and find much shorter effective lengths.' },
+  { q: 'Your RAG prompt concatenates 20 passages in the order the index returned them, then the question. Which change is free and most likely to raise accuracy?', options: ['Double the number of passages', 'Sort the passages by retrieval score with the best first, and restate the key instruction next to the question at the end', 'Move the question to the very start and delete it from the end', 'Raise the model’s context window'], answer: 1, why: 'Ranking puts the most likely answer where the model reads best, and the question stays at the end where recency helps. More passages add distractors and prefill; a bigger window does not change how the model uses the same prompt.' },
+]} />
