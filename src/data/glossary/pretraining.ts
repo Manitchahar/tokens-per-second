@@ -30,4 +30,19 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'A model pretrained once on broad data that can be adapted to many downstream tasks by finetuning or prompting. The term was popularised by a 2021 Stanford report; BERT and GPT-2 are early examples.',
     lesson: 'pretraining/self-supervision',
   },
+  'cross-entropy': {
+    term: 'Cross-entropy loss',
+    def: 'The loss every language model is trained on: the average of −ln p(true token) over the targets. Also called negative log-likelihood. Measured in nats (natural log) or bits (log₂); 1 nat = 1.443 bits.',
+    lesson: 'pretraining/loss-perplexity',
+  },
+  'bits-per-byte': {
+    term: 'Bits per byte (BPB)',
+    def: 'Total loss on a text in bits, divided by the text’s size in UTF-8 bytes: (loss per token ÷ ln 2) × tokens ÷ bytes. Unlike per-token loss or perplexity, it is fair across different tokenizers.',
+    lesson: 'pretraining/loss-perplexity',
+  },
+  'data-contamination': {
+    term: 'Data contamination',
+    def: 'When a benchmark’s test text was in a model’s training data, so the model has partly memorised the answers. An unusually low perplexity on the test set, compared with fresh text of the same style, is a warning sign.',
+    lesson: 'pretraining/loss-perplexity',
+  },
 };
