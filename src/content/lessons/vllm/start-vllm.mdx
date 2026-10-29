@@ -327,6 +327,41 @@ Because TTFT does not matter, you can push the engine to its limits: raise `max_
   Inference engineers often default to spinning up `vllm serve` and writing an async Python client with `httpx` to blast requests at `http://localhost:8000`. If your data is already on disk, avoid the network hop entirely. The Python `LLM` class executes with lower overhead, avoids HTTP serialization, and automatically maximizes continuous batch efficiency.
 </Callout>
 
+## Streaming from Python, and cancelling: the async engine
+
+The `LLM` class blocks until a whole batch is done, which is right for a pipeline and wrong for a product. A web backend needs to start many requests, stream each one's tokens as they appear, and **stop** a request the moment its user leaves. vLLM's <Term t="async-engine">asynchronous engine</Term>, `AsyncLLMEngine` (in the V1 engine at the time of writing, a name for `AsyncLLM`), is the object the OpenAI-compatible server is built on, and you can use it directly:
+
+```python
+import asyncio, uuid
+from vllm import SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+
+engine = AsyncLLMEngine.from_engine_args(
+    AsyncEngineArgs(model="Qwen/Qwen2.5-0.5B-Instruct", dtype="half", max_model_len=2048)
+)
+
+async def answer(prompt: str, user_is_gone) -> str:
+    request_id = str(uuid.uuid4())                     # your handle for this request
+    params = SamplingParams(max_tokens=2000, temperature=0.7)
+    text = ""
+    async for out in engine.generate(prompt, params, request_id):
+        text = out.outputs[0].text                     # the text so far, growing each step
+        print(text[-60:], end="\r")                    # stream it to the client
+        if user_is_gone():                             # e.g. the HTTP connection closed
+            await engine.abort(request_id)             # stop decoding, free its KV blocks now
+            break
+    return text
+```
+
+Three things to notice:
+
+- **`async for` yields once per engine step.** Each `RequestOutput` carries the text generated so far. Many `answer()` coroutines can run at once in one event loop, and the engine core batches all of them together underneath, exactly as the scheduler in the next lesson describes.
+- **The request id is the handle.** It is how logs, metrics and `abort()` refer to one request among hundreds.
+- **`abort(request_id)` is not a nicety.** Without it, a request whose user closed the tab keeps decoding until `max_tokens`, holding a batch slot and its KV blocks the whole time. The OpenAI-compatible server does this for you when an HTTP client disconnects; if you wrap the engine yourself, you must.
+
+**What an abandoned request costs.** A Llama-3.1-8B user sends a 500-token prompt, reads 50 tokens and leaves; `max_tokens` is 2,000. Without an abort the request runs 1,950 more decode steps, about 15 seconds at ~7.5 ms per step, and its cache keeps growing to 2,500 tokens: ${}2{,}500 \times 128$ KiB $\approx 312$ MiB, or 157 blocks of 16, that no waiting request can use. Abort it after token 50 and its 35 blocks (550 tokens) go back to the pool on the next step. Multiply by every user who closes a tab mid-answer and you have a capacity leak that no dashboard labels as such.
+
 ## Now you can drive it
 
 You have a server, an API, an offline Python engine, and a memory budget you can compute before starting. The next lesson opens the hood: what happens to a request between the HTTP body and the bytes that come back.
@@ -339,7 +374,7 @@ You have a server, an API, an offline Python engine, and a memory budget you can
   5. `/v1/completions` handles raw text while `/v1/chat/completions` formats chat templates; setting `stream: true` streams server-sent events per token so users read while the model generates.
   6. Of the sampling parameters, only `max_tokens`, `n` and `stop` change how much work a request creates. The rest are quality knobs that cost the same either way.
   7. `/metrics` and the periodic stdout summary tell you `Running`, `Waiting`, KV cache usage and prefix-cache hit rate. Waiting above zero means capacity, not configuration, is your limit.
-  8. For offline pipelines like bulk summarization, the Python `LLM` class executes continuous batching directly in-process without HTTP overhead, maximizing throughput rather than TTFT.
+  8. For offline pipelines like bulk summarization, the Python `LLM` class executes continuous batching directly in-process without HTTP overhead, maximizing throughput rather than TTFT. For online use from Python, `AsyncLLMEngine` streams each request with `async for`, and `abort(request_id)` stops it and frees its KV blocks the moment its user leaves.
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -350,4 +385,5 @@ You have a server, an API, an offline Python engine, and a memory budget you can
   { q: 'Why does vLLM run the model on a dummy batch before allocating the KV cache?', options: ['To warm up the weights file', 'To measure peak activation memory, so the pool is sized against real numbers', 'To check the GPU is not already full', 'To compile CUDA graphs for speed'], answer: 1, why: 'The profiling run measures the activation peak, which has to come out of the budget before the KV pool can be sized. That is why startup does not crash later on a long prompt.' },
   { q: 'The server logs Running: 24 reqs, Waiting: 37 reqs. What does that tell an inference engineer?', options: ['The GPU is saturated; you need more capacity', 'The KV cache is about to run out', 'The sampler is too slow', 'The token budget per step is too small'], answer: 0, why: 'A non-empty waiting queue means arrivals outpace what the engine can retire per second. Tuning flags move the point on the curve; only more GPUs or cheaper tokens change the queue.' },
   { q: 'An offline batch job processes 10,000 documents with vLLM’s Python LLM class. If each document generates 180 tokens and the engine sustains an aggregate throughput of 500 tokens/s, how many hours will the job take?', numeric: true, answer: 1, tolerance: 0.05, unit: 'hours', why: '10,000 documents × 180 tokens = 1,800,000 tokens. At 500 tokens/s, total execution time is 1,800,000 ÷ 500 = 3,600 seconds = 1.0 hour. Offline batch processing focuses on total runtime and throughput rather than per-request latency.' },
+  { q: 'A Llama-3.1-8B request with a 500-token prompt is aborted after generating 50 tokens. How many 16-token KV blocks go back to the pool?', numeric: true, answer: 35, tolerance: 0, unit: 'blocks', why: '500 + 50 = 550 tokens of context; ceil(550 / 16) = 35 blocks (70 MiB at 2 MiB per block). Without the abort it would have grown to 2,500 tokens and 157 blocks, decoding for ~15 s for nobody.' },
 ]} />

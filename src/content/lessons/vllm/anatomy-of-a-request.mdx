@@ -92,6 +92,52 @@ Three rules decide who is in `running`, and each one is a knob you will meet in 
 
 **The detokenizer.** The unglamorous stage that makes streaming work. A token is not a character: it can be half of a multi-byte UTF-8 sequence, or the first half of a word like `Ġatten`. The <Term t="detokenizer">detokenizer</Term> buffers partial tokens and only emits complete text, and it has to be incremental, because the alternative is to wait for the whole answer — which is exactly the latency you were trying to avoid.
 
+## Inside the engine core: who calls whom
+
+The six stages tell you what happens to a request. To read vLLM's code, its logs or a stack trace, you also need the names of the objects that do the work. In the V1 engine, at the time of writing, they nest like this:
+
+```text
+LLM / AsyncLLM (the LLMEngine facade)   what you call: generate(), add_request(), abort()
+ └─ EngineCore                          the busy loop: schedule → execute → update, forever
+     ├─ Scheduler                       writes this step's work order: a SchedulerOutput
+     │   └─ KV cache manager            hands out and frees KV blocks, prefix cache included
+     └─ Executor                        ships the work order to the GPU workers
+         └─ Worker (one per GPU)         owns one device
+             └─ ModelRunner              builds input tensors, runs the model, samples
+```
+
+- **LLMEngine** (and **AsyncLLM**, its asynchronous twin that the API server uses) is a **facade**: a thin front door that turns your prompt and `SamplingParams` into an engine request, and turns engine outputs back into text. It does no scheduling of its own.
+- **EngineCore** is the **busy loop**. Every iteration it asks the scheduler for work, hands it to the executor, gets sampled token ids back and updates every request. It runs as long as any request exists, and in the V1 design it can live in its own process so the API server's Python never delays it.
+- The **Scheduler** produces a <Term t="scheduler-output">**SchedulerOutput**</Term>: a work order for exactly one forward pass. It says which requests run, how many new tokens each contributes this step (one for a request that is decoding, a chunk of prompt for one that is still in prefill), and which KV blocks each may write.
+- The **Executor** sends that order to the **Workers**, one per GPU. Each worker's **ModelRunner** turns it into input tensors and block tables, runs the model (as a CUDA graph when the shape allows), samples, and returns token ids.
+
+```python
+# EngineCore.step(), simplified (V1, at the time of writing)
+def step(self):
+    sched_out = self.scheduler.schedule()                  # the work order for ONE forward pass
+    model_out = self.executor.execute_model(sched_out)     # workers -> model runners -> token ids
+    return self.scheduler.update_from_output(sched_out, model_out)  # append, finish, free blocks
+```
+
+### The scheduler's two waves
+
+`schedule()` builds that work order in two passes, and the order *is* the policy:
+
+1. **Running requests first.** Every request already running gets its next tokens: one if it is decoding, the next prompt chunk if it is still prefilling. Each takes its share of the step's **token budget** (`--max-num-batched-tokens`) and any new KV block it needs. If no block is free, the scheduler preempts a running request (under first-come-first-served, the one admitted last) to make room.
+2. **Then waiting requests**, in arrival or priority order, **while** the remaining token budget, the free KV blocks and the `--max-num-seqs` cap all allow. A prompt larger than the budget that is left gets a chunk of it now if chunked prefill is on (the V1 default at the time of writing), and the rest on later steps.
+
+Serving running requests first means a request that has started streaming is never starved by newcomers: decodes, which users feel as streaming speed, always get their token before any new prompt is admitted.
+
+**Worked example.** Token budget 8,192. Forty requests are decoding; two are waiting, A with a 6,000-token prompt and B with 3,000.
+
+| | tokens this step | budget left | new KV blocks |
+|---|---|---|---|
+| Wave 1: 40 decodes, one token each | 40 | 8,152 | only those crossing a 16-token boundary |
+| Wave 2: A's whole prompt | 6,000 | 2,152 | ⌈6,000 / 16⌉ = 375 |
+| Wave 2: B, first chunk | 2,152 | 0 | ⌈2,152 / 16⌉ = 135 |
+
+B's remaining 848 tokens run next step. Notice what this step costs the 40 streaming users: on Llama-3.1-8B it carries 8,152 prompt tokens, about ${}2 \times 8.03 \times 10^9 \times 8{,}152 \approx 1.3 \times 10^{14}$ FLOPs, roughly 240 ms on an H100 at 544 TFLOP/s effective, so their next token arrives after ~240 ms instead of ~7.5 ms. The token budget is a latency knob as much as a throughput one, which is exactly the trade Module 10's chunked-prefill lesson tunes.
+
 ## The three clocks, and the arithmetic
 
 <Callout type="math" title="Where TTFT comes from">
@@ -142,7 +188,7 @@ $$
 \left\lceil \frac{576}{16} \right\rceil = 36\ \text{blocks}
 $$
 
-and every block is 16 tokens × 32 layers × 8 KV heads × 128 head dim × 2 (K and V) × 2 bytes = **128 KB**. So $(36 \times 128)$ KB = **4.7 MB**, and it is freed the instant the request finishes.
+and every block is 16 tokens × 32 layers × 8 KV heads × 128 head dim × 2 (K and V) × 2 bytes = **2 MiB** (16 tokens at 128 KiB each). So 36 blocks hold **72 MiB** (75.5 MB), and they are freed the instant the request finishes.
 
 Two consequences worth carrying forward:
 
@@ -181,16 +227,20 @@ Once these steps finish, the server logs `Application startup complete` and begi
 
 ### Optimizing at the right layer
 
-A modern inference engine like vLLM does not apply optimizations randomly. If an attention kernel optimization leaked into the request scheduler, or if scheduling logic was tied to a specific GPU architecture, the engine would collapse under architectural complexity.
+A modern inference engine does not apply optimizations at random. If an attention-kernel trick leaked into the request scheduler, or scheduling logic were tied to one GPU architecture, the engine would collapse under its own complexity. vLLM's code is organised in four layers, each with its own scope, and every optimization lives in one of them (directory names at the time of writing):
 
-Instead, optimizations are divided into four distinct layers:
+| Layer | Scope | Examples | Where in the code | Covered in |
+|---|---|---|---|---|
+| **Scheduler** | system-wide, works for any model | continuous batching, the token budget, chunked prefill, preemption, block allocation and prefix-cache reuse | `vllm/v1/core/` | Modules 07, 08, 10 |
+| **Model executor** | one model architecture at a time | how a Llama, a Qwen or a DeepSeek model wires its blocks: GQA, multi-head latent attention (MLA), MoE routing, multi-token prediction | `vllm/model_executor/models/` | Modules 03, 16, 19 |
+| **Model layers** | reusable building blocks shared by many models | fused QKV and gate/up projections, RMSNorm fused with the residual add, rotary embeddings, quantized linear methods (AWQ, FP8), the attention layer that reads paged and prefix-shared KV | `vllm/model_executor/layers/` | Modules 11, 13, 15 |
+| **Custom ops** | one piece of hardware | CUDA, CUTLASS and Triton kernels: paged and flash attention backends, FP8 and INT4 GEMMs, all-reduce | `csrc/`, `vllm/_custom_ops.py` | Modules 13, 14, 18 |
 
-| Layer | Optimization scope | Concrete example | Covered in |
-|---|---|---|---|
-| **Request & scheduler level** | System-wide, model-agnostic request batching and admission | Continuous batching, token budgets per iteration, and priority preemption | Module 07 · Batching & Scheduling & Module 10 · Prefill & Prefix |
-| **Memory level (KV cache)** | Virtualized memory allocation and context reuse | PagedAttention block tables and prefix caching to share common prompt prefixes | Module 08 · PagedAttention & Module 10 · Prefill & Prefix |
-| **Kernel level** | GPU execution efficiency and hardware-specific math acceleration | Fused attention kernels (FlashAttention) and custom Triton operations for normalization | Module 13 · Triton & Module 14 · Attention Optimization |
-| **Model level** | Structural parameter compression and algorithmic shortcuts | Weight/activation quantization (AWQ, FP8) and speculative decoding with draft models | Module 11 · Quantization & Module 16 · Speculative Decoding |
+Read a change by asking which layer it touches. A new scheduling policy helps every model on every GPU. A new attention backend helps every model on one kind of GPU. A fused layer helps every model that uses that layer. A model-executor change helps one architecture.
+
+<Callout type="real" title="One reported case: the right flags, about 15× faster">
+  *Hands-On LLM Serving and Optimization* (Wang & Hu) reports a DeepSeek-R1 deployment whose throughput rose from about **38 to about 600 tokens per second, roughly 15×**, from engine configuration alone: turning on FP8 kernels for DeepSeek's multi-head latent attention (MLA) and allowing a larger batch. Read it through the layer map: the FP8 MLA kernels are the **custom-op** layer serving one **model-executor** architecture, and the larger batch is the **scheduler** layer. Neither touched the model's weights. Treat it as one data point, not a promise: the size of such a gain depends on how badly the defaults fit the model and hardware to begin with, which is why [the optimization plan](/learn/vllm/optimization-plan/) measures before and after every single change.
+</Callout>
 
 <Callout type="mentor" title="Fix the problem at its own layer">
   When diagnosing slow inference, match the symptom to the layer. If TTFT is high because requests wait in line, tweaking a GPU kernel will not help you: that is a scheduler-layer capacity issue. Conversely, if decode step latency is high for a single user, changing scheduler batch flags does nothing: you need kernel-level or model-level optimizations like quantization or CUDA graphs.
@@ -206,12 +256,12 @@ Now you can see the whole path. The next lesson is the practical one: what to ac
 <KeyNotes>
   1. vLLM splits into an **API server** (HTTP, tokenizer, streams, no GPU) and an **engine core** (scheduler, KV cache, model runner, sampler). Keeping Python off the GPU path is a deliberate design choice.
   2. A request passes through six stages: HTTP API → tokenizer → scheduler → model runner → sampler → detokenizer. Only the model runner and the sampler touch the GPU.
-  3. The scheduler admits a request only if there are free KV blocks, room under `max_num_seqs`, and token budget left in the step. It re-forms the batch every iteration.
+  3. Every iteration the scheduler writes a work order (a `SchedulerOutput`) in two waves: running requests get their next tokens first, then waiting requests are admitted while token budget, free KV blocks and `max_num_seqs` allow. The `EngineCore` loop hands that order to the executor, workers and model runners.
   4. `TTFT = queue + prefill + one decode step`. For Llama-3.1-8B on an H100 that is about `0 + 17 ms + 7.5 ms`, but under real load **the queue dominates**.
   5. `ITL` is one memory-bound decode step: weights plus that sequence's KV cache, divided by effective bandwidth, plus fixed overhead. Sampling parameters do not change it.
   6. KV blocks are allocated in 16-token chunks up front; when a request finishes, its blocks return immediately to the pool for waiting sequences in the very next step.
   7. When the pool is exhausted the engine preempts. A rising `vllm:num_preemptions_total` means the KV pool is too small for your traffic — not that a flag is mistyped.
-  8. At startup, vLLM profiles peak activation memory with a dummy pass to size the KV pool before capturing CUDA graphs, organizing optimizations across scheduler, memory, kernel, and model layers.
+  8. At startup, vLLM profiles peak activation memory with a dummy pass to size the KV pool before capturing CUDA graphs. Its optimizations live in four code layers: scheduler (any model), model executor (one architecture), model layers (shared fused blocks) and custom ops (one GPU's kernels).
 </KeyNotes>
 
 <Quiz client:visible questions={[
@@ -222,4 +272,5 @@ Now you can see the whole path. The next lesson is the practical one: what to ac
   { q: 'Why does the engine core refuse to admit a request that needs 12,288 tokens of context while it has room for several small ones?', options: ['Prefill for 12,288 tokens would exceed the token budget', 'All its KV blocks must be reserved before it starts, and one big request can hold them all', 'n would have to be set to 1', 'The chat template forbids long prompts'], answer: 1, why: 'Blocks are allocated up front, not grown on demand: 12,288 tokens is 768 blocks committed before the first token. A long request can therefore starve small ones behind it.' },
   { q: 'Which component is responsible for keeping Python work off the GPU critical path?', options: ['The tokenizer', 'The detokenizer', 'The API server and engine core running separately', 'The sampler'], answer: 2, why: 'HTTP, tokenization and detokenization all live outside the engine, so scheduling and GPU execution are not interrupted. Tokenizer and detokenizer cost microseconds; the structure is what matters.' },
   { q: 'When deploying a model on a single node across 4 GPUs using tensor parallelism (--tensor-parallel-size 4), at the time of writing how many dedicated worker processes does vLLM spawn to manage the physical GPUs?', numeric: true, answer: 4, tolerance: 0, unit: 'processes', why: 'Under single-node tensor parallelism, vLLM’s MultiProcessExecutor spawns exactly one worker process per GPU to isolate CUDA context management and kernel execution.' },
+  { q: 'Token budget 8,192. Forty requests are decoding (one token each) and request A, with a 6,000-token prompt, is admitted next. With chunked prefill, how many tokens of request B’s 3,000-token prompt run this step?', numeric: true, answer: 2152, tolerance: 0, unit: 'tokens', why: 'Wave 1 gives the 40 running decodes 40 tokens, leaving 8,152. Wave 2 admits A’s 6,000 tokens, leaving 2,152, so B gets a 2,152-token first chunk and its other 848 tokens run next step.' },
 ]} />

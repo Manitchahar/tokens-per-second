@@ -119,4 +119,14 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The engine initialization step where a dummy forward pass runs to measure peak activation memory before allocating the KV cache pool, ensuring the server will not run out of memory under load.',
     lesson: 'vllm/anatomy-of-a-request',
   },
+  'scheduler-output': {
+    term: 'SchedulerOutput',
+    def: 'vLLM’s work order for one forward pass: which requests run this step, how many new tokens each contributes (one for a decode, a chunk for a prefill) and which KV blocks each may write. The scheduler builds it in two waves, running requests first, then waiting ones while budget and blocks allow.',
+    lesson: 'vllm/anatomy-of-a-request',
+  },
+  'async-engine': {
+    term: 'Async engine (AsyncLLMEngine / AsyncLLM)',
+    def: 'vLLM’s asynchronous front door: generate() is an async iterator that yields each request’s output once per engine step, so one event loop can stream many requests, and abort(request_id) stops a request and frees its KV blocks when its user leaves. The OpenAI-compatible server is built on it.',
+    lesson: 'vllm/start-vllm',
+  },
 };

@@ -244,8 +244,27 @@ outputs = llm.generate(prompts, SamplingParams(max_tokens=64, temperature=0.7))
 6. Pre-allocate contiguous paged KV cache tensor.
 7. Capture CUDA graphs for common decode batch sizes (unless `--enforce-eager`).
 
-**The 4 optimization layers:**
-- **Request / scheduler level**: Continuous batching, token budgets, preemption (Modules 07, 10).
-- **Memory level (KV)**: PagedAttention, block tables, prefix caching (Modules 08, 10).
-- **Kernel level**: Fused attention, Triton kernels, graph replay (Modules 13, 14, 15).
-- **Model level**: Quantization (FP8, AWQ), speculative decoding, MoE routing (Modules 11, 16, 19).
+**The 4 optimization layers (vLLM's code structure, at the time of writing):**
+- **Scheduler** (system-wide, any model; `vllm/v1/core/`): continuous batching, token budget, chunked prefill, preemption, block allocation and prefix-cache reuse.
+- **Model executor** (one architecture; `vllm/model_executor/models/`): how a model wires its blocks: GQA, MLA, MoE routing, multi-token prediction.
+- **Model layers** (shared building blocks; `vllm/model_executor/layers/`): fused QKV / gate-up projections, fused RMSNorm + residual, rotary, quantized linear methods, the paged/prefix-sharing attention layer.
+- **Custom ops** (one GPU; `csrc/`, `vllm/_custom_ops.py`): CUDA / CUTLASS / Triton kernels: attention backends, FP8 / INT4 GEMMs, all-reduce.
+- Reported case (Wang & Hu): DeepSeek-R1 ~38 → ~600 tok/s (~15×) from FP8 MLA kernels (custom ops) + a larger batch (scheduler). One data point; measure your own.
+
+**Inside the engine (V1):**
+```
+LLM / AsyncLLM (LLMEngine facade) → EngineCore (busy loop: schedule → execute → update)
+  ├─ Scheduler → SchedulerOutput (work order for ONE forward pass) ; KV cache manager
+  └─ Executor → Worker (one per GPU) → ModelRunner (inputs, model, sampler)
+```
+- **Two waves per step:** (1) running requests get their next tokens (1 per decode, a chunk per prefill), preempting if blocks run out; (2) waiting requests are admitted while token budget, free blocks and `max_num_seqs` allow. Budget 8,192, 40 decodes, A = 6,000, B = 3,000 → 40 + 6,000 + 2,152 (B's first chunk).
+- KV block for Llama-3.1-8B = 16 × 128 KiB = **2 MiB**; 576 tokens = 36 blocks = 72 MiB.
+
+**Async streaming and cancel:**
+```python
+engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(model=...))
+async for out in engine.generate(prompt, SamplingParams(max_tokens=2000), request_id):
+    send(out.outputs[0].text)                 # text so far
+    if user_left(): await engine.abort(request_id); break   # frees KV blocks now
+```
+An unaborted 500 + 2,000-token request whose user left at token 50 decodes ~15 s for nobody and grows to 157 blocks (312 MiB); aborting returns 35 blocks immediately.
