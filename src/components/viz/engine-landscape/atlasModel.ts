@@ -142,8 +142,8 @@ export const COLUMNS: Column[] = [
   },
   {
     id: 'vendor', label: 'needs NVIDIA', kind: 'structural',
-    value: (b) => (b.engine.id === 'llamacpp' ? 'no' : 'yes'),
-    note: 'llama.cpp also runs on CPU, Apple Silicon and Metal',
+    value: (b) => (b.engine.id === 'trtllm' ? 'yes' : 'no'),
+    note: 'at the time of writing: vLLM also runs on AMD ROCm, Google TPU, x86 CPU and Intel Gaudi; SGLang on AMD ROCm and CPU; llama.cpp on CPU, Apple Metal and Vulkan',
   },
 ];
 

@@ -136,14 +136,14 @@ Here is the honest summary. Every row is a design commitment, and design commitm
 | **Fixed cost per step** | highest of the GPU-native three | similar to vLLM | **lowest** — few launches | high |
 | **Prefix reuse** | block-level, copy-on-write | **best** — tree walked directly | block-level, copy-on-write | limited; whole-sequence cache |
 | **4-bit** | supported | supported | supported | **native and the reason it exists** |
-| **Runs without an NVIDIA GPU** | no | no | no | **yes** |
+| **Runs without an NVIDIA GPU** | yes: AMD ROCm, Google TPU, x86 CPU, Intel Gaudi | yes: AMD ROCm, CPU and others | no | **yes**: CPU, Apple Metal, Vulkan |
 | **Build step** | none | none | **yes, per configuration** | none |
-| **Where it is strongest** | breadth: most models, most docs | prefix-heavy: agents, multi-turn chat, few-shot | fixed shape on one GPU: lowest latency, highest throughput | fitting a big model on small or non-NVIDIA hardware |
+| **Where it is strongest** | breadth: most models, most hardware, most docs | prefix-heavy: agents, multi-turn chat, few-shot | fixed shape on one NVIDIA GPU: lowest latency, highest throughput | fitting a model on small hardware: laptops, CPUs, Apple silicon, consumer GPUs |
 
 <Callout type="intuition" title="The decision, in the order you should make it">
   1. **Does it fit?** Weights plus a reserve against your GPU's memory, in the precision you need. This is arithmetic, and it eliminates candidates before anything is benchmarked. Most "which engine" questions die here.
   2. **Is there a hard constraint you cannot satisfy?** A model with no kernel support. A hardware you do not own. A build you cannot run in your deployment pipeline.
-  3. **Which design matches your traffic?** Prefix-heavy → SGLang. One shape, latency-critical, stable config → TensorRT-LLM. Everything else, or maximum model coverage → vLLM. Non-NVIDIA or memory-starved → llama.cpp.
+  3. **Which design matches your traffic?** Prefix-heavy → SGLang. One shape, latency-critical, stable config → TensorRT-LLM. Everything else, or maximum model coverage → vLLM. A laptop, a CPU, Apple silicon or a memory-starved consumer GPU → llama.cpp. A datacenter AMD GPU or a TPU → vLLM or SGLang, which both run there; TensorRT-LLM is NVIDIA-only.
   4. **Only now, measure.** And measure under the contract from the previous lesson.
 
   Steps 1 and 2 need no GPU. They eliminate most of the field for free, and they are the steps teams skip.
