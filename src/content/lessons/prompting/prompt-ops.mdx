@@ -1,0 +1,249 @@
+---
+title: 'Versioning, testing & optimizing prompts'
+summary: 'A prompt is code that changes your product''s behaviour, so treat it like code: keep it in files, version it, score every version on a fixed eval set, gate releases on the score, and roll back in one line. Then let an optimizer such as DSPy search for better prompts, and count the calls and tokens that search really costs.'
+objectives:
+  - Store prompts as versioned files pinned to a model and sampling settings, and trace any production answer to its prompt version
+  - Compute the noise on an eval score and decide whether a difference between two versions is real
+  - Gate prompt releases with regression tests and plan a rollback
+  - Explain what automatic prompt optimizers such as DSPy do, and compute the hidden calls and tokens they add
+---
+import PromptTimeline from '@/components/viz/prompting/PromptTimeline.tsx';
+import Quiz from '@/components/learn/Quiz.tsx';
+
+On Friday afternoon a teammate makes the support prompt a little friendlier and a little shorter. It is one sentence, so it goes straight into the code and out with the evening deploy. On Monday, escalations to human agents are up by a third. Was it Friday's sentence? The model provider's update over the weekend? The new product launch? Nobody knows, because the old prompt text exists only in a chat message somewhere, there is no score for either version, and the same prompt is pasted, slightly differently, in three files.
+
+Every lesson in this module so far has changed model behaviour by changing text. That makes prompt text **code**: it is the program the model runs. This lesson applies to prompts the habits that make ordinary code safe to change: files, version control, tests, release gates and rollbacks. Then it looks at the newer idea of letting software write the prompts for you, and at the bill that comes with it.
+
+<Scrolly>
+  <PromptTimeline client:visible slot="stage" />
+
+  <Step title="1. A prompt with no history">
+    The prompt is an f-string inside the application, copied into three places. When it changes, the previous text is gone and nobody measured either one. **Every edit is an untracked change to production behaviour.**
+  </Step>
+
+  <Step title="2. Every change is a version">
+    Move the prompt into its own file under version control. Each edit becomes a commit with a reason: "explicit label list", "+ refund rule". Seven versions, every one recoverable, and the file states **which model and settings** it was written for.
+  </Step>
+
+  <Step title="3. Every version gets a score">
+    Run every version on the same labelled <Term t="eval-set">eval set</Term> and record the score. The history becomes a curve: 71% for the first draft, 87% by v5 (scores illustrative). Now "better" is a number, not an opinion.
+  </Step>
+
+  <Step title="4. Is v4 really better? Count the noise">
+    A score from 200 examples carries about **±5 points** of noise at 95% confidence. The step from v3 to v4 is one point: invisible. Drag the eval-set size: at 2,000 examples the bars shrink to ±1.6. Small differences need many examples, or a paired comparison.
+  </Step>
+
+  <Step title="5. A regression test gates the release">
+    In continuous integration, a candidate version must score no worse than production minus a small margin. v6 cut 180 tokens to save money and lost 7 points; the gate **blocks it before any user sees it**.
+  </Step>
+
+  <Step title="6. Ship, watch, roll back">
+    v7 moves the prompt to a newer model. Offline it scores 86%, inside the margin, so it ships. Live, escalations rise. Because production points at a version, rolling back to v5 is **one configuration change**. Offline evals sample yesterday's traffic; live metrics catch the rest.
+  </Step>
+
+  <Step title="7. Let an optimizer search">
+    An <Term t="prompt-optimizer">automatic prompt optimizer</Term> such as DSPy generates candidate prompts, here by bootstrapping few-shot demonstrations, and scores each on a dev set. Drag the number of candidates: more candidates, a better best, and the winner carries more examples, so **more tokens on every call**.
+  </Step>
+
+  <Step title="8. The bill for searching">
+    Scoring a candidate means running the whole program on every dev example. With 16 candidates, 200 examples and 3 model calls per run, plus 100 bootstrap runs, that is **9,900 calls** to compile once. Switch the dated price to see what one compile costs, then remember it repeats every time anything changes.
+  </Step>
+</Scrolly>
+
+## Prompts are code: files, templates, pinned models
+
+The first move is the simplest: **take the prompt out of the application code**. One file per prompt, one source of truth, loaded at runtime:
+
+```text
+prompts/
+  support_router.md        # the text, with {{ variables }}
+  support_billing.md
+  README.md                # the catalog: what each prompt is for, who owns it
+evals/
+  support_router.jsonl     # labelled test cases
+```
+
+Each prompt file carries a small header describing what the text is for and what it was tested with:
+
+```yaml
+---
+id: support_router
+version: 5
+model: an-exact-dated-model-snapshot   # never a floating alias like "latest"
+temperature: 0
+max_tokens: 5
+owner: support-platform
+eval: evals/support_router.jsonl
+eval_score: 0.87                         # n = 200, ±4.7 at 95%
+---
+Classify the support ticket inside <ticket> tags as exactly one of:
+BILLING, BUG, ACCOUNT, OTHER. ...
+<ticket>{{ ticket }}</ticket>
+```
+
+```python
+import yaml, jinja2, pathlib
+
+def load_prompt(name: str):
+    raw = pathlib.Path(f"prompts/{name}.md").read_text()
+    _, header, body = raw.split("---", 2)
+    meta = yaml.safe_load(header)
+    return meta, jinja2.Template(body.strip())
+
+meta, tmpl = load_prompt("support_router")
+text = tmpl.render(ticket=ticket_text)          # static text first, the variable last (B1.1)
+log.info("prompt", extra={"prompt_id": meta["id"], "prompt_version": meta["version"]})
+```
+
+Three details in that header matter more than they look.
+
+**The model is part of the prompt.** The same text on a different model is a different program: a prompt tuned for one model's habits (its template, its default verbosity, its reaction to examples) can lose points on another. So the header pins a model, and moving to a new model is a prompt change that goes through the same tests. Where the provider offers dated model snapshots, pin the snapshot; a floating alias can change underneath you, which is one candidate explanation for Monday morning.
+
+**The sampling settings are part of the prompt.** Temperature 0 for a router, a higher one for drafting replies (Module 03): change them and behaviour changes, so they are versioned with the text.
+
+**Every request logs the version.** When a user reports a bad answer, the log line tells you exactly which prompt text produced it. Without that, every investigation starts with guessing. Module B7 builds this into production observability.
+
+<Callout type="mentor" title="A prompt is a triple">
+  Think of a prompt as **(text, model, sampling settings)**, never as text alone. A change to any one of the three is a new version and gets a new score. Most "the prompt suddenly got worse" mysteries turn out to be a change in the second or third element that nobody recorded.
+</Callout>
+
+## Version control and the eval set
+
+With prompts in files, version control is just git: every change is a commit with a message, reviewed in a pull request like any other code. What turns the history into engineering is a score on every commit.
+
+An **eval set** is a fixed list of real inputs with known-good outputs or checks. For a router: tickets and their correct labels. For a reply writer: tickets and checks such as "mentions the 5-day refund window" or "valid JSON with an `escalate` field". Build it from real traffic, cover every intent and the known edge cases, and **add every production failure to it** so the same bug cannot ship twice. Module B2 covers how to score open-ended answers, including with a model as judge; here we only need a number per version.
+
+Running it is cheap. 200 examples × (700 prompt + 150 ticket + 5 output tokens) = 171,000 tokens, about 2.6 cents at a dated \$0.15 per million input tokens. There is no budget excuse for not running it on every change.
+
+### How much of a score is noise
+
+A score measured on $n$ examples is itself an estimate. If the true accuracy is $p$, the standard error of the measured accuracy is
+
+$$
+\text{SE} = \sqrt{\frac{p(1-p)}{n}}
+$$
+
+and a 95% confidence interval is about $\pm 1.96\,\text{SE}$. For $p = 0.85$ and $n = 200$:
+
+$$
+1.96 \times \sqrt{\frac{0.85 \times 0.15}{200}} = 1.96 \times 0.0252 = 0.049
+$$
+
+**±4.9 points.** So v3 at 84% and v4 at 85% on 200 examples are indistinguishable. To make the interval ±1 point you need
+
+$$
+n = \frac{1.96^2 \times 0.85 \times 0.15}{0.01^2} = \frac{3.8416 \times 0.1275}{0.0001} \approx 4{,}900 \text{ examples}
+$$
+
+which is more labelled data than most teams have. The practical answer is to compare versions **on the same examples** and look only where they disagree.
+
+<Callout type="math" title="A paired comparison in one calculation">
+  Run v3 and v4 on the same 500 tickets. They agree on 470 and disagree on 30: v4 is right and v3 wrong on 20, the reverse on 10. If the versions were truly equal, each disagreement would be a coin flip, so the chance of a split at least this lopsided in v4's favour is
+
+  $$
+  P(X \ge 20) = \sum_{k=20}^{30} \binom{30}{k} 2^{-30} \approx 0.049
+  $$
+
+  and about 0.10 counting lopsided splits in either direction. Suggestive, not proof. Notice what the pairing bought: the 470 agreements, which carry no information about which version is better, no longer add noise. This is the sign test (McNemar's test is its standard form); Module B2 uses it.
+</Callout>
+
+### The release gate
+
+Put the eval in continuous integration: any change under `prompts/`, or to a pinned model, runs the eval set and compares the candidate with production. The rule from the visual is simple: **the candidate must not be worse than production by more than a margin**, where the margin reflects the noise you can afford to ignore. v6 in the visual, shortened by 180 tokens to save money, scored 80% against production's 87% and was blocked. Saving tokens is a fine goal; the gate makes sure it is not paid for in accuracy without anyone deciding to.
+
+Offline evals do not catch everything. They are a sample of past traffic, and real users bring new intents, new products and new phrasing. So release behind a canary or an A/B split, watch the live metrics that matter (escalation rate, task completion, user ratings) per prompt version, and keep production pointing at a version identifier so that **rollback is a one-line configuration change**, as in step 6.
+
+## Prompt catalogs
+
+Once a team has a few dozen prompts, the problems become organisational: three slightly different summarisation prompts with three owners, a prompt with tool access that nobody reviewed, a deprecated prompt still called by a batch job. A <Term t="prompt-catalog">prompt catalog</Term> is the registry that answers, for each prompt: what it is for, who owns it, which model and version are live, its current eval score, and which services call it. It enables reuse (one good summariser instead of three) and review (prompts that can trigger actions get a security look, Module B7).
+
+A folder in git with a README index is a perfectly good first catalog. At the time of writing, several LLM-operations platforms offer hosted prompt registries with the same fields plus a web editor; the discipline matters more than the tool.
+
+## Letting software write the prompt
+
+Look at the workflow so far: change the text, score it on a dev set, keep it if the score went up. That is an optimisation loop with a human as the optimiser. Researchers asked the obvious question: why not automate it?
+
+- **Search over instructions.** Zhou et al. (2022, APE) had a model propose many candidate instructions from a few input-output examples, scored each on held-out data, and kept the best. Yang et al. (2023, OPRO) showed the model its previous prompts and their scores and asked for better ones, iterating.
+- **Search over whole programs.** Khattab et al. (2023) built **DSPy**, which goes further. You do not write prompt text at all; you declare what each step takes and returns, and an optimiser writes the prompts.
+
+A DSPy program looks like this (the API at the time of writing; check the current documentation):
+
+```python
+import dspy
+
+class AnswerTicket(dspy.Module):
+    def __init__(self):
+        self.classify = dspy.Predict("ticket -> intent")               # a signature, not a prompt
+        self.answer = dspy.ChainOfThought("ticket, intent, policy -> reply")
+
+    def forward(self, ticket, policy):
+        intent = self.classify(ticket=ticket).intent
+        return self.answer(ticket=ticket, intent=intent, policy=policy)
+
+def metric(example, pred, trace=None):
+    return judge_reply(example, pred.reply)       # your eval check, returning a score
+
+optimizer = dspy.BootstrapFewShotWithRandomSearch(metric=metric, num_candidate_programs=16)
+compiled = optimizer.compile(AnswerTicket(), trainset=train_examples, valset=dev_examples)
+```
+
+`compile` runs your program on training examples, keeps the runs that pass your metric as **demonstrations**, assembles candidate prompts from different sets of those demonstrations, scores every candidate on the dev set, and returns the best. In the paper, a few lines of DSPy let GPT-3.5 and Llama-2-13B-chat build pipelines that beat standard few-shot prompting by over 25% and 65% respectively, and pipelines with expert-written demonstrations by smaller margins. It is a genuinely good idea: the prompt becomes a parameter, the eval becomes the loss, and the search is automatic.
+
+### The hidden calls, and the hidden tokens
+
+Now count, because nothing about compiling is free. With $B$ bootstrap runs, $C$ candidates, $D$ dev examples and $c$ model calls per run of the program:
+
+$$
+\text{calls} = B \cdot c + C \cdot D \cdot c
+$$
+
+With the visual's numbers, $B = 100$, $C = 16$, $D = 200$, $c = 3$:
+
+$$
+100 \times 3 + 16 \times 200 \times 3 = 300 + 9{,}600 = 9{,}900 \text{ calls}
+$$
+
+At about 1,500 input and 200 output tokens per call, that is 14.85 million input and 1.98 million output tokens per compile. At dated example prices:
+
+| Prices per million (input / output) | One compile |
+|---|---|
+| \$0.15 / \$0.60 (GPT-4o mini at launch, Jul 2024) | 14.85 × 0.15 + 1.98 × 0.60 = **\$3.42** |
+| \$2.50 / \$10 (GPT-4o from Aug 2024) | 14.85 × 2.50 + 1.98 × 10 = **\$56.93** |
+
+Then you recompile whenever the program, the data or the model changes. And the larger cost hides in production. In the visual the winning candidate carries six bootstrapped demonstrations and is 2,200 tokens long against the hand-written 700. That is 1,500 extra input tokens on **every** call: at 100,000 calls a day, 150 million tokens a day, \$22.50 a day at \$0.15 per million or \$375 a day at \$2.50, every day, for a gain that may be smaller than it looks.
+
+<Callout type="pitfall" title="The winner's curse, and other things optimizers hide">
+  1. **The best of many noisy scores is too high.** Pick the maximum of 16 candidates each measured with ±4 points of noise and the winner's score is biased upward. Confirm it on a **held-out test set** the optimizer never saw before you believe the gain.
+  2. **Generated prompts are hard to review.** A prompt assembled from bootstrapped examples may contain odd or sensitive content. Read it before it ships; it still goes through your release gate.
+  3. **Frameworks make calls you did not write.** Retries, multi-step modules and output parsers can turn one logical request into several model calls. Count calls and tokens per request in your logs, for any framework, before you trust a cost estimate.
+</Callout>
+
+None of this argues against optimizers. It argues for treating them like any other engineering tool: measure what they cost to run, what they add to every call, and whether their gain survives a fresh test set.
+
+<Callout type="real" title="Now read the paper">
+  **Khattab et al., "DSPy: Compiling Declarative Language Model Calls into Self-Improving Pipelines" (2023), [arXiv 2310.03714](https://arxiv.org/abs/2310.03714).**
+
+  Read the introduction, the sections that define signatures, modules and the optimisers ("teleprompters" in the paper), and the two case studies on math word problems and multi-hop question answering. Skip the detailed comparison tables on a first pass. You will recognise the compile loop from step 7, and you can now estimate what each of their experiments cost in calls.
+
+  For the instruction-search line of work, the abstracts of Zhou et al., "Large Language Models Are Human-Level Prompt Engineers" ([arXiv 2211.01910](https://arxiv.org/abs/2211.01910)) and Yang et al., "Large Language Models as Optimizers" ([arXiv 2309.03409](https://arxiv.org/abs/2309.03409)) are enough.
+</Callout>
+
+<KeyNotes>
+  1. Prompt text is code. Keep each prompt in its own file with a header, render it from a template, and log the prompt id and version with every request.
+  2. A prompt is a triple of (text, model, sampling settings). Pin an exact model snapshot; changing any of the three is a new version that must be re-scored.
+  3. Score every version on a fixed eval set built from real traffic, and add each production failure to it. One run of 200 examples costs cents.
+  4. Eval scores are noisy: the 95% interval is 1.96 × √(p(1 − p) / n), ±4.9 points at p = 0.85 and n = 200; ±1 point needs about 4,900 examples. Compare versions on the same examples and look at the disagreements.
+  5. Gate releases in CI: a candidate may not score worse than production by more than a margin. Then canary, watch live metrics per version, and keep rollback a one-line change.
+  6. A prompt catalog records purpose, owner, live version, model, score and consumers for every prompt; it enables reuse and review.
+  7. Automatic optimizers (APE, OPRO, DSPy) search prompts against a metric. A DSPy compile with 16 candidates, 200 dev examples and 3 calls per run is 9,900 calls, about \$3.42 to \$56.93 per compile at dated prices.
+  8. The bigger cost is recurring: a winner with 1,500 extra prompt tokens adds 150 million tokens a day at 100,000 calls. Confirm the gain on a held-out set, because the best of many noisy scores is biased upward.
+</KeyNotes>
+
+<Quiz client:visible questions={[
+  { q: 'A version scores 85% on an eval set of 200 examples. What is the half-width of its 95% confidence interval, in percentage points?', numeric: true, answer: 4.9, tolerance: 0.15, unit: 'points', why: '1.96 × √(0.85 × 0.15 / 200) = 1.96 × √0.000638 = 1.96 × 0.0252 = 0.049, so ±4.9 points.' },
+  { q: 'About how many examples would you need for that interval to be ±1 point at p = 0.85?', numeric: true, answer: 4898, tolerance: 150, unit: 'examples', why: 'n = 1.96² × 0.85 × 0.15 / 0.01² = 3.8416 × 0.1275 / 0.0001 ≈ 4,898. Far more than most teams label, which is why paired comparisons matter.' },
+  { q: 'An optimizer runs 100 bootstrap examples, then scores 16 candidate programs on 200 dev examples. Each run of the program makes 3 model calls. How many calls does one compile make?', numeric: true, answer: 9900, tolerance: 0, unit: 'calls', why: '100 × 3 + 16 × 200 × 3 = 300 + 9,600 = 9,900 calls.' },
+  { q: 'The optimized prompt is 1,500 tokens longer than the hand-written one. At 100,000 calls a day, how many million extra input tokens is that per day?', numeric: true, answer: 150, tolerance: 1, unit: 'M tokens', why: '1,500 × 100,000 = 150,000,000 = 150 million tokens a day, every day, against a one-off compile of a few million calls’ worth.' },
+  { q: 'Your team switches the support prompt to a newer model without changing a word of the text. How should this be treated?', options: ['As no change: the prompt text is identical', 'As a new prompt version: the model is part of the prompt, so it must be re-scored and pass the release gate', 'As a change only if the new model is larger', 'As a template change only'], answer: 1, why: 'A prompt is (text, model, sampling settings). The same text on another model is a different program, which is exactly what step 6 shows: v7 changed only the model and regressed live.' },
+  { q: 'An optimizer reports that the best of 32 candidates scores 4 points above your current prompt on the 200-example dev set it searched over. What should you do before shipping?', options: ['Ship it: 4 points is well beyond noise', 'Re-score it on a held-out test set the optimizer never saw, and check the extra tokens it adds per call', 'Run the optimizer again with more candidates', 'Lower the release gate margin'], answer: 1, why: 'The maximum of 32 noisy scores is biased upward (the winner’s curse), and ±4–5 points is the noise on 200 examples. A held-out set gives an unbiased estimate; the token cost per call is the recurring price of the gain.' },
+]} />

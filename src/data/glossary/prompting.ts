@@ -74,4 +74,19 @@ export const terms: Record<string, GlossaryEntry> = {
     def: 'The prompt length up to which a model still performs acceptably on a given task, as opposed to the advertised window it can hold. Harder long-context benchmarks often find it far below the advertised number; measure it on your own task.',
     lesson: 'prompting/context-position',
   },
+  'eval-set': {
+    term: 'Eval set',
+    def: 'A fixed list of real inputs with known-good outputs or checks, run against every prompt or model version so that each change gets a comparable score. Grow it with every production failure.',
+    lesson: 'prompting/prompt-ops',
+  },
+  'prompt-catalog': {
+    term: 'Prompt catalog',
+    def: 'A registry of a team\u2019s prompts: what each is for, its owner, live version, pinned model, current eval score and the services that call it. Enables reuse and review instead of many near-duplicate prompts.',
+    lesson: 'prompting/prompt-ops',
+  },
+  'prompt-optimizer': {
+    term: 'Automatic prompt optimizer',
+    def: 'Software that searches for better prompts against a metric, for example by having a model propose instructions (APE, OPRO) or by bootstrapping few-shot demonstrations and scoring candidate programs (DSPy). Each compile costs many model calls, and the winner is often a longer prompt.',
+    lesson: 'prompting/prompt-ops',
+  },
 };
