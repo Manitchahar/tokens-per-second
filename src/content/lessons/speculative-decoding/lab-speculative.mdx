@@ -37,16 +37,16 @@ The point is not any single number. It is that the verdict flips when you change
     Code accepts around 0.8; creative writing sits near 0.4. The speedup moves several-fold across that range. **If you measure $a$ on the wrong traffic, every conclusion you draw is wrong.**
   </Step>
 
-  <Step title="3. The break-even line is $a = \rho$">
-    The dashed line on the acceptance bar is where speculation exactly pays for itself. For a 1B drafting an 8B it is 12.5%. Nothing below it is worth doing, however good the method.
+  <Step title="3. The break-even line">
+    The line on the acceptance bar is where speculation exactly pays for itself: where the fraction of drafted tokens kept equals $\rho$. For a 1B drafting an 8B at four drafts per block it sits at about 34% (it would be 12.5% if you drafted one token at a time). Nothing below it is worth doing, however good the method.
   </Step>
 
   <Step title="4. The method only moves $\rho$">
     Every drafting method changes the cost ratio and nothing else. Prompt lookup sits almost on the break-even line; a large draft model sits well to the right of it. Pick the method that matches your traffic's acceptance rate.
   </Step>
 
-  <Step title="5. $\gamma$ has a flat part">
-    Speedup rises with $\gamma$ then flattens as the token count approaches $\frac{1}{1-a}$. Past the flat part, more drafts buy nothing and cost scheduling work and memory.
+  <Step title="5. $\gamma$ has a peak">
+    Speedup rises with $\gamma$, peaks, then falls: the token count flattens toward $\frac{1}{1-a}$ while every extra draft still costs $\rho$. Past the peak, more drafts cost more than they return.
   </Step>
 
   <Step title="6. Batch kills it">
@@ -101,7 +101,7 @@ Section 2 runs the algorithm 10,000 times against a deliberately miscalibrated d
 
 Section 3 evaluates the derived expressions for $a = 0.72$, $\rho = 0.125$ across a $\gamma$ sweep, then solves numerically for the break-even acceptance rate at several cost ratios.
 
-**Expected:** the break-even comes out at essentially $\rho$ for every value tried — 0.02, 0.125, 0.300. That is the cancellation from the previous lesson made visible: the $\gamma$ dependence divides out, and the rule is simply $a > \rho$.
+**Expected:** at $\gamma = 1$ the break-even equals $\rho$ exactly. At $\gamma = 4$ it is higher: about 0.074, 0.336 and 0.574 for $\rho$ = 0.02, 0.125 and 0.300. Every drafted token is paid for and later drafts are kept less often, so a longer block needs a higher acceptance rate: the rule is that the **keep rate** beats $\rho$, and only at $\gamma = 1$ is that simply $a > \rho$.
 
 ### 4. Measure acceptance on real text
 
@@ -125,13 +125,13 @@ Section 6 times the target on one position versus on $\gamma+1$ positions for se
 
 Section 7 plugs your measured $a$ and $\rho$ into the model and prints the verdict.
 
-**Be prepared for a loss.** On a T4 with these two small models, $\rho$ is often *above* the acceptance rate, which means the correct answer is "do not enable it here". That is a legitimate and instructive result: it means the drafter is too close in size to the target, on a card too slow at launches.
+**Be prepared for a loss.** On a T4 with these two small models, $\rho$ is often *above* the keep rate, which means the correct answer is "do not enable it here". That is a legitimate and instructive result: it means the drafter is too close in size to the target, on a card too slow at launches.
 
 ### 8. Find the regimes that flip the sign
 
 Section 8 sweeps acceptance from 0.1 to 0.9 and prints the verdict for each, then shows how the weight bytes per token fall as batch grows, then notes the short-output case.
 
-**Expected:** the sign flip exactly where $a$ crosses $\rho$. If it does not, your implementation is wrong.
+**Expected:** the sign flip exactly where the keep rate (printed next to each $a$) crosses $\rho$, which at $\gamma = 4$ means an acceptance rate well above $\rho$. If it does not, your implementation is wrong.
 
 ### 9. N-gram drafting, where $\rho \approx 0$
 
@@ -163,9 +163,9 @@ Answer these in your notes, with the arithmetic shown.
 
 **Answers, once you have done the work:**
 
-1. $d = (1 - 0.55^5)/(1 - 0.55) = (1 - 0.0503)/0.45 = 0.9497/0.45 = 2.110$. Tokens $= 1 + 0.55 \times 2.110 = 2.161$. Cost $= 1 + 0.22 \times 2.110 = 1.464$. Speedup $= 2.161/1.464 = 1.48\times$. Note the margin: $a/\rho = 2.5$, so it wins — but not by the \$2.2\times$ a 1B-drafts-8B pairing gives, because that pairing has a much lower $\rho$.
+1. Kept drafts $K = 0.55 + 0.55^2 + \dots + 0.55^5 = 0.55 \times (1 - 0.0503)/0.45 = 1.161$. Tokens $= 1 + 1.161 = 2.161$. Cost $= 1 + 5 \times 0.22 = 2.10$. Speedup $= 2.161/2.10 = 1.03\times$: a bare win, because the keep rate $1.161/5 = 23\%$ only just beats $\rho = 22\%$. A shorter block does better: at $\gamma = 2$, tokens $= 1.853$, cost $= 1.44$, speedup $1.29\times$. With low acceptance and an expensive drafter, draft less.
 2. The fixed per-step overhead — kernel launches, scheduling, Python — which both models pay identically regardless of size (Module 15). It is a larger *share* of a small model's step, so $\rho$ exceeds the parameter ratio, and the effect is worse on a T4 because the T4's memory bandwidth is low, making the step longer in absolute terms while the launch overhead stays the same.
-3. The speedup would fall by roughly the same factor, because the verification pass is the dominant term in the cost (it is the "1" in cost $= 1 + \rho d$, and $\rho d$ is small). Tripling the dominant term takes the speedup from about 1.5× to well under 1× — speculation would become a loss. This is why section 6 is measured rather than assumed.
+3. The speedup would fall by roughly the same factor, because the verification pass is the dominant term in the cost (it is the "1" in cost $= 1 + \gamma\rho$, and $\gamma\rho$ is usually the smaller term). Tripling the dominant term takes the speedup from about 1.5× to well under 1× — speculation would become a loss. This is why section 6 is measured rather than assumed.
 4. No. The deciding number is $\rho$, and $\rho$ falls sharply on a faster card: an H100's much higher bandwidth shortens the target's step, so the same fixed overhead is a smaller share of it, and the parameter ratio dominates again. The 8B target also gives the free methods much less to copy from. Measure both before deciding.
 5. $\rho$, more likely. Acceptance can be estimated by reading a paper's reported numbers for a similar model and workload, and it degrades gracefully — being wrong about it by 0.1 changes the speedup modestly. $\rho$ is a property of *your* deployment (model pair, batch size, card, whether you compiled) and is commonly assumed to be the parameter ratio, which is what section 5 shows to be wrong.
 
@@ -173,7 +173,7 @@ Answer these in your notes, with the arithmetic shown.
   1. The order is always **implement, verify, then time**. Exactness is a provable property of the algorithm, so a distribution test is the strongest check available.
   2. Three details make the algorithm exact: sample the proposal from $q$, emit an accepted token as-is, and sample the bonus token from $p$. Section 11 shows the argmax version is off by tens of percent with no error raised.
   3. Normalise a variable-length histogram by the **tokens emitted**, not the trial count, or every row is uniformly wrong.
-  4. The break-even check is $a > \rho$, and the numerical solve should return $\rho$ itself for every cost ratio — that is the $\gamma$ cancellation made visible.
+  4. The break-even check is that the **keep rate** (accepted drafts ÷ drafted tokens) beats $\rho$. The numerical solve returns $\rho$ itself only at $\gamma = 1$; at $\gamma = 4$ it returns more (0.336 for $\rho = 0.125$), because every draft is paid for and later drafts are kept less often.
   5. Measured $\rho$ on a T4 is much larger than the parameter ratio, because both models pay the same fixed per-step overhead and it is a bigger share of a small model's step.
   6. Verifying the pass costs about one decode step for small $\gamma$ — the premise the whole technique rests on, and the one most worth measuring.
   7. A "loss" on small hardware is a legitimate result, not a failed experiment; it usually means the drafter is too close in size to the target for that card.
@@ -182,9 +182,9 @@ Answer these in your notes, with the arithmetic shown.
 
 <Quiz client:visible questions={[
   { q: 'Section 2 prints a histogram where every token is off from the target by roughly the same proportion. What is the most likely cause?', options: ['The acceptance rule is wrong', 'The histogram was normalised by the number of trials instead of the number of tokens emitted', 'The draft model is miscalibrated', 'gamma is too small'], answer: 1, why: 'A uniform scaling error across all tokens is a normalisation bug, not an algorithm bug. Each trial emits a variable number of tokens, so you must divide by the total emitted. A genuinely wrong acceptance rule produces lopsided errors concentrated on the tokens the drafter favours.' },
-  { q: 'Your measured acceptance is a = 0.55 and rho = 0.22 at gamma = 5. What is the speedup?', numeric: true, answer: 1.48, tolerance: 0.05, unit: 'x', why: 'd = (1 - 0.55^5)/(1 - 0.55) = 2.110. Tokens = 1 + 0.55 x 2.110 = 2.161. Cost = 1 + 0.22 x 2.110 = 1.464. Speedup = 2.161 / 1.464 = 1.48x. It wins because a > rho.' },
+  { q: 'Your measured acceptance is a = 0.55 and rho = 0.22 at gamma = 5. What is the speedup?', numeric: true, answer: 1.03, tolerance: 0.03, unit: 'x', why: 'Kept drafts = 0.55 + 0.55² + … + 0.55⁵ = 1.161, so tokens = 2.161. All five drafts are paid for: cost = 1 + 5 × 0.22 = 2.10. Speedup = 2.161 / 2.10 = 1.03x, a bare win because the keep rate (23%) only just beats rho (22%). At gamma = 2 it would be 1.29x.' },
   { q: 'Section 5 measures rho around 0.5 while the parameter ratio is 0.33. Why is rho higher?', options: ['Both models pay the same fixed per-step overhead, which is a larger share of a small model\'s step', 'The draft model runs at lower precision', 'The target model has more layers', 'KV cache reads dominate'], answer: 0, why: 'Kernel launches, scheduling and Python cost the same for both models. Because a small model\'s memory-bound step is shorter, that fixed cost is a bigger fraction of it, so the measured ratio exceeds the parameter ratio. The effect is worse on a slow card like the T4.' },
-  { q: 'Section 6 finds the verify pass costs 1.02x a decode step at gamma = 4. If this ratio were 3x instead, what would happen?', options: ['Nothing, since acceptance is what matters', 'The dominant cost term triples, so the speedup falls and could drop below 1', 'The acceptance rate would rise', 'Tokens per block would increase'], answer: 1, why: 'The verify pass is the "1" in cost = 1 + rho*d, and rho*d is small. Tripling it takes the dominant term to 3, which with tokens around 2 means the cost exceeds the tokens delivered and speculation becomes a net loss.' },
-  { q: 'An 8B target is verified on a single A100 at batch 1. Its verification pass costs about the same as one decode step. Over 20 blocks it emits 48 tokens, and drafting costs 0.15 decode steps per token drafted, 1.2 tokens drafted per block. What is the total cost in decode steps?', numeric: true, answer: 23.6, tolerance: 0.4, unit: 'decode steps', why: 'Verification: 20 blocks x 1 pass = 20 decode steps. Drafting: 20 blocks x 1.2 drafted x 0.15 = 3.6 decode steps. Total = 23.6 decode steps for 48 tokens. Plain decoding would have cost 48 decode steps, so the speedup is 48 / 23.6 = 2.03x.' },
+  { q: 'Section 6 finds the verify pass costs 1.02x a decode step at gamma = 4. If this ratio were 3x instead, what would happen?', options: ['Nothing, since acceptance is what matters', 'The dominant cost term triples, so the speedup falls and could drop below 1', 'The acceptance rate would rise', 'Tokens per block would increase'], answer: 1, why: 'The verify pass is the "1" in cost = 1 + gamma*rho, and gamma*rho is usually the smaller term. Tripling it takes the dominant term to 3, which with tokens around 2 means the cost exceeds the tokens delivered and speculation becomes a net loss.' },
+  { q: 'An 8B target is verified on a single A100 at batch 1, and its verification pass costs about one decode step. Over 20 blocks of gamma = 2 drafts it emits 48 tokens, and each drafted token costs 0.15 decode steps. What is the total cost in decode steps?', numeric: true, answer: 26, tolerance: 0.4, unit: 'decode steps', why: 'Verification: 20 blocks × 1 pass = 20 decode steps. Drafting: every block drafts both tokens, kept or not, so 20 × 2 × 0.15 = 6.0 decode steps. Total = 26.0 decode steps for 48 tokens. Plain decoding would have cost 48, so the speedup is 48 / 26 = 1.85x.' },
   { q: 'Which measurement is more dangerous to skip: a or rho?', options: ['a, because it varies wildly between runs', 'rho, because it is a property of your specific deployment and is commonly assumed to equal the parameter ratio', 'Neither, both are easy to estimate', 'a, because it cannot be measured'], answer: 1, why: 'rho depends on the model pair, batch size, card and whether you compiled. People routinely assume it equals the parameter ratio, and section 5 shows how wrong that is. Acceptance degrades more gracefully: being wrong about it changes the speedup smoothly.' },
 ]} />

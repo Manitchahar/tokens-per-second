@@ -1,10 +1,10 @@
 ---
 title: 'Draft & verify: the core trick'
-summary: 'Decode produces one token per step and each step re-reads every weight. Speculative decoding breaks the serial chain: something cheap guesses several tokens ahead, the real model checks the whole guess in one pass, and the wrong ones are thrown away. You learn why the check is nearly free and why being wrong costs nothing.'
+summary: 'Decode produces one token per step and each step re-reads every weight. Speculative decoding breaks the serial chain: something cheap guesses several tokens ahead, the real model checks the whole guess in one pass, and the wrong ones are thrown away. You learn why the check is nearly free and why a wrong guess costs only the time spent drafting it.'
 objectives:
   - Explain why decode is memory-bound and why that makes one extra token in a step nearly free
   - Describe the three phases of a speculative block — draft, verify, then accept the prefix
-  - Compute how many tokens a block yields from its accepted prefix plus the bonus token
+  - 'Compute how many tokens a block yields: its accepted prefix plus one token from the target'
   - State what makes the technique exact rather than an approximation
   - Implement the rejection rule that keeps the output distribution identical to plain sampling
 ---
@@ -62,8 +62,8 @@ Now put it together. If five positions cost the same as one, then a pass that pr
     Walk left to right. Keep tokens matching the target's own prediction; stop at the first disagreement and discard that one and everything after. The accepted prefix is the longest prefix that was genuinely correct.
   </Step>
 
-  <Step title="6. The last position is a free token">
-    The final position is one the draft never predicted. Whatever the target samples there is correct by definition — so every block emits at least one token, whatever the acceptance rate. This is the <Term t="bonus-token">bonus token</Term>.
+  <Step title="6. The target always adds one token">
+    The target scored every position in the same pass, so wherever the run stops it already has its own answer there. At the first rejection it emits a **corrected token** in place of the rejected draft. If every draft was accepted, it emits a <Term t="bonus-token">bonus token</Term> from the extra position $\gamma + 1$, which the draft never predicted. Either way every block emits at least one token, whatever the acceptance rate.
   </Step>
 
   <Step title="7. One pass, several tokens">
@@ -203,7 +203,7 @@ Three details in that loop carry the whole exactness argument, and each is a pla
 
 ## Where this leaves you
 
-You have the mechanism. Something cheap guesses $\gamma$ tokens, the target checks them all in one pass because positions are causally independent, you keep the accepted prefix, and you get a free bonus token at the end. The output is exactly what plain sampling would have produced.
+You have the mechanism. Something cheap guesses $\gamma$ tokens, the target checks them all in one pass because positions are causally independent, you keep the accepted prefix, and the target adds one token of its own: a corrected token at the first rejection, or a bonus token if every draft was accepted. The output is exactly what plain sampling would have produced.
 
 What you do not yet have is any way to predict whether it will be worth it. That depends on the acceptance rate — how often the draft and target agree — and on the draft model's cost relative to the target's. Those are the two numbers the next lesson derives.
 
@@ -211,16 +211,16 @@ What you do not yet have is any way to predict whether it will be worth it. That
   1. Decode is memory-bound, so a step's cost is set by reading the weights, and that cost does not depend on how many token positions the step processes.
   2. Speculative decoding uses that: a cheap proposer drafts $\gamma$ tokens, the target scores all $\gamma+1$ positions in **one** forward pass, and the weights are read once.
   3. Accept the longest prefix of drafts that matches the target's own predictions; discard the first disagreement and everything after it.
-  4. The final position is never predicted by the draft, so its token is correct by construction and free. **Every block emits at least one token.**
+  4. After the accepted prefix the target always adds one token from the same pass: a corrected token at the first rejection, or a bonus token from position $\gamma + 1$ if all drafts were accepted. **Every block emits at least one token.**
   5. The rejection rule $p'_i(x) = \mathrm{normalize}(\max(0, p_i(x) - q_i(x)))$ preserves the target's distribution exactly — speculation is not an approximation.
-  6. A rejected draft costs compute and nothing else: no user sees it and no quality is lost. The tradeoff is time, not accuracy.
+  6. A rejected draft costs compute and nothing else: no user sees it and no quality is lost. But all $\gamma$ drafts are generated before verification, so the drafts after the first rejection are paid for and thrown away. The tradeoff is time, not accuracy.
   7. Because the verification pass is $\gamma$ times taller in the matmuls, a very large $\gamma$ eventually stops being free — which is why there is a best $\gamma$, not an unbounded one.
-  8. Drafting is sequential and therefore costs real time; speculation pays only when the acceptance rate beats the draft model's cost ratio. That is the next lesson's whole subject.
+  8. Drafting is sequential and therefore costs real time; speculation pays only when the fraction of drafted tokens you keep beats the draft model's cost ratio. That is the next lesson's whole subject.
 </KeyNotes>
 
 <Quiz client:visible questions={[
   { q: 'Why can the target model verify a whole block of gamma drafted tokens in one forward pass?', options: ['Because attention can look at future tokens during verification', 'Because each position depends only on itself and earlier context, so all positions can be scored in parallel', 'Because the draft tokens are cheap to recompute', 'Because the GPU can skip weight loading when positions are similar'], answer: 1, why: 'The causal mask means position i depends only on positions up to i. That is the same property prefill exploits to process a whole prompt in one pass. The weights are still read once, and the block is scored position-parallel.' },
-  { q: 'In a block where 2 of 4 drafted tokens are accepted, how many tokens leave the block in total?', numeric: true, answer: 3, tolerance: 0, unit: 'tokens', why: 'Two accepted drafts, plus one bonus token from the final position the draft never predicted. The rejected drafts produce nothing. Accepted = 2, so total = 2 + 1 = 3.' },
+  { q: 'In a block where 2 of 4 drafted tokens are accepted, how many tokens leave the block in total?', numeric: true, answer: 3, tolerance: 0, unit: 'tokens', why: 'Two accepted drafts, plus the target’s own corrected token at position 3, where the first rejection happened. The fourth draft is discarded (it was drafted and paid for, but never used). Total = 2 + 1 = 3.' },
   { q: 'Why is a speculative decoding step able to check several positions for roughly the cost of one decode step?', options: ['Because the weights are cached in registers between positions', 'Because decode is memory-bound, and weight traffic does not depend on the number of positions in a step', 'Because verification skips the KV cache', 'Because the draft tokens make the attention cheaper'], answer: 1, why: 'Decode time is dominated by streaming the weights, which is a fixed byte count per forward pass. Processing gamma+1 positions instead of 1 reads the same weights and writes gamma+1 times more KV, which is negligible next to the weights.' },
   { q: 'What happens to the output distribution when a draft token is rejected and the corrected distribution p is used?', options: ['It shifts slightly toward lower-probability tokens', 'Nothing — the rejection rule preserves the target distribution exactly', 'It becomes deterministic', 'It becomes higher-entropy than plain sampling'], answer: 1, why: 'The corrected distribution p prime, which keeps the probability mass the draft under-covered, is constructed so the total probability of every output matches plain sampling from the target. Speculation is exact, not approximate.' },
   { q: 'A decode step on an H100 for Llama-3.1-8B in BF16 must read 16.06 GB of weights. At 3.35 TB/s, about how long is that read?', numeric: true, answer: 4.8, tolerance: 0.6, unit: 'ms', why: '16.06 GB divided by 3.35 TB/s = 4.8 ms. That is the floor for one token, and it is why decode is memory-bound. Speculation does not shrink this number; it gets more tokens out of each one.' },

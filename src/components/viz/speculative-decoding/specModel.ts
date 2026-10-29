@@ -15,7 +15,8 @@
 // step processes. Running the target on gamma+1 positions therefore costs almost
 // the same wall-clock as running it on one — that is why a block of drafts can be
 // checked for nearly free. "Nearly": the block does gamma times the FLOPs, and at
-// some point that stops being negligible. That is where the best gamma comes from.
+// some point that stops being negligible. The best gamma comes mostly from the
+// drafting side, though: every draft costs rho, and later drafts are kept less often.
 
 import { GPUS } from '../lib/perfModel';
 
@@ -58,53 +59,63 @@ export const draftStep = (rho: number, tDecode: number) => rho * tDecode;
 
 export interface BlockResult {
   gamma: number;
-  /** Expected drafted tokens before the first rejection (and before the block ends). */
+  /** Drafted tokens per block: always gamma. The draft model proposes all of them before the target verifies any. */
   draftSteps: number;
-  /** Tokens that leave the block: the accepted run plus one bonus token. */
+  /** Expected drafts the target accepts: a + a^2 + ... + a^gamma. */
+  accepted: number;
+  /** Keep rate: the fraction of drafted tokens that survive, accepted / gamma. */
+  keepRate: number;
+  /** Tokens that leave the block: the accepted run plus one corrected-or-bonus token. */
   tokens: number;
-  /** Forward passes per delivered token — the metric the literature actually reports. */
+  /** Target forward passes per delivered token, 1 / tokens. */
   rounds: number;
-  /** Cost in decode-step units. */
+  /** Cost in seconds (or decode-step units when tDecode = 1). */
   cost: number;
   perToken: number;
   speedup: number;
-  /** Drafted tokens thrown away. */
+  /** Drafted tokens thrown away: gamma minus the accepted ones. */
   wasted: number;
   /** Probability every draft in the block is accepted. */
   allAccepted: number;
 }
 
+/** Expected accepted drafts in a block of gamma: sum of a^i for i = 1..gamma = a (1 - a^gamma) / (1 - a). */
+export function expectedAccepted(a: number, gamma: number) {
+  const g = Math.max(1, Math.round(gamma));
+  return Math.abs(1 - a) < 1e-9 ? g : (a * (1 - Math.pow(a, g))) / (1 - a);
+}
+
 /**
- * One block, exactly. Drafting stops at the first rejection, so we never pay for
- * all gamma draft steps — only for min(k+1, gamma) of them, where k accepted.
- * With k ~ Geometric(1-a):
+ * One block of standard speculative decoding (Leviathan et al. 2023; Chen et al. 2023).
  *
- *   expected draft steps = (1 - a^gamma) / (1 - a)
- *   expected tokens out  = 1 + a * (that)
+ * The draft model proposes all gamma tokens, one after another, so all gamma draft
+ * steps are paid for. The target then verifies the gamma drafts in ONE forward pass
+ * over gamma+1 positions, keeps the prefix up to the first rejection, and adds one
+ * more token: a corrected token at the rejected position, or a bonus token if all
+ * gamma were accepted. With each draft accepted independently with probability a:
  *
- * Verification is one pass over gamma+1 positions. The bonus token is the one
- * thing every block gets for free.
+ *   accepted drafts  = a + a^2 + ... + a^gamma = a (1 - a^gamma) / (1 - a)
+ *   tokens out       = 1 + accepted          = (1 - a^(gamma+1)) / (1 - a)
+ *   cost             = verify + gamma * rho  (drafts you do not keep are still paid)
  */
 export function block(a: number, rho: number, gamma: number, tVerify = 1, tDecode = 1): BlockResult {
   const g = Math.max(1, Math.round(gamma));
-  const denom = 1 - a;
-  const draftSteps = Math.abs(denom) < 1e-9 ? g : (1 - Math.pow(a, g)) / denom;
-  const tokens = 1 + a * draftSteps;
-  // tVerify and tDecode are SECONDS. The baseline is what one plain decode step
-  // would cost to emit one token, so the speedup is a true ratio:
-  //   baseline = tDecode, and we emit `tokens` tokens for `cost` seconds.
-  const cost = tVerify + rho * tDecode * draftSteps;
-  let wasted = 0;
-  for (let j = 0; j < g; j++) wasted += (g - j - 1) * Math.pow(a, j) * (1 - a);
+  const accepted = expectedAccepted(a, g);
+  const tokens = 1 + accepted;
+  // tVerify and tDecode are SECONDS. The baseline is one plain decode step per token,
+  // so the speedup is a true ratio: we emit `tokens` tokens for `cost` seconds.
+  const cost = tVerify + rho * tDecode * g;
   return {
     gamma: g,
-    draftSteps,
+    draftSteps: g,
+    accepted,
+    keepRate: accepted / g,
     tokens,
-    rounds: (g + 1) / tokens,
+    rounds: 1 / tokens,
     cost,
     perToken: cost / tokens,
     speedup: tokens / (cost / tDecode),
-    wasted,
+    wasted: g - accepted,
     allAccepted: Math.pow(a, g),
   };
 }
@@ -112,15 +123,13 @@ export function block(a: number, rho: number, gamma: number, tVerify = 1, tDecod
 /**
  * Break-even acceptance rate: the a at which the block exactly pays for itself.
  *
- * In the idealised model where verification costs exactly one decode step, this
- * collapses to a* = rho, and gamma cancels entirely:
- *
- *   speedup > 1  <=>  1 + a*d  >  1 + rho*d  <=>  a > rho
- *
- * because the tokens and the cost share the same draft-step count d. In words:
- * you win exactly when your acceptance rate beats your draft model's cost ratio.
- * Real verification costs slightly more than a decode step (see verifyPass), so
- * the real break-even sits a little above rho — which is what this finds.
+ * When verification costs exactly one decode step, speedup = (1 + K) / (1 + gamma*rho)
+ * with K the expected accepted drafts, so speedup > 1 exactly when K > gamma*rho, i.e.
+ * when the KEEP RATE K / gamma beats rho. Each drafted token costs rho of a step and
+ * each kept one saves a whole step. For gamma = 1 the keep rate is a, so the rule is
+ * a > rho; for longer blocks later drafts are kept less often, so the break-even
+ * acceptance rises with gamma. Real verification costs slightly more than a decode
+ * step (see verifyPass), which nudges it a little higher still.
  *
  * Both times are in SECONDS.
  */
@@ -133,7 +142,10 @@ export function breakEvenAcceptance(rho: number, gamma: number, tVerify: number,
   return (lo + hi) / 2;
 }
 
-/** Scan gamma and return the best one — finite once verification is modelled honestly. */
+/** The idealised break-even (verification = one decode step): the a whose keep rate equals rho. */
+export const breakEvenIdeal = (rho: number, gamma: number) => breakEvenAcceptance(rho, gamma, 1, 1);
+
+/** Scan gamma and return the best one. It is finite even with free verification, because every draft costs rho and later drafts are kept less often. */
 export function bestGamma(a: number, rho: number, machine: Machine, maxGamma = 32) {
   const tDecode = decodeStep(machine);
   let best: BlockResult | null = null;

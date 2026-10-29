@@ -24,7 +24,7 @@ const STEPS = [
   'The acceptance rate is the whole game',
   'The break-even line',
   'Draft cost decides the method',
-  'gamma: find the flat part',
+  'gamma: find the peak',
   'Batch kills the benefit',
   'Read your own verdict',
   'Now go measure it',
@@ -33,9 +33,9 @@ const STEPS = [
 const CAPTIONS = [
   'Five workloads, same model and card. Only two things change: how predictable the text is, and how many sequences are in the batch. Watch what that does to the verdict.',
   'Acceptance is the single strongest lever. Code accepts around 0.8 because syntax repeats; creative writing sits near 0.4 because it does not. The speedup moves several-fold across that range.',
-  'The break-even line is a = rho, and for a 1B drafting an 8B that is 12.5%. Nothing below it is worth doing, whatever else is going on.',
+  'The break-even is where the keep rate, the fraction of drafted tokens that survive, equals rho. For a 1B drafting an 8B with four drafts per block that needs an acceptance of about 34%; with one draft per block it would be 12.5%. Nothing below the line is worth doing.',
   'The method only changes rho, and therefore where your workload sits relative to that line. Prompt lookup sits almost on top of it; a big draft model sits well to the right.',
-  'Speedup rises with gamma and then flattens as the token count approaches 1/(1-a). Past the flat part, more drafts buy nothing — and cost memory and scheduling.',
+  'Speedup rises with gamma, peaks, then falls: the token count flattens toward 1/(1-a) while every extra draft still costs rho. Past the peak, more drafts cost more than they return.',
   'Raise the batch and the verdict inverts. The weights are read once for everyone, the step is compute-bound, and the free-verification premise no longer holds.',
   'Your verdict line combines all of it: acceptance, method, batch and block size. Before you trust it, measure the two numbers it rests on.',
   'The notebook measures acceptance rate, draft cost and the verify-versus-decode time on a real T4. Compare its numbers with these predictions and you will know exactly how much to trust a model like this one.',
@@ -94,7 +94,7 @@ export default function SpecLab() {
       legend={[
         ['token', 'faster than plain decode'],
         ['error', 'slower — leave it off'],
-        ['memory', 'break-even, a = rho'],
+        ['memory', 'break-even acceptance'],
         ['compute', 'draft cost'],
       ]}
       {...s}
@@ -198,7 +198,7 @@ export default function SpecLab() {
           <Label x={CX + 312} y={200} tone={3} size={8.5}>{`tokens per block ${r.tokens.toFixed(2)}`}</Label>
           <Label x={CX + 312} y={240} size={9} kind="compute" bold>{`best γ ≈ ${bg.gamma} → ${bg.speedup.toFixed(2)}x`}</Label>
           <Label x={CX + 312} y={254} tone={3} size={8.5}>{`ceiling 1/(1−a) = ${(1 / (1 - a)).toFixed(2)} tokens`}</Label>
-          <Label x={CX + 312} y={266} tone={3} size={8.5}>{`drafts paid: ${r.draftSteps.toFixed(2)}, wasted ${r.wasted.toFixed(2)}`}</Label>
+          <Label x={CX + 312} y={266} tone={3} size={8.5}>{`drafts paid: ${r.draftSteps}, wasted ${r.wasted.toFixed(2)}`}</Label>
         </Fade>
 
         {/* ── the machine ──────────────────────────────────── */}
